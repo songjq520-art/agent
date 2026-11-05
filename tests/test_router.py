@@ -237,7 +237,10 @@ def test_muse_provider_cached_cost(tmp_path):
 
 def test_budget_tracker_monthly_reset_while_running(tmp_path):
     """预算运行期间跨月重置：程序一直运行时，把月份手动改成上个月，
-    再调用 can_call() 时应重置为 0、恢复可调用，文件里的月份也已更新。"""
+    再调用 can_call() 时应重置为 0、恢复可调用，文件里的月份也已更新。
+    注意：如果之前没有未知成本，unknown_cost 保持 False；如果有未知成本，
+    跨月后它必须保留（见 test_unknown_cost_survives_month_rollover），
+    不能在这里断言它被清掉。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(4.5)
     assert tracker.total_cost_usd == 4.5
@@ -245,10 +248,42 @@ def test_budget_tracker_monthly_reset_while_running(tmp_path):
     tracker.month = "2000-01"
     assert tracker.can_call() is True
     assert tracker.total_cost_usd == 0.0
+    assert tracker.unknown_cost is False  # 本来就没有未知成本，不是被清掉的
     assert tracker.month == datetime.now().strftime("%Y-%m")
     saved = json.loads((tmp_path / "budget_usage.json").read_text(encoding="utf-8"))
     assert saved["month"] == datetime.now().strftime("%Y-%m")
     assert saved["total_cost_usd"] == 0.0
+
+
+def test_unknown_cost_survives_month_rollover(tmp_path):
+    """未知成本跨月保留：上个月产生未知成本，进入新月份后仍然不能发起付费请求。
+    跨月只重置当月累计，不自动解除暂停。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    tracker.add_cost(4.5)
+    tracker.mark_unknown_cost()
+    assert tracker.unknown_cost is True
+    assert tracker.can_call() is False
+    # 模拟跨月：只改内存里的月份，不重建 Tracker。
+    tracker.month = "2000-01"
+    assert tracker.can_call() is False  # 仍暂停，不能发起付费请求
+    assert tracker.total_cost_usd == 0.0  # 当月累计已重置
+    assert tracker.month == datetime.now().strftime("%Y-%m")
+    assert tracker.unknown_cost is True  # 未核对的未知成本必须保留
+    saved = json.loads((tmp_path / "budget_usage.json").read_text(encoding="utf-8"))
+    assert saved["total_cost_usd"] == 0.0
+    assert saved["unknown_cost"] is True
+
+
+def test_unknown_cost_cleared_only_by_manual_confirmation(tmp_path):
+    """未知成本只能人工清除：接上一个场景，人工核对并清除标记后才恢复调用。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    tracker.mark_unknown_cost()
+    tracker.month = "2000-01"
+    assert tracker.can_call() is False  # 跨月后仍暂停
+    # 人工核对后清除标记，才恢复可调用。
+    tracker.clear_unknown_cost()
+    assert tracker.unknown_cost is False
+    assert tracker.can_call() is True
 
 
 def test_estimated_cost_blocks_before_api_request(tmp_path):
@@ -258,7 +293,7 @@ def test_estimated_cost_blocks_before_api_request(tmp_path):
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(4.998)
     provider = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker)
-    long_prompt = "你好" * 5000  # 约 10000 字符，预估输入约 2500 Token
+    long_prompt = "你好" * 5000  # 10000 个汉字，新估算为 15000 Token，旧算法只估 2500
     with patch("providers.muse.requests.post") as mock_post:
         with pytest.raises(RuntimeError, match="预估成本可能超过"):
             provider.chat(long_prompt)
@@ -277,6 +312,47 @@ def test_estimated_cost_blocks_before_api_request(tmp_path):
         result = provider2.chat("你好")
         mock_post.assert_called_once()
     assert result["text"] == "你好"
+
+
+def test_chinese_prompt_estimate_not_underestimated(tmp_path):
+    """中文长提示词预估不低估：10000 个汉字按旧算法（字符数/4）只估 2500 Token，
+    实际可能接近 10000 Token，低估约 4 倍；新算法按每个汉字 1.5 Token，
+    应估为 15000 Token，明显大于 2500，且预估成本也大于旧算法的成本。"""
+    from config import MAX_OUTPUT_TOKENS
+
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    long_chinese = "你好" * 5000  # 10000 个汉字
+    assert tracker.estimate_input_tokens(long_chinese) == 15000
+    assert tracker.estimate_input_tokens(long_chinese) >= 10000
+    assert tracker.estimate_input_tokens(long_chinese) > 2500  # 旧算法的值
+    # 新预估成本 = 15000/1e6*1.25 + 2048/1e6*4.25 = 0.027454 美元，
+    # 旧算法成本 = 2500/1e6*1.25 + 512/1e6*4.25 = 0.005301 美元。
+    assert tracker.estimate_cost(long_chinese) == pytest.approx(0.027454)
+    assert tracker.estimate_cost(long_chinese) > 0.005301
+    # 短中文 prompt 的预估仍在 $5 预算内，能通过预估检查。
+    assert tracker.estimate_input_tokens("你好") == 3  # 2 个汉字 * 1.5
+    assert tracker.can_afford_estimated("你好") is True
+    assert MAX_OUTPUT_TOKENS == 2048
+
+
+def test_max_output_tokens_is_sent_in_request(tmp_path):
+    """输出上限实际生效：调 chat() 时，请求体里必须带 max_completion_tokens=2048，
+    而不是只在预估里假设 2048、实际请求不限输出。"""
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    provider = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker)
+    with patch("providers.muse.requests.post", return_value=fake_response) as mock_post:
+        result = provider.chat("你好")
+        mock_post.assert_called_once()
+    assert result["text"] == "你好"
+    sent_payload = mock_post.call_args.kwargs["json"]
+    assert sent_payload["max_completion_tokens"] == 2048
+    assert sent_payload["model"] == "muse-spark-1.3"
 
 
 def test_unknown_cost_pauses_and_clears(tmp_path):

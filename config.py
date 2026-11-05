@@ -101,10 +101,11 @@ CONTROLLER = "gpt"  # 未来主控，本次不接入 GPT，仅作为长期方向
 # ---------- 预算配置 ----------
 MONTHLY_BUDGET_USD = 5.0  # 每月预算：5 美元（初期参考值）
 BUDGET_WARN_RATIO = 0.8  # 达到预算 80%（$4）时警告
-# ESTIMATED_MAX_OUTPUT_TOKENS（预估输出上限）：只用于调用前的费用预估，
-# 假设一次回答最多输出 512 Token。注意：这只是预估假设，不是限制模型输出，
-# 程序不会在请求里加 max_tokens 限制，实际输出可能比 512 长、成本也可能更高。
-ESTIMATED_MAX_OUTPUT_TOKENS = 512
+# MAX_OUTPUT_TOKENS（输出上限，单位 Token）：一次回答最多输出 2048 Token。
+# 这个值既是调用前费用预估用的输出量，也是请求里实际传给 API 的
+# max_completion_tokens 上限；输出成本上限 = 2048/1e6*4.25 美元。
+# 注意：预估仍是粗略估算，不能保证单次请求绝对不超支。
+MAX_OUTPUT_TOKENS = 2048
 # 提醒：这是 Agent 自身的限制，不代表服务商账单的绝对上限，
 #       还要关注 Meta 官方后台的消费情况。
 
@@ -148,7 +149,8 @@ class BudgetTracker:
     原理：累计成本存在本地文件 logs/budget_usage.json（JSON 格式），
           这个文件会被 .gitignore 忽略，不上传到 GitHub。
           文件里还有 month（月份，YYYY-MM）和 unknown_cost（成本未知标记）字段，
-          跨月时自动重置为 0。
+          跨月时累计自动重置为 0，但 unknown_cost 不会因跨月自动清除——
+          只有人工核对过官方后台后才能清除（见 clear_unknown_cost）。
     注意：cost 为 None（模型没返回 usage，成本未知）时，不计入累计，不编造，
           但会把 unknown_cost 标记为 True，暂停后续付费调用，等人工核对。
     限制：本地预算只能拦截“已累计超支”和“预估明显超支”，
@@ -168,14 +170,18 @@ class BudgetTracker:
         return datetime.now().strftime("%Y-%m")
 
     def _check_month_rollover(self):
-        """检查是否跨过自然月：是就重置累计和未知成本标记，并保存。
+        """检查是否跨过自然月：是就只重置当月累计成本，并保存。
 
+        安全规则：跨月只重置 total_cost_usd 和 month，绝对不清除
+        unknown_cost（成本未知标记）。例如 11 月发生了一笔无法确定成本的
+        调用，12 月不能因为月份变化就自动解除暂停——必须等人工核对过
+        Meta 官方后台的实际消费后，才能调用 clear_unknown_cost() 清除。
         每次判断预算或记账前都先调用它，所以程序一直运行、跨过自然月时
         也能重置，不只是在启动时检查一次。
         """
         if self.month != self.current_month():
             self.total_cost_usd = 0.0
-            self.unknown_cost = False
+            # 注意：这里故意不碰 self.unknown_cost，保留未核对的暂停状态。
             self.month = self.current_month()
             self._save()
 
@@ -264,18 +270,33 @@ class BudgetTracker:
         self._check_month_rollover()
         return MONTHLY_BUDGET_USD - self.total_cost_usd
 
+    def estimate_input_tokens(self, prompt_text):
+        """粗略估算输入 Token 数（不是真实分词，只是调用前预估用）。
+
+        中文低估问题：原来按 len(prompt)/4 估算，10000 个汉字会被估成
+        2500 Token，实际可能接近 10000 Token，成本低估约 4 倍。
+        现在分开算：ASCII 字符（英文、数字、标点，ord<128）按 4 个字符
+        1 个 Token；非 ASCII 字符（中文等）按每个字符 1.5 个 Token 向上取整，
+        中文按 1.5 倍留余量，宁可高估、不要低估。
+        """
+        text = str(prompt_text or "")
+        ascii_count = sum(1 for ch in text if ord(ch) < 128)
+        non_ascii_count = len(text) - ascii_count
+        return math.ceil(ascii_count / 4 + non_ascii_count * 1.5)
+
     def estimate_cost(self, prompt_text):
         """调用前预估本次成本（美元），只用于拦截明显超支的请求。
 
-        预估方法（粗略估算，不是真实分词）：输入 Token 数约等于
-        len(prompt_text) / 4 向上取整；输出按 ESTIMATED_MAX_OUTPUT_TOKENS
-        （512 Token）估算；缓存按 0 算（最保守，即全部输入按普通价算）。
+        预估方法：输入 Token 用 estimate_input_tokens() 估算；
+        输出按 MAX_OUTPUT_TOKENS（2048 Token）估算，这个值同时是请求里
+        实际传给 API 的 max_completion_tokens 上限，所以输出量不再是
+        凭空假设；缓存按 0 算（最保守，即全部输入按普通价算）。
         """
-        prompt_tokens = math.ceil(len(str(prompt_text or "")) / 4)
+        prompt_tokens = self.estimate_input_tokens(prompt_text)
         muse_cfg = MODEL_CONFIG["muse"]
         return (
             prompt_tokens / 1_000_000 * muse_cfg["price_input_per_1m"]
-            + ESTIMATED_MAX_OUTPUT_TOKENS / 1_000_000 * muse_cfg["price_output_per_1m"]
+            + MAX_OUTPUT_TOKENS / 1_000_000 * muse_cfg["price_output_per_1m"]
         )
 
     def can_afford_estimated(self, prompt_text):

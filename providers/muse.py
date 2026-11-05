@@ -15,7 +15,7 @@
 
 import requests
 
-from config import MODEL_CONFIG
+from config import MAX_OUTPUT_TOKENS, MODEL_CONFIG
 
 
 class MuseProvider:
@@ -65,8 +65,9 @@ class MuseProvider:
             )
 
         # 3. 调用前费用预估：预估成本超过剩余预算时也在请求前拦截。
-        #    注意：这是粗略预估（输入按字符数/4 估算，输出按 512 Token 估算），
-        #    不能保证单次请求绝对不超支。
+        #    注意：这是粗略预估（输入分中英文估算，中文按 1.5 倍留余量；
+        #    输出按 MAX_OUTPUT_TOKENS=2048 Token 估算，且该值同时是
+        #    请求里实际生效的输出上限），不能保证单次请求绝对不超支。
         if self.budget_tracker is not None and not self.budget_tracker.can_afford_estimated(prompt):
             raise RuntimeError(
                 "预估成本可能超过本月剩余预算，已在请求前拦截："
@@ -84,6 +85,10 @@ class MuseProvider:
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
+            # max_completion_tokens（最大输出 Token 数）：实际生效的输出上限，
+            # 与调用前预估用的 MAX_OUTPUT_TOKENS 是同一个值（2048），
+            # 所以预估里的输出量不是凭空假设。
+            "max_completion_tokens": MAX_OUTPUT_TOKENS,
         }
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=60)
