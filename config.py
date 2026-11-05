@@ -240,14 +240,21 @@ class BudgetTracker:
         # 先保留能读到的值（仅作显示，不作为可信累计去调用）。
         raw_total = data.get("total_cost_usd")
         raw_month = data.get("month")
-        keep_total = raw_total if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool) else 0.0
+        # total_cost_usd 必须是有限数字：拒绝 bool、NaN、Infinity 和负数。
+        total_is_valid = (
+            isinstance(raw_total, (int, float))
+            and not isinstance(raw_total, bool)
+            and math.isfinite(raw_total)
+            and raw_total >= 0
+        )
+        keep_total = raw_total if total_is_valid else 0.0
         keep_month = raw_month if isinstance(raw_month, str) and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", raw_month) else None
         # 逐个检查关键字段，缺失或类型不对都算损坏。
         problems = []
         if not keep_month:
             problems.append("缺少 month 字段")
-        if not (isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool)):
-            problems.append("缺少 total_cost_usd 字段")
+        if not total_is_valid:
+            problems.append("total_cost_usd 非法（必须是大于或等于 0 的有限数字）")
         if not isinstance(data.get("unknown_cost"), bool):
             problems.append("缺少 unknown_cost 字段")
         if problems:

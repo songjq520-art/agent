@@ -256,6 +256,44 @@ def test_corrupted_budget_file_missing_fields_pauses(tmp_path):
     assert json.loads(budget_file.read_text(encoding="utf-8")) == {"total_cost_usd": 1.0}
 
 
+def test_invalid_total_cost_values_pause(tmp_path):
+    """非法金额进损坏暂停：NaN、Infinity、负数、布尔值都拒绝。
+
+    注意：JSON 本身不允许 NaN/Infinity 字面量，json.dumps 默认会写出
+    NaN/Infinity，Python 的 json.loads 能读回，所以这里用文本直接写，
+    覆盖这四种非法值。"""
+    import math
+
+    cases = [
+        '{"month": "2026-11", "total_cost_usd": NaN, "unknown_cost": false}',
+        '{"month": "2026-11", "total_cost_usd": Infinity, "unknown_cost": false}',
+        '{"month": "2026-11", "total_cost_usd": -1.5, "unknown_cost": false}',
+        '{"month": "2026-11", "total_cost_usd": true, "unknown_cost": false}',
+        '{"month": "2026-11", "total_cost_usd": false, "unknown_cost": false}',
+    ]
+    for raw in cases:
+        budget_file = tmp_path / "budget_usage.json"
+        budget_file.write_text(raw, encoding="utf-8")
+        tracker = BudgetTracker(file_path=budget_file)
+        assert tracker.corrupted is True, raw
+        assert tracker.can_call() is False, raw
+        # 原文件不被覆盖。
+        assert budget_file.read_text(encoding="utf-8") == raw
+    # 0 是合法值，不应判损坏。
+    budget_file = tmp_path / "budget_usage.json"
+    budget_file.write_text(
+        json.dumps(
+            {"month": datetime.now().strftime("%Y-%m"), "total_cost_usd": 0, "unknown_cost": False},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    tracker = BudgetTracker(file_path=budget_file)
+    assert tracker.corrupted is False
+    assert tracker.can_call() is True
+    assert tracker.total_cost_usd == 0.0
+
+
 def test_normal_budget_file_reads_fine(tmp_path):
     """正常预算文件读取不受影响：三个字段齐全合法，累计能正常读出和记账，
     文件也能正常更新。"""
