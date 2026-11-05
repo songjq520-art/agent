@@ -1,0 +1,6 @@
+# requirements.txt（Python 依赖清单）
+# 只用 Python 自带库 + requests，尽量少，方便学习和维护。
+# 版本号放宽（>=），避免因小版本不同装不上。
+
+requests>=2.31
+pytest>=8.0
