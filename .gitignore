@@ -1,0 +1,36 @@
+# .gitignore（Git 忽略配置文件）
+# 作用：告诉 Git 哪些文件不要传到 GitHub，不要把敏感信息传上去。
+# 注意：.env.example 不在这里，不要把它忽略掉。
+
+# 真实环境变量文件（里面有 API Key，绝对不能上传）
+.env
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+
+# 运行日志（里面可能有调用记录）
+logs/*
+# 例外：保留 logs/.gitkeep，让空文件夹能被 Git 保留
+!logs/.gitkeep
+# 预算累计文件也在 logs/ 下，上面 logs/* 已忽略
+
+# 本地记忆数据（私人记忆只保存在本地，不上传）
+memory/*
+!memory/.gitkeep
+
+# 临时文件
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
