@@ -57,10 +57,15 @@ class MuseProvider:
                 "或设置环境变量 MODEL_API_KEY 后再运行。"
             )
 
-        # 2. 再检查预算，超了或有未核对的未知成本时，停下来等用户确认。
+        # 2. 再检查预算，超了、有未核对的未知成本或预算文件损坏时，
+        #    停下来等用户确认。损坏时用 status_reason() 给出具体原因。
         if self.budget_tracker is not None and not self.budget_tracker.can_call():
+            reason = ""
+            if hasattr(self.budget_tracker, "status_reason"):
+                reason = self.budget_tracker.status_reason()
             raise RuntimeError(
-                "已达到每月预算上限（$5）或有未核对的未知成本，"
+                reason
+                or "已达到每月预算上限（$5）或有未核对的未知成本，"
                 "已暂停后续付费调用，请确认后再继续。"
             )
 

@@ -180,7 +180,10 @@ def test_budget_tracker_monthly_reset(tmp_path):
         last_month = f"{now.year}-{now.month - 1:02d}"
     budget_file = tmp_path / "budget_usage.json"
     budget_file.write_text(
-        json.dumps({"month": last_month, "total_cost_usd": 4.5}, ensure_ascii=False),
+        json.dumps(
+            {"month": last_month, "total_cost_usd": 4.5, "unknown_cost": False},
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     tracker = BudgetTracker(file_path=budget_file)
@@ -189,16 +192,94 @@ def test_budget_tracker_monthly_reset(tmp_path):
     assert tracker.can_call() is True
 
 
-def test_budget_tracker_old_file_without_month_keeps_total(tmp_path):
-    """预算旧文件兼容：没有 month 字段的旧文件，保留原累计值，只补上当前月份。"""
+def test_budget_tracker_old_file_without_month_is_corrupted(tmp_path):
+    """预算旧文件缺少 month 字段：按关键字段缺失处理，进入损坏暂停状态，
+    不能发起付费调用，原文件不被覆盖。"""
     budget_file = tmp_path / "budget_usage.json"
     budget_file.write_text(
         json.dumps({"total_cost_usd": 2.5}, ensure_ascii=False),
         encoding="utf-8",
     )
     tracker = BudgetTracker(file_path=budget_file)
+    assert tracker.corrupted is True
+    assert tracker.can_call() is False
+    # 原文件不被覆盖，内容仍是只有 total_cost_usd 的旧文件。
+    assert json.loads(budget_file.read_text(encoding="utf-8")) == {"total_cost_usd": 2.5}
+    # 人工清除也不允许，必须先修好预算文件。
+    with pytest.raises(RuntimeError, match="预算文件已损坏"):
+        tracker.clear_unknown_cost()
+
+
+def test_corrupted_budget_file_pauses(tmp_path):
+    """预算文件损坏暂停：unknown_cost 为 True 后，文件被改成损坏的 JSON，
+    Agent 仍然不能发起付费请求，原文件不被覆盖。"""
+    budget_file = tmp_path / "budget_usage.json"
+    budget_file.write_text(
+        json.dumps(
+            {
+                "month": datetime.now().strftime("%Y-%m"),
+                "total_cost_usd": 1.0,
+                "unknown_cost": True,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    # 模拟文件损坏：改成不是合法 JSON 的内容。
+    budget_file.write_text("{不是合法 JSON", encoding="utf-8")
+    tracker = BudgetTracker(file_path=budget_file)
+    assert tracker.corrupted is True
+    assert tracker.unknown_cost is True
+    assert tracker.can_call() is False
+    assert "预算记录异常" in tracker.status_reason()
+    # 原损坏文件不被覆盖。
+    assert budget_file.read_text(encoding="utf-8") == "{不是合法 JSON"
+    # 付费请求在请求前被拦截，requests.post 一次也不被调用。
+    provider = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker)
+    with patch("providers.muse.requests.post") as mock_post:
+        with pytest.raises(RuntimeError, match="预算记录异常"):
+            provider.chat("你好")
+        mock_post.assert_not_called()
+
+
+def test_corrupted_budget_file_missing_fields_pauses(tmp_path):
+    """预算文件缺少关键字段也暂停：合法 JSON 但只有 total_cost_usd，
+    缺少 month 和 unknown_cost，can_call() 为 False，文件内容不变。"""
+    budget_file = tmp_path / "budget_usage.json"
+    budget_file.write_text(
+        json.dumps({"total_cost_usd": 1.0}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tracker = BudgetTracker(file_path=budget_file)
+    assert tracker.corrupted is True
+    assert tracker.can_call() is False
+    assert json.loads(budget_file.read_text(encoding="utf-8")) == {"total_cost_usd": 1.0}
+
+
+def test_normal_budget_file_reads_fine(tmp_path):
+    """正常预算文件读取不受影响：三个字段齐全合法，累计能正常读出和记账，
+    文件也能正常更新。"""
+    budget_file = tmp_path / "budget_usage.json"
+    budget_file.write_text(
+        json.dumps(
+            {
+                "month": datetime.now().strftime("%Y-%m"),
+                "total_cost_usd": 2.5,
+                "unknown_cost": False,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    tracker = BudgetTracker(file_path=budget_file)
+    assert tracker.corrupted is False
+    assert tracker.can_call() is True
     assert tracker.total_cost_usd == 2.5
-    assert tracker.month == datetime.now().strftime("%Y-%m")
+    tracker.add_cost(0.5)
+    assert tracker.total_cost_usd == 3.0
+    saved = json.loads(budget_file.read_text(encoding="utf-8"))
+    assert saved["total_cost_usd"] == 3.0
+    assert saved["unknown_cost"] is False
 
 
 def test_budget_block_happens_before_api_request(tmp_path):

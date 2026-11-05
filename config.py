@@ -7,6 +7,7 @@
 import json
 import math
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -153,6 +154,9 @@ class BudgetTracker:
           只有人工核对过官方后台后才能清除（见 clear_unknown_cost）。
     注意：cost 为 None（模型没返回 usage，成本未知）时，不计入累计，不编造，
           但会把 unknown_cost 标记为 True，暂停后续付费调用，等人工核对。
+    安全规则：预算文件损坏、无法解析或关键字段缺失时，不会自动初始化为
+          正常可调用状态，而是进入安全暂停状态（corrupted=True），
+          原损坏文件会被保留、不被覆盖，只能人工检查修复后才能恢复。
     限制：本地预算只能拦截“已累计超支”和“预估明显超支”，
           不能保证单次请求绝对不超支，实际费用以 Meta 官方后台为准。
     """
@@ -163,6 +167,8 @@ class BudgetTracker:
         self.total_cost_usd = 0.0
         self.month = self.current_month()
         self.unknown_cost = False  # 是否有一次调用的成本未知（没返回 usage）
+        self.corrupted = False  # 预算文件是否损坏/异常，损坏时暂停付费调用
+        self.corruption_reason = ""  # 损坏原因，中文简短说明
         self._load()
 
     def current_month(self):
@@ -178,41 +184,91 @@ class BudgetTracker:
         Meta 官方后台的实际消费后，才能调用 clear_unknown_cost() 清除。
         每次判断预算或记账前都先调用它，所以程序一直运行、跨过自然月时
         也能重置，不只是在启动时检查一次。
+        安全规则：预算文件损坏时直接返回，不重置、不保存、不清除任何状态。
         """
+        if self.corrupted:
+            return
         if self.month != self.current_month():
             self.total_cost_usd = 0.0
             # 注意：这里故意不碰 self.unknown_cost，保留未核对的暂停状态。
             self.month = self.current_month()
             self._save()
 
+    def _enter_corrupted(self, reason, total_cost_usd=0.0, month=None):
+        """进入预算文件损坏的安全暂停状态。
+
+        参数 reason：损坏原因（中文）；total_cost_usd：能读到的累计值，
+        读不到时为 0，但不要把它当成可信值去调用；month：能读到的合法月份，
+        读不到时为当前月，仅作显示。
+        安全规则：只改内存状态，绝对不调用 _save() 覆盖原损坏文件；
+        unknown_cost 设为 True，暂停后续付费调用。
+        """
+        self.corrupted = True
+        self.corruption_reason = reason
+        self.total_cost_usd = float(total_cost_usd)
+        self.month = month or self.current_month()
+        self.unknown_cost = True
+
     def _load(self):
         """从本地文件读出之前累计的成本，文件不存在就从 0 开始。
 
-        每月重置规则：文件里有 month 字段时，先按文件里的月份加载，
-        再复用 _check_month_rollover() 判断是否跨月、是否重置；
-        文件没有 month 字段（旧文件）时，保留原累计值，只补上当前月份，
-        不静默清零。
+        关键字段（三个缺一不可，类型不对也算损坏）：
+          month：YYYY-MM 格式字符串，月份 01-12；
+          total_cost_usd：数字（int/float，不能是 bool/字符串）；
+          unknown_cost：bool。
+        损坏、无法解析或关键字段缺失时，进入安全暂停状态（corrupted=True），
+        原文件会被保留、不被覆盖，只能人工检查修复后才能恢复。
+        旧文件缺少 month 字段时，也按关键字段缺失处理，不再“保留累计、
+        只补月份并保存”。
         """
+        if not self.file_path.exists():
+            # 文件不存在是正常情况（第一次运行），从 0 开始。
+            return
         try:
-            if self.file_path.exists():
-                data = json.loads(self.file_path.read_text(encoding="utf-8"))
-                self.total_cost_usd = float(data.get("total_cost_usd", 0.0))
-                self.unknown_cost = bool(data.get("unknown_cost", False))
-                old_month = data.get("month")
-                if old_month is None:
-                    # 旧文件：保留累计值，只补月份。
-                    self.month = self.current_month()
-                    self._save()
-                else:
-                    self.month = old_month
-                    self._check_month_rollover()
-        except (ValueError, OSError):
-            self.total_cost_usd = 0.0
-            self.month = self.current_month()
-            self.unknown_cost = False
+            raw_text = self.file_path.read_text(encoding="utf-8")
+        except OSError:
+            self._enter_corrupted("预算文件无法读取")
+            return
+        try:
+            data = json.loads(raw_text)
+        except ValueError:
+            self._enter_corrupted("预算文件无法解析为 JSON")
+            return
+        if not isinstance(data, dict):
+            self._enter_corrupted("预算文件内容不是 JSON 对象")
+            return
+        # 先保留能读到的值（仅作显示，不作为可信累计去调用）。
+        raw_total = data.get("total_cost_usd")
+        raw_month = data.get("month")
+        keep_total = raw_total if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool) else 0.0
+        keep_month = raw_month if isinstance(raw_month, str) and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", raw_month) else None
+        # 逐个检查关键字段，缺失或类型不对都算损坏。
+        problems = []
+        if not keep_month:
+            problems.append("缺少 month 字段")
+        if not (isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool)):
+            problems.append("缺少 total_cost_usd 字段")
+        if not isinstance(data.get("unknown_cost"), bool):
+            problems.append("缺少 unknown_cost 字段")
+        if problems:
+            self._enter_corrupted(
+                "预算文件" + "、".join(problems) + "或字段类型不对",
+                total_cost_usd=keep_total,
+                month=keep_month,
+            )
+            return
+        self.total_cost_usd = float(raw_total)
+        self.unknown_cost = bool(data["unknown_cost"])
+        self.month = raw_month
+        self._check_month_rollover()
 
     def _save(self):
-        """把累计成本、月份和未知成本标记写回本地文件。"""
+        """把累计成本、月份和未知成本标记写回本地文件。
+
+        安全保护：预算文件损坏时直接返回、不写文件，保证原损坏文件不被覆盖。
+        """
+        if self.corrupted:
+            return
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.file_path.write_text(
             json.dumps(
@@ -227,7 +283,12 @@ class BudgetTracker:
         )
 
     def mark_unknown_cost(self):
-        """标记一次调用成本未知：暂停后续付费调用，等人工核对后再清除。"""
+        """标记一次调用成本未知：暂停后续付费调用，等人工核对后再清除。
+
+        预算文件损坏时不写文件（_save() 本身也会拦截），直接返回。
+        """
+        if self.corrupted:
+            return
         self._check_month_rollover()
         self.unknown_cost = True
         self._save()
@@ -237,13 +298,22 @@ class BudgetTracker:
 
         注意：这只是清除“暂停”标记，不会补记那次未知调用的实际成本，
         那次成本请以官方后台为准，人工记下。
+        安全规则：预算文件损坏时不允许通过代码清除，必须先人工检查并修复
+        预算文件，否则会把暂停状态悄悄解除。
         """
+        if self.corrupted:
+            raise RuntimeError("预算文件已损坏，不能通过代码清除，请先人工检查并修复预算文件")
         self._check_month_rollover()
         self.unknown_cost = False
         self._save()
 
     def add_cost(self, cost_usd):
-        """记一笔成本。cost 为 None 时不记，返回当前累计。"""
+        """记一笔成本。cost 为 None 时不记，返回当前累计。
+
+        预算文件损坏时不记账、不写文件，直接返回当前累计（仅作显示）。
+        """
+        if self.corrupted:
+            return self.total_cost_usd
         self._check_month_rollover()
         if cost_usd is None:
             return self.total_cost_usd
@@ -303,7 +373,26 @@ class BudgetTracker:
         """预估成本是否在剩余预算内。返回 False 时，调用方应在请求前拦截。"""
         return self.estimate_cost(prompt_text) <= self.remaining_usd()
 
+    def status_reason(self):
+        """不能发起付费调用时的中文原因，正常时返回空字符串。
+
+        区分三种情况：预算文件损坏、未知成本未核对、已超预算。
+        """
+        if self.corrupted:
+            return (
+                f"预算记录异常：{self.corruption_reason}，已暂停付费调用，"
+                "请人工检查 logs/budget_usage.json 后再恢复"
+            )
+        if self.unknown_cost:
+            return "有未核对的未知成本，已暂停后续付费调用，请核对 Meta 官方后台后再清除标记。"
+        if self.is_over_budget():
+            return "已达到每月预算上限（$5），已暂停后续付费调用，请确认后再继续。"
+        return ""
+
     def can_call(self):
-        """是否允许继续付费调用：没超预算、且没有未核对的未知成本时才能调用。"""
+        """是否允许继续付费调用：预算文件正常、没超预算、且没有未核对的
+        未知成本时才能调用。损坏时一律返回 False。"""
         self._check_month_rollover()
+        if self.corrupted:
+            return False
         return not self.is_over_budget() and not self.unknown_cost

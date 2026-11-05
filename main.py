@@ -53,6 +53,14 @@ def run_question(prompt, task_type="question", budget_tracker=None):
     status = get_model_status()
     routing = route(prompt, task_type)
 
+    # 预算文件损坏时明确提示：原文件已保留、未被覆盖，人工修复后才能恢复。
+    if getattr(tracker, "corrupted", False):
+        print(
+            f"⚠️ 预算记录异常：{tracker.corruption_reason}，已暂停后续付费调用，"
+            "请人工检查 logs/budget_usage.json（原文件已保留，未被覆盖），"
+            "核对后手动修复该文件或备份后删除重建。"
+        )
+
     # 预算警告：达到 80% 时先提醒（只提醒，不拦截）。
     if tracker.is_over_warn() and not tracker.is_over_budget():
         print(f"⚠️ 预算警告：本月累计成本已达到预算 80%（${tracker.total_cost_usd:.4f} / ${MONTHLY_BUDGET_USD:.2f}）。")
