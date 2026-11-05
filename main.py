@@ -100,6 +100,11 @@ def run_question(prompt, task_type="question", budget_tracker=None):
         usage.get("total_tokens"),
         result.get("cost_usd"),
     )
+    if result.get("cost_usd") is None:
+        print(
+            "⚠️ 本次调用成本未知（模型没有返回 usage），已暂停后续付费调用，"
+            "请先去 Meta 官方后台核对实际消费，核对后再清除未知成本标记。"
+        )
     if tracker.is_over_warn():
         print(f"⚠️ 预算警告：本月累计成本 ${tracker.total_cost_usd:.4f} / ${MONTHLY_BUDGET_USD:.2f}。")
     return {

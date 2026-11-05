@@ -141,7 +141,8 @@ def test_muse_provider_cost_only_when_usage_returned(tmp_path):
 
 
 def test_muse_provider_no_usage_means_cost_unknown(tmp_path):
-    """模型接口：模型没返回 usage 时，成本为 None，绝不编造。"""
+    """模型接口：模型没返回 usage 时，成本为 None，绝不编造；
+    同时要标记成本未知、暂停后续付费调用，不能当成零成本继续调用。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好"}}],
@@ -154,6 +155,8 @@ def test_muse_provider_no_usage_means_cost_unknown(tmp_path):
         result = provider.chat("你好")
     assert result["cost_usd"] is None
     assert tracker.total_cost_usd == 0.0
+    assert tracker.unknown_cost is True
+    assert tracker.can_call() is False  # 已暂停，等人工核对
 
 
 def test_budget_tracker_warn_and_block(tmp_path):
@@ -230,6 +233,76 @@ def test_muse_provider_cached_cost(tmp_path):
         result = provider.chat("你好")
     assert result["cost_usd"] == pytest.approx(0.0002495)
     assert tracker.total_cost_usd == pytest.approx(0.0002495)
+
+
+def test_budget_tracker_monthly_reset_while_running(tmp_path):
+    """预算运行期间跨月重置：程序一直运行时，把月份手动改成上个月，
+    再调用 can_call() 时应重置为 0、恢复可调用，文件里的月份也已更新。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    tracker.add_cost(4.5)
+    assert tracker.total_cost_usd == 4.5
+    # 模拟“程序一直运行、跨过自然月”：只改内存里的月份，不重建 Tracker。
+    tracker.month = "2000-01"
+    assert tracker.can_call() is True
+    assert tracker.total_cost_usd == 0.0
+    assert tracker.month == datetime.now().strftime("%Y-%m")
+    saved = json.loads((tmp_path / "budget_usage.json").read_text(encoding="utf-8"))
+    assert saved["month"] == datetime.now().strftime("%Y-%m")
+    assert saved["total_cost_usd"] == 0.0
+
+
+def test_estimated_cost_blocks_before_api_request(tmp_path):
+    """单次预估拦截：累计 $4.998、只剩 $0.002 时，长 prompt 的预估成本
+    超过剩余预算，chat() 应抛错且 requests.post 一次也不能被调用；
+    累计为 0、短 prompt 时，预估检查应通过，能正常走到 post。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    tracker.add_cost(4.998)
+    provider = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker)
+    long_prompt = "你好" * 5000  # 约 10000 字符，预估输入约 2500 Token
+    with patch("providers.muse.requests.post") as mock_post:
+        with pytest.raises(RuntimeError, match="预估成本可能超过"):
+            provider.chat(long_prompt)
+        mock_post.assert_not_called()
+
+    # 累计为 0、短 prompt 时，预估应通过。
+    tracker2 = BudgetTracker(file_path=tmp_path / "budget2.json")
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
+    provider2 = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker2)
+    with patch("providers.muse.requests.post", return_value=fake_response) as mock_post:
+        result = provider2.chat("你好")
+        mock_post.assert_called_once()
+    assert result["text"] == "你好"
+
+
+def test_unknown_cost_pauses_and_clears(tmp_path):
+    """usage 缺失暂停：模拟返回无 usage，chat() 返回 cost None，
+    之后 can_call() 为 False；再调一次应在请求前被拦截，post 不被调用；
+    人工清除标记后 can_call() 恢复为 True。"""
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        # 注意：这里故意没有 usage 字段
+    }
+    fake_response.raise_for_status.return_value = None
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    provider = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker)
+    with patch("providers.muse.requests.post", return_value=fake_response) as mock_post:
+        result = provider.chat("你好")
+        assert result["cost_usd"] is None
+        assert mock_post.call_count == 1
+        # 成本未知已暂停：再调一次应在请求前被拦截，不会再发 post。
+        with pytest.raises(RuntimeError, match="未知成本"):
+            provider.chat("你好")
+        assert mock_post.call_count == 1
+    assert tracker.can_call() is False
+    # 人工核对后清除标记，恢复可调用。
+    tracker.clear_unknown_cost()
+    assert tracker.can_call() is True
 
 
 # ---------- 模拟测试：主入口（无 Key 演示模式） ----------

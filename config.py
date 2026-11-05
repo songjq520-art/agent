@@ -5,6 +5,7 @@
 # 关系：config.py 是“总开关”，main.py 启动时先读它，router.py 按它分配模型。
 
 import json
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -55,9 +56,13 @@ MODEL_CONFIG = {
         "model": "muse-spark-1.3",  # Muse Spark 1.3，官方推荐新工作使用
         "enabled": True,  # 本次唯一启用的模型
         "base_url": "https://api.meta.ai/v1",  # Meta Model API 官方地址
-        "price_input_per_1m": 1.25,   # 每百万输入 Token $1.25（2026-11-05 核实，以官方定价页为准）
-        "price_output_per_1m": 4.25,  # 每百万输出 Token $4.25（同上）
-        "price_cached_input_per_1m": 0.15,  # 每百万缓存输入 Token $0.15（同上）
+        # 以下价格是 Muse Spark 1.3 Standard mode（标准模式）的官方价格
+        # （2026-11-05 核实，以官方定价页为准）。
+        # 注意：Contributor 版（贡献者模式）价格不同（输入 $0.10、缓存输入 $0.002、
+        # 输出 $0.20），本项目不用 Contributor，只用 Standard mode。
+        "price_input_per_1m": 1.25,   # 每百万普通输入 Token $1.25
+        "price_output_per_1m": 4.25,  # 每百万输出 Token $4.25
+        "price_cached_input_per_1m": 0.15,  # 每百万缓存输入 Token $0.15
     },
     "gpt": {
         "model": None,  # 未来主控，待接入，模型名按官方文档填写
@@ -96,6 +101,10 @@ CONTROLLER = "gpt"  # 未来主控，本次不接入 GPT，仅作为长期方向
 # ---------- 预算配置 ----------
 MONTHLY_BUDGET_USD = 5.0  # 每月预算：5 美元（初期参考值）
 BUDGET_WARN_RATIO = 0.8  # 达到预算 80%（$4）时警告
+# ESTIMATED_MAX_OUTPUT_TOKENS（预估输出上限）：只用于调用前的费用预估，
+# 假设一次回答最多输出 512 Token。注意：这只是预估假设，不是限制模型输出，
+# 程序不会在请求里加 max_tokens 限制，实际输出可能比 512 长、成本也可能更高。
+ESTIMATED_MAX_OUTPUT_TOKENS = 512
 # 提醒：这是 Agent 自身的限制，不代表服务商账单的绝对上限，
 #       还要关注 Meta 官方后台的消费情况。
 
@@ -138,8 +147,12 @@ class BudgetTracker:
     作用：记录本月累计成本，达 80% 警告，达 100% 拒绝后续付费调用。
     原理：累计成本存在本地文件 logs/budget_usage.json（JSON 格式），
           这个文件会被 .gitignore 忽略，不上传到 GitHub。
-          文件里还有 month（月份，YYYY-MM）字段，跨月时自动重置为 0。
-    注意：cost 为 None（模型没返回 usage，成本未知）时，不计入累计，不编造。
+          文件里还有 month（月份，YYYY-MM）和 unknown_cost（成本未知标记）字段，
+          跨月时自动重置为 0。
+    注意：cost 为 None（模型没返回 usage，成本未知）时，不计入累计，不编造，
+          但会把 unknown_cost 标记为 True，暂停后续付费调用，等人工核对。
+    限制：本地预算只能拦截“已累计超支”和“预估明显超支”，
+          不能保证单次请求绝对不超支，实际费用以 Meta 官方后台为准。
     """
 
     def __init__(self, file_path=None):
@@ -147,52 +160,85 @@ class BudgetTracker:
         self.file_path = Path(file_path) if file_path else Path(__file__).parent / "logs" / "budget_usage.json"
         self.total_cost_usd = 0.0
         self.month = self.current_month()
+        self.unknown_cost = False  # 是否有一次调用的成本未知（没返回 usage）
         self._load()
 
     def current_month(self):
         """当前月份，格式 YYYY-MM，例如 2026-11。用于每月预算重置。"""
         return datetime.now().strftime("%Y-%m")
 
+    def _check_month_rollover(self):
+        """检查是否跨过自然月：是就重置累计和未知成本标记，并保存。
+
+        每次判断预算或记账前都先调用它，所以程序一直运行、跨过自然月时
+        也能重置，不只是在启动时检查一次。
+        """
+        if self.month != self.current_month():
+            self.total_cost_usd = 0.0
+            self.unknown_cost = False
+            self.month = self.current_month()
+            self._save()
+
     def _load(self):
         """从本地文件读出之前累计的成本，文件不存在就从 0 开始。
 
-        每月重置规则：文件里有 month 字段且与当前月份不同时，
-        把累计成本重置为 0 并更新月份后保存；文件没有 month 字段
-        （旧文件）时，保留原累计值，只补上当前月份，不静默清零。
+        每月重置规则：文件里有 month 字段时，先按文件里的月份加载，
+        再复用 _check_month_rollover() 判断是否跨月、是否重置；
+        文件没有 month 字段（旧文件）时，保留原累计值，只补上当前月份，
+        不静默清零。
         """
         try:
             if self.file_path.exists():
                 data = json.loads(self.file_path.read_text(encoding="utf-8"))
                 self.total_cost_usd = float(data.get("total_cost_usd", 0.0))
+                self.unknown_cost = bool(data.get("unknown_cost", False))
                 old_month = data.get("month")
                 if old_month is None:
                     # 旧文件：保留累计值，只补月份。
                     self.month = self.current_month()
                     self._save()
-                elif old_month != self.current_month():
-                    # 跨月了：重置为 0，月份更新为当前月。
-                    self.total_cost_usd = 0.0
-                    self.month = self.current_month()
-                    self._save()
                 else:
                     self.month = old_month
+                    self._check_month_rollover()
         except (ValueError, OSError):
             self.total_cost_usd = 0.0
             self.month = self.current_month()
+            self.unknown_cost = False
 
     def _save(self):
-        """把累计成本和月份写回本地文件。"""
+        """把累计成本、月份和未知成本标记写回本地文件。"""
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.file_path.write_text(
             json.dumps(
-                {"month": self.month, "total_cost_usd": round(self.total_cost_usd, 6)},
+                {
+                    "month": self.month,
+                    "total_cost_usd": round(self.total_cost_usd, 6),
+                    "unknown_cost": self.unknown_cost,
+                },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
         )
 
+    def mark_unknown_cost(self):
+        """标记一次调用成本未知：暂停后续付费调用，等人工核对后再清除。"""
+        self._check_month_rollover()
+        self.unknown_cost = True
+        self._save()
+
+    def clear_unknown_cost(self):
+        """清除未知成本标记：只有人工核对过 Meta 官方后台的实际消费后才能调用。
+
+        注意：这只是清除“暂停”标记，不会补记那次未知调用的实际成本，
+        那次成本请以官方后台为准，人工记下。
+        """
+        self._check_month_rollover()
+        self.unknown_cost = False
+        self._save()
+
     def add_cost(self, cost_usd):
         """记一笔成本。cost 为 None 时不记，返回当前累计。"""
+        self._check_month_rollover()
         if cost_usd is None:
             return self.total_cost_usd
         self.total_cost_usd += float(cost_usd)
@@ -205,12 +251,38 @@ class BudgetTracker:
 
     def is_over_budget(self):
         """是否已达到或超过预算上限。"""
+        self._check_month_rollover()
         return self.total_cost_usd >= MONTHLY_BUDGET_USD
 
     def is_over_warn(self):
         """是否已达到警告线。"""
+        self._check_month_rollover()
         return self.total_cost_usd >= self.warn_threshold_usd()
 
+    def remaining_usd(self):
+        """本月剩余预算（美元），已累计超支时为负数。"""
+        self._check_month_rollover()
+        return MONTHLY_BUDGET_USD - self.total_cost_usd
+
+    def estimate_cost(self, prompt_text):
+        """调用前预估本次成本（美元），只用于拦截明显超支的请求。
+
+        预估方法（粗略估算，不是真实分词）：输入 Token 数约等于
+        len(prompt_text) / 4 向上取整；输出按 ESTIMATED_MAX_OUTPUT_TOKENS
+        （512 Token）估算；缓存按 0 算（最保守，即全部输入按普通价算）。
+        """
+        prompt_tokens = math.ceil(len(str(prompt_text or "")) / 4)
+        muse_cfg = MODEL_CONFIG["muse"]
+        return (
+            prompt_tokens / 1_000_000 * muse_cfg["price_input_per_1m"]
+            + ESTIMATED_MAX_OUTPUT_TOKENS / 1_000_000 * muse_cfg["price_output_per_1m"]
+        )
+
+    def can_afford_estimated(self, prompt_text):
+        """预估成本是否在剩余预算内。返回 False 时，调用方应在请求前拦截。"""
+        return self.estimate_cost(prompt_text) <= self.remaining_usd()
+
     def can_call(self):
-        """是否允许继续付费调用：没超预算才能调用，超了要等用户确认。"""
-        return not self.is_over_budget()
+        """是否允许继续付费调用：没超预算、且没有未核对的未知成本时才能调用。"""
+        self._check_month_rollover()
+        return not self.is_over_budget() and not self.unknown_cost

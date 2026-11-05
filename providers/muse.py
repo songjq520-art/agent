@@ -9,7 +9,9 @@
 #   接口地址：https://api.meta.ai/v1
 #   模型：muse-spark-1.3
 #   端点：POST /v1/chat/completions（Chat Completions，聊天补全）
-#   价格以官方定价页为准，2026-11-05 核实为每百万 Token 输入 $1.25、输出 $4.25、缓存输入 $0.15。
+#   价格（Standard mode，标准模式）以官方定价页为准，2026-11-05 核实为
+#   每百万 Token 普通输入 $1.25、缓存输入 $0.15、输出 $4.25。
+#   Contributor 版价格不同，本项目不用。
 
 import requests
 
@@ -42,7 +44,10 @@ class MuseProvider:
                   "cost_usd": 成本（美元）或 None, "model": 模型名}
         - 无 Key 时：抛出明确错误，不返回假成功。
         - 超预算时：抛出明确错误，等待用户确认，不偷偷调用。
-        - 模型没返回 usage 时：cost_usd 为 None，绝不编造 Token 或成本。
+        - 预估成本超过剩余预算时：也在请求前拦截，但这只是粗略预估，
+          不能保证单次请求绝对不超支，实际费用以官方后台为准。
+        - 模型没返回 usage 时：cost_usd 为 None，绝不编造 Token 或成本，
+          并标记成本未知，暂停后续付费调用，等人工核对。
         """
         # 1. 先检查 Key，没有 Key 就明确说“未完成”，不要假装调用成功。
         if not self.api_key:
@@ -52,13 +57,25 @@ class MuseProvider:
                 "或设置环境变量 MODEL_API_KEY 后再运行。"
             )
 
-        # 2. 再检查预算，超了就停下来等用户确认。
+        # 2. 再检查预算，超了或有未核对的未知成本时，停下来等用户确认。
         if self.budget_tracker is not None and not self.budget_tracker.can_call():
             raise RuntimeError(
-                "已达到每月预算上限（$5），已暂停后续付费调用，请确认后再继续。"
+                "已达到每月预算上限（$5）或有未核对的未知成本，"
+                "已暂停后续付费调用，请确认后再继续。"
             )
 
-        # 3. 发真实请求。timeout（超时）设为 60 秒，避免一直等下去。
+        # 3. 调用前费用预估：预估成本超过剩余预算时也在请求前拦截。
+        #    注意：这是粗略预估（输入按字符数/4 估算，输出按 512 Token 估算），
+        #    不能保证单次请求绝对不超支。
+        if self.budget_tracker is not None and not self.budget_tracker.can_afford_estimated(prompt):
+            raise RuntimeError(
+                "预估成本可能超过本月剩余预算，已在请求前拦截："
+                f"预估约 ${self.budget_tracker.estimate_cost(prompt):.6f}，"
+                f"本月剩余约 ${self.budget_tracker.remaining_usd():.6f}。"
+                "这是粗略预估，不是保证，实际费用以 Meta 官方后台为准。"
+            )
+
+        # 4. 发真实请求。timeout（超时）设为 60 秒，避免一直等下去。
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -77,18 +94,22 @@ class MuseProvider:
 
         data = response.json()
 
-        # 4. 解析回答。choices[0].message.content 是回答文本。
+        # 5. 解析回答。choices[0].message.content 是回答文本。
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Muse API 返回格式异常，无法解析回答：{data}") from exc
 
-        # 5. 解析 Token 使用量。只有模型返回了 usage 才计算成本，否则 cost 为 None。
+        # 6. 解析 Token 使用量。只有模型返回了 usage 才计算成本，否则 cost 为 None。
         #    缓存 Token（cached_tokens）按缓存价 $0.15 计，普通输入按 $1.25 计；
         #    completion_tokens 里已包含 reasoning_tokens（推理 Token），它是输出的子集，
         #    不要重复加，只按 completion_tokens 计输出价 $4.25。
+        #    注意：usage 缺失时不能当成零成本，要标记成本未知、暂停后续付费调用。
         usage = data.get("usage")
         cost_usd = None
+        if not usage:
+            if self.budget_tracker is not None:
+                self.budget_tracker.mark_unknown_cost()
         if usage:
             prompt_tokens = usage.get("prompt_tokens", 0) or 0
             completion_tokens = usage.get("completion_tokens", 0) or 0
