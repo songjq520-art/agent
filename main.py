@@ -61,7 +61,7 @@ def run_question(prompt, task_type="question", budget_tracker=None):
     api_key = get_api_key(routing["provider"])
     if not api_key:
         message = (
-            "模拟模式 / 未接通真实 API：未配置 MUSE_API_KEY，"
+            "模拟模式 / 未接通真实 API：未配置 MODEL_API_KEY（或 MUSE_API_KEY），"
             "本次只做了配置检查和路由演示，未调用模型，未产生费用。"
             "真实 API 连接标记为未完成，等你准备好密钥后再测试。"
         )

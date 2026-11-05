@@ -84,11 +84,17 @@ pip install -r requirements.txt
 cp .env.example .env
 
 # 2. 用文本编辑器打开 .env，填入你自己的 Key（密钥），不要发给别人，也不要写进聊天记录
-# MUSE_API_KEY=你的 Muse Key
+# MODEL_API_KEY=你的 Muse Key（官方变量名；旧名 MUSE_API_KEY 也兼容）
+```
 
-# 3. 每次运行前，在终端里加载它（macOS / Linux）
-export $(cat .env | xargs)
-# Windows（PowerShell）请按你的系统方式设置环境变量，或在运行前用 set 命令设置
+**程序启动时会自动读取项目根目录的 .env 文件**（`config.py` 里的 `load_env_file()`，只用 Python 自带库，不用 dotenv）。你不需要每次手动加载。
+
+如果不想用 `.env` 文件，也可以手动设置环境变量（可选方式）：
+```bash
+# macOS / Linux：
+export MODEL_API_KEY=你的 Muse Key
+# Windows（PowerShell）：
+# $env:MODEL_API_KEY="你的 Muse Key"
 ```
 
 **目前状态：没有 API Key。** 按无 Key 处理，先完成骨架和模拟测试，真实 API 连接标记为**未完成**，等你准备好密钥再测试。
@@ -118,7 +124,7 @@ export $(cat .env | xargs)
   ```json
   {"model": "muse-spark-1.3", "messages": [{"role": "user", "content": "你的问题"}]}
   ```
-- **返回格式**：`choices[0].message.content` 是回答文本；`usage` 里有 `prompt_tokens`（输入 Token 数）、`completion_tokens`（输出 Token 数）、`total_tokens`（总 Token 数）。**如果模型没有返回 usage，程序不会编造，成本记为未知（None）。**
+- **返回格式**：`choices[0].message.content` 是回答文本；`usage` 里有 `prompt_tokens`（输入 Token 数）、`completion_tokens`（输出 Token 数）、`total_tokens`（总 Token 数），还有 `prompt_tokens_details.cached_tokens`（缓存输入 Token 数）和 `completion_tokens_details.reasoning_tokens`（推理 Token 数）。**如果模型没有返回 usage，程序不会编造，成本记为未知（None）。** 成本计算：普通输入按 $1.25、缓存输入按 $0.15、输出按 $4.25（每百万 Token）；`reasoning_tokens` 是 `completion_tokens` 的子集，不重复计费。
 
 **价格说明（必须注明）**：价格以 Meta 官方定价页为准，2026-11-05 核实为每百万 Token 输入 $1.25、输出 $4.25、缓存输入 $0.15。本次未能直接打开官方定价页，上述价格来自多家资料一致的记录，**不要把它当成绝对不变的官方定论**，实际以你开通账单时官方页面为准。
 
@@ -128,8 +134,7 @@ export $(cat .env | xargs)
 # 无 Key 模式（目前的状态）：只做配置检查 + 路由演示，明确提示“未接通真实 API”，不调用模型，不产生费用
 python3 main.py "你好"
 
-# 有 Key 且你确认要真实调用时：先设置环境变量，再运行同样命令
-# export MUSE_API_KEY=你的 Key
+# 有 Key 且你确认要真实调用时：先在 .env 里填入 MODEL_API_KEY（程序启动自动读取），再运行同样命令
 # python3 main.py "你好"
 ```
 
@@ -145,7 +150,7 @@ python3 -m pytest tests/ -v
 测试分两类，`tests/test_router.py` 里已明确区分：
 
 - **模拟测试（Mock Test）**：不需要 API Key，不产生费用，默认运行。
-- **真实测试（Real API Test）**：需要 API Key，可能产生实际费用，默认跳过（skip）。只有设置了 `MUSE_API_KEY` **并且**显式设置 `RUN_REAL_API_TESTS=1` 时才运行。**没有你的确认，不要进行产生费用的真实 API 测试。**
+- **真实测试（Real API Test）**：需要 API Key，可能产生实际费用，默认跳过（skip）。只有设置了 `MODEL_API_KEY`（或 `MUSE_API_KEY`）**并且**显式设置 `RUN_REAL_API_TESTS=1` 时才运行。**没有你的确认，不要进行产生费用的真实 API 测试。**
 
 ## 十、预算控制（简单版）
 
@@ -153,7 +158,7 @@ python3 -m pytest tests/ -v
 - 每次调用记录 Token 使用量，尽可能记录实际成本。
 - 达到预算 **80%（$4）** 时打印警告。
 - 达到预算 **100%（$5）** 时，暂停 Agent 后续付费调用，等待你确认。
-- 累计成本存在本地 `logs/budget_usage.json`，这个文件会被 `.gitignore` 忽略，不上传。
+- 累计成本存在本地 `logs/budget_usage.json`，这个文件会被 `.gitignore` 忽略，不上传。文件里还有 `month`（月份，`YYYY-MM`）字段，跨月时累计自动重置为 0；如果是没有 `month` 字段的旧文件，保留原累计值，只补上当前月份。
 
 **重要提醒：这是 Agent 自身的调用限制，不代表服务商账单的绝对上限。** 请同时关注 Meta 官方后台的消费情况，服务商后台才是最终账单。
 
@@ -166,7 +171,7 @@ python3 -m pytest tests/ -v
 1. 在 `providers/` 下新建一个文件，例如 `providers/gpt.py`，写一个和 `MuseProvider` 一样有 `chat(prompt)` 方法的类。
 2. 在 `config.py` 的 `MODEL_CONFIG`（模型配置）里把对应模型的 `enabled`（启用状态）改成 `True`，填好模型名和价格。
 3. 在 `router.py` 里把相应任务类型指向新模型；如果要换主控，在 `config.py` 里改 `CONTROLLER` 即可，不用重写其他模块。
-4. 在 `.env.example` 里已有 `OPENAI_API_KEY=`、`GEMINI_API_KEY=`、`GROK_API_KEY=`，按同样方式在 `.env` 里填入真实 Key。
+4. 在 `.env.example` 里已有 `MODEL_API_KEY=`、`OPENAI_API_KEY=`、`GEMINI_API_KEY=`、`GROK_API_KEY=`，按同样方式在 `.env` 里填入真实 Key。
 5. 先用模拟测试验证路由，再用真实测试（需你确认）验证接口。
 
 ## 十三、已知未完成项

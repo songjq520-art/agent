@@ -6,7 +6,43 @@
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
+
+
+def load_env_file(env_path=None):
+    """读取 .env 文件（环境变量文件），只用 Python 自带库，不加 dotenv 依赖。
+
+    参数 env_path：.env 文件路径，不传时默认读 config.py 同目录下的 .env。
+    解析规则：忽略空行和以 # 开头的注释行；支持可选的 "export " 前缀；
+    按第一个 = 分割键和值；值去掉首尾空格，并去掉一层单引号或双引号；
+    用 os.environ.setdefault 写入，不覆盖已有的环境变量。
+    文件不存在时什么也不做，不报错。
+    """
+    path = Path(env_path) if env_path else Path(__file__).parent / ".env"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+# 程序启动时自动读取项目根目录的 .env 文件（如果有的话）。
+load_env_file()
 
 # ---------- 模型配置 ----------
 # MODEL_CONFIG（模型配置）：每个模型一个条目。
@@ -70,10 +106,13 @@ RECORD_USAGE = True  # 是否记录每次调用的 Token 和成本
 def get_api_key(provider: str):
     """从环境变量读取 API Key（接口密钥）。
 
-    参数 provider：模型名，例如 "muse" 对应环境变量 MUSE_API_KEY。
-    原理：只用 os.environ.get（读环境变量），不用 dotenv，避免多一个依赖。
-    绝不把 Key 写进代码里。
+    参数 provider：模型名。Muse 优先读官方变量名 MODEL_API_KEY，
+    没有再读旧名 MUSE_API_KEY（兼容用）；其他模型仍按 {PROVIDER}_API_KEY 读。
+    原理：只用 os.environ.get（读环境变量），绝不把 Key 写进代码里。
     """
+    if provider == "muse":
+        # 官方变量名优先，旧名兼容：两个都填时以 MODEL_API_KEY 为准。
+        return os.environ.get("MODEL_API_KEY") or os.environ.get("MUSE_API_KEY")
     env_name = f"{provider.upper()}_API_KEY"
     return os.environ.get(env_name)
 
@@ -99,6 +138,7 @@ class BudgetTracker:
     作用：记录本月累计成本，达 80% 警告，达 100% 拒绝后续付费调用。
     原理：累计成本存在本地文件 logs/budget_usage.json（JSON 格式），
           这个文件会被 .gitignore 忽略，不上传到 GitHub。
+          文件里还有 month（月份，YYYY-MM）字段，跨月时自动重置为 0。
     注意：cost 为 None（模型没返回 usage，成本未知）时，不计入累计，不编造。
     """
 
@@ -106,22 +146,48 @@ class BudgetTracker:
         # 默认存在项目根目录下的 logs/budget_usage.json
         self.file_path = Path(file_path) if file_path else Path(__file__).parent / "logs" / "budget_usage.json"
         self.total_cost_usd = 0.0
+        self.month = self.current_month()
         self._load()
 
+    def current_month(self):
+        """当前月份，格式 YYYY-MM，例如 2026-11。用于每月预算重置。"""
+        return datetime.now().strftime("%Y-%m")
+
     def _load(self):
-        """从本地文件读出之前累计的成本，文件不存在就从 0 开始。"""
+        """从本地文件读出之前累计的成本，文件不存在就从 0 开始。
+
+        每月重置规则：文件里有 month 字段且与当前月份不同时，
+        把累计成本重置为 0 并更新月份后保存；文件没有 month 字段
+        （旧文件）时，保留原累计值，只补上当前月份，不静默清零。
+        """
         try:
             if self.file_path.exists():
                 data = json.loads(self.file_path.read_text(encoding="utf-8"))
                 self.total_cost_usd = float(data.get("total_cost_usd", 0.0))
+                old_month = data.get("month")
+                if old_month is None:
+                    # 旧文件：保留累计值，只补月份。
+                    self.month = self.current_month()
+                    self._save()
+                elif old_month != self.current_month():
+                    # 跨月了：重置为 0，月份更新为当前月。
+                    self.total_cost_usd = 0.0
+                    self.month = self.current_month()
+                    self._save()
+                else:
+                    self.month = old_month
         except (ValueError, OSError):
             self.total_cost_usd = 0.0
+            self.month = self.current_month()
 
     def _save(self):
-        """把累计成本写回本地文件。"""
+        """把累计成本和月份写回本地文件。"""
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.file_path.write_text(
-            json.dumps({"total_cost_usd": round(self.total_cost_usd, 6)}, ensure_ascii=False),
+            json.dumps(
+                {"month": self.month, "total_cost_usd": round(self.total_cost_usd, 6)},
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
 

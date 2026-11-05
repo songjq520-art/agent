@@ -4,6 +4,9 @@
 
 # 真实环境变量文件（里面有 API Key，绝对不能上传）
 .env
+.env.*
+# 例外：.env.example 是示例文件，没有真实密钥，可以上传
+!.env.example
 
 # Python 缓存文件
 __pycache__/

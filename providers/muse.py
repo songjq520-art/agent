@@ -33,6 +33,7 @@ class MuseProvider:
         self.budget_tracker = budget_tracker
         self.price_input = cfg["price_input_per_1m"]
         self.price_output = cfg["price_output_per_1m"]
+        self.price_cached_input = cfg["price_cached_input_per_1m"]
 
     def chat(self, prompt):
         """向 Muse 提一个问题，返回字典。
@@ -47,7 +48,8 @@ class MuseProvider:
         if not self.api_key:
             raise RuntimeError(
                 "未配置 API Key，真实连接未完成："
-                "请在 .env 里填写 MUSE_API_KEY，或设置环境变量 MUSE_API_KEY 后再运行。"
+                "请在 .env 里填写 MODEL_API_KEY（或旧名 MUSE_API_KEY），"
+                "或设置环境变量 MODEL_API_KEY 后再运行。"
             )
 
         # 2. 再检查预算，超了就停下来等用户确认。
@@ -82,13 +84,21 @@ class MuseProvider:
             raise RuntimeError(f"Muse API 返回格式异常，无法解析回答：{data}") from exc
 
         # 5. 解析 Token 使用量。只有模型返回了 usage 才计算成本，否则 cost 为 None。
+        #    缓存 Token（cached_tokens）按缓存价 $0.15 计，普通输入按 $1.25 计；
+        #    completion_tokens 里已包含 reasoning_tokens（推理 Token），它是输出的子集，
+        #    不要重复加，只按 completion_tokens 计输出价 $4.25。
         usage = data.get("usage")
         cost_usd = None
         if usage:
             prompt_tokens = usage.get("prompt_tokens", 0) or 0
             completion_tokens = usage.get("completion_tokens", 0) or 0
+            details = usage.get("prompt_tokens_details") or {}
+            cached_tokens = details.get("cached_tokens", 0) or 0
+            # 安全保护：缓存 Token 数不能超过总输入 Token 数。
+            cached_tokens = min(cached_tokens, prompt_tokens)
             cost_usd = (
-                prompt_tokens / 1_000_000 * self.price_input
+                (prompt_tokens - cached_tokens) / 1_000_000 * self.price_input
+                + cached_tokens / 1_000_000 * self.price_cached_input
                 + completion_tokens / 1_000_000 * self.price_output
             )
             if self.budget_tracker is not None:
