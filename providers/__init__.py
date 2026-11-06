@@ -4,6 +4,7 @@
 # 例如：from .gpt import GPTProvider
 # 这样 main.py 和 router.py 只要从这里取模型，不用管每个模型文件在哪里。
 
+from .deepseek import DeepSeekProvider
 from .muse import MuseProvider
 
-__all__ = ["MuseProvider"]
+__all__ = ["DeepSeekProvider", "MuseProvider"]

@@ -62,7 +62,7 @@ class MuseProvider:
         if self.budget_tracker is not None and not self.budget_tracker.can_call():
             reason = ""
             if hasattr(self.budget_tracker, "status_reason"):
-                reason = self.budget_tracker.status_reason()
+                reason = self.budget_tracker.status_reason(provider="muse")
             raise RuntimeError(
                 reason
                 or "已达到每月预算上限（$5）或有未核对的未知成本，"
@@ -73,10 +73,12 @@ class MuseProvider:
         #    注意：这是粗略预估（输入分中英文估算，中文按 1.5 倍留余量；
         #    输出按 MAX_OUTPUT_TOKENS=2048 Token 估算，且该值同时是
         #    请求里实际生效的输出上限），不能保证单次请求绝对不超支。
-        if self.budget_tracker is not None and not self.budget_tracker.can_afford_estimated(prompt):
+        if self.budget_tracker is not None and not self.budget_tracker.can_afford_estimated(
+            prompt, provider="muse"
+        ):
             raise RuntimeError(
                 "预估成本可能超过本月剩余预算，已在请求前拦截："
-                f"预估约 ${self.budget_tracker.estimate_cost(prompt):.6f}，"
+                f"预估约 ${self.budget_tracker.estimate_cost(prompt, provider='muse'):.6f}，"
                 f"本月剩余约 ${self.budget_tracker.remaining_usd():.6f}。"
                 "这是粗略预估，不是保证，实际费用以 Meta 官方后台为准。"
             )
@@ -133,7 +135,7 @@ class MuseProvider:
                 + completion_tokens / 1_000_000 * self.price_output
             )
             if self.budget_tracker is not None:
-                self.budget_tracker.add_cost(cost_usd)
+                self.budget_tracker.add_cost(cost_usd, model=self.model)
 
         return {
             "text": text,

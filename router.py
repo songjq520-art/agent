@@ -1,12 +1,13 @@
 # router.py（任务路由模块）
 # 作用：按任务类型决定把任务交给哪个模型。
 # 原理：很简单，就是一张“任务类型 → 模型”的对应表。
-#       本次所有任务都交给 Muse，以后加模型时，只改这张表和 config.py，
+#       本次所有任务都交给 DeepSeek（第一任主控），Muse 保留为工作模型；
+#       以后加模型或换主控时，只改这张表和 config.py，
 #       main.py 和 providers 不用重写。
 # 关系：main.py 先问 router“这个任务给谁”，再按 router 的答案去调用对应模型。
 # 主控说明：主控（Controller）是“谁来做分配决策”这个角色，
-#       本次就是 router.py 里这张简单的表；未来 GPT 当主控时，
-#       可以把这张表换成 GPT 的决策逻辑，其他模块不用改。
+#       本次就是 router.py 里这张简单的表；未来换主控时，
+#       可以把这张表换成新主控的决策逻辑，其他模块不用改。
 
 from config import DEFAULT_MODEL, MODEL_CONFIG
 
@@ -14,11 +15,12 @@ from config import DEFAULT_MODEL, MODEL_CONFIG
 #   question：普通问答任务；code：代码相关任务；general：通用任务。
 TASK_TYPES = ("question", "code", "general")
 
-# PROVIDER_FOR_TASK（任务类型 → 模型）：本次都交给 Muse。
+# PROVIDER_FOR_TASK（任务类型 → 模型）：本次都交给 DeepSeek（第一任主控）。
+# Muse 保留为工作模型，需要时改这张表就能再指过去。
 PROVIDER_FOR_TASK = {
-    "question": "muse",
-    "code": "muse",
-    "general": "muse",
+    "question": "deepseek",
+    "code": "deepseek",
+    "general": "deepseek",
 }
 
 

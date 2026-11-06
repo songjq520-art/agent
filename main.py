@@ -2,7 +2,8 @@
 # 作用：程序从这里启动，流程是：
 #   1. 读配置（config.py），检查每个模型的状态（是否启用、有无 Key）；
 #   2. 用 router.py（任务路由模块）分配任务；
-#   3. 调用 providers/muse.py（Muse 模型接口）；
+#   3. 调用 providers/deepseek.py（DeepSeek 模型接口，默认）或
+#      providers/muse.py（Muse 模型接口，工作模型）；
 #   4. 展示结果，并写日志（运行记录）到 logs/agent.log。
 # 关系：main.py 是“总指挥”，它本身不直接调 API，只负责串起 config、router、providers。
 #
@@ -20,8 +21,16 @@ from config import (
     get_api_key,
     get_model_status,
 )
+from providers.deepseek import DeepSeekProvider
 from providers.muse import MuseProvider
 from router import route
+
+# PROVIDER_CLASSES（模型名 → Provider 类）：按路由结果选调用哪个模型。
+# DeepSeek 是默认主控，Muse 保留为工作模型；以后加新模型时在这里加一行。
+PROVIDER_CLASSES = {
+    "deepseek": DeepSeekProvider,
+    "muse": MuseProvider,
+}
 
 # ---------- 日志配置 ----------
 # 日志写到 logs/agent.log（文本格式），同时在终端打印一份。
@@ -47,7 +56,7 @@ def run_question(prompt, task_type="question", budget_tracker=None):
     返回：字典，含 mode（模式）、route（路由结果）、result（模型结果或 None）、message（提示）。
     模式：
       - "demo"（演示模式）：无 Key，只演示配置 + 路由，不调用模型；
-      - "real"（真实模式）：有 Key，真实调用 Muse API。
+      - "real"（真实模式）：有 Key，真实调用对应模型的 API（默认 DeepSeek）。
     """
     tracker = budget_tracker or BudgetTracker()
     status = get_model_status()
@@ -68,8 +77,13 @@ def run_question(prompt, task_type="question", budget_tracker=None):
     # 无 Key：演示模式，明确提示，不调用模型。
     api_key = get_api_key(routing["provider"])
     if not api_key:
+        key_name = (
+            "DEEPSEEK_API_KEY"
+            if routing["provider"] == "deepseek"
+            else "MODEL_API_KEY（或 MUSE_API_KEY）"
+        )
         message = (
-            "模拟模式 / 未接通真实 API：未配置 MODEL_API_KEY（或 MUSE_API_KEY），"
+            f"模拟模式 / 未接通真实 API：未配置 {key_name}，"
             "本次只做了配置检查和路由演示，未调用模型，未产生费用。"
             "真实 API 连接标记为未完成，等你准备好密钥后再测试。"
         )
@@ -87,8 +101,9 @@ def run_question(prompt, task_type="question", budget_tracker=None):
             "model_status": status,
         }
 
-    # 有 Key：真实调用。
-    provider = MuseProvider(api_key=api_key, budget_tracker=tracker)
+    # 有 Key：真实调用。按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型）。
+    provider_cls = PROVIDER_CLASSES[routing["provider"]]
+    provider = provider_cls(api_key=api_key, budget_tracker=tracker)
     try:
         result = provider.chat(prompt)
     except RuntimeError as exc:
@@ -109,9 +124,10 @@ def run_question(prompt, task_type="question", budget_tracker=None):
         result.get("cost_usd"),
     )
     if result.get("cost_usd") is None:
+        backend = "DeepSeek" if routing["provider"] == "deepseek" else "Meta"
         print(
             "⚠️ 本次调用成本未知（模型没有返回 usage），已暂停后续付费调用，"
-            "请先去 Meta 官方后台核对实际消费，核对后再清除未知成本标记。"
+            f"请先去{backend}官方后台核对实际消费，核对后再清除未知成本标记。"
         )
     if tracker.is_over_warn():
         print(f"⚠️ 预算警告：本月累计成本 ${tracker.total_cost_usd:.4f} / ${MONTHLY_BUDGET_USD:.2f}。")
@@ -152,7 +168,7 @@ def main(argv=None):
         print("（演示模式，未调用模型）")
     else:
         result = outcome["result"]
-        print("\n--- Muse 的回答 ---")
+        print(f"\n--- {result['model']} 的回答 ---")
         print(result["text"])
         print(f"\nToken 使用量：{result.get('usage')}")
         print(f"本次成本：{result.get('cost_usd')} 美元（None 表示模型未返回 usage，成本未知）")

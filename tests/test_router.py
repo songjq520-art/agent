@@ -80,17 +80,17 @@ def test_load_env_file(tmp_path, monkeypatch):
 
 # ---------- 模拟测试：路由 ----------
 def test_router_question():
-    """路由：普通问答任务应交给 Muse。"""
+    """路由：普通问答任务应交给 DeepSeek（第一任主控）。"""
     result = route("你好", "question")
-    assert result["provider"] == "muse"
-    assert result["model"] == "muse-spark-1.3"
+    assert result["provider"] == "deepseek"
+    assert result["model"] == "deepseek-flash"
     assert result["task_type"] == "question"
 
 
 def test_router_code_and_general():
-    """路由：代码相关和通用任务目前也交给 Muse。"""
-    assert route("帮我写一段代码", "code")["provider"] == "muse"
-    assert route("随便聊聊", "general")["provider"] == "muse"
+    """路由：代码相关和通用任务目前也交给 DeepSeek。"""
+    assert route("帮我写一段代码", "code")["provider"] == "deepseek"
+    assert route("随便聊聊", "general")["provider"] == "deepseek"
 
 
 def test_router_unknown_type_raises():
@@ -503,6 +503,7 @@ def test_unknown_cost_pauses_and_clears(tmp_path):
 # ---------- 模拟测试：主入口（无 Key 演示模式） ----------
 def test_main_no_key_demo_mode(monkeypatch, tmp_path):
     """主入口：无 Key 时应为演示模式，不调用模型，不产生费用。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("MODEL_API_KEY", raising=False)
     monkeypatch.delenv("MUSE_API_KEY", raising=False)
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
