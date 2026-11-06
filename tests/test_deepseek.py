@@ -89,7 +89,7 @@ def test_deepseek_provider_no_key_raises():
 
 def test_deepseek_provider_sends_correct_request(tmp_path):
     """模型接口：请求应发到 DeepSeek 官方地址，模型 deepseek-flash，
-    输出上限 max_completion_tokens=2048，用模拟的 requests，不联网。"""
+    输出上限 max_tokens=2048，用模拟的 requests，不联网。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好，我是 DeepSeek。"}}],
@@ -107,7 +107,7 @@ def test_deepseek_provider_sends_correct_request(tmp_path):
     assert called_url == "https://api.deepseek.com/chat/completions"
     sent_payload = mock_post.call_args.kwargs["json"]
     assert sent_payload["model"] == "deepseek-flash"
-    assert sent_payload["max_completion_tokens"] == 2048
+    assert sent_payload["max_tokens"] == 2048
     sent_headers = mock_post.call_args.kwargs["headers"]
     assert sent_headers["Authorization"] == "Bearer fake-key-for-test"
 

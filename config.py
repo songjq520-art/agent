@@ -126,7 +126,7 @@ MONTHLY_BUDGET_USD = 5.0  # 每月预算：5 美元（初期参考值）
 BUDGET_WARN_RATIO = 0.8  # 达到预算 80%（$4）时警告
 # MAX_OUTPUT_TOKENS（输出上限，单位 Token）：一次回答最多输出 2048 Token。
 # 这个值既是调用前费用预估用的输出量，也是请求里实际传给 API 的
-# max_completion_tokens 上限；输出成本上限 = 2048/1e6*4.25 美元。
+# max_tokens 上限；输出成本上限 = 2048/1e6*4.25 美元。
 # 注意：预估仍是粗略估算，不能保证单次请求绝对不超支。
 MAX_OUTPUT_TOKENS = 2048
 # 提醒：这是 Agent 自身的限制，不代表服务商账单的绝对上限，
@@ -437,7 +437,7 @@ class BudgetTracker:
 
         预估方法：输入 Token 用 estimate_input_tokens() 估算；
         输出按 MAX_OUTPUT_TOKENS（2048 Token）估算，这个值同时是请求里
-        实际传给 API 的 max_completion_tokens 上限，所以输出量不再是
+        实际传给 API 的 max_tokens 上限，所以输出量不再是
         凭空假设；缓存按 0 算（最保守，即全部输入按普通价算）。
         参数 provider：按哪个模型的价格估算；model：DeepSeek 时可指定
         "deepseek-v4-pro"（按 Pro 价算），不指定时按 deepseek-flash 算。

@@ -117,10 +117,10 @@ class DeepSeekProvider:
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            # max_completion_tokens（最大输出 Token 数）：实际生效的输出上限，
+            # max_tokens（最大输出 Token 数）：实际生效的输出上限，
             # 与调用前预估用的 MAX_OUTPUT_TOKENS 是同一个值（2048），
             # 所以预估里的输出量不是凭空假设。
-            "max_completion_tokens": MAX_OUTPUT_TOKENS,
+            "max_tokens": MAX_OUTPUT_TOKENS,
         }
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=60)
