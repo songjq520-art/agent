@@ -12,7 +12,7 @@
 
 - **Agent（智能代理）**：能理解你的问题、自己去调用 AI 模型、并把结果返回给你的程序。
 - **多模型**：计划接入多个模型——DeepSeek、Muse、GPT、Gemini、Grok、Kimi。现在已接入 **DeepSeek**（第一任主控，默认模型 deepseek-flash）和 **Muse**（工作模型，Muse Spark 1.3，先跑通接口和调用流程）。
-- **主控模型（Controller）**：负责理解任务、制定计划、协调其他模型。**DeepSeek 是第一任主控**（见 `PROJECT_PRINCIPLES.md`），负责任务分配、模型调度、信息传递、总结；GPT 是远期主控候选，目前不接入。主控是可以更换的角色，**不要把系统写死成只能由某个模型控制**，见 `config.py` 里的 `CONTROLLER`（主控）说明。
+- **主控模型（Controller）**：负责理解任务、制定计划、协调其他模型。**DeepSeek 是第一任主控**（见 `PROJECT_PRINCIPLES.md`），负责任务分配、模型调度、信息传递、总结；GPT 是远期主控候选，目前不接入。主控是可以更换的角色，**不要把系统写死成只能由某个模型控制**，见 `config.py` 里的 `CONTROLLER`（主控）说明。注意：目前 `CONTROLLER` 只是角色名，实际路由由 `router.py` 里的固定映射决定，改 `CONTROLLER` 本身不会改变路由。
 
 本次不做：多个模型同时运行、复杂智能调度、电脑控制、自动化工作流、云服务器部署、复杂长期记忆系统、复杂成本控制系统。
 
@@ -208,7 +208,7 @@ DeepSeek 和 Muse 已经接入（DeepSeek 的接入方法和上面一样：`prov
 
 1. 在 `providers/` 下新建一个文件，例如 `providers/gpt.py`，写一个和 `DeepSeekProvider` / `MuseProvider` 一样有 `chat(prompt)` 方法的类。
 2. 在 `config.py` 的 `MODEL_CONFIG`（模型配置）里把对应模型的 `enabled`（启用状态）改成 `True`，填好模型名和价格。
-3. 在 `router.py` 里把相应任务类型指向新模型；如果要换主控，在 `config.py` 里改 `CONTROLLER` 即可，不用重写其他模块。
+3. 在 `router.py` 里把相应任务类型指向新模型；如果要换主控，要同时改两处：`router.py` 里的路由表（真正决定路由）和 `config.py` 里的 `CONTROLLER`（角色名），让两者保持一致——只改 `CONTROLLER` 不会改变实际路由。
 4. 在 `.env.example` 里已有 `MODEL_API_KEY=`、`DEEPSEEK_API_KEY=`、`OPENAI_API_KEY=`、`GEMINI_API_KEY=`、`GROK_API_KEY=`，按同样方式在 `.env` 里填入真实 Key。
 5. 先用模拟测试验证路由，再用真实测试（需你确认）验证接口。
 
