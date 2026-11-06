@@ -41,7 +41,7 @@
 ### 已确认的事实
 
 - Muse Spark 1.3：要分清两件事，不能混在一起。第一是 Muse App 里的十一，属于 App 外部的协作：BOOS 平时在 App 里跟十一聊天，十一帮他想办法、写代码、做开发协作，这走的是 App 本身的服务。第二是 Agent 内部的 Provider（模型接入），也就是仓库里写好的、通过 Meta Model API 调用 Muse Spark 1.3 的代码：这部分代码已经写好，但尚未取得 API Key，也没有进行真实 API 调用。因此，目前还不能在 Agent 内部实际执行任务。未来完成真实调用和测试后，再确定其具体职责。代码写好了不等于已经完成真实调用，别把在 App 里聊天误当成 Agent 已经调通了接口。
-- DeepSeek：目前尚未注册、接入、启用或真实调用。API 好接、开 Key 方便，结算也方便。
+- DeepSeek：代码已接入、已启用（2026-11-06，feature/deepseek-integration 分支，未合并）；尚未注册（无 API Key）、尚未真实调用。API 好接、开 Key 方便，结算也方便。
 - Meta API 不好接入：没有银行卡不好结算，这是现阶段 Muse 真调用的一道门槛。Muse App 的会员和 Meta API 是两笔不同的账，App 里的额度不能拿到 Agent 里用。
 
 ### 已确认的规划
