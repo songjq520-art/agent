@@ -93,6 +93,18 @@ def test_router_code_and_general():
     assert route("随便聊聊", "general")["provider"] == "deepseek"
 
 
+def test_routing_matches_controller():
+    """路由一致性检查：所有任务类型路由到的模型必须等于 CONTROLLER。
+    注意：这只是配置一致性检查，不代表已经实现动态主控——
+    当前路由仍是固定映射，CONTROLLER 只是角色名。"""
+    from config import CONTROLLER, MODEL_CONFIG
+
+    for task_type in TASK_TYPES:
+        result = route("你好", task_type)
+        assert result["provider"] == CONTROLLER
+        assert result["model"] == MODEL_CONFIG[CONTROLLER]["model"]
+
+
 def test_router_unknown_type_raises():
     """路由：不支持的任务类型应报错，而不是默默交给某个模型。"""
     with pytest.raises(ValueError):
@@ -116,6 +128,37 @@ def test_muse_provider_no_key_raises():
     provider = MuseProvider(api_key=None)
     with pytest.raises(RuntimeError, match="未配置 API Key"):
         provider.chat("你好")
+
+
+def test_muse_provider_default_model_is_spark(tmp_path):
+    """Muse 模型参数：不传 model 时默认用 muse-spark-1.3。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    provider = MuseProvider(api_key="sk-test-key", budget_tracker=tracker)
+    assert provider.model == "muse-spark-1.3"
+
+
+def test_muse_provider_accepts_explicit_model(tmp_path):
+    """Muse 模型参数：显式传 muse-spark-1.3 时正常使用，请求里也是这个模型。
+    用模拟的 requests，不联网，不产生费用。"""
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    provider = MuseProvider(api_key="sk-test-key", budget_tracker=tracker, model="muse-spark-1.3")
+    assert provider.model == "muse-spark-1.3"
+    with patch("providers.muse.requests.post", return_value=fake_response) as mock_post:
+        result = provider.chat("你好")
+    assert result["model"] == "muse-spark-1.3"
+    assert mock_post.call_args.kwargs["json"]["model"] == "muse-spark-1.3"
+
+
+def test_muse_provider_unknown_model_raises():
+    """Muse 模型参数：传一个不存在的模型名时应直接报错，不用错的价格记账。"""
+    with pytest.raises(ValueError, match="不支持的 Muse 模型"):
+        MuseProvider(api_key="sk-test-key", model="muse-spark-9.9")
 
 
 def test_muse_provider_cost_only_when_usage_returned(tmp_path):
@@ -511,6 +554,33 @@ def test_main_no_key_demo_mode(monkeypatch, tmp_path):
     assert outcome["mode"] == "demo"
     assert outcome["result"] is None
     assert "未接通真实 API" in outcome["message"]
+
+
+def test_main_passes_routing_model_to_muse(monkeypatch, tmp_path):
+    """主入口传模型：路由算出 Muse 时，main.py 必须把 muse-spark-1.3 传给 Provider，
+    不能丢了 routing["model"]、让 Provider 又按默认模型自己猜。
+    用模拟的 requests，不联网，不产生费用。"""
+    monkeypatch.setenv("MODEL_API_KEY", "sk-test-key")
+    monkeypatch.setattr(
+        "main.route",
+        lambda prompt, task_type="question": {
+            "task_type": task_type,
+            "provider": "muse",
+            "model": "muse-spark-1.3",
+        },
+    )
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    with patch("providers.muse.requests.post", return_value=fake_response) as mock_post:
+        outcome = run_question("你好", budget_tracker=tracker)
+    assert outcome["mode"] == "real"
+    assert outcome["result"]["model"] == "muse-spark-1.3"
+    assert mock_post.call_args.kwargs["json"]["model"] == "muse-spark-1.3"
 
 
 # ---------- 真实测试：默认跳过，需要 Key + 显式开启 ----------

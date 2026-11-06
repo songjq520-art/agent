@@ -325,6 +325,61 @@ def test_main_no_deepseek_key_demo_mode(monkeypatch, tmp_path):
     assert "未接通真实 API" in outcome["message"]
 
 
+def test_main_passes_routing_model_to_deepseek_flash(monkeypatch, tmp_path):
+    """主入口传模型：默认路由算出 Flash 时，main.py 传给 Provider 的也是 Flash，
+    成本按 Flash 价格算。用模拟的 requests，不联网，不产生费用。
+
+    模拟返回：prompt 1000、completion 500（无缓存），
+    成本应为 1000/1e6*0.15 + 500/1e6*0.60 = 0.00045 美元。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+    }
+    fake_response.raise_for_status.return_value = None
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    with patch("providers.deepseek.requests.post", return_value=fake_response) as mock_post:
+        outcome = run_question("你好", budget_tracker=tracker)
+    assert outcome["mode"] == "real"
+    assert outcome["result"]["model"] == "deepseek-flash"
+    assert mock_post.call_args.kwargs["json"]["model"] == "deepseek-flash"
+    assert outcome["result"]["cost_usd"] == pytest.approx(0.00045)
+
+
+def test_main_passes_routing_model_to_deepseek_pro(monkeypatch, tmp_path):
+    """主入口传模型：路由算出 Pro 时，main.py 必须把 Pro 传给 Provider，
+    不能丢了 routing["model"]、让 Provider 又按默认 Flash 自己猜；
+    成本必须按 Pro 价格算。用模拟的 requests，不联网，不产生费用。
+
+    模拟返回：prompt 1000、completion 500（无缓存），
+    成本应为 1000/1e6*0.66 + 500/1e6*1.98 = 0.00165 美元。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    monkeypatch.setattr(
+        "main.route",
+        lambda prompt, task_type="question": {
+            "task_type": task_type,
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+        },
+    )
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+    }
+    fake_response.raise_for_status.return_value = None
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    with patch("providers.deepseek.requests.post", return_value=fake_response) as mock_post:
+        outcome = run_question("你好", budget_tracker=tracker)
+    assert outcome["mode"] == "real"
+    assert outcome["result"]["model"] == "deepseek-v4-pro"
+    assert mock_post.call_args.kwargs["json"]["model"] == "deepseek-v4-pro"
+    assert outcome["result"]["cost_usd"] == pytest.approx(0.00165)
+    assert tracker.cost_for_model("deepseek-v4-pro") == pytest.approx(0.00165)
+    assert tracker.cost_for_model("deepseek-flash") == 0.0
+
+
 # ---------- 真实测试：默认跳过，需要 Key + 显式开启 ----------
 RUN_REAL_DEEPSEEK = bool(os.environ.get("DEEPSEEK_API_KEY")) and os.environ.get("RUN_REAL_API_TESTS") == "1"
 

@@ -101,9 +101,11 @@ def run_question(prompt, task_type="question", budget_tracker=None):
             "model_status": status,
         }
 
-    # 有 Key：真实调用。按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型）。
+    # 有 Key：真实调用。按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型），
+    # 并把路由算出的模型名传给 Provider——路由说用哪个模型就用哪个，
+    # 不能丢了 routing["model"]、让 Provider 又按默认模型自己猜。
     provider_cls = PROVIDER_CLASSES[routing["provider"]]
-    provider = provider_cls(api_key=api_key, budget_tracker=tracker)
+    provider = provider_cls(api_key=api_key, budget_tracker=tracker, model=routing["model"])
     try:
         result = provider.chat(prompt)
     except RuntimeError as exc:
