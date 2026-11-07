@@ -35,6 +35,7 @@
 import argparse
 import ipaddress
 import json
+import logging
 import os
 import sys
 import threading
@@ -49,6 +50,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import MONTHLY_BUDGET_USD, BudgetTracker, get_model_status  # noqa: E402
 from main import run_question  # noqa: E402
+from memory.memories import MemoryStore, ensure_first_memories  # noqa: E402
+
+logger = logging.getLogger("agent")
 
 # INDEX_PATH（聊天页面文件）：按 server.py 的位置找，不依赖当前工作目录。
 INDEX_PATH = Path(__file__).resolve().parent / "index.html"
@@ -84,18 +88,34 @@ class ServerConfig:
 
 
 class ChatState:
-    """一次服务运行里的对话状态：共用的预算跟踪器 + 对话历史。
+    """一次服务运行里的对话状态：共用的预算跟踪器 + 对话历史 + 长期记忆库。
 
     做法和 main.py 的 chat_loop() 一样：整个服务进程只用一个
     BudgetTracker 和一个 messages 历史（user 和 assistant 消息按时间顺序）。
     成功拿到回答后，才把本轮 user 问题和 assistant 回答追加进历史；
     演示模式或调用失败时，历史不动。
     对话历史只保存在内存里，重启服务后清空；本阶段不做持久化。
+    长期记忆：memory_store 不传时不带记忆；传了时，启动时种下前三条记忆
+    （只在空库时写一次），每轮提问先搜相关记忆带给模型（见 main.run_question）。
+    记忆文件只保存在本地（memory/memories.json），不上传。
     """
 
-    def __init__(self, budget_tracker=None):
+    def __init__(self, budget_tracker=None, memory_store=None):
         self.tracker = budget_tracker or BudgetTracker()
         self.messages = []
+        self.memory_store = memory_store
+        if self.memory_store is not None:
+            # 启动时确保前三条记忆已存（只在空库时写一次）；记忆库坏了也不影响服务。
+            if getattr(self.memory_store, "corrupted", False):
+                logger.warning(
+                    "记忆文件异常：%s，本次服务不带记忆运行。",
+                    self.memory_store.corruption_reason,
+                )
+            else:
+                try:
+                    ensure_first_memories(self.memory_store)
+                except Exception:
+                    logger.warning("初始化记忆失败，本次服务不带记忆运行。", exc_info=True)
         # _lock（并发锁）：服务用 ThreadingHTTPServer，每个请求一个线程。
         # 没有这把锁，两个 /api/chat 同时跑会互相污染历史（你问你的、他答他的，
         # 追加顺序乱掉），还可能同时通过预算检查、多记一笔费用。
@@ -133,7 +153,10 @@ class ChatState:
         """
         with self._lock:
             outcome = run_question(
-                prompt, budget_tracker=self.tracker, messages=self.messages
+                prompt,
+                budget_tracker=self.tracker,
+                messages=self.messages,
+                memory_store=self.memory_store,
             )
             if outcome["mode"] == "demo":
                 return {
@@ -305,11 +328,14 @@ def _is_loopback_host(host):
         return False
 
 
-def create_server(config=None, budget_tracker=None, authenticator=None):
+def create_server(config=None, budget_tracker=None, authenticator=None, memory_store=None):
     """建一个网页服务（不启动），方便测试用临时端口和临时预算文件。
 
     config 是 ServerConfig；不传时用环境变量/默认值（ServerConfig.from_env()）。
     authenticator 是身份验证钩子（见 make_handler），默认不校验。
+    memory_store 是长期记忆库（MemoryStore），不传时不带记忆；传了时，
+    ChatState 启动时种下前三条记忆，每轮提问先搜相关记忆带给模型。
+    测试时可传一个用临时文件的记忆库，避免碰真实记忆文件。
 
     安全保护：监听地址不是本机回环地址（比如 0.0.0.0 或局域网地址），
     却没有配置身份验证函数时，拒绝启动（抛 ValueError），防止一不小心
@@ -324,7 +350,7 @@ def create_server(config=None, budget_tracker=None, authenticator=None):
             "为防止无身份验证的局域网访问，拒绝启动。"
             "如需开放局域网，请先接上 authenticator 做身份验证。"
         )
-    state = ChatState(budget_tracker=budget_tracker)
+    state = ChatState(budget_tracker=budget_tracker, memory_store=memory_store)
     handler = make_handler(state, authenticator=authenticator)
     return ThreadingHTTPServer((config.host, config.port), handler), state
 
@@ -342,7 +368,9 @@ def main(argv=None):
         port=args.port if args.port is not None else env_config.port,
     )
     try:
-        server, _state = create_server(config=config)
+        # 长期记忆库：真实服务建一个（memory/memories.json），启动时种下
+        # 前三条记忆，每轮提问先搜相关记忆带给模型。
+        server, _state = create_server(config=config, memory_store=MemoryStore())
     except ValueError as exc:
         # 非回环地址又没配身份验证时，create_server 会拒绝启动；
         # 这里只打印一句清楚的原因就退出，不甩一堆堆栈给用户看。
