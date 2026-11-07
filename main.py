@@ -49,14 +49,22 @@ logging.basicConfig(
 logger = logging.getLogger("agent")
 
 
-def run_question(prompt, task_type="question", budget_tracker=None):
+def run_question(prompt, task_type="question", budget_tracker=None, messages=None):
     """跑一次普通问答任务（最简单的运行示例）。
 
     参数 prompt：用户的问题；task_type：任务类型，默认 "question"。
+    参数 budget_tracker：共用的预算跟踪器，不传时新建一个。
+    参数 messages：多轮对话的历史（可选），按时间顺序排列，每项为
+    {"role": "user" 或 "assistant", "content": 文本}，应为本轮之前
+    已完成的轮次（不含本轮问题）。不传时为单次问答；
+    传入时，本轮会把历史 + 本轮问题一起发给模型（chat_messages），
+    预算预估也覆盖完整历史。
     返回：字典，含 mode（模式）、route（路由结果）、result（模型结果或 None）、message（提示）。
     模式：
       - "demo"（演示模式）：无 Key，只演示配置 + 路由，不调用模型；
       - "real"（真实模式）：有 Key，真实调用对应模型的 API（默认 DeepSeek）。
+    注意：本函数不修改传入的 messages 列表；调用方在成功拿到回答后，
+    再把本轮 user 问题和 assistant 回答追加进历史。
     """
     tracker = budget_tracker or BudgetTracker()
     status = get_model_status()
@@ -107,7 +115,13 @@ def run_question(prompt, task_type="question", budget_tracker=None):
     provider_cls = PROVIDER_CLASSES[routing["provider"]]
     provider = provider_cls(api_key=api_key, budget_tracker=tracker, model=routing["model"])
     try:
-        result = provider.chat(prompt)
+        if messages is None:
+            # 单次问答：只发本轮问题。
+            result = provider.chat(prompt)
+        else:
+            # 多轮对话：把历史 + 本轮问题一起发给模型，预算预估也覆盖完整历史。
+            send_messages = list(messages) + [{"role": "user", "content": prompt}]
+            result = provider.chat_messages(send_messages)
     except RuntimeError as exc:
         logger.info(
             "real | model=%s task_type=%s success=False tokens=None cost=None error=%s",
@@ -142,16 +156,82 @@ def run_question(prompt, task_type="question", budget_tracker=None):
     }
 
 
+# EXIT_COMMANDS（退出命令）：连续对话里输入这些就结束，不区分大小写，前后空格忽略。
+# 退出时直接结束，不再调用 API。
+EXIT_COMMANDS = ("exit", "quit", "退出")
+
+
+def is_exit_command(text):
+    """判断输入是否为退出命令（exit / quit / 退出）。"""
+    return str(text or "").strip().lower() in EXIT_COMMANDS
+
+
+def chat_loop(budget_tracker=None):
+    """连续对话循环：持续与模型对话，直到输入退出命令。
+
+    整个会话共用一个 BudgetTracker 和一个 messages 历史（user 和 assistant
+    消息按时间顺序排列）。每轮：读用户输入 → 经原来路由和 Provider 调用
+    机制（run_question，带完整历史）→ 打印回答 → 把本轮 user 问题和
+    assistant 回答追加进历史。失败（调用报错、演示模式）时历史不动。
+    退出命令（exit / quit / 退出）不调用 API，直接正常结束。
+    返回 0 表示正常结束。
+    """
+    tracker = budget_tracker or BudgetTracker()
+    messages = []
+    print("=== 个人多模型 Agent（连续对话）===")
+    print(f"模型状态：{get_model_status()}")
+    print(f"每月预算：${MONTHLY_BUDGET_USD:.2f}，警告线 80%")
+    print("输入问题开始对话，输入 exit、quit 或 退出 结束。")
+    while True:
+        try:
+            prompt = input("\n你：").strip()
+        except (EOFError, KeyboardInterrupt):
+            # Ctrl+D / Ctrl+C：正常结束，不报错。
+            print("\n对话结束。")
+            break
+        if not prompt:
+            # 空输入：不调用 API，继续等下一句。
+            continue
+        if is_exit_command(prompt):
+            # 退出命令：不调用 API，直接结束。
+            print("对话结束。")
+            break
+        try:
+            outcome = run_question(prompt, budget_tracker=tracker, messages=messages)
+        except RuntimeError as exc:
+            # 调用失败：历史不动，继续等下一句，不伪造回答。
+            print(f"调用失败：{exc}")
+            continue
+        if outcome["mode"] == "demo":
+            # 演示模式：未调用模型，没有回答可追加，历史不动。
+            print("（演示模式，未调用模型）")
+            continue
+        result = outcome["result"]
+        # 成功拿到回答后，再把本轮 user 问题和 assistant 回答追加进历史。
+        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "assistant", "content": result["text"]})
+        print(f"\n--- {result['model']} 的回答 ---")
+        print(result["text"])
+        print(f"\nToken 使用量：{result.get('usage')}")
+        print(f"本次成本：{result.get('cost_usd')} 美元（None 表示模型未返回 usage，成本未知）")
+    return 0
+
+
 def main(argv=None):
     """命令行入口。
 
     用法：
-      python3 main.py "你好"        # 问一个问题
-      python3 main.py              # 不带问题时，程序会提示你输入
+      python3 main.py "你好"        # 问一个问题（单次问答）
+      python3 main.py              # 不带问题时，进入连续对话循环，
+                                   # 可持续对话，直到输入 exit、quit 或 退出
     """
     args = list(sys.argv[1:] if argv is None else argv)
-    prompt = args[0] if args else input("请输入你的问题：").strip()
-    if not prompt:
+    if not args:
+        # 不带参数：连续对话循环。
+        return chat_loop()
+
+    prompt = args[0]
+    if not prompt.strip():
         print("问题不能为空。")
         return 1
 
