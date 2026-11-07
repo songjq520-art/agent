@@ -137,24 +137,26 @@ def test_non_list_file_is_corrupted(tmp_path):
     assert store.corrupted is True
 
 
-def test_bad_entries_are_skipped(tmp_path):
-    """文件里混着格式不对的条目：好条目留下来，坏条目整条跳过，不毁掉全部。"""
+def test_bad_entries_trigger_corrupted_not_skip(tmp_path):
+    """文件里混着格式不对的条目：不再跳过，而是整份文件进安全状态，原文件保留。
+
+    原因：跳过再保存会永久丢掉坏条目；必须保留原文件，等人工检查修复。
+    """
     path = tmp_path / "memories.json"
-    path.write_text(
-        json.dumps(
-            [
-                {"text": "好记忆", "date": "2026-11-07", "layers": ["core"], "source": "user"},
-                {"text": "   ", "date": "2026-11-07", "layers": ["core"], "source": "user"},
-                {"text": "层不对", "date": "2026-11-07", "layers": ["nope"], "source": "user"},
-                {"text": "来源不对", "date": "2026-11-07", "layers": ["core"], "source": "maybe"},
-            ],
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    raw = json.dumps(
+        [
+            {"text": "好记忆", "date": "2026-11-07", "layers": ["core"], "source": "user"},
+            {"text": "   ", "date": "2026-11-07", "layers": ["core"], "source": "user"},
+            {"text": "层不对", "date": "2026-11-07", "layers": ["nope"], "source": "user"},
+            {"text": "来源不对", "date": "2026-11-07", "layers": ["core"], "source": "maybe"},
+        ],
+        ensure_ascii=False,
     )
+    path.write_text(raw, encoding="utf-8")
     store = MemoryStore(path)
-    assert len(store.memories) == 1
-    assert store.memories[0]["text"] == "好记忆"
+    assert store.corrupted is True
+    assert store.memories == []
+    assert path.read_text(encoding="utf-8") == raw
 
 
 # ---------- 首批三条记忆 ----------
@@ -183,3 +185,107 @@ def test_ensure_first_memories_only_once(tmp_path):
     assert any("DeepSeek" in t for t in texts)
     assert any("连续对话" in t for t in texts)
     assert any("5 美元" in t for t in texts)
+
+
+# ---------- 修复 1：格式异常条目进安全状态 ----------
+
+def test_bad_entry_triggers_corrupted_state(tmp_path):
+    """文件里只要有一条格式异常，就进安全状态，原文件保留，不被覆盖。"""
+    path = tmp_path / "memories.json"
+    raw = json.dumps(
+        [
+            {"text": "好记忆", "date": "2026-11-07", "layers": ["core"], "source": "user"},
+            {"text": "坏记忆", "date": "2026-11-07", "layers": ["nope"], "source": "user"},
+        ],
+        ensure_ascii=False,
+    )
+    path.write_text(raw, encoding="utf-8")
+    store = MemoryStore(path)
+    assert store.corrupted is True
+    assert "第 2 条" in store.corruption_reason
+    assert store.memories == []
+    # 原文件一字没动，坏条目还在。
+    assert path.read_text(encoding="utf-8") == raw
+    # 保存和新增都被禁止，不会覆盖原文件。
+    with pytest.raises(RuntimeError):
+        store.save()
+    with pytest.raises(RuntimeError):
+        store.add_memory("新记忆", ["core"], "user")
+
+
+def test_bad_entry_each_kind_triggers_corrupted(tmp_path):
+    """每种格式异常（空内容、坏日期、坏层、坏来源）都会进安全状态。"""
+    good = {"text": "好记忆", "date": "2026-11-07", "layers": ["core"], "source": "user"}
+    bad_variants = [
+        {**good, "text": "   "},
+        {**good, "date": "2026-13-01"},
+        {**good, "date": "不是日期"},
+        {**good, "layers": []},
+        {**good, "layers": ["core", "nope"]},
+        {**good, "source": "maybe"},
+        {"text": "缺字段"},
+    ]
+    for bad in bad_variants:
+        path = tmp_path / "memories.json"
+        path.write_text(json.dumps([good, bad], ensure_ascii=False), encoding="utf-8")
+        store = MemoryStore(path)
+        assert store.corrupted is True, f"这条坏数据没进安全状态：{bad}"
+        assert store.memories == []
+
+
+# ---------- 修复 2：返回深拷贝 ----------
+
+def test_search_returns_deep_copy(tmp_path):
+    """search 返回的是深拷贝：改返回结果的 text 和 layers，都不影响内部记忆。"""
+    store = MemoryStore(tmp_path / "memories.json")
+    store.add_memory("测试记忆", ["core"], "user", "2026-11-07")
+    found = store.search("测试")
+    found[0]["text"] = "被改掉了"
+    found[0]["layers"].append("knowledge")
+    assert store.memories[0]["text"] == "测试记忆"
+    assert store.memories[0]["layers"] == ["core"]
+
+
+def test_list_all_returns_deep_copy(tmp_path):
+    """list_all 返回的是深拷贝：改返回结果的 text 和 layers，都不影响内部记忆。"""
+    store = MemoryStore(tmp_path / "memories.json")
+    store.add_memory("测试记忆", ["core"], "user", "2026-11-07")
+    listed = store.list_all()
+    listed[0]["text"] = "被改掉了"
+    listed[0]["layers"].append("relationship")
+    assert store.memories[0]["text"] == "测试记忆"
+    assert store.memories[0]["layers"] == ["core"]
+
+
+# ---------- 顺手检查：日期严格验证 ----------
+
+def test_propose_memory_rejects_bad_dates():
+    """拟记忆时日期要严格验证：不是 YYYY-MM-DD 的真实日期就报错。"""
+    with pytest.raises(ValueError):
+        propose_memory("test", ["core"], "user", "2026-13-01")
+    with pytest.raises(ValueError):
+        propose_memory("test", ["core"], "user", "2026-02-30")
+    with pytest.raises(ValueError):
+        propose_memory("test", ["core"], "user", "不是日期")
+    with pytest.raises(ValueError):
+        propose_memory("test", ["core"], "user", "20261107")
+    assert propose_memory("test", ["core"], "user", "2026-11-07")["date"] == "2026-11-07"
+
+
+# ---------- 顺手检查：保存失败时内存和磁盘一致 ----------
+
+def test_add_memory_keeps_consistent_when_save_fails(tmp_path, monkeypatch):
+    """保存失败时，内存里的记忆不变，和磁盘保持一致（不会内存有、磁盘没有）。"""
+    store = MemoryStore(tmp_path / "memories.json")
+    store.add_memory("已有记忆", ["core"], "user", "2026-11-07")
+    assert len(store.memories) == 1
+
+    def _boom(*args, **kwargs):
+        raise OSError("磁盘写不进去（模拟）")
+
+    monkeypatch.setattr("pathlib.Path.write_text", _boom)
+    with pytest.raises(OSError):
+        store.add_memory("新记忆", ["core"], "user", "2026-11-07")
+    # 内存里还是只有原来那一条，新记忆没存进去。
+    assert len(store.memories) == 1
+    assert store.memories[0]["text"] == "已有记忆"

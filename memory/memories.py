@@ -8,10 +8,12 @@
 #       检索优先：search() 用关键词搜，找到相关的再回答，不把全部记忆塞进上下文。
 # 关系：main.py 以后会用到它（问问题前先搜记忆）；现在先把读写、检索做可靠，
 #       向量数据库、知识图谱这些复杂的以后再说。先把记忆做准，再把记忆做大。
-# 安全规则：记忆文件损坏、无法解析时，不会自动初始化为空白，而是进入安全状态
-#       （corrupted=True），原损坏文件会被保留、不被覆盖，只能人工检查修复后才能恢复。
+# 安全规则：记忆文件损坏、无法解析、或里面任何一条格式异常时，
+#       都进入安全状态（corrupted=True），原文件会被保留、不被覆盖，
+#       只能人工检查修复后才能恢复；保存失败时内存状态不变，和磁盘保持一致。
 #       这和 config.py 里 BudgetTracker 对预算文件的处理是一样的思路。
 
+import copy
 import json
 from datetime import date
 from pathlib import Path
@@ -63,6 +65,22 @@ def _today():
     return date.today().isoformat()
 
 
+def _check_date(date_str):
+    """检查日期格式：必须是 YYYY-MM-DD 的真实日期（例如 2026-11-07）。
+
+    不合法就报 ValueError。记忆要做准，日期不能是假的。
+    """
+    if not isinstance(date_str, str):
+        raise ValueError("日期必须是字符串")
+    try:
+        date.fromisoformat(date_str)
+    except ValueError:
+        raise ValueError(f"日期格式不对：{date_str!r}，要是 YYYY-MM-DD 的真实日期")
+    # fromisoformat 在 Python 3.11+ 还会接受 YYYYMMDD 这种写法，再卡一道格式。
+    if len(date_str) != 10 or date_str[4] != "-" or date_str[7] != "-":
+        raise ValueError(f"日期格式不对：{date_str!r}，要是 YYYY-MM-DD 的真实日期")
+
+
 def _check_layers(layers):
     """检查 layers 是否合法：必须是非空列表，里面每一项都得是 LAYERS 里的五层之一。
 
@@ -84,13 +102,39 @@ def _check_source(source):
         raise ValueError(f"source 必须是 {SOURCES} 里的一档，不能是 {source!r}")
 
 
+def _entry_problem(item):
+    """检查一条记忆字典的格式。格式正确返回 None；不对返回中文原因。
+
+    用途：读文件时逐条校验，只要有一条不对，整个文件就进安全状态。
+    """
+    if not isinstance(item, dict):
+        return "不是一个字典"
+    if not isinstance(item.get("text"), str) or not item["text"].strip():
+        return "内容不是非空字符串"
+    if not isinstance(item.get("date"), str):
+        return "日期不是字符串"
+    try:
+        _check_date(item["date"])
+    except ValueError:
+        return f"日期格式不对（{item['date']!r}，要是 YYYY-MM-DD 的真实日期）"
+    if not isinstance(item.get("layers"), list):
+        return "layers 不是列表"
+    try:
+        _check_layers(item["layers"])
+    except ValueError as exc:
+        return f"layers 不对：{exc}"
+    if item.get("source") not in SOURCES:
+        return f"source 不对（{item.get('source')!r}，只能是 {SOURCES} 里的档）"
+    return None
+
+
 def propose_memory(text, layers, source, mem_date=None):
     """拟一条候选记忆（先问再存的“拟”这一步），不保存，只返回记忆字典。
 
     参数 text：记忆内容，不能是空字符串。
     参数 layers：属于哪几层，例如 ["core"] 或 ["experience", "core"]。
     参数 source：来源，三档之一（user / inferred / unconfirmed）。
-    参数 mem_date：日期，不传时用今天。
+    参数 mem_date：日期，不传时用今天；传了就要是 YYYY-MM-DD 的真实日期。
 
     返回：一条记忆字典，有 text、date、layers、source 四个字段。
     这条记忆还没存进文件，等 BOOS 点头确认后，再用 add_memory() 存进去。
@@ -99,9 +143,11 @@ def propose_memory(text, layers, source, mem_date=None):
         raise ValueError("text 必须是非空字符串")
     _check_layers(layers)
     _check_source(source)
+    mem_date = mem_date or _today()
+    _check_date(mem_date)
     return {
         "text": text.strip(),
-        "date": mem_date or _today(),
+        "date": mem_date,
         "layers": list(layers),
         "source": source,
     }
@@ -113,8 +159,9 @@ class MemoryStore:
     作用：把记忆存在本地 JSON 文件里，支持读写、检索、先问再存。
     原理：记忆存在 memory/memories.json（JSON 格式），这个文件会被 .gitignore 忽略，
           不上传到 GitHub。文件里就是一个列表，每一项是一条记忆字典。
-          文件不存在时当作空列表；文件损坏、无法解析时进入安全状态
-          （corrupted=True），原文件保留、不被覆盖，只能人工检查修复。
+          文件不存在时当作空列表；文件损坏、无法解析、或里面任何一条格式异常时，
+          都进入安全状态（corrupted=True），原文件保留、不被覆盖，
+          只能人工检查修复后才能恢复。
     注意：工作记忆（当前项目进度、待办、最近对话）是临时的，一般不进这个文件；
           这个文件存的是长期记忆（核心、经历、知识、关系四层）。
     """
@@ -132,7 +179,12 @@ class MemoryStore:
         self._load()
 
     def _load(self):
-        """读取记忆文件。文件不存在时当作空列表；损坏时设 corrupted=True，不覆盖原文件。"""
+        """读取记忆文件。
+
+        文件不存在时当作空列表；损坏、无法解析、或里面任何一条格式异常时，
+        都进安全状态（corrupted=True），不加载、不覆盖原文件。
+        原因：跳过坏条目再保存会永久丢掉它；必须保留原文件，等人工检查修复。
+        """
         try:
             raw = self.file_path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -155,48 +207,48 @@ class MemoryStore:
             self.corruption_reason = "记忆文件损坏：里面不是一个列表"
             self.memories = []
             return
-        # 只保留格式正确的记忆条目，格式不对的条目整条跳过，不让一条坏数据毁掉全部。
-        kept = []
-        for item in data:
-            if (
-                isinstance(item, dict)
-                and isinstance(item.get("text"), str)
-                and item["text"].strip()
-                and isinstance(item.get("date"), str)
-                and isinstance(item.get("layers"), list)
-                and item.get("source") in SOURCES
-            ):
-                try:
-                    _check_layers(item["layers"])
-                except ValueError:
-                    continue
-                kept.append(item)
-        self.memories = kept
+        # 逐条校验：只要发现任何一条格式异常，就进安全状态，不加载、不覆盖。
+        for index, item in enumerate(data):
+            reason = _entry_problem(item)
+            if reason:
+                self.corrupted = True
+                self.corruption_reason = f"记忆文件损坏：第 {index + 1} 条记忆{reason}"
+                self.memories = []
+                return
+        self.memories = data
 
-    def save(self):
-        """把当前记忆列表保存到 JSON 文件。
+    def _write(self, memories):
+        """把给定的记忆列表写到 JSON 文件（不改内存状态）。
 
-        安全规则：文件损坏（corrupted=True）时不保存、不覆盖，等人工检查修复。
+        安全规则：文件损坏（corrupted=True）时不写，等人工检查修复。
         """
         if self.corrupted:
             raise RuntimeError(f"记忆文件已损坏，不保存：{self.corruption_reason}")
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.file_path.write_text(
-            json.dumps(self.memories, ensure_ascii=False, indent=2),
+            json.dumps(memories, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def save(self):
+        """把当前记忆列表保存到 JSON 文件。"""
+        self._write(self.memories)
 
     def add_memory(self, text, layers, source, mem_date=None):
         """存一条记忆（先问再存的“存”这一步）。
 
         调用前应该已经用 propose_memory() 拟好、并经 BOOS 确认过。
         存完自动保存到文件。返回存进去的那条记忆字典。
+
+        一致性：先写磁盘（含新记忆），写成功了再更新内存；
+        写失败时内存不变，和磁盘保持一致。
         """
         memory = propose_memory(text, layers, source, mem_date)
         if self.corrupted:
             raise RuntimeError(f"记忆文件已损坏，不能存：{self.corruption_reason}")
-        self.memories.append(memory)
-        self.save()
+        new_memories = self.memories + [memory]
+        self._write(new_memories)
+        self.memories = new_memories
         return memory
 
     def add_proposed(self, memory):
@@ -215,15 +267,19 @@ class MemoryStore:
 
         检索优先：回答问题前先搜记忆，找到相关的再回答，不把全部记忆塞进上下文。
         一开始关键词搜就够了，向量搜索以后再说。
+
+        返回的是深拷贝，改它不影响存着的记忆。
         """
         if not isinstance(keyword, str) or not keyword.strip():
             return []
         word = keyword.strip().lower()
-        return [m for m in self.memories if word in m["text"].lower()]
+        return [
+            copy.deepcopy(m) for m in self.memories if word in m["text"].lower()
+        ]
 
     def list_all(self):
-        """返回全部记忆（返回一份拷贝，改它不影响存着的记忆）。"""
-        return [dict(m) for m in self.memories]
+        """返回全部记忆（返回深拷贝，改它不影响存着的记忆）。"""
+        return copy.deepcopy(self.memories)
 
 
 def ensure_first_memories(store):
