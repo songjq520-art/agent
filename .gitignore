@@ -24,7 +24,9 @@ logs/*
 # 预算累计文件也在 logs/ 下，上面 logs/* 已忽略
 
 # 本地记忆数据（私人记忆只保存在本地，不上传）
-memory/*
+# 注意：只忽略 JSON 数据文件（memories.json、habits.json），
+#       记忆的代码文件（memories.py、__init__.py）要上传，上面不要写 memory/*
+memory/*.json
 !memory/.gitkeep
 
 # 临时文件
