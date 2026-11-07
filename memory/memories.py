@@ -15,6 +15,8 @@
 
 import copy
 import json
+import os
+import uuid
 from datetime import date
 from pathlib import Path
 
@@ -221,14 +223,26 @@ class MemoryStore:
         """把给定的记忆列表写到 JSON 文件（不改内存状态）。
 
         安全规则：文件损坏（corrupted=True）时不写，等人工检查修复。
+        原子写入：先写临时文件，写成功后再用 os.replace() 原子替换正式文件。
+        这样写一半时程序突然退出或磁盘出错，原文件也不会只剩半截坏 JSON；
+        临时文件没用上就删掉，不留垃圾。
         """
         if self.corrupted:
             raise RuntimeError(f"记忆文件已损坏，不保存：{self.corruption_reason}")
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.file_path.write_text(
-            json.dumps(memories, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        content = json.dumps(memories, ensure_ascii=False, indent=2)
+        tmp_path = self.file_path.with_name(
+            self.file_path.name + f".tmp-{uuid.uuid4().hex[:8]}"
         )
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            os.replace(tmp_path, self.file_path)
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def save(self):
         """把当前记忆列表保存到 JSON 文件。"""

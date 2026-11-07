@@ -272,6 +272,58 @@ def test_propose_memory_rejects_bad_dates():
     assert propose_memory("test", ["core"], "user", "2026-11-07")["date"] == "2026-11-07"
 
 
+# ---------- 原子写入：临时文件 + 原子替换 ----------
+
+def test_save_leaves_no_temp_file(tmp_path):
+    """保存成功后，目录里不留临时文件，只剩正式的 memories.json。"""
+    store = MemoryStore(tmp_path / "memories.json")
+    store.add_memory("测试记忆", ["core"], "user", "2026-11-07")
+    leftovers = [p for p in tmp_path.iterdir() if ".tmp-" in p.name]
+    assert leftovers == []
+    assert (tmp_path / "memories.json").exists()
+
+
+def test_failed_temp_write_keeps_original(tmp_path, monkeypatch):
+    """写临时文件失败时，原文件一字不动，临时文件也被清理掉。"""
+    path = tmp_path / "memories.json"
+    store = MemoryStore(path)
+    store.add_memory("已有记忆", ["core"], "user", "2026-11-07")
+    original = path.read_text(encoding="utf-8")
+
+    real_write = type(path).write_text
+
+    def _boom(self, *args, **kwargs):
+        # 只有写临时文件时才失败，写正式文件那条路不走（因为走不到替换那步）。
+        if ".tmp-" in self.name:
+            raise OSError("写临时文件失败（模拟）")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.write_text", _boom)
+    with pytest.raises(OSError):
+        store.add_memory("新记忆", ["core"], "user", "2026-11-07")
+    assert path.read_text(encoding="utf-8") == original
+    assert len(store.memories) == 1
+    assert [p for p in tmp_path.iterdir() if ".tmp-" in p.name] == []
+
+
+def test_failed_replace_keeps_original_and_cleans_temp(tmp_path, monkeypatch):
+    """原子替换失败时，原文件一字不动，临时文件也被清理掉。"""
+    path = tmp_path / "memories.json"
+    store = MemoryStore(path)
+    store.add_memory("已有记忆", ["core"], "user", "2026-11-07")
+    original = path.read_text(encoding="utf-8")
+
+    def _boom_replace(src, dst):
+        raise OSError("原子替换失败（模拟）")
+
+    monkeypatch.setattr("os.replace", _boom_replace)
+    with pytest.raises(OSError):
+        store.add_memory("新记忆", ["core"], "user", "2026-11-07")
+    assert path.read_text(encoding="utf-8") == original
+    assert len(store.memories) == 1
+    assert [p for p in tmp_path.iterdir() if ".tmp-" in p.name] == []
+
+
 # ---------- 顺手检查：保存失败时内存和磁盘一致 ----------
 
 def test_add_memory_keeps_consistent_when_save_fails(tmp_path, monkeypatch):
