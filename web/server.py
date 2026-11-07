@@ -279,7 +279,11 @@ def make_handler(state, authenticator=None):
             try:
                 reply = state.ask(prompt)
             except RuntimeError as exc:
-                self._send_json({"error": f"调用失败：{exc}"}, status=502)
+                # 服务端日志保留完整异常（含服务商错误详情），方便排查；
+                # 前端只回通用提示，不把原始异常（服务商错误详情或内部
+                # 请求信息）暴露出去。状态码仍是 502。
+                traceback.print_exc()
+                self._send_json({"error": "调用失败，请稍后再试。"}, status=502)
                 return
             self._send_json(reply)
 

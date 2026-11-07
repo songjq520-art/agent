@@ -132,16 +132,25 @@ def test_chat_success_appends_history(running_server, monkeypatch):
 
 
 def test_chat_failure_returns_error_and_keeps_history(running_server, monkeypatch):
-    """调用抛错时：返回 502 和错误信息，历史不动。"""
+    """调用抛 RuntimeError 时：返回 502 和通用错误，不泄露内部信息，历史不动。"""
     port, state = running_server
 
     def _boom(prompt, budget_tracker=None, messages=None):
-        raise RuntimeError("模拟调用失败")
+        # 模拟服务商报错里夹带内部信息：接口地址、内部请求号、假密钥片段。
+        raise RuntimeError(
+            "DeepSeek API 调用失败：401 Client Error for url: "
+            "https://api.deepseek.com/chat/completions，内部请求号 req-abc123，"
+            "密钥片段 sk-fake-secret-xyz"
+        )
 
     monkeypatch.setattr("web.server.run_question", _boom)
     status, _ct, data = _request(port, "POST", "/api/chat", {"message": "你好"})
     assert status == 502
-    assert "调用失败" in data["error"]
+    assert data["error"] == "调用失败，请稍后再试。"
+    assert "req-abc123" not in data["error"]
+    assert "sk-fake-secret-xyz" not in data["error"]
+    assert "api.deepseek.com" not in data["error"]
+    assert "DeepSeek" not in data["error"]
     assert state.messages == []
 
 
