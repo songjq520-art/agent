@@ -182,7 +182,8 @@
     <button class="btn btn-primary" id="newChat">＋ 新对话</button>
     <div class="status" id="status">正在加载状态…</div>
     <div class="sidebar-foot">
-      只在你自己的电脑上运行（http://127.0.0.1:8000），不上云，别人打不开。<br>
+      只在你自己的电脑上运行（<span id="origin">本机</span>），不上云，别人打不开。<br>
+      对话历史只保存在内存里，重启服务后清空。<br>
       想改颜色、名字、头像：改本文件最上面 &lt;style&gt; 里 :root 的颜色，和标着“可改”的地方。
     </div>
   </aside>
@@ -315,6 +316,9 @@
     chatEl.querySelectorAll('.msg').forEach((el) => el.remove());
     addMsg('ai', '已开始新对话，之前的记录清空了。');
   });
+
+  // 侧边栏显示当前实际地址（端口改了也能对上，不用在 HTML 里写死地址）。
+  document.getElementById('origin').textContent = window.location.origin;
 
   refreshStatus();
   inputEl.focus();
