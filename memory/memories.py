@@ -299,13 +299,26 @@ class MemoryStore:
 def ensure_first_memories(store):
     """如果记忆文件是空的，把首批三条记忆写进去（只在第一次时做）。
 
+    原子初始化：三条记忆先拟好，再一次写进文件（一次原子写入）。
+    写失败时一条也不存，文件仍是空的，下次启动可干净重试，
+    不会留下“只存了一条/两条”的半初始化状态。
+    以前是逐条调 add_memory() 写三次，中途失败会留半套记忆；
+    现在三条一起写，要么全有，要么全无。
+
     参数 store：一个 MemoryStore。文件里已经有记忆时什么也不做，不重复写。
     返回：写进去的条数（0 或 3）。
     """
     if store.memories:
         return 0
-    for item in FIRST_MEMORIES:
-        store.add_memory(
-            item["text"], item["layers"], item["source"], item["date"]
-        )
-    return len(FIRST_MEMORIES)
+    # 先把三条都拟好（校验不过会直接抛错，一条也不写）。
+    memories = [
+        propose_memory(item["text"], item["layers"], item["source"], item["date"])
+        for item in FIRST_MEMORIES
+    ]
+    # 一次原子写入：_write() 本身就是临时文件 + os.replace()，
+    # 写失败时抛错，store.memories 不变（仍是空），文件里什么也没存，
+    # 下次启动可干净重试，不留半初始化状态。
+    new_memories = store.memories + memories
+    store._write(new_memories)
+    store.memories = new_memories
+    return len(memories)
