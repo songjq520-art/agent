@@ -33,6 +33,7 @@
 #     以后开放局域网/手机访问时，先接上校验，再把 host 改成 0.0.0.0。
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
@@ -285,14 +286,40 @@ def make_handler(state, authenticator=None):
     return ChatHandler
 
 
+def _is_loopback_host(host):
+    """判断监听地址是不是本机回环地址（127.0.0.1、::1、localhost 等）。
+
+    127.0.0.0/8 整个段都是回环地址（127.0.0.2 也算），::1 是 IPv6 回环。
+    主机名只有 "localhost" 算回环；其他主机名或写错的地址一律按非回环处理，
+    宁可严一点，不让它悄悄开放出去。
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def create_server(config=None, budget_tracker=None, authenticator=None):
     """建一个网页服务（不启动），方便测试用临时端口和临时预算文件。
 
     config 是 ServerConfig；不传时用环境变量/默认值（ServerConfig.from_env()）。
     authenticator 是身份验证钩子（见 make_handler），默认不校验。
+
+    安全保护：监听地址不是本机回环地址（比如 0.0.0.0 或局域网地址），
+    却没有配置身份验证函数时，拒绝启动（抛 ValueError），防止一不小心
+    开放了无身份验证的局域网访问。默认 127.0.0.1 不受影响。
+    如需开放局域网，请先接上 authenticator 做身份验证，再改 host。
     """
     if config is None:
         config = ServerConfig.from_env()
+    if not _is_loopback_host(config.host) and authenticator is None:
+        raise ValueError(
+            f"监听地址 {config.host} 不是本机回环地址，但没有配置身份验证函数；"
+            "为防止无身份验证的局域网访问，拒绝启动。"
+            "如需开放局域网，请先接上 authenticator 做身份验证。"
+        )
     state = ChatState(budget_tracker=budget_tracker)
     handler = make_handler(state, authenticator=authenticator)
     return ThreadingHTTPServer((config.host, config.port), handler), state
@@ -310,7 +337,13 @@ def main(argv=None):
         host=args.host or env_config.host,
         port=args.port if args.port is not None else env_config.port,
     )
-    server, _state = create_server(config=config)
+    try:
+        server, _state = create_server(config=config)
+    except ValueError as exc:
+        # 非回环地址又没配身份验证时，create_server 会拒绝启动；
+        # 这里只打印一句清楚的原因就退出，不甩一堆堆栈给用户看。
+        print(f"启动失败：{exc}", file=sys.stderr, flush=True)
+        return 1
     print(f"本地网页入口已启动：http://{config.host}:{config.port}", flush=True)
     print("在浏览器打开上面的地址就能对话，按 Ctrl+C 停止服务。", flush=True)
     try:

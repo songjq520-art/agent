@@ -430,3 +430,92 @@ def test_concurrent_chat_calls_are_isolated(running_server, monkeypatch):
     assert seen["慢"] == 0
     # 历史最终是 4 条，配对正确。
     assert len(state.messages) == 4
+
+
+# ---------- 监听地址安全保护 ----------
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("127.0.0.1", True),
+        ("127.0.0.2", True),  # 127.0.0.0/8 整个段都是回环
+        ("::1", True),
+        ("localhost", True),
+        ("0.0.0.0", False),
+        ("192.168.1.5", False),
+        ("10.0.0.1", False),
+        ("not-an-ip", False),  # 写错的地址按非回环处理，宁可严一点
+    ],
+)
+def test_is_loopback_host(host, expected):
+    """回环地址判断：127 段、::1、localhost 算回环，其他不算。"""
+    from web.server import _is_loopback_host
+
+    assert _is_loopback_host(host) is expected
+
+
+def test_non_loopback_without_auth_refuses_to_start(tmp_path):
+    """监听地址不是回环、又没配身份验证时：拒绝启动，抛 ValueError，不建服务。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    config = ServerConfig(host="0.0.0.0", port=0)
+    with pytest.raises(ValueError, match="不是本机回环地址"):
+        create_server(config=config, budget_tracker=tracker)
+
+
+def test_non_loopback_lan_address_without_auth_refuses_to_start(tmp_path):
+    """局域网地址（192.168.x.x）没配身份验证时：同样拒绝启动。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    config = ServerConfig(host="192.168.1.5", port=0)
+    with pytest.raises(ValueError, match="不是本机回环地址"):
+        create_server(config=config, budget_tracker=tracker)
+
+
+def test_non_loopback_with_auth_starts(tmp_path):
+    """非回环地址配了身份验证函数时：允许启动（绑定 0.0.0.0，临时端口）。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    config = ServerConfig(host="0.0.0.0", port=0)
+    server, state = create_server(
+        config=config, budget_tracker=tracker, authenticator=lambda handler: True
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        status, _ct, data = _request(port, "GET", "/api/status")
+        assert status == 200
+        assert "deepseek" in data["model_status"]
+    finally:
+        _stop_test_server(server)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_loopback_without_auth_starts(tmp_path, host):
+    """回环地址没配身份验证时：默认行为不变，允许启动。
+    （::1 只测 _is_loopback_host 的判断逻辑，不在这里绑定——标准 socket 默认是 IPv4。）"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    config = ServerConfig(host=host, port=0)
+    server, state = create_server(config=config, budget_tracker=tracker)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        assert port > 0
+        assert state is not None
+        status, _ct, data = _request(port, "GET", "/api/status")
+        assert status == 200
+    finally:
+        _stop_test_server(server)
+
+
+def test_main_refuses_non_loopback_without_auth(capsys, monkeypatch):
+    """命令行 --host 0.0.0.0 且没配身份验证时：main 打印清楚原因，返回 1，不启动。"""
+    monkeypatch.delenv("AGENT_WEB_HOST", raising=False)
+    monkeypatch.delenv("AGENT_WEB_PORT", raising=False)
+    from web.server import main
+
+    assert main(["--host", "0.0.0.0"]) == 1
+    captured = capsys.readouterr()
+    assert "启动失败" in captured.err
+    assert "不是本机回环地址" in captured.err
+    assert "身份验证" in captured.err
