@@ -5,6 +5,8 @@
 # 原理：用 unittest.mock 假装 requests 返回固定数据，并假装用户输入，
 #       只验证“我们的代码逻辑对不对”，不验证“模型真的回答了什么”。
 
+import json
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 import pytest
@@ -375,3 +377,68 @@ def test_main_without_arg_enters_chat_loop(monkeypatch, tmp_path):
     ):
         assert main([]) == 0
         mock_post.assert_called_once()
+
+
+# ---------- 第二阶段补充验收：会话隔离 ----------
+def test_session_isolation_new_chat_loop_starts_with_empty_history(monkeypatch, tmp_path):
+    """会话隔离：每次启动新的 chat_loop() 都会创建独立的空 messages 历史，
+    上一轮会话的 user/assistant 消息不会传入下一轮会话。
+
+    第一轮会话问“你好”，第二轮会话问“再见”。第二轮发送的消息应只有
+    本轮的“再见”，不含第一轮的“你好”和模型的回答。
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    # 两个会话各用独立的预算文件，只隔离消息历史这一个变量。
+    tracker1 = BudgetTracker(file_path=tmp_path / "budget1.json")
+    tracker2 = BudgetTracker(file_path=tmp_path / "budget2.json")
+    with patch(
+        "providers.deepseek.requests.post", return_value=_fake_ok_response()
+    ) as mock_post:
+        # 第一轮会话：问“你好”，然后 exit。
+        with patch("builtins.input", side_effect=["你好", "exit"]):
+            assert chat_loop(budget_tracker=tracker1) == 0
+        # 第二轮会话（全新启动）：问“再见”，然后 exit。
+        with patch("builtins.input", side_effect=["再见", "exit"]):
+            assert chat_loop(budget_tracker=tracker2) == 0
+        assert mock_post.call_count == 2
+    # 第一轮只发本轮问题。
+    first_sent = mock_post.call_args_list[0].kwargs["json"]["messages"]
+    assert first_sent == [{"role": "user", "content": "你好"}]
+    # 第二轮也只发本轮问题，不含第一轮的任何消息，证明历史是独立的空历史。
+    second_sent = mock_post.call_args_list[1].kwargs["json"]["messages"]
+    assert second_sent == [{"role": "user", "content": "再见"}]
+    assert all(m["content"] != "你好" for m in second_sent)
+
+
+# ---------- 第二阶段补充验收：预算连续累计 ----------
+def test_budget_accumulates_across_turns_in_one_chat_loop(monkeypatch, tmp_path):
+    """预算连续累计：同一个 chat_loop() 中的多轮调用共用同一个 BudgetTracker，
+    连续两轮 API 调用产生的成本会累计到同一个预算记录中，
+    且预算文件保存的累计金额正确。
+
+    每轮模拟返回 prompt 100、completion 50，成本为
+    100/1e6*0.15 + 50/1e6*0.60 = 0.000045 美元，两轮共 0.00009 美元。
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    budget_file = tmp_path / "budget_usage.json"
+    tracker = BudgetTracker(file_path=budget_file)
+    with (
+        patch("builtins.input", side_effect=["你好", "再见", "exit"]),
+        patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post,
+    ):
+        assert chat_loop(budget_tracker=tracker) == 0
+        assert mock_post.call_count == 2
+    # 内存中的 tracker：两轮成本累计到同一个记录。
+    assert tracker.total_cost_usd == pytest.approx(0.00009)
+    assert tracker.cost_for_model("deepseek-flash") == pytest.approx(0.00009)
+    # 预算文件：保存的累计金额正确。
+    saved = json.loads(budget_file.read_text(encoding="utf-8"))
+    assert saved["total_cost_usd"] == pytest.approx(0.00009)
+    assert saved["cost_by_model"]["deepseek-flash"] == pytest.approx(0.00009)
+    assert saved["month"] == datetime.now().strftime("%Y-%m")
+    assert saved["unknown_cost"] is False
+    # 重新读文件的新 tracker：累计金额持久化正确，不是只存在内存里。
+    tracker2 = BudgetTracker(file_path=budget_file)
+    assert tracker2.corrupted is False
+    assert tracker2.total_cost_usd == pytest.approx(0.00009)
+    assert tracker2.cost_for_model("deepseek-flash") == pytest.approx(0.00009)
