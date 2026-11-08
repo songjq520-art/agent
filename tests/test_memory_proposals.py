@@ -185,6 +185,32 @@ def test_proposal_store_confirm_save_failure_keeps_proposal(tmp_path, monkeypatc
     assert memory_store.list_all() == []
 
 
+# ---------- 提取提示词 ----------
+
+
+def test_extraction_instruction_requires_user_explicit_content():
+    """提取提示词必须明确：只提用户明确表达的事实、偏好和决定。
+
+    明确排除：AI 自己提出的建议、假设、举例，不能当成用户事实；
+    第三方信息，不能当成用户个人记忆。这是防止模型把 AI 的话
+    或通用知识记成用户记忆的关键防线，提示词被改弱时这条测试会失败。
+    """
+    from main import EXTRACTION_INSTRUCTION
+
+    assert "用户自己明确表达" in EXTRACTION_INSTRUCTION
+    assert "事实" in EXTRACTION_INSTRUCTION
+    assert "偏好" in EXTRACTION_INSTRUCTION
+    assert "决定" in EXTRACTION_INSTRUCTION
+    # 明确排除 AI 的建议、假设、举例。
+    assert "建议" in EXTRACTION_INSTRUCTION
+    assert "假设" in EXTRACTION_INSTRUCTION
+    assert "举例" in EXTRACTION_INSTRUCTION
+    assert "不能当成用户事实" in EXTRACTION_INSTRUCTION
+    # 明确排除第三方信息。
+    assert "第三方" in EXTRACTION_INSTRUCTION
+    assert "不能把第三方信息当成用户个人记忆" in EXTRACTION_INSTRUCTION
+
+
 # ---------- 提取解析 ----------
 
 
@@ -356,6 +382,71 @@ def test_run_question_with_extract_creates_proposals(monkeypatch, tmp_path):
     # 提议在待确认列表里，记忆文件里还没有（未经确认不写）。
     assert len(proposal_store.list_pending()) == 1
     assert _store(tmp_path).list_all() == []
+
+
+def test_run_question_duplicate_candidates_appear_once_in_new_proposals(monkeypatch, tmp_path):
+    """同一轮提取里内容重复的候选，在 new_proposals 里只出现一次。
+
+    回归测试：之前 _run_extraction_and_propose() 会把 ProposalStore.add()
+    返回的已有提议也追加进返回列表，导致同一条提议在 new_proposals 里
+    出现两次（同一个 ID）。待确认列表本身只有一条（add() 的去重是好的），
+    但返回列表重复会让前端误以为新建了两条。
+    """
+    extraction = json.dumps(
+        [
+            {"text": "每月预算 5 美元。", "layers": ["core"], "reason": "长期预算规则"},
+            {"text": "每月预算 5 美元。", "layers": ["core"], "reason": "长期预算规则"},
+        ],
+        ensure_ascii=False,
+    )
+    outcome, _memory_store, proposal_store = _run_question_with_extract(
+        monkeypatch, tmp_path, "你的预算是每月 5 美元。", extraction
+    )
+    assert outcome["mode"] == "real"
+    assert len(outcome["new_proposals"]) == 1
+    assert outcome["new_proposals"][0]["id"].startswith("prop-")
+    assert len(proposal_store.list_pending()) == 1
+    # 返回列表里的 ID 不重复。
+    ids = [p["id"] for p in outcome["new_proposals"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_run_question_candidate_matching_existing_proposal_not_in_new_proposals(monkeypatch, tmp_path):
+    """提取出的候选与已在待确认列表里的提议内容相同时，不重复放进 new_proposals。
+
+    new_proposals 的含义是“本轮新创建的提议”，已在列表里的不算新提议。
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    memory_store = _store(tmp_path)
+    proposal_store = ProposalStore()
+    # 先放一条已在待确认列表里的提议。
+    existing = proposal_store.add("每月预算 5 美元。", ["core"], "inferred", "长期规则")
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    extraction = json.dumps(
+        [{"text": "每月预算 5 美元。", "layers": ["core"], "reason": "长期预算规则"}],
+        ensure_ascii=False,
+    )
+    with patch(
+        "providers.deepseek.requests.post",
+        side_effect=[
+            _fake_ok_response(text="你的预算是每月 5 美元。"),
+            _fake_ok_response(text=extraction),
+        ],
+    ):
+        outcome = run_question(
+            "我的预算是多少",
+            budget_tracker=tracker,
+            messages=[],
+            memory_store=memory_store,
+            extract_proposals=True,
+            proposal_store=proposal_store,
+        )
+    assert outcome["mode"] == "real"
+    # 本轮没有新创建提议（候选与已有的重复），返回列表为空。
+    assert outcome["new_proposals"] == []
+    # 待确认列表里仍只有原来那一条。
+    assert len(proposal_store.list_pending()) == 1
+    assert proposal_store.list_pending()[0]["id"] == existing["id"]
 
 
 def test_run_question_extract_failure_does_not_affect_chat(monkeypatch, tmp_path):
@@ -562,7 +653,8 @@ def test_web_proposals_reject_missing_returns_404(proposal_server):
 
 
 def test_web_proposals_confirm_save_failure_keeps_proposal(proposal_server, monkeypatch):
-    """保存失败时返回 502，提议保留在待确认列表（可重试）。"""
+    """保存失败时返回 500（不是 502：这是本地磁盘写入失败，不是网关错误），
+    提议保留在待确认列表（可重试），并明确提示是保存失败。"""
     port, _state, memory_store, proposal_store = proposal_server
     proposal = proposal_store.add("每月预算 5 美元。", ["core"], "inferred", "长期规则")
 
@@ -571,9 +663,34 @@ def test_web_proposals_confirm_save_failure_keeps_proposal(proposal_server, monk
 
     monkeypatch.setattr(MemoryStore, "_write", _boom)
     status, body = _request(port, "POST", f"/api/proposals/{proposal['id']}/confirm")
-    assert status == 502
+    assert status == 500
     assert "error" in body
+    assert "保存失败" in body["error"]
     # 提议还在，记忆文件里没有这条（仍只有启动时种下的 3 条）。
+    status, body = _request(port, "GET", "/api/proposals")
+    assert len(body["proposals"]) == 1
+    assert "每月预算 5 美元。" not in [m["text"] for m in memory_store.list_all()]
+
+
+def test_web_proposals_confirm_real_io_error_returns_500_and_keeps_proposal(proposal_server, monkeypatch):
+    """真实磁盘 I/O 错误（OSError，如权限不足、磁盘满）时也返回 500，
+    提议保留在待确认列表（可重试），并明确提示是保存失败。
+
+    回归测试：之前 _do_proposal_action 只 catch RuntimeError，
+    OSError 会落到通用 500 处理（“服务内部出错”），不是明确的“保存失败”。
+    """
+    port, _state, memory_store, proposal_store = proposal_server
+    proposal = proposal_store.add("每月预算 5 美元。", ["core"], "inferred", "长期规则")
+
+    def _boom(self, _memories):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(MemoryStore, "_write", _boom)
+    status, body = _request(port, "POST", f"/api/proposals/{proposal['id']}/confirm")
+    assert status == 500
+    assert "error" in body
+    assert "保存失败" in body["error"]
+    # 提议还在，记忆文件里没有这条。
     status, body = _request(port, "GET", "/api/proposals")
     assert len(body["proposals"]) == 1
     assert "每月预算 5 美元。" not in [m["text"] for m in memory_store.list_all()]

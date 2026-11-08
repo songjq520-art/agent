@@ -25,7 +25,7 @@
 #   GET  /api/proposals → 待确认的记忆提议列表，返回 {"proposals": [...]}。
 #   POST /api/proposals/<id>/confirm → 确认一条提议，把记忆写进长期记忆文件，
 #                        返回 {"ok": true, "memory": 存进去的记忆}；提议不存在时 404，
-#                        保存失败时 502，提议保留在待确认列表。
+#                        保存失败时 500（记忆文件损坏、磁盘 I/O 错误等），提议保留在待确认列表。
 #   POST /api/proposals/<id>/reject → 拒绝一条提议，不保存，返回 {"ok": true}；
 #                        提议不存在时 404。
 #
@@ -317,13 +317,18 @@ def make_handler(state, authenticator=None):
                 try:
                     saved = state.confirm_proposal(proposal_id)
                 except ValueError as exc:
+                    # 提议不存在或已处理过：404。
                     self._send_json({"error": str(exc)}, status=404)
                     return
-                except RuntimeError as exc:
-                    # 保存失败（比如记忆文件损坏）：提议保留在待确认列表，
-                    # 前端回 502 并提示用户稍后重试，不把堆栈泄露出去。
+                except Exception as exc:
+                    # 保存失败：记忆文件损坏、磁盘 I/O 错误（权限不足、磁盘满等）
+                    # 都会到这里。提议保留在待确认列表（confirm 只在保存成功
+                    # 后才移除），用户可稍后重试；前端回 500 并明确提示是
+                    # 保存失败，不把堆栈泄露出去。
+                    # 注意：这里必须 catch Exception，不能只 catch RuntimeError——
+                    # 真实磁盘 I/O 错误是 OSError，不是 RuntimeError。
                     traceback.print_exc()
-                    self._send_json({"error": f"保存失败：{exc}"}, status=502)
+                    self._send_json({"error": f"保存失败：{exc}"}, status=500)
                     return
                 self._send_json({"ok": True, "memory": saved})
                 return

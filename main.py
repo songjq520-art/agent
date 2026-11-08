@@ -385,12 +385,23 @@ def handle_remember(store, text):
 EXTRACTION_HISTORY_MAX = 6
 
 # EXTRACTION_INSTRUCTION（提取指令）：告诉模型要什么、不要什么、返回什么格式。
-# 只提取真正值得长期记住的内容，没有就返回空数组；只要 JSON，不要其他文字。
+# 核心原则：只提取用户自己明确表达过的内容（事实、偏好、决定）。
+# 明确排除：AI 自己提出的建议、假设、举例，不能当成用户事实；
+# 第三方信息（模型介绍的通用知识、别人的情况、新闻里的事），不能当成
+# 用户个人记忆。没有值得保存的就返回空数组。
 EXTRACTION_INSTRUCTION = (
     "你是一个记忆提取助手。以下是用户与 Agent 的最近对话。\n"
-    "请从中提取值得长期保存的重要信息，例如：用户的长期目标、重要偏好、"
-    "做过的决定、重要的经验教训、明确说过的事实。\n"
-    "只提取真正值得长期记住的内容；如果没有值得保存的信息，返回空数组 []。\n"
+    "请从中提取值得长期保存的信息，只提取用户自己明确表达过的内容：\n"
+    "- 用户明确说过的事实（比如身份、目标、做过的事）\n"
+    "- 用户明确表达的偏好（比如喜欢什么、想要什么）\n"
+    "- 用户明确做出的决定（比如定下的规则、选定的方案）\n"
+    "重要限制（必须遵守）：\n"
+    "- 只提用户自己说过的话。AI 自己提出的建议、假设、举例，不能当成用户事实来记。\n"
+    "  比如 AI 说“你可以试试每天运动”，这不是用户的偏好，不能记。\n"
+    "- 不能把第三方信息当成用户个人记忆。比如模型介绍的通用知识、别人的情况、\n"
+    "  新闻里的事，都不能记成用户的记忆。\n"
+    "- 只提取真正值得长期记住的内容；如果对话里没有用户明确表达的值得保存的\n"
+    "  信息，返回空数组 []。\n"
     "以 JSON 数组格式返回，不要写其他文字。每个元素包含三个字段：\n"
     "- text：记忆内容，一句话，写清楚、写完整\n"
     "- layers：所属层，从 [\"core\", \"experience\", \"knowledge\", \"relationship\"] 中选 1-2 个\n"
@@ -496,7 +507,9 @@ def _run_extraction_and_propose(provider, messages, budget_tracker, proposal_sto
 
     参数 provider：聊天用的 Provider 实例；messages：最近对话消息；
     budget_tracker：共用预算跟踪器；proposal_store：提议暂存。
-    返回：本次新建的提议列表（深拷贝过的字典）。
+    返回：本次新创建的提议列表（深拷贝过的字典）。
+    去重：同一轮提取里内容重复的候选（或与已在待确认列表里的提议内容
+    相同），只保留一条；返回列表里不出现重复 ID。
     任何一步失败都按“没有新提议”处理，不抛异常、不影响聊天。
     """
     if provider is None or proposal_store is None:
@@ -506,21 +519,29 @@ def _run_extraction_and_propose(provider, messages, budget_tracker, proposal_sto
     except Exception:
         logger.warning("记忆提取失败：本次不生成提议。", exc_info=True)
         return []
+    # 先记下本轮开始前已在待确认列表里的提议 ID：返回列表只放本轮
+    # 新创建的提议，已在列表里的不重复放进去。
+    existing_ids = {p["id"] for p in proposal_store.list_pending()}
     created = []
+    created_ids = set()
     for candidate in candidates:
         try:
-            created.append(
-                proposal_store.add(
-                    candidate["text"],
-                    candidate["layers"],
-                    "inferred",
-                    candidate["reason"],
-                )
+            proposal = proposal_store.add(
+                candidate["text"],
+                candidate["layers"],
+                "inferred",
+                candidate["reason"],
             )
         except Exception:
             # 单条提议创建失败不影响其他候选，记一条日志继续。
             logger.warning("提议创建失败：跳过一条候选。", exc_info=True)
             continue
+        # 去重：同一轮里内容重复的候选，add() 会返回已有的提议（同一个 ID）；
+        # 已在待确认列表里的候选也一样。只把本轮新创建的、且没放过的 ID
+        # 加入返回列表，避免 new_proposals 里出现重复条目。
+        if proposal["id"] not in existing_ids and proposal["id"] not in created_ids:
+            created_ids.add(proposal["id"])
+            created.append(proposal)
     return created
 
 
