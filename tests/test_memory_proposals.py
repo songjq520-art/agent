@@ -17,6 +17,7 @@
 import http.client
 import json
 import threading
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -737,6 +738,283 @@ def test_find_duplicate_memory_returns_first_match():
     assert found["text"] == "每月预算 5 美元。"
     assert find_duplicate_memory("我喜欢喝茶。", memories) is None
     assert find_duplicate_memory("", memories) is None
+
+
+# ---------- 并发安全（ProposalStore 线程锁） ----------
+# 问题：网页服务是 ThreadingHTTPServer，多个聊天请求可能并发执行。
+# add() 的“查重 + 创建”如果没有锁保护，两个请求同时检查时可能都发现
+# 没有重复提议，然后各自创建一条。
+# 修复：ProposalStore 内部用一把 RLock 保护所有读写操作，查重和创建
+# 是原子操作；confirm()/reject()/list_pending()/get() 也在同一把锁内。
+# 下面的测试用 Barrier 同时放出多个线程，并给查重加一点延迟来放大
+# 竞态窗口（没有锁时一定会复现重复创建，有锁时一定不会）。
+
+
+def _slow_find_duplicate_memory(monkeypatch, delay=0.005):
+    """把查重和创建函数换成“慢速版”：每次查重、每次创建先睡几毫秒再做。
+
+    用途：放大 add() 里“查重”和“创建”之间的竞态窗口，让并发测试
+    不靠运气——没有锁时，多个线程一定会同时通过查重、各自创建；
+    有锁时，只有一个线程能进查重和创建，测试一定通过。
+    查重和创建都要放慢：只放慢查重不够，因为“查重完 → 创建”这一步
+    太快，线程可能在别的线程查重前就完成创建，竞态撞不上；
+    创建也放慢后，多个线程的查重和创建必然重叠，没有锁一定重复创建。
+    返回：原始函数（测试结束后自动恢复）。
+    """
+    import memory.proposals as proposals_module
+    from memory.memories import find_duplicate_memory as real_find
+    from memory.proposals import create_proposal as real_create
+
+    def slow_find(text, memories, threshold=0.75):
+        time.sleep(delay)
+        return real_find(text, memories, threshold)
+
+    def slow_create(text, layers, source, reason):
+        time.sleep(delay)
+        return real_create(text, layers, source, reason)
+
+    monkeypatch.setattr(proposals_module, "find_duplicate_memory", slow_find)
+    monkeypatch.setattr(proposals_module, "create_proposal", slow_create)
+    return real_find
+
+
+def test_concurrent_add_same_candidate_creates_one_proposal(monkeypatch):
+    """多个线程同时提交相同候选，最终只能存在一条 Pending 提议。"""
+    import threading
+
+    _slow_find_duplicate_memory(monkeypatch)
+    store = ProposalStore()
+    thread_count = 16
+    barrier = threading.Barrier(thread_count)
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait()
+            proposal = store.add(
+                "每月预算 5 美元。", ["core"], "inferred", "长期预算规则"
+            )
+            results.append(proposal)
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert len(results) == thread_count
+    # 所有线程拿到的都是同一条提议（同一个 ID）。
+    ids = {p["id"] for p in results}
+    assert len(ids) == 1
+    # 待确认列表里只有一条。
+    assert len(store.list_pending()) == 1
+
+
+def test_concurrent_add_same_candidate_with_saved_memory_creates_none(monkeypatch, tmp_path):
+    """多个线程同时提交与正式记忆重复的候选，一条提议都不会创建。"""
+    import threading
+
+    _slow_find_duplicate_memory(monkeypatch)
+    memory_store = _store(tmp_path)
+    memory_store.add_memory("每月预算 5 美元。", ["core"], "user", "2026-11-08")
+    store = ProposalStore()
+    thread_count = 16
+    barrier = threading.Barrier(thread_count)
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait()
+            proposal = store.add(
+                "用户每月预算 5 美元。",
+                ["core"],
+                "inferred",
+                "长期预算规则",
+                memory_store=memory_store,
+            )
+            results.append(proposal)
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert len(results) == thread_count
+    # 全部返回 None（已保存过，不生成提议）。
+    assert all(p is None for p in results)
+    assert store.list_pending() == []
+    assert len(memory_store.list_all()) == 1
+
+
+def test_concurrent_add_different_candidates_all_created(monkeypatch):
+    """多个线程同时提交不同候选，全部创建成功（锁不误拦、不丢提议）。"""
+    import threading
+
+    _slow_find_duplicate_memory(monkeypatch)
+    store = ProposalStore()
+    thread_count = 16
+    barrier = threading.Barrier(thread_count)
+    results = []
+    errors = []
+
+    def worker(index):
+        try:
+            barrier.wait()
+            proposal = store.add(
+                f"我喜欢喝咖啡{index}号。",
+                ["experience"],
+                "inferred",
+                f"偏好{index}",
+            )
+            results.append(proposal)
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(i,)) for i in range(thread_count)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert len(results) == thread_count
+    # 16 条不同的提议全部创建，ID 各不相同。
+    ids = {p["id"] for p in results}
+    assert len(ids) == thread_count
+    assert len(store.list_pending()) == thread_count
+
+
+def test_concurrent_confirm_same_proposal_only_one_succeeds(monkeypatch, tmp_path):
+    """多个线程同时确认同一条提议，只有一个能成功，记忆只写一次。"""
+    import threading
+
+    _slow_find_duplicate_memory(monkeypatch)
+    memory_store = _store(tmp_path)
+    store = ProposalStore()
+    proposal = store.add("我喜欢喝咖啡。", ["experience"], "inferred", "个人偏好")
+    proposal_id = proposal["id"]
+    thread_count = 16
+    barrier = threading.Barrier(thread_count)
+    successes = []
+    value_errors = []
+    other_errors = []
+
+    def worker():
+        try:
+            barrier.wait()
+            saved = store.confirm(proposal_id, memory_store)
+            successes.append(saved)
+        except ValueError:
+            value_errors.append(1)
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            other_errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert other_errors == []
+    # 只有一个线程确认成功，其余 15 个报 ValueError（提议已处理）。
+    assert len(successes) == 1
+    assert len(value_errors) == thread_count - 1
+    # 记忆只写了一条。
+    assert len(memory_store.list_all()) == 1
+    assert memory_store.list_all()[0]["text"] == "我喜欢喝咖啡。"
+    # 提议已从待确认列表移除。
+    assert store.list_pending() == []
+
+
+def test_concurrent_add_confirm_reject_list_state_consistent(monkeypatch, tmp_path):
+    """并发混合操作（添加、确认、拒绝、列表）后状态一致，不丢不重不报错。
+
+    场景：先建 8 条提议；然后 8 个线程同时确认其中 4 条、拒绝其中 4 条，
+    另有 4 个线程同时读列表、4 个线程同时添加新提议。
+    结束后：确认的 4 条进了记忆文件，拒绝的 4 条没进，新提议全部在列表里，
+    列表快照与实际状态一致。
+    """
+    import threading
+
+    _slow_find_duplicate_memory(monkeypatch)
+    memory_store = _store(tmp_path)
+    store = ProposalStore()
+    # 先建 8 条不同的提议。
+    initial_ids = []
+    for i in range(8):
+        p = store.add(f"记忆内容第{i}号。", ["experience"], "inferred", f"理由{i}")
+        initial_ids.append(p["id"])
+    confirm_ids = initial_ids[:4]
+    reject_ids = initial_ids[4:]
+    thread_count = 16
+    barrier = threading.Barrier(thread_count)
+    errors = []
+    list_results = []
+
+    def confirm_worker(pid):
+        try:
+            barrier.wait()
+            store.confirm(pid, memory_store)
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            errors.append(exc)
+
+    def reject_worker(pid):
+        try:
+            barrier.wait()
+            store.reject(pid)
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            errors.append(exc)
+
+    def list_worker():
+        try:
+            barrier.wait()
+            # 列表操作不应抛异常（字典在迭代时被改会报 RuntimeError）。
+            snapshot = store.list_pending()
+            list_results.append(len(snapshot))
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            errors.append(exc)
+
+    def add_worker(index):
+        try:
+            barrier.wait()
+            store.add(f"新记忆第{index}号。", ["experience"], "inferred", f"新理由{index}")
+        except Exception as exc:  # noqa: BLE001 - 并发测试要收全部异常
+            errors.append(exc)
+
+    threads = []
+    for pid in confirm_ids:
+        threads.append(threading.Thread(target=confirm_worker, args=(pid,)))
+    for pid in reject_ids:
+        threads.append(threading.Thread(target=reject_worker, args=(pid,)))
+    for _ in range(4):
+        threads.append(threading.Thread(target=list_worker))
+    for i in range(4):
+        threads.append(threading.Thread(target=add_worker, args=(i,)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    # 确认的 4 条进了记忆文件，拒绝的 4 条没进。
+    saved_texts = {m["text"] for m in memory_store.list_all()}
+    assert len(saved_texts) == 4
+    for i in range(4):
+        assert f"记忆内容第{i}号。" in saved_texts
+    # 最终列表里只有新添加的 4 条。
+    final = store.list_pending()
+    assert len(final) == 4
+    final_texts = {p["text"] for p in final}
+    for i in range(4):
+        assert f"新记忆第{i}号。" in final_texts
+    # 列表快照的条数都在合理范围（0 到 12 条之间，不会读到损坏的状态）。
+    assert all(0 <= n <= 12 for n in list_results)
 
 
 # ---------- 网页接口 ----------
