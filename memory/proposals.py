@@ -18,7 +18,7 @@ import logging
 import uuid
 from datetime import date
 
-from .memories import propose_memory
+from .memories import find_duplicate_memory, propose_memory
 
 logger = logging.getLogger("agent")
 
@@ -84,18 +84,33 @@ class ProposalStore:
     def __init__(self):
         self._proposals = {}  # id -> 提议字典
 
-    def add(self, text, layers, source, reason):
+    def add(self, text, layers, source, reason, memory_store=None):
         """创建一个提议并加入待确认列表。返回提议字典（深拷贝）。
 
-        去重：已有待确认提议里内容完全相同的，不重复创建，返回已有的那条
-        （并记一条日志）。这样同一次提取返回重复候选时，列表里不会出现两条。
+        去重（两层）：
+        1. 待确认提议：内容与已有待确认提议完全相同或仅有轻微措辞差异的，
+           不重复创建，返回已有的那条（并记一条日志）。
+        2. 正式记忆：memory_store 传了时，内容与已保存的正式记忆完全相同
+           或仅有轻微措辞差异的，不生成提议，返回 None（并记一条日志）。
+           这样已经保存过的记忆再次被提取时，不会又出现在待确认列表。
+        内容有实质区别的（比如关键数字、对象不同），不受影响，照常创建。
         """
         clean_text = text.strip() if isinstance(text, str) else ""
+        # 1. 先查正式记忆：已经保存过的，不再生成提议。
+        if memory_store is not None:
+            existing_memory = find_duplicate_memory(
+                clean_text, memory_store.list_all()
+            )
+            if existing_memory is not None:
+                logger.info(
+                    "已保存过：内容与正式记忆重复，不生成提议。"
+                )
+                return None
+        # 2. 再查待确认提议：内容重复的不重复创建，返回已有的那条。
         for existing in self._proposals.values():
-            if (
-                existing["status"] == PROPOSAL_STATUS_PENDING
-                and existing["text"] == clean_text
-            ):
+            if existing["status"] != PROPOSAL_STATUS_PENDING:
+                continue
+            if find_duplicate_memory(clean_text, [existing]) is not None:
                 logger.info(
                     "重复提议：id=%s 内容已在待确认列表，不重复创建。",
                     existing["id"],

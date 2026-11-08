@@ -17,6 +17,7 @@ import copy
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import date
 from pathlib import Path
@@ -130,6 +131,186 @@ def _entry_problem(item):
         return f"layers 不对：{exc}"
     if item.get("source") not in SOURCES:
         return f"source 不对（{item.get('source')!r}，只能是 {SOURCES} 里的档）"
+    return None
+
+
+# ---------- 记忆去重（正式记忆与新提议之间的去重） ----------
+# 问题：已经保存的正式记忆，再次被模型提取出来时，会重复生成提议
+# （待确认列表里又出现同一条），虽然正式记忆文件里不会重复写，
+# 但用户每次都要再确认一次，体验差。
+# 解决：创建提议前，同时检查待确认提议和已保存的正式记忆；内容完全相同
+# 或仅有轻微措辞差异的，不重复生成提议；内容有实质区别的，仍允许生成。
+# 注意：去重靠的是下面的相似度比较（归一化比对 + 关键词重合度），
+# 不是扩大停用词表——停用词表（_MEMORY_DUP_STOPWORDS）与 main.py 的
+# _STOPWORDS 完全一致，不扩大。
+
+# _DUPLICATE_SIMILARITY_THRESHOLD（去重相似度阈值）：
+# 候选记忆与已有记忆的关键词 Jaccard 相似度达到这个值，就认为是同一条
+# （完全相同或仅有轻微措辞差异），不重复生成提议。
+# 0.75 的意思是 75% 的关键词重合；内容有实质区别时（如关键数字、对象不同），
+# 相似度通常远低于 0.75，不会被误拦；数字不同时直接判定为不同条（见下）。
+_DUPLICATE_SIMILARITY_THRESHOLD = 0.75
+
+# 去重用的停用词：与 main.py 的 _STOPWORDS 完全一致（中文通用词 + 英文通用词），
+# 不扩大。只去掉“怎么/什么/多少/the/is”这类没信息量的词，不参与相似度计算。
+_MEMORY_DUP_STOPWORDS = frozenset(
+    [
+        "怎么",
+        "什么",
+        "多少",
+        "这个",
+        "那个",
+        "一下",
+        "可以",
+        "一个",
+        "为什么",
+        "怎么办",
+        "是不是",
+        "有没有",
+        "请问",
+        "谢谢",
+        "the",
+        "is",
+        "are",
+        "do",
+        "does",
+        "can",
+        "could",
+        "please",
+        "tell",
+    ]
+)
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _strip_user_prefix(text):
+    """去掉开头的“用户”前缀（模型提取时常加，如“用户每月预算 5 美元”）。
+
+    “用户”本身不携带事实信息，去掉后比对更准确。
+    只去掉开头的“用户”及后面的冒号/逗号/空白，不动中间的“用户”
+    （比如“用户手册”里的“用户”是内容的一部分，但出现在开头时
+    通常是模型加的前缀；为去重准确，这里仍去掉——“用户手册”这类
+    记忆本身极少作为用户事实被提取）。
+    """
+    if not isinstance(text, str):
+        return text
+    return re.sub(r"^\s*用户\s*[：:，、]?\s*", "", text)
+
+
+def _normalize_memory_text(text):
+    """归一化记忆文本：去掉空白和常见标点，英文转小写。
+
+    用于“完全相同或仅有标点/空白差异”的快速判断。
+    比如“每月预算 5 美元。”和“每月预算5美元”归一化后完全相同。
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = re.sub(r"[\s，。！？、；：\"\"''（）()\[\]【】《》<>·~～!?,.;:]", "", text)
+    return cleaned.lower()
+
+
+def _memory_text_keywords(text):
+    """提取记忆文本的关键词（供去重时的相似度计算用）。
+
+    规则（与 main.py 的 _extract_keywords 同款思路，但为去重做了两处调整）：
+    - 按空白和标点分词；含中文的长词只拆成两字窗口，**不保留整词**——
+      整词太具体，措辞稍有不同就对不上，会把“同一条”误判成“不同条”。
+    - 数字（哪怕只有一位）也要保留——数字常常是关键区别
+      （比如预算 5 美元和 10 美元，区别就在于数字）。
+    - 英文按整词；去掉停用词。
+    返回去重后的关键词集合（用于计算两条记忆的关键词重合度）。
+    """
+    parts = re.split(r"[^\w]+", text or "")
+    keywords = set()
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # 数字（哪怕只有一位）也要保留——数字常常是关键区别。
+        if part.isdigit():
+            keywords.add(part)
+            continue
+        if len(part) < 2:
+            continue
+        if part.lower() in _MEMORY_DUP_STOPWORDS:
+            continue
+        # 含中文的长词：只拆成两字窗口，不保留整词。
+        if len(part) > 2 and _CJK_RE.search(part):
+            for i in range(len(part) - 1):
+                word = part[i : i + 2]
+                if word.lower() not in _MEMORY_DUP_STOPWORDS:
+                    keywords.add(word)
+        else:
+            keywords.add(part)
+    return keywords
+
+
+def _memory_text_numbers(text):
+    """提取记忆文本里的全部数字（整数序列，如 5、10、2026）。
+
+    用途：两条记忆的数字集合不同时，直接判定为不同条——
+    数字不同通常意味着实质区别（比如预算 5 美元和 10 美元、2026 年和 2027 年），
+    即使关键词重合度很高，也不能当成同一条。
+    """
+    return set(re.findall(r"\d+", text or ""))
+
+
+def is_duplicate_memory_text(candidate_text, existing_text, threshold=_DUPLICATE_SIMILARITY_THRESHOLD):
+    """判断候选记忆与已有记忆是不是同一条（完全相同或仅有轻微措辞差异）。
+
+    参数 candidate_text：候选记忆内容；existing_text：已有记忆内容；
+    threshold：关键词 Jaccard 相似度阈值，默认 0.75。
+    返回 True 表示是同一条（不应重复生成提议/不应重复保存），False 表示
+    内容有实质区别（允许生成新提议）。
+    判断分三步：
+    1. 归一化比对：去掉空白、标点后完全相同 → 同一条。
+    2. 数字集合不同 → 不是同一条（数字不同通常是实质区别，直接放行）。
+    3. 关键词 Jaccard 相似度：关键词集合的交集/并集 ≥ 阈值 → 同一条。
+       比如“每月预算 5 美元”与“每月预算 10 美元”，因数字不同直接判定
+       为不同条；“我喜欢喝咖啡”与“我喜欢喝茶”相似度约 0.5，不会被误判。
+    """
+    if not isinstance(candidate_text, str) or not isinstance(existing_text, str):
+        return False
+    if not candidate_text.strip() or not existing_text.strip():
+        return False
+    # 先去掉开头的“用户”前缀（模型提取时常加，不携带事实信息）。
+    candidate_text = _strip_user_prefix(candidate_text)
+    existing_text = _strip_user_prefix(existing_text)
+    # 1. 归一化后完全相同 → 同一条。
+    if _normalize_memory_text(candidate_text) == _normalize_memory_text(existing_text):
+        return True
+    # 2. 数字集合不同 → 不是同一条（数字不同通常是实质区别）。
+    if _memory_text_numbers(candidate_text) != _memory_text_numbers(existing_text):
+        return False
+    # 3. 关键词 Jaccard 相似度 ≥ 阈值 → 同一条。
+    candidate_keywords = _memory_text_keywords(candidate_text)
+    existing_keywords = _memory_text_keywords(existing_text)
+    if not candidate_keywords or not existing_keywords:
+        return False
+    union = candidate_keywords | existing_keywords
+    if not union:
+        return False
+    similarity = len(candidate_keywords & existing_keywords) / len(union)
+    return similarity >= threshold
+
+
+def find_duplicate_memory(text, memories, threshold=_DUPLICATE_SIMILARITY_THRESHOLD):
+    """在已有记忆列表里找与给定内容重复的那一条。
+
+    参数 text：候选记忆内容；memories：已有记忆列表（每项为记忆字典，
+    至少有 "text" 字段）；threshold：相似度阈值，默认 0.8。
+    返回：找到的第一条重复记忆字典（原对象，不复制），没找到返回 None。
+    用途：创建提议前检查正式记忆、检查待确认提议时共用。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    for memory in memories or []:
+        if not isinstance(memory, dict):
+            continue
+        existing_text = memory.get("text") or ""
+        if is_duplicate_memory_text(text, existing_text, threshold):
+            return memory
     return None
 
 

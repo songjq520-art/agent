@@ -502,14 +502,17 @@ def extract_memory_candidates(provider, messages, budget_tracker):
     return candidates
 
 
-def _run_extraction_and_propose(provider, messages, budget_tracker, proposal_store):
+def _run_extraction_and_propose(provider, messages, budget_tracker, proposal_store, memory_store=None):
     """跑一次提取并创建提议（供 run_question 在聊天成功后调用）。
 
     参数 provider：聊天用的 Provider 实例；messages：最近对话消息；
-    budget_tracker：共用预算跟踪器；proposal_store：提议暂存。
+    budget_tracker：共用预算跟踪器；proposal_store：提议暂存；
+    memory_store：长期记忆库（MemoryStore），传了时，候选会先与已保存的
+    正式记忆去重（完全相同或仅有轻微措辞差异的不生成提议），
+    避免已经保存过的记忆再次出现在待确认列表。
     返回：本次新创建的提议列表（深拷贝过的字典）。
     去重：同一轮提取里内容重复的候选（或与已在待确认列表里的提议内容
-    相同），只保留一条；返回列表里不出现重复 ID。
+    相同，或与正式记忆重复），只保留一条；返回列表里不出现重复 ID。
     任何一步失败都按“没有新提议”处理，不抛异常、不影响聊天。
     """
     if provider is None or proposal_store is None:
@@ -531,10 +534,14 @@ def _run_extraction_and_propose(provider, messages, budget_tracker, proposal_sto
                 candidate["layers"],
                 "inferred",
                 candidate["reason"],
+                memory_store=memory_store,
             )
         except Exception:
             # 单条提议创建失败不影响其他候选，记一条日志继续。
             logger.warning("提议创建失败：跳过一条候选。", exc_info=True)
+            continue
+        # add() 返回 None 表示候选与已保存的正式记忆重复，不生成提议。
+        if proposal is None:
             continue
         # 去重：同一轮里内容重复的候选，add() 会返回已有的提议（同一个 ID）；
         # 已在待确认列表里的候选也一样。只把本轮新创建的、且没放过的 ID
@@ -669,7 +676,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         ]
         recent = recent[-EXTRACTION_HISTORY_MAX:]
         new_proposals = _run_extraction_and_propose(
-            provider, recent, tracker, proposal_store
+            provider, recent, tracker, proposal_store, memory_store=memory_store
         )
     return {
         "mode": "real",

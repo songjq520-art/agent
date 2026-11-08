@@ -542,6 +542,203 @@ def test_confirm_duplicate_proposal_does_not_duplicate_memory(tmp_path):
     assert proposal_store.list_pending() == []
 
 
+# ---------- 正式记忆与提议去重（BOOS 本地验收发现的问题） ----------
+# 问题：已经保存的正式记忆，再次被模型提取出来时，又出现在待确认列表。
+# 原因：创建提议时只检查了 Pending 提议，没检查已保存的正式记忆。
+# 修复：ProposalStore.add() 增加 memory_store 参数，创建前同时检查
+# 待确认提议和正式记忆（相似度去重，不只是完全相同）。
+
+
+def test_saved_memory_reextracted_creates_no_proposal(tmp_path):
+    """已保存的记忆再次被提取时，不生成重复提议（核心修复）。
+
+    复现 BOOS 的本地测试：先保存一条长期目标，后续聊天再次提取出
+    同一条（措辞略有不同），待确认列表里不应再出现它。
+    """
+    from main import _run_extraction_and_propose
+
+    memory_store = _store(tmp_path)
+    memory_store.add_memory(
+        "长期目标：做出真正属于自己的多模型 Agent。", ["core"], "user", "2026-11-08"
+    )
+    proposal_store = ProposalStore()
+    extraction = json.dumps(
+        [
+            {
+                "text": "用户长期目标是做出真正属于自己的多模型 Agent。",
+                "layers": ["core"],
+                "reason": "长期目标",
+            }
+        ],
+        ensure_ascii=False,
+    )
+    provider = Mock()
+    provider.chat_messages.return_value = {"text": extraction, "model": "deepseek-flash"}
+    created = _run_extraction_and_propose(
+        provider,
+        [{"role": "user", "content": "我的目标是什么"}],
+        None,
+        proposal_store,
+        memory_store=memory_store,
+    )
+    assert created == []
+    assert proposal_store.list_pending() == []
+    # 正式记忆只有一条，没被修改。
+    assert len(memory_store.list_all()) == 1
+
+
+def test_saved_memory_reextracted_via_run_question_creates_no_proposal(monkeypatch, tmp_path):
+    """端到端：已保存的记忆再次被提取，run_question 的 new_proposals 为空。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    memory_store = _store(tmp_path)
+    memory_store.add_memory(
+        "每月预算 5 美元，4 美元提醒，5 美元停。", ["core"], "user", "2026-11-08"
+    )
+    proposal_store = ProposalStore()
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    extraction = json.dumps(
+        [
+            {
+                "text": "用户每月预算 5 美元，4 美元提醒，5 美元停。",
+                "layers": ["core"],
+                "reason": "长期预算规则",
+            }
+        ],
+        ensure_ascii=False,
+    )
+    with patch(
+        "providers.deepseek.requests.post",
+        side_effect=[
+            _fake_ok_response(text="你的预算是每月 5 美元。"),
+            _fake_ok_response(text=extraction),
+        ],
+    ):
+        outcome = run_question(
+            "我的预算是多少",
+            budget_tracker=tracker,
+            messages=[],
+            memory_store=memory_store,
+            extract_proposals=True,
+            proposal_store=proposal_store,
+        )
+    assert outcome["mode"] == "real"
+    assert outcome["new_proposals"] == []
+    assert proposal_store.list_pending() == []
+    assert len(memory_store.list_all()) == 1
+
+
+def test_pending_proposal_similar_text_not_duplicated():
+    """Pending 中已有措辞略有不同的提议时，不重复生成。"""
+    store = ProposalStore()
+    first = store.add("每月预算 5 美元，4 美元提醒，5 美元停。", ["core"], "inferred", "长期规则")
+    # 措辞略有不同（加“用户”前缀），不应再创建一条。
+    second = store.add("用户每月预算 5 美元，4 美元提醒，5 美元停。", ["core"], "inferred", "长期规则")
+    assert second["id"] == first["id"]
+    assert len(store.list_pending()) == 1
+
+
+def test_substantively_different_memory_still_creates_proposal(tmp_path):
+    """内容相似但有实质区别的记忆，仍允许生成新提议（不过度去重）。"""
+    memory_store = _store(tmp_path)
+    memory_store.add_memory("每月预算 5 美元。", ["core"], "user", "2026-11-08")
+    proposal_store = ProposalStore()
+    # 关键数字不同（5 美元 → 10 美元），是实质区别，应允许生成。
+    created = proposal_store.add(
+        "每月预算 10 美元。", ["core"], "inferred", "预算调整", memory_store=memory_store
+    )
+    assert created is not None
+    assert created["id"].startswith("prop-")
+    assert len(proposal_store.list_pending()) == 1
+    # 正式记忆仍只有原来那一条，没被修改。
+    assert len(memory_store.list_all()) == 1
+
+
+def test_dedup_does_not_affect_confirm_and_reject(tmp_path):
+    """去重不影响正常的确认、拒绝和保存流程。"""
+    memory_store = _store(tmp_path)
+    proposal_store = ProposalStore()
+    # 一条与正式记忆重复的候选不生成提议，一条全新的照常生成。
+    memory_store.add_memory("每月预算 5 美元。", ["core"], "user", "2026-11-08")
+    dup = proposal_store.add(
+        "每月预算 5 美元。", ["core"], "inferred", "", memory_store=memory_store
+    )
+    assert dup is None
+    new = proposal_store.add(
+        "我喜欢喝咖啡。", ["experience"], "inferred", "个人偏好", memory_store=memory_store
+    )
+    assert new is not None
+    # 确认新提议：照常写入。
+    saved = proposal_store.confirm(new["id"], memory_store)
+    assert saved["text"] == "我喜欢喝咖啡。"
+    assert len(memory_store.list_all()) == 2
+    # 再建一条并拒绝：照常丢弃，不写文件。
+    another = proposal_store.add(
+        "我喜欢喝茶。", ["experience"], "inferred", "", memory_store=memory_store
+    )
+    assert proposal_store.reject(another["id"]) is True
+    assert len(memory_store.list_all()) == 2
+    assert proposal_store.list_pending() == []
+
+
+# ---------- 相似度函数单元测试 ----------
+
+
+def test_is_duplicate_memory_text_cases():
+    """相似度函数的正反案例：完全相同/轻微措辞差异算重复，实质区别不算。"""
+    from memory.memories import is_duplicate_memory_text
+
+    # 算重复的。
+    assert is_duplicate_memory_text("每月预算 5 美元。", "每月预算 5 美元。") is True
+    assert is_duplicate_memory_text("每月预算5美元", "每月预算 5 美元。") is True
+    assert (
+        is_duplicate_memory_text(
+            "用户长期目标是做出真正属于自己的多模型 Agent。",
+            "长期目标：做出真正属于自己的多模型 Agent。",
+        )
+        is True
+    )
+    assert (
+        is_duplicate_memory_text(
+            "每月预算 5 美元，4 美元提醒，5 美元停。",
+            "用户每月预算 5 美元，4 美元提醒，5 美元停。",
+        )
+        is True
+    )
+    # 不算重复的（实质区别）。
+    assert is_duplicate_memory_text("每月预算 5 美元", "每月预算 10 美元") is False
+    assert is_duplicate_memory_text("我喜欢喝咖啡", "我喜欢喝茶") is False
+    assert (
+        is_duplicate_memory_text(
+            "DeepSeek 已接通，是第一任主控。", "DeepSeek 已接通，是第二任主控。"
+        )
+        is False
+    )
+    assert (
+        is_duplicate_memory_text("我喜欢喝咖啡", "我喜欢喝咖啡，也喜欢喝茶") is False
+    )
+    assert (
+        is_duplicate_memory_text(
+            "2026 年的目标是做出 Agent。", "2027 年的目标是做出 Agent。"
+        )
+        is False
+    )
+
+
+def test_find_duplicate_memory_returns_first_match():
+    """find_duplicate_memory 在列表里找到重复的那一条，没找到返回 None。"""
+    from memory.memories import find_duplicate_memory
+
+    memories = [
+        {"text": "每月预算 5 美元。", "layers": ["core"], "source": "user"},
+        {"text": "我喜欢喝咖啡。", "layers": ["experience"], "source": "user"},
+    ]
+    found = find_duplicate_memory("用户每月预算 5 美元。", memories)
+    assert found is not None
+    assert found["text"] == "每月预算 5 美元。"
+    assert find_duplicate_memory("我喜欢喝茶。", memories) is None
+    assert find_duplicate_memory("", memories) is None
+
+
 # ---------- 网页接口 ----------
 
 
@@ -694,6 +891,56 @@ def test_web_proposals_confirm_real_io_error_returns_500_and_keeps_proposal(prop
     status, body = _request(port, "GET", "/api/proposals")
     assert len(body["proposals"]) == 1
     assert "每月预算 5 美元。" not in [m["text"] for m in memory_store.list_all()]
+
+
+def test_web_end_to_end_saved_memory_not_reextracted_as_proposal(monkeypatch, proposal_server):
+    """端到端：保存过的记忆再次被提取，不再出现在待确认列表（BOOS 本地验收场景）。
+
+    流程：聊天提取出提议 → 确认保存进文件 → 再聊天，模型又提取出同一条
+    → 待确认列表里不应再出现它，正式记忆仍只有一条。
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    port, state, memory_store, proposal_store = proposal_server
+    extraction = json.dumps(
+        [{"text": "每月预算 5 美元。", "layers": ["core"], "reason": "长期预算规则"}],
+        ensure_ascii=False,
+    )
+    # 第一轮：聊天提取出提议。
+    with patch(
+        "providers.deepseek.requests.post",
+        side_effect=[
+            _fake_ok_response(text="你的预算是每月 5 美元。"),
+            _fake_ok_response(text=extraction),
+        ],
+    ):
+        status, body = _request(port, "POST", "/api/chat", {"message": "我的预算是多少"})
+    assert status == 200
+    assert len(body["new_proposals"]) == 1
+    proposal_id = body["new_proposals"][0]["id"]
+    # 确认保存。
+    status, body = _request(port, "POST", f"/api/proposals/{proposal_id}/confirm")
+    assert status == 200
+    # 第二轮：再聊天，模型又提取出同一条（措辞略有不同）。
+    extraction2 = json.dumps(
+        [{"text": "用户每月预算 5 美元。", "layers": ["core"], "reason": "长期预算规则"}],
+        ensure_ascii=False,
+    )
+    with patch(
+        "providers.deepseek.requests.post",
+        side_effect=[
+            _fake_ok_response(text="你的预算还是每月 5 美元。"),
+            _fake_ok_response(text=extraction2),
+        ],
+    ):
+        status, body = _request(port, "POST", "/api/chat", {"message": "我的预算变了吗"})
+    assert status == 200
+    # 不应再生成提议。
+    assert body["new_proposals"] == []
+    status, body = _request(port, "GET", "/api/proposals")
+    assert body == {"proposals": []}
+    # 正式记忆里只有这一条（加上启动时种下的 3 条，共 4 条），没有重复。
+    texts = [m["text"] for m in memory_store.list_all()]
+    assert texts.count("每月预算 5 美元。") == 1
 
 
 def test_web_end_to_end_chat_extract_confirm(monkeypatch, proposal_server):
