@@ -115,6 +115,18 @@ class FakeMemory:
                 continue
             if sentence.startswith(cls._CONDITIONAL_LEADS):
                 continue
+            # 纠错句（“不对，我喜欢喝茶。”）：先按 mem0_store 的真实
+            # 识别规则把新说法抠出来，再按前缀规则提——真实 mem0 调
+            # DeepSeek 提取，本来就听得懂“不对，”后面是用户亲口说的
+            # 新偏好；假对象只认句首前缀，不先剥掉纠错说法就提不出来，
+            # 那样 not_found 那条路（新说法当新记忆存下来）离线测不到。
+            # 用的是 mem0_store._detect_correction 本尊（不是抄一份），
+            # 识别规则改了，假对象跟着变，不会悄悄跑偏。
+            from memory.mem0_store import _detect_correction
+
+            detected = _detect_correction(sentence)
+            if detected is not None:
+                sentence = detected["fact"]
             if sentence.startswith(cls._EXTRACT_PREFIXES):
                 out.append(sentence)
         return out

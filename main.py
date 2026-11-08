@@ -207,6 +207,44 @@ def handle_remember(budget_tracker, text):
         print("没记住：保存失败，记忆库可能出了问题，稍后再试。")
 
 
+def _print_correction_result(saved):
+    """把 add_turn 的纠错结果用人话打印一行（只在有纠错时打印）。
+
+    参数 saved：add_turn 的返回字典；没纠错时里面没有 "correction" 键。
+    返回纠错结果字典（有纠错时）或 None（没纠错时），供 run_question
+    放进返回里、让调用方（比如测试）也能看到。
+    - updated：告诉 BOOS 把哪条换成了哪条；
+    - unchanged：已经记对了，不用改；
+    - ambiguous：列出分不清的候选，请 BOOS 回“第几条”挑一条
+      （下一轮 add_turn 会按他的挑法接着改，不用他再说一遍新说法）；
+    - failed：说清楚改失败了、原记忆没动；
+    - not_found：新说法已经当新记忆正常存了，不用多说。
+    """
+    correction = (saved or {}).get("correction") or {}
+    status = correction.get("status")
+    if not status:
+        return None
+    if status == "updated":
+        old = correction.get("old_text") or ""
+        new = correction.get("new_text") or ""
+        print(f"已纠正：把“{old}”换成了“{new}”。")
+    elif status == "unchanged":
+        print("这条已经记对了，不用改。")
+    elif status == "ambiguous":
+        candidates = correction.get("candidates") or []
+        print(f"有 {len(candidates)} 条相似的记忆，分不清改哪条：")
+        for i, cand in enumerate(candidates, 1):
+            print(f"  {i}. {(cand or {}).get('text')}")
+        print("请回复第几条（比如“第 1 条”），我再帮你改。")
+    elif status == "failed":
+        print(
+            f"纠正失败，原记忆没动（{correction.get('reason') or '原因未知'}），"
+            "请稍后再试。"
+        )
+    # not_found：新说法已经当新记忆正常存了，不用多说。
+    return correction
+
+
 def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None):
     """跑一次普通问答任务（最简单的运行示例）.
 
@@ -319,6 +357,9 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 另外调（run_question 已存过，重复调等于每轮多付几次提取费用）。
     # 只带最近 6 条（约 3 轮）：每轮都把全部历史发去提取又贵又慢，
     # 最近的就够提取理解本轮了；和网页服务（web/server.py）一致。
+    # 聊天纠错：add_turn 里已经改好/问好了，这里只把结果用人话告诉
+    # BOOS（见 _print_correction_result），并放进返回里供调用方看。
+    correction = None
     if mem0_store is not None:
         recent = (
             list(messages or [])
@@ -327,13 +368,15 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
                 {"role": "assistant", "content": result["text"]},
             ]
         )[-6:]
-        mem0_store.add_turn(recent)
+        saved = mem0_store.add_turn(recent)
+        correction = _print_correction_result(saved)
     return {
         "mode": "real",
         "route": routing,
         "result": result,
         "message": "真实调用完成。",
         "model_status": status,
+        **({"correction": correction} if correction is not None else {}),
     }
 
 

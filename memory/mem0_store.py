@@ -590,6 +590,177 @@ def _find_duplicate_memory(text, existing_items):
     return None
 
 
+# ---------- 聊天纠错的意图识别（供 Mem0Store.add_turn 用） ----------
+# 只认明确的纠错说法，宁可漏认、不要误认——普通聊天绝不能触发纠错。
+# “我不是”要特别小心：“我不是很确定”只是犹豫，不是纠错；所以
+# “我不是”后面必须跟一个替换说法（“而是/其实是/，新说法”），
+# 否则不触发（见 _detect_correction）。
+
+# _CORRECTION_PHRASES（纠错说法）：只认这五个明确的说法。
+_CORRECTION_PHRASES = ("你记错了", "不对", "纠正一下", "其实是", "我不是")
+
+# _CORRECTION_SEPARATORS（纠错说法前面能跟的分隔符）：纠错说法必须在
+# 句首，或在句号/逗号/换行之后——比如“我喜欢科幻电影。不对，我喜欢
+# 纪录片。”这种一句里先肯定后纠正的也认；但“我觉得不对劲”里的
+# “不对”前面是“得”，不是分隔符，不认。
+_CORRECTION_SEPARATORS = set("。！？；\n，、： ")
+
+# _BUDUI_BOUNDARY（“不对”后面能跟的字）：“不对”后面必须是个边界，
+# 不然可能是“不对劲/不对头”这种词的一部分——“不对劲，我先走了”
+# 不是纠错。标点、语气词（啊/呀/哦/呢/吧）、人称（我/你/他/这/那）
+# 都算边界；其他汉字（劲/头/味/路……）不算。
+_BUDUI_BOUNDARY = set("，。：、；！？\n \t啊呀哦呢吧我你他她它这那是")
+
+# _CHINESE_NUMERALS（挑候选时认的中文数字）：“第 1 条”里的 1 是阿拉伯
+# 数字，“第一个”里的“一”是中文数字，都认。
+_CHINESE_NUMERALS = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+
+def _detect_correction(text):
+    """从一句话里认出“纠错意图 + 新说法”。
+
+    返回 {"phrase": 触发的说法, "fact": 新说法}，不是纠错时返回 None。
+    认法（保守，只认明确的）：
+    - 说法必须在句首，或在句号/逗号/换行等分隔符之后；
+    - “不对”后面必须是个边界（标点/语气词/人称），排除“不对劲”这种词；
+    - 新说法 = 说法后面的话，去掉开头的标点/空格；
+    - “我不是 X，Y”这种否定句式：Y 才是新说法——先看“而是/其实是”，
+      没有就取第一个逗号后面的；两个都没有（比如“我不是很确定”）
+      就不是纠错，返回 None；
+    - 新说法太短（只剩一个字或空）不算纠错，走正常保存。
+    例子：
+    - “不对，我喜欢看纪录片。”→ fact “我喜欢看纪录片。”
+    - “你记错了，我喜欢用 Go 写代码”→ fact “我喜欢用 Go 写代码”
+    - “我不是喜欢科幻电影，我喜欢纪录片。”→ fact “我喜欢纪录片。”
+    - “我不是很确定”→ None（只是犹豫，没有替换说法）
+    - “我觉得不对劲”→ None（“不对”是词的一部分）
+    """
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    best = None  # (出现位置, 说法)：多个说法同时出现时取最早的。
+    for phrase in _CORRECTION_PHRASES:
+        start = 0
+        while True:
+            idx = text.find(phrase, start)
+            if idx < 0:
+                break
+            start = idx + 1
+            if idx != 0 and text[idx - 1] not in _CORRECTION_SEPARATORS:
+                continue
+            if phrase == "不对":
+                after = text[idx + len(phrase):idx + len(phrase) + 1]
+                if after and after not in _BUDUI_BOUNDARY:
+                    continue
+            if best is None or idx < best[0]:
+                best = (idx, phrase)
+            break  # 同一个说法只取第一次出现。
+    if best is None:
+        return None
+    idx, phrase = best
+    fact = text[idx + len(phrase):].lstrip("，,：:、；; \t")
+    if phrase == "我不是":
+        # 否定句式：新说法在“而是/其实是”后面，或在第一个逗号后面。
+        for marker in ("而是", "其实是"):
+            pos = fact.find(marker)
+            if pos >= 0:
+                fact = fact[pos + len(marker):].lstrip("，,：:、；; \t")
+                break
+        else:
+            comma = fact.find("，")
+            if comma < 0:
+                comma = fact.find(",")
+            if comma >= 0:
+                fact = fact[comma + 1:].lstrip(" \t")
+            else:
+                return None
+    fact = fact.strip()
+    # 新说法太短（去掉句末标点只剩一个字、或空）不算纠错，走正常保存。
+    if len(fact.rstrip("。！？；，、.!?;,")) < 2:
+        return None
+    return {"phrase": phrase, "fact": fact}
+
+
+def _latest_user_content(messages):
+    """取消息列表里最后一条 user 消息的内容（本轮用户刚说的那句）。
+
+    add_turn 收到的可能是最近几轮的消息（CLI/网页都只带最近 6 条），
+    纠错只看最新那句——以前轮次的纠错在它那轮已经处理过了。
+    没有 user 消息时返回 ""。
+    """
+    for message in reversed(messages or []):
+        if (message or {}).get("role") == "user":
+            return (message or {}).get("content") or ""
+    return ""
+
+
+def _correction_result(outcome):
+    """把 correct_memory 的返回收成调用方好用的样子（只留必要字段）。
+
+    {"status", "memory_id", "old_text", "new_text",
+     "candidates": [{"id", "text"}]（ambiguous 时给调用方展示用）,
+     "reason": 没改成的原因（给人看的）}。
+    """
+    outcome = outcome or {}
+    return {
+        "status": outcome.get("status"),
+        "memory_id": outcome.get("memory_id"),
+        "old_text": outcome.get("old_text"),
+        "new_text": outcome.get("new_text"),
+        "candidates": [
+            {"id": (c or {}).get("id"), "text": (c or {}).get("text")}
+            for c in (outcome.get("candidates") or [])
+        ],
+        "reason": outcome.get("reason") or "",
+    }
+
+
+def _parse_pending_selection(text, candidates):
+    """用户回“第 1 条/第一个/1”或直接引用某条候选原文时，认出他指的是哪条。
+
+    返回挑中的候选（{"id", "text"}），认不出时返回 None——认不出
+    就当放弃这次纠错（add_turn 会清掉待确认、不再问），绝不猜一条。
+    认法（按明确程度从高到低）：
+    - “第 1 条 / 第1条 / 第一个 / 1”：数字指明第几条；
+    - 直接引用候选原文：某条候选里连续 4 个字出现在用户的话里，
+      且只有这一条对得上（两条都对得上时不猜，返回 None）。
+      比如候选是“我喜欢看科幻电影”，用户说“科幻电影那条”——
+      “科幻电影”这 4 个字只在这一条里，就认它。
+    """
+    if not isinstance(text, str) or not candidates:
+        return None
+    stripped = text.strip()
+    match = re.search(r"第\s*(\d+)\s*条", stripped)
+    if match:
+        n = int(match.group(1))
+        return candidates[n - 1] if 1 <= n <= len(candidates) else None
+    match = re.search(r"第\s*([一二三四五六七八九十])\s*个", stripped)
+    if match:
+        n = _CHINESE_NUMERALS[match.group(1)]
+        return candidates[n - 1] if 1 <= n <= len(candidates) else None
+    if re.fullmatch(r"\d+", stripped):
+        n = int(stripped)
+        return candidates[n - 1] if 1 <= n <= len(candidates) else None
+    # 直接引用原文：候选里连续 4 个字出现在用户的话里，且只有一条对得上。
+    norm_text = _normalize_memory_text(stripped)
+    matched = []
+    for cand in candidates:
+        norm_cand = _normalize_memory_text((cand or {}).get("text") or "")
+        if len(norm_cand) < 4:
+            continue
+        windows = {norm_cand[i:i + 4] for i in range(len(norm_cand) - 3)}
+        if any(window in norm_text for window in windows):
+            matched.append(cand)
+    if len(matched) == 1:
+        return matched[0]
+    return None
+
+
 # ---------- 版本文件（embedding 模型 + 维度记录） ----------
 # 换 embedding 模型必须全量重嵌：维度不同时 Chroma 直接报硬错，
 # 旧库不能混用。所以每次建库时，把用的模型名、维度、mem0 版本
@@ -716,6 +887,11 @@ class Mem0Store:
         self.embedding_dims = embedding_dims
         self.mem0_version = mem0_version
         self._memory = memory
+        # _pending_correction（待确认的纠错）：上一轮纠错分不清改哪条
+        # （ambiguous）时留下的，新说法 + 候选列表，等 BOOS 下一句挑
+        # 哪条（见 add_turn / _parse_pending_selection）。
+        # 只放内存里，重启就没了——对话里的追问本来就是临时的。
+        self._pending_correction = None
         if self._memory is None:
             # 真实 mem0：先校验版本文件，再建 Memory（建的时候会加载
             # embedding 模型，约 25 秒，常驻服务只付一次）。
@@ -975,6 +1151,90 @@ class Mem0Store:
             logger.warning("底层 add 不支持 metadata 参数：本次记忆没带来源信息。")
             return self._memory.add(messages, user_id=user_id, infer=infer)
 
+    # ---------- 聊天纠错接线（“你记错了”走 correct_memory） ----------
+    # 背景：correct_memory() 本身能改，但聊天里说“你记错了”时没人调它——
+    # add_turn 只会把新说法当成一条新记忆存下来，旧的错的还留在库里
+    # （2026-11-09 生命周期复测证实的已知缺口：用户说“不对，我喜欢看
+    # 纪录片。”，库里最后科幻和纪录片两条都在）。
+    # 所以纠错的判断做在 add_turn 里：CLI、网页、直接调 add_turn 的
+    # 调用方都走同一条路，不用每个调用方各写一份。流程：
+    #   1. 看本轮最后一条 user 消息里有没有明确的纠错说法；
+    #   2. 有，就把新说法抠出来，当成 old_text 和 new_text 一起交给
+    #      correct_memory(new_fact, new_fact)——它自己会找候选、判断
+    #      唯一/多个/没有、原地替换并校验；
+    #   3. 按 correct_memory 的 status 决定本轮还做不做正常提取保存。
+    # 冲突判断：不另建一套关键词规则引擎（BOOS 的规矩：价值/冲突判断
+    # 由模型在提示里做，不硬编码规则）。这里的判断就是两点：
+    # 用户亲口说“记错了”——这是他本人断言旧记忆错了，不用模型再猜；
+    # 哪条是旧记忆——交给 correct_memory 的候选检索（语义 + 关键词）
+    # 和它的唯一/多个/没有逻辑。候选不止一条时不猜，问 BOOS。
+    # 检索验证（2026-11-09，离线 FakeMemory 实测）：
+    # “我喜欢看纪录片”搜“用户喜欢看科幻电影。”，语义分 0.43（≥ 0.4
+    # 阈值）且关键词权重 6（≥ 2），两路都找得到，不用改候选检索、
+    # 也不动全局 0.4 阈值（BOOS 定的，留着不动）。
+
+    def _handle_correction_outcome(self, outcome):
+        """按 correct_memory 的 status 决定本轮怎么收尾（供 add_turn 用）。
+
+        返回最终要返回给调用方的字典；返回 None 表示“没冲突可改，
+        走正常提取保存”（not_found 时，调用方继续走正常保存）。
+        规矩：
+        - updated：改好了，新说法已经存进去了（同一 id 原地替换），
+          不要再走正常提取——提取会把新说法又存一条，变重复。
+        - unchanged：新说法库里已经有了，不用再存。
+        - ambiguous：分不清改哪条：把这次纠错（新说法 + 候选）留着，
+          等 BOOS 下一句挑，不猜、不存重复。
+        - failed：改失败了，原记忆没动（correct_memory 已回滚），
+          不走提取兜底——兜底会把新说法存成重复记忆；如实报失败。
+        - not_found：库里没有冲突的旧记忆，返回 None，让调用方走
+          正常提取保存（新说法当成一条新记忆存下来）。
+        - 未知 status：保守处理——不猜、不存重复，只把结果报出来。
+        """
+        status = (outcome or {}).get("status")
+        correction = _correction_result(outcome)
+        if status == "updated":
+            return {
+                "correction": correction,
+                "results": [
+                    {
+                        "id": outcome.get("memory_id"),
+                        "memory": outcome.get("new_text"),
+                        "event": "UPDATE",
+                    }
+                ],
+            }
+        if status in ("unchanged", "ambiguous", "failed"):
+            if status == "ambiguous":
+                # 留着等 BOOS 下一句挑（只放内存里，重启就没了——
+                # 对话里的追问本来就是临时的，可以接受）。
+                self._pending_correction = {
+                    "new_text": outcome.get("new_text"),
+                    "candidates": outcome.get("candidates") or [],
+                }
+            return {"correction": correction}
+        if status == "not_found":
+            return None
+        return {"correction": correction}
+
+    def _extract_and_save_turn(self, safe_messages):
+        """正常提取保存（add_turn 的老路子，只做这一件事）。
+
+        调 mem0.add 提取本轮对话、去重、存入；提取出的记忆里万一
+        还带着敏感信息，_drop_sensitive_results 会再删掉。
+        失败时返回 {}，绝不抛异常——存记忆失败不能把聊天回答搞崩。
+        """
+        try:
+            result = self._mem0_add(
+                safe_messages,
+                self.user_id,
+                True,
+                _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False),
+            )
+        except Exception:
+            logger.warning("mem0 自动存记忆失败：本轮对话未存入长期记忆。", exc_info=True)
+            return {}
+        return self._drop_sensitive_results(result or {})
+
     def add_turn(self, messages):
         """把本轮对话存进长期记忆（回答后调一次）。
 
@@ -994,8 +1254,21 @@ class Mem0Store:
         提取，省一次调用。提取回来之后再复查一遍：万一哪条提取出的
         记忆还带着敏感信息（比如模型把没见过的密钥格式复述出来了），
         立刻删掉、不留库里（见 _drop_sensitive_results）。
+        聊天纠错（“你记错了”接线，2026-11-09）：
+        本轮最后一条 user 消息里有明确纠错说法时（见 _detect_correction），
+        不走正常提取——先调 correct_memory(new_fact, new_fact) 改旧记忆，
+        按它的 status 收尾（见 _handle_correction_outcome）：
+        updated/unchanged/ambiguous/failed 都直接返回纠错结果（不重复存），
+        只有 not_found 才走正常提取保存（新说法当新记忆存下来）。
+        上一轮 ambiguous 留下的待确认纠错（_pending_correction），
+        本轮先看 BOOS 是不是在挑候选（见 _parse_pending_selection），
+        挑中了就按他挑的那条改；没挑中就当放弃这次纠错，继续正常处理。
         返回：mem0.add() 的结果（字典），失败时返回 {}，绝不抛异常——
         存记忆失败不能把已经拿到的聊天回答搞崩。
+        纠错路径返回的字典里多一个 "correction" 键：
+        {"status", "memory_id", "old_text", "new_text", "candidates",
+         "reason"}，调用方（main.py / web/server.py）按它告诉 BOOS
+        改好了、还是要他挑一条、还是改失败了。
         """
         if not messages:
             return {}
@@ -1011,17 +1284,52 @@ class Mem0Store:
                 _meaningful_after_redaction(m["content"]) for m in safe_messages
             ):
                 return {}
-            try:
-                result = self._mem0_add(
-                    safe_messages,
-                    self.user_id,
-                    True,
-                    _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False),
+            latest_user = _latest_user_content(safe_messages)
+            # 1. 先处理上一轮留下的待确认纠错：BOOS 这句是不是在挑候选？
+            if self._pending_correction is not None and latest_user:
+                pending = self._pending_correction
+                # 无论成不成，这轮都先清掉——不留着反复问。
+                self._pending_correction = None
+                selected = _parse_pending_selection(
+                    latest_user, pending.get("candidates") or []
                 )
-            except Exception:
-                logger.warning("mem0 自动存记忆失败：本轮对话未存入长期记忆。", exc_info=True)
-                return {}
-            return self._drop_sensitive_results(result or {})
+                if selected is not None:
+                    # 按他挑的那条改：old_text 传挑中的原文，
+                    # correct_memory 里原文对上了就不用猜。
+                    outcome = self.correct_memory(
+                        selected.get("text") or "", pending.get("new_text") or ""
+                    )
+                    handled = self._handle_correction_outcome(outcome)
+                    if handled is not None:
+                        return handled
+                    # not_found：挑中的那条已经不在库里了（被删了），
+                    # 新说法还是他确认过的，直接当新记忆存下来。
+                    saved = self.add_memory_text(
+                        pending.get("new_text") or "", source=SOURCE_USER
+                    )
+                    if isinstance(saved, dict):
+                        saved = dict(saved)
+                        saved["correction"] = _correction_result(outcome)
+                    return saved
+                # 没挑中（说了别的、或说“都不是”）：当作放弃这次纠错，
+                # 继续按本轮消息正常处理（下面可能又是一次新的纠错）。
+            # 2. 本轮是不是纠错（“你记错了……”）？
+            detected = _detect_correction(latest_user) if latest_user else None
+            if detected is not None:
+                outcome = self.correct_memory(
+                    detected["fact"], detected["fact"]
+                )
+                handled = self._handle_correction_outcome(outcome)
+                if handled is not None:
+                    return handled
+                # not_found：库里没有冲突的旧记忆——新说法当成一条新记忆，
+                # 走正常提取保存（下面），结果里附上这次纠错的尝试记录。
+                normal = self._extract_and_save_turn(safe_messages)
+                if isinstance(normal, dict):
+                    normal = dict(normal)
+                    normal["correction"] = _correction_result(outcome)
+                return normal
+            return self._extract_and_save_turn(safe_messages)
 
     def _drop_sensitive_results(self, result):
         """提取后二次过滤：检查本次提取出的记忆，万一哪条还带着敏感信息

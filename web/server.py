@@ -162,6 +162,10 @@ class ChatState:
         成功时：{"reply": 回答, "model": 模型名, "mode": "real",
                   "cost_usd": 成本, "usage": Token 用量}，
         并把本轮问答追加进历史。
+        本轮是聊天纠错（“你记错了……”）时，成功返回里多一个
+        "correction" 键：{"status", "memory_id", "old_text",
+        "new_text", "candidates", "reason"}（见 Mem0Store.add_turn），
+        页面按它展示“改好了 / 请挑一条 / 改失败了”。
         演示模式（无 Key）时：{"reply": 提示, "model": None,
         "mode": "demo", "cost_usd": None, "usage": None}，历史不动。
         调用失败时：直接抛 RuntimeError，调用方转成错误返回，历史不动。
@@ -204,15 +208,27 @@ class ChatState:
             self.messages.append({"role": "user", "content": prompt})
             self.messages.append({"role": "assistant", "content": result["text"]})
             # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
+            # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
+            # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
+            # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
+            # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
+            # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
+            # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
+            correction = None
             if self.mem0_store is not None:
-                self.mem0_store.add_turn(self.messages[-_MEMORY_SAVE_HISTORY_MAX:])
-            return {
+                saved = self.mem0_store.add_turn(self.messages[-_MEMORY_SAVE_HISTORY_MAX:])
+                if isinstance(saved, dict):
+                    correction = saved.get("correction")
+            response = {
                 "reply": result["text"],
                 "model": result["model"],
                 "mode": "real",
                 "cost_usd": result.get("cost_usd"),
                 "usage": result.get("usage"),
             }
+            if correction is not None:
+                response["correction"] = correction
+            return response
 
     # ---------- 长期记忆管理（“长期记忆”页面用） ----------
     # 原则：网页层只做“传话”——列出、展示范围、把 BOOS 的确认传下去；
