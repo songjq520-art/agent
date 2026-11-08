@@ -299,7 +299,7 @@ def find_duplicate_memory(text, memories, threshold=_DUPLICATE_SIMILARITY_THRESH
     """在已有记忆列表里找与给定内容重复的那一条。
 
     参数 text：候选记忆内容；memories：已有记忆列表（每项为记忆字典，
-    至少有 "text" 字段）；threshold：相似度阈值，默认 0.8。
+    至少有 "text" 字段）；threshold：相似度阈值，默认 0.75。
     返回：找到的第一条重复记忆字典（原对象，不复制），没找到返回 None。
     用途：创建提议前检查正式记忆、检查待确认提议时共用。
     """
