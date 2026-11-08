@@ -109,7 +109,7 @@ def test_chat_success_appends_history(running_server, monkeypatch):
     """真实调用成功（用假结果模拟）时：返回回答，历史追加一问一答。"""
     port, state = running_server
 
-    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None):
+    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
         return {
             "mode": "real",
             "route": {"task_type": "question", "provider": "deepseek", "model": "deepseek-flash"},
@@ -135,7 +135,7 @@ def test_chat_failure_returns_error_and_keeps_history(running_server, monkeypatc
     """调用抛 RuntimeError 时：返回 502 和通用错误，不泄露内部信息，历史不动。"""
     port, state = running_server
 
-    def _boom(prompt, budget_tracker=None, messages=None, memory_store=None):
+    def _boom(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
         # 模拟服务商报错里夹带内部信息：接口地址、内部请求号、假密钥片段。
         raise RuntimeError(
             "DeepSeek API 调用失败：401 Client Error for url: "
@@ -179,7 +179,7 @@ def test_reset_clears_history(running_server, monkeypatch):
     """POST /api/reset 清空对话历史：先攒一轮问答，再清空，历史变回空。"""
     port, state = running_server
 
-    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None):
+    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
         return {
             "mode": "real",
             "route": {"task_type": "question", "provider": "deepseek", "model": "deepseek-flash"},
@@ -273,7 +273,7 @@ def test_unexpected_error_returns_generic_500(running_server, monkeypatch):
     """run_question 抛非 RuntimeError 时：返回 500 通用错误，不泄露内部信息。"""
     port, state = running_server
 
-    def _boom(prompt, budget_tracker=None, messages=None, memory_store=None):
+    def _boom(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
         raise ValueError("内部秘密：数据库连接串 abc123")
 
     monkeypatch.setattr("web.server.run_question", _boom)
@@ -330,7 +330,7 @@ def test_authenticator_error_is_treated_as_deny(tmp_path):
 # ---------- 并发安全 ----------
 
 
-def _slow_fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None):
+def _slow_fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
     """假的 run_question：故意拖 0.2 秒，让两个请求重叠；回答里带上问题本身，方便核对配对。"""
     time.sleep(0.2)
     return {
@@ -406,7 +406,7 @@ def test_concurrent_chat_calls_are_isolated(running_server, monkeypatch):
     seen = {}
     started = threading.Event()
 
-    def _timed_fake(prompt, budget_tracker=None, messages=None, memory_store=None):
+    def _timed_fake(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
         if prompt == "慢":
             started.set()  # 告诉测试：慢请求已经进来了，锁已拿到。
         time.sleep(0.4 if prompt == "慢" else 0.1)

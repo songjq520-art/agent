@@ -347,7 +347,7 @@ def test_chat_state_ask_passes_memory_store_to_run_question(monkeypatch, tmp_pat
     state = ChatState(budget_tracker=tracker, memory_store=store)
     seen = {}
 
-    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None):
+    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
         seen["prompt"] = prompt
         seen["memory_store"] = memory_store
         seen["messages"] = list(messages or [])
@@ -404,7 +404,7 @@ def test_chat_state_corrupted_memory_does_not_break_ask(monkeypatch, tmp_path):
     state = ChatState(budget_tracker=tracker, memory_store=store)
     seen = {}
 
-    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None):
+    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
         seen["memory_store"] = memory_store
         return {
             "mode": "real",

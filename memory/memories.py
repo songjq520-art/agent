@@ -15,10 +15,13 @@
 
 import copy
 import json
+import logging
 import os
 import uuid
 from datetime import date
 from pathlib import Path
+
+logger = logging.getLogger("agent")
 
 
 # 记忆分层（五层，用来判断什么值得记）。
@@ -254,12 +257,19 @@ class MemoryStore:
         调用前应该已经用 propose_memory() 拟好、并经 BOOS 确认过。
         存完自动保存到文件。返回存进去的那条记忆字典。
 
+        去重：内容与已有记忆完全相同的，不重复写文件，直接返回已有记忆。
+        这样同一条记忆确认两次、或模型两次提取出同一条时，文件里只留一条。
+
         一致性：先写磁盘（含新记忆），写成功了再更新内存；
         写失败时内存不变，和磁盘保持一致。
         """
         memory = propose_memory(text, layers, source, mem_date)
         if self.corrupted:
             raise RuntimeError(f"记忆文件已损坏，不能存：{self.corruption_reason}")
+        for existing in self.memories:
+            if existing["text"] == memory["text"]:
+                logger.info("重复记忆：内容已在长期记忆里，不重复保存。")
+                return existing
         new_memories = self.memories + [memory]
         self._write(new_memories)
         self.memories = new_memories
