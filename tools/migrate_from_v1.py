@@ -6,7 +6,8 @@
 #   1. 建一个 Mem0Store（建不好就报错退出，并说清原因）；
 #   2. 调 store.migrate_from_v1()：读 memory/memories.json 原文迁移，
 #      旧预算记忆（“4 美元提醒，5 美元停”那句）会按新规矩改写，其他一字不改，
-#      已经在库里的不会重复存；
+#      已经在库里的不会重复存；迁过来的旧记忆都记 source="user"、
+#      user_confirmed=True（v1 时代是先确认再存），有 date 的用它当形成时间；
 #   3. 调 store.ensure_first_memories()：库里还是空时，种下首批三条记忆。
 # 跑完打印：这次新存了几条、现在库里一共几条。
 # 注意：

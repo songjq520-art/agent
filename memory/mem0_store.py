@@ -4,7 +4,38 @@
 # 原理：mem0 负责三件事——每轮对话后自动提取记忆、存进本地 Chroma 向量库、
 #       提问时语义检索。这里只做薄薄一层包装：配好 DeepSeek + 本地
 #       embedding + 本地 Chroma、强制关遥测、加阈值过滤、加写锁、记账、
-#       存前脱敏（隐私过滤）、直接存入时去重。
+#       存前脱敏（隐私过滤）、直接存入时去重、每条记忆带来源元数据、
+#       纠错（改）与深度删除（忘）。
+# 关系：main.py 的 run_question() 提问前调 search()、回答后调 add_turn()；
+#       web/server.py 常驻服务里建一个 Mem0Store；命令行默认不建（见下）。
+# 来源（provenance）：每条记忆存进 mem0 时都带一份 metadata——
+#       source（user：BOOS 亲口说的/让记住的；inferred：DeepSeek 从对话
+#       里提取的）、created_at（形成时间）、confidence（可信度）、
+#       user_confirmed（BOOS 是否逐条确认过）。没有 metadata 的旧记忆，
+#       取回时一律按“未确认”处理，绝不默认当成已确认的事实（安全降级）。
+#       只有 user_confirmed=True 的记忆才能在回答里直接当作事实；
+#       inferred 的只能当背景参考；未确认的不能当作事实（见 main.py
+#       的 _memory_block，那里按来源给每条记忆打标签、分层）。
+# 纠错（改）：用户说“你记错了”时调 correct_memory()——先找到唯一对得上
+#       的那条，找不到/对不上多个时不猜、不改（返回状态让调用方问用户），
+#       找准了才用 mem0.update() 原地替换（同一 id），再验旧文本确实
+#       检索不到；改失败时原记忆不动、报失败，绝不谎称改好了。改过的
+#       记忆来源变成 user（BOOS 亲口纠正的）、user_confirmed=True。
+#       注意：改只换向量库里的当前文本，history.db 里的 UPDATE 审计行
+#       会留着旧文本——那是“改过什么”的审计记录，有意保留，和“忘”不同。
+# 深度删除（忘）：delete_memory() 删的不只是向量——向量删掉之后，还要
+#       把 history.db 里这条记忆的全部审计行（ADD/UPDATE/DELETE 行，
+#       DELETE 行里还留着被删记忆的全文）清掉，再验向量、历史、检索
+#       三处都干净。删之前先调 deletion_scope() 把删除范围（删哪条、
+#       删几行历史、哪些地方不在删除范围内）展示给 BOOS 看，拿到
+#       approve=True 才动手。删的过程中先写一个只含 id 和文本哈希
+#       （不含原文）的删除日志，验完干净再清掉；中途崩了，日志留着，
+#       下次能查到这次删了一半（见 list_pending_deletes）。
+#       不在删除范围内的东西（实话）：history.db 里 messages 表的原始
+#       对话记录（那是“说过什么话”的记录，不是记忆本身，删记忆不动它，
+#       但它也不会被重新提取——提取只对新轮次跑）；BOOS 自己在 Agent
+#       之外做的备份；Chroma 底层文件碎片（delete 后查不到，但文件层
+#       的清理归 Chroma 管）。删除范围展示里会把这些逐项列出来。
 # 关系：main.py 的 run_question() 提问前调 search()、回答后调 add_turn()；
 #       web/server.py 常驻服务里建一个 Mem0Store；命令行默认不建（见下）。
 # 安全与隐私：
@@ -38,13 +69,15 @@
 #     所以 mem0 只在常驻的网页服务里启用；命令行单次问答默认不加载，
 #     需要时（比如用户说“记住……”）才懒加载一次。
 
+import hashlib
 import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import unicodedata
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("agent")
@@ -87,7 +120,9 @@ KEYWORD_MIN_WEIGHT = 2
 
 # CUSTOM_INSTRUCTIONS_VERSION（自定义提取规则的版本号）：
 # 规则文本改了就改这个版本号，方便以后追踪“哪版规则存的记忆”。
-CUSTOM_INSTRUCTIONS_VERSION = "2026-11-08-spike"
+# 2026-11-09 改到第二版：加了“价值判断”（只存值得长期记的）和
+# “不存未确认/不存别人的事/不存没被认可的 AI 观点”（见下文第 9–12 条）。
+CUSTOM_INSTRUCTIONS_VERSION = "2026-11-09-provenance"
 
 # CUSTOM_INSTRUCTIONS（自定义提取规则，BOOS 定的，最高优先级）：
 # 原文照抄试跑验证过的版本（~/workspace/mem0-spike/spike_common.py）。
@@ -123,7 +158,25 @@ CUSTOM_INSTRUCTIONS = """CUSTOM EXTRACTION RULES — HIGHEST PRIORITY, these ove
    memory list for it.
 8. LANGUAGE: write every extracted memory in the SAME LANGUAGE as the user's
    messages. Chinese input -> Chinese memory text. Preserve proper nouns,
-   brand names and model names exactly as written."""
+   brand names and model names exactly as written.
+9. VALUE JUDGEMENT — only store information with lasting value: long-term goals,
+   stable preferences, important decisions, completed items, and
+   facts the user will still need weeks from now. Do NOT store trivial
+   chat, passing remarks, transient states, or one-off small talk, even if
+   it is about the user. When in doubt whether something is worth keeping
+   for the long term, do NOT store it: unconfirmed / not-worth-remembering
+   content must not be stored at all (there is no "unconfirmed" storage
+   state and no review queue — it simply is not saved).
+10. NEVER store other people's experiences, preferences or words as facts
+    about the user. "My friend likes hiking" is a fact about the friend,
+    not about the user — do not store that the user likes hiking.
+11. NEVER store the assistant's own suggestions, recommendations or views
+    as the user's stance. An AI view only becomes a user fact when the user
+    explicitly endorses it in their own words ("I agree", "yes, do that").
+12. Apply rules 9-11 per fact, not per turn: a turn may mix trivial chat
+    with a real long-term fact — store the fact, drop the trivial part.
+    Never drop a whole turn just because part of it is trivial, and never
+    keep a trivial sentence just because it shares a turn with a real fact."""
 
 # FIRST_MEMORIES（首批三条记忆，2026-11-07 BOOS 确认过）：
 # 从 memory/memories.py 原样搬过来，只改了一处：第 3 条的预算规则
@@ -169,6 +222,89 @@ _WRITE_LOCK = threading.RLock()
 def _today():
     """今天的日期，格式 YYYY-MM-DD。"""
     return date.today().isoformat()
+
+
+# ---------- 来源元数据（provenance） ----------
+# 每条记忆存进 mem0 时带的 metadata（见文件头“来源”一节）：
+#   source：记忆从哪来。"user"——BOOS 亲口说的/让记住的/亲口纠正的；
+#           "inferred"——DeepSeek 从对话里提取的（用户明确说过的话，
+#           但 BOOS 没逐条确认过那个写法）。
+#   created_at：记忆形成的时间（UTC 的 ISO 时间串，精确到秒）。
+#   confidence：可信度 0–1。BOOS 亲口说的记 1.0；提取的记 0.7——
+#           不是因为提取得不准，而是因为“模型提的”本身就比“用户
+#           亲口确认的”低一档；模型用它来判断这条记忆有多可信。
+#   user_confirmed：BOOS 是否逐条确认过。只在 source="user" 时为 True。
+#           注意：提取的记忆哪怕存下来了，也绝不会因为“存下来了”就
+#           自动变成已确认——source 还是 "inferred"，user_confirmed
+#           还是 False；只有 BOOS 亲口说/纠正/让记住，才是已确认。
+# 没有 metadata 的旧记忆（2026-11-09 之前存的）：取回时一律按
+# "unconfirmed" 处理（见 _normalize_metadata），绝不默认已确认。
+
+SOURCE_USER = "user"
+SOURCE_INFERRED = "inferred"
+SOURCE_UNCONFIRMED = "unconfirmed"
+CONFIDENCE_USER = 1.0
+CONFIDENCE_INFERRED = 0.7
+
+
+def _now_iso():
+    """现在的时间，UTC 的 ISO 时间串（精确到秒），供 metadata 用。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _provenance(source, confidence, user_confirmed, created_at=None):
+    """拼一份来源元数据（存记忆时传给 mem0.add 的 metadata 参数）。
+
+    source 不是 "user" 时一律按 "inferred" 存（调用方传错也不让它
+    进库）；user_confirmed 只在 source="user" 时才可能是 True。
+    """
+    source = SOURCE_USER if source == SOURCE_USER else SOURCE_INFERRED
+    return {
+        "source": source,
+        "created_at": created_at or _now_iso(),
+        "confidence": confidence,
+        "user_confirmed": bool(user_confirmed) and source == SOURCE_USER,
+    }
+
+
+def _normalize_metadata(raw):
+    """把 mem0 返回的 metadata 规整成统一形状（检索时用）。
+
+    规整规则（安全降级，宁可信度低、不可误认）：
+    - raw 不是字典、或缺 source、或 source 不是 user/inferred，
+      一律按 "unconfirmed" 处理（旧记忆、新旧版本混用、损坏数据
+      都走这条路）；
+    - user_confirmed 只有明确是 True（布尔值）才算确认，写成
+      "yes"/1 这类非布尔值不算——确认必须是明确的，不能靠猜；
+    - confidence 不是 0–1 之间的数字时记成 None（不知道就是不知道）；
+    - created_at 不是字符串时记成 None。
+    返回：{"source", "created_at", "confidence", "user_confirmed",
+           "confirmed"}，其中 confirmed 就是 user_confirmed（取了
+    个短名字，方便调用方判断“能不能当作事实用”）。
+    """
+    source = SOURCE_UNCONFIRMED
+    created_at = None
+    confidence = None
+    user_confirmed = False
+    if isinstance(raw, dict):
+        raw_source = raw.get("source")
+        if raw_source in (SOURCE_USER, SOURCE_INFERRED):
+            source = raw_source
+        raw_created = raw.get("created_at")
+        if isinstance(raw_created, str) and raw_created:
+            created_at = raw_created
+        raw_conf = raw.get("confidence")
+        if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool):
+            if 0 <= raw_conf <= 1:
+                confidence = float(raw_conf)
+        user_confirmed = raw.get("user_confirmed") is True and source == SOURCE_USER
+    return {
+        "source": source,
+        "created_at": created_at,
+        "confidence": confidence,
+        "user_confirmed": user_confirmed,
+        "confirmed": user_confirmed,
+    }
 
 
 # ---------- 关键词补充信号（从 v1 main.py 搬过来，只做补充用） ----------
@@ -539,7 +675,9 @@ class Mem0Store:
       store.search("你记得我叫什么吗？")  # 提问前检索，返回过阈值的记忆
       store.add_turn(messages)  # 回答后自动存本轮对话（加全局写锁）
       store.add_memory_text("我喜欢喝咖啡。")  # CLI“记住：内容”手动存原文
-      store.delete_memory(mem_id, approve=True)  # 删除：先校验归属，再要 BOOS 同意
+      store.delete_memory(mem_id, approve=True)  # 深度删除：先校验归属，再要 BOOS 同意
+      store.correct_memory("我喜欢喝咖啡", "我喜欢喝茶")  # 纠错：原地替换旧记忆
+      store.deletion_scope(mem_id)  # 删之前展示删除范围，给 BOOS 确认用
     记忆库出问题（没 Key、mem0 没装、Chroma 目录坏了）时，建 store 失败
     返回 None，调用方照常聊天、不拦路（见 create_mem0_store）。
     测试时可传一个假的 memory 对象（FakeMemory），不碰真实 mem0。
@@ -691,8 +829,17 @@ class Mem0Store:
     def search(self, query, top_k=5):
         """搜和问题相关的记忆（语义检索 + 关键词补充信号）。
 
-        返回：记忆列表，每项为 {"id", "text", "score", "source"}，
-        source 是 "semantic"（语义）或 "keyword"（关键词补充）。
+        返回：记忆列表，每项为 {"id", "text", "score", "source",
+        "metadata", "confirmed"}，source 是 "semantic"（语义）或
+        "keyword"（关键词补充），metadata 是规整过的来源信息
+        （见 _normalize_metadata），confirmed 是“BOOS 是否逐条确认过”
+        （只有 source="user" 的记忆才可能是 True）。
+        注意：search 不按来源过滤——提取的（inferred）记忆和未确认的
+        旧记忆也会返回，调用方（main.py 的 _memory_block）按来源决定
+        怎么用：已确认的才能当作事实，未确认的不能当作事实。
+        这样设计的原因：提取的记忆是记忆功能的主力（自动存的都在这），
+        过滤掉它们等于记忆功能作废；安全靠“注入时打标签、分层”
+        来保证，不靠检索时偷偷丢掉。
         流程：
         1. mem0 语义检索（top_k 条），只留分数 ≥ 阈值（默认 0.4）的。
            分数不够的直接丢掉，不注入——宁可不带记忆，也别把看着像的
@@ -724,12 +871,15 @@ class Mem0Store:
                 if _contains_sensitive(text):
                     skipped_sensitive += 1
                     continue
+                metadata = _normalize_metadata(item.get("metadata"))
                 results.append(
                     {
                         "id": item.get("id"),
                         "text": text,
                         "score": score,
                         "source": "semantic",
+                        "metadata": metadata,
+                        "confirmed": metadata["confirmed"],
                     }
                 )
                 seen_texts.add(text)
@@ -752,12 +902,15 @@ class Mem0Store:
                             continue
                         weight, _matched = _keyword_weight(text, keywords)
                         if weight >= KEYWORD_MIN_WEIGHT:
+                            metadata = _normalize_metadata(item.get("metadata"))
                             results.append(
                                 {
                                     "id": item.get("id"),
                                     "text": text,
                                     "score": None,
                                     "source": "keyword",
+                                    "metadata": metadata,
+                                    "confirmed": metadata["confirmed"],
                                 }
                             )
                             seen_texts.add(text)
@@ -768,7 +921,8 @@ class Mem0Store:
         return results
 
     def get_all(self, include_sensitive=False):
-        """返回当前用户的所有记忆（列表，每项 {"id", "text"}）。
+        """返回当前用户的所有记忆（列表，每项 {"id", "text", "metadata"}，
+        metadata 是规整过的来源信息，见 _normalize_metadata）。
 
         默认不含敏感信息：导出、迁移、展示用的都是这个默认口径，
         旧库里已有的敏感记忆不会从这里漏出去。
@@ -786,13 +940,40 @@ class Mem0Store:
                     continue
                 if not include_sensitive and _contains_sensitive(text):
                     continue
-                out.append({"id": item.get("id"), "text": text})
+                out.append(
+                    {
+                        "id": item.get("id"),
+                        "text": text,
+                        "metadata": _normalize_metadata(item.get("metadata")),
+                    }
+                )
             return out
         except Exception:
             logger.warning("mem0 取全部记忆失败。", exc_info=True)
             return []
 
     # ---------- 写入（回答后自动存 / 手动存） ----------
+
+    def _mem0_add(self, messages, user_id, infer, metadata):
+        """调底层 mem0.add() 存记忆（带来源元数据）。
+
+        mem0 2.2.1 的 add 接受 metadata 参数（试跑已核实）；但万一
+        底下的对象是旧版本 mem0、或测试里的子类没写 metadata 参数，
+        传 metadata 会报 TypeError（unexpected keyword argument），
+        这时退一步：不带 metadata 再调一次（记忆照常存，只是没来源；
+        取回时按“未确认”处理，见 _normalize_metadata）。
+        注意：只有报错信息里提到 metadata 时才退；别的 TypeError
+        （比如底层实现内部出错）不重试——重试可能把一条记忆存两遍。
+        """
+        try:
+            return self._memory.add(
+                messages, user_id=user_id, infer=infer, metadata=metadata
+            )
+        except TypeError as exc:
+            if "metadata" not in str(exc):
+                raise
+            logger.warning("底层 add 不支持 metadata 参数：本次记忆没带来源信息。")
+            return self._memory.add(messages, user_id=user_id, infer=infer)
 
     def add_turn(self, messages):
         """把本轮对话存进长期记忆（回答后调一次）。
@@ -801,6 +982,11 @@ class Mem0Store:
         mem0 自己调 DeepSeek 提取（自动存，BOOS 已同意不用确认），
         再去重、存进向量库。整个写入走全局写锁，一次只让一个写，
         防止并发写出重复记忆。
+        来源：提取出的记忆记 source="inferred"、user_confirmed=False、
+        confidence=0.7（见文件头“来源”一节）——用户明确说过的话，
+        但 BOOS 没逐条确认过那个写法；存下来了也不会自动变成已确认。
+        价值判断在提取提示里（CUSTOM_INSTRUCTIONS 第 9–12 条，DeepSeek
+        自己判断）：只存值得长期记的，不值得记的/没确认的直接不存。
         隐私（存前脱敏 + 存后复查，两道）：
         提取要把对话原文发给 DeepSeek，秘密不能跟着原文一起发出去——
         所以先把每条消息里的敏感信息换成占位符，再调提取；脱敏后
@@ -826,7 +1012,12 @@ class Mem0Store:
             ):
                 return {}
             try:
-                result = self._memory.add(safe_messages, user_id=self.user_id)
+                result = self._mem0_add(
+                    safe_messages,
+                    self.user_id,
+                    True,
+                    _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False),
+                )
             except Exception:
                 logger.warning("mem0 自动存记忆失败：本轮对话未存入长期记忆。", exc_info=True)
                 return {}
@@ -864,11 +1055,35 @@ class Mem0Store:
         filtered["results"] = kept
         return filtered
 
+    def _add_text_with_metadata(self, text, metadata):
+        """原文存一条记忆（infer=False），带上来源元数据。
+
+        只做“调 mem0.add”这一件事：脱敏、去重由调用方先做好。
+        mem0 报错时记日志、返回 {}，不抛异常（存记忆失败不能把
+        聊天搞崩，见 add_turn 的约定）。
+        """
+        try:
+            result = self._mem0_add(
+                [{"role": "user", "content": text}],
+                self.user_id,
+                False,
+                metadata,
+            )
+            return result or {}
+        except Exception:
+            logger.warning("mem0 手动存记忆失败。", exc_info=True)
+            return {}
+
     def add_memory_text(self, text, layers=None, source="user"):
         """手动存一条记忆原文（CLI“记住：内容”用，不经过提取）。
 
-        参数 text：记忆内容原文；layers/source：保留给以后用，
-        mem0 的 infer=False 路径不吃这两个字段，这里只记日志。
+        参数 text：记忆内容原文；layers：保留给以后用；
+        source：这条记忆的来源，默认 "user"——CLI“记住”是 BOOS
+        亲口让记住的，所以记 source="user"、user_confirmed=True、
+        confidence=1.0，并把这份 metadata 传给 mem0.add（以前这里
+        接受了 source 参数却没传给 mem0，是个 bug：库里存的记忆
+        metadata 是 None，查不到来源——2026-11-09 修好）。
+        不是 "user" 的 source 一律按 "inferred" 存（见 _provenance）。
         走全局写锁。
         隐私（存前脱敏）：直接存的原文不经过提取，没有模型把关，
         秘密会原样进库——所以存之前先把秘密换成占位符；脱敏后
@@ -879,8 +1094,6 @@ class Mem0Store:
         返回已有的那条（event=NONE，和 mem0“没变化”的意思一致，
         顶层再带一个 duplicate=True，方便迁移脚本数数）。
         返回：mem0.add() 的结果，失败返回 {}，不抛异常。
-        layers/source 现在不用（mem0 的 infer=False 直接存原文，
-        不分层、不标来源），参数留着是为了调用方不用改签名。
         """
         if not isinstance(text, str) or not text.strip():
             return {}
@@ -901,16 +1114,12 @@ class Mem0Store:
                     ],
                     "duplicate": True,
                 }
-            try:
-                result = self._memory.add(
-                    [{"role": "user", "content": safe_text}],
-                    user_id=self.user_id,
-                    infer=False,
-                )
-                return result or {}
-            except Exception:
-                logger.warning("mem0 手动存记忆失败。", exc_info=True)
-                return {}
+            metadata = _provenance(
+                source,
+                CONFIDENCE_USER if source == SOURCE_USER else CONFIDENCE_INFERRED,
+                source == SOURCE_USER,
+            )
+            return self._add_text_with_metadata(safe_text, metadata)
 
     # ---------- 迁移与种子 ----------
 
@@ -919,6 +1128,9 @@ class Mem0Store:
 
         参数 memories_json_path：旧文件路径，不传时用项目 memory/memories.json。
         每条用 add(infer=False) 原文存入，旧记忆默认全部有效。
+        来源：v1 时代是“先确认再存”（confirm-first），所以迁过来的旧记忆
+        都记 source="user"、user_confirmed=True、confidence=1.0，并把
+        旧条目里的 date（有的话）当作形成时间；没有 date 的用今天。
         例外：旧的第 3 条预算记忆写的是已作废的旧规矩
         （“每月预算 5 美元，4 美元提醒，5 美元停。”），迁移时改成新规矩
         （FIRST_MEMORIES 里的第 3 条），并记一条日志说明改过；
@@ -965,7 +1177,16 @@ class Mem0Store:
                 continue
             if _normalize_memory_text(text) in existing_normalized:
                 continue
-            result = self.add_memory_text(text)
+            # v1 记忆是 BOOS 确认过才存的，来源记 user；旧条目有 date
+            # 就用它当形成时间（add_memory_text 自己会拼 metadata，
+            # 但形成时间它不知道，这里直接传一份拼好的 metadata——
+            # 所以这里不走 add_memory_text，改走 _add_text_with_metadata。
+            # 注意：直接调 mem0.add 之前，脱敏/去重上面已经做过了。）
+            created_at = item.get("date") if isinstance(item.get("date"), str) else None
+            result = self._add_text_with_metadata(
+                text,
+                _provenance(SOURCE_USER, CONFIDENCE_USER, True, created_at=created_at),
+            )
             if result and not result.get("duplicate"):
                 added += 1
                 existing_texts.add(text)
@@ -998,43 +1219,616 @@ class Mem0Store:
             return migrated
         added = 0
         for item in FIRST_MEMORIES:
-            result = self.add_memory_text(item["text"])
+            result = self.add_memory_text(
+                item["text"], source=item.get("source", SOURCE_USER)
+            )
             if result:
                 added += 1
         if added:
             logger.info("已记录 %d 条初始记忆。", added)
         return added
 
-    # ---------- 删除与历史（带守卫） ----------
+    # ---------- 纠错（改）与深度删除（忘） ----------
+    # 改和忘是两件不同的事，别搞混：
+    #   - 改（correct_memory）：旧内容错了，换成新的；同一 id 原地替换，
+    #     history.db 里留一条 UPDATE 审计（旧文本还在审计行里，那是
+    #     “改过什么”的记录，有意保留）；改完旧文本检索不到、新文本能检索到。
+    #   - 忘（delete_memory）：这条记忆不要了，向量删掉，history.db 里
+    #     这条记忆的全部审计行也清掉，验三处都干净才算删完。
+    # 两者共用一道规矩：绝不谎称成功——改失败原记忆不动、报失败；
+    # 删失败（或删了一半）报清楚哪一步没成，日志/返回值里不写“已删除”。
+
+    def _find_correction_candidates(self, old_text, top_k=5):
+        """找“纠错要改的那条记忆”的候选（供 correct_memory 用）。
+
+        两路信号，和 search 一样：
+        1. 语义检索 old_text（过阈值的才算）；
+        2. 关键词：库里所有记忆里，和 old_text 有 ≥2 权重关键词重合的。
+        两路合并、按 id 去重，返回 [{"id", "text", "score", "metadata",
+        "confirmed"}]，按分数从高到低排（关键词捞回的分数记 None，
+        排在有分数的后面）。调用方按这个结果判断“唯一/多个/没有”。
+        出错时返回 []（找不到就报找不到，不猜）。
+        """
+        candidates = []
+        seen_ids = set()
+        try:
+            for item in self.search(old_text, top_k=top_k):
+                mem_id = item.get("id")
+                if mem_id and mem_id not in seen_ids:
+                    seen_ids.add(mem_id)
+                    candidates.append(item)
+        except Exception:
+            logger.warning("纠错：语义找候选失败，只用关键词找。", exc_info=True)
+        try:
+            keywords = _extract_keywords(old_text)
+            if keywords:
+                for item in self.get_all(include_sensitive=True):
+                    mem_id = item.get("id")
+                    if not mem_id or mem_id in seen_ids:
+                        continue
+                    weight, _matched = _keyword_weight(item.get("text") or "", keywords)
+                    if weight >= KEYWORD_MIN_WEIGHT:
+                        seen_ids.add(mem_id)
+                        candidates.append(
+                            {
+                                "id": mem_id,
+                                "text": item.get("text") or "",
+                                "score": None,
+                                "source": "keyword",
+                                "metadata": item.get("metadata")
+                                or _normalize_metadata(None),
+                                "confirmed": (item.get("metadata") or {}).get(
+                                    "confirmed", False
+                                ),
+                            }
+                        )
+        except Exception:
+            logger.warning("纠错：关键词找候选失败。", exc_info=True)
+        return candidates
+
+    def correct_memory(self, old_text, new_text):
+        """纠错：把一条记错的记忆换成正确的（原地替换，同一 id）。
+
+        什么时候调：BOOS 说“你记错了”并给出正确说法时（或以后网页端/
+        命令行的纠错入口调）。old_text 是“错的那句大概是什么”
+        （调用方从刚检索到的那条记忆里取），new_text 是正确的说法。
+        流程：
+        1. 先找候选（_find_correction_candidates）。
+           - 候选里有和 old_text 规整后完全相同的，先认它（哪怕还有
+             别的相似记忆——原文对上了就不用猜）。
+           - 恰好 1 个候选：改它。
+           - 0 个候选：status="not_found"，什么都不改（调用方可以问
+             BOOS、或改走“记住”新存一条，绝不凭空造一条“纠正”）。
+           - ≥2 个候选、又没有原文完全相同的：status="ambiguous"，
+             把候选列表原样返回，让调用方问 BOOS 到底是哪条——
+             绝不猜一条改掉。
+        2. 新文本和旧文本规整后相同：status="unchanged"，不用改。
+        3. 脱敏新文本：新文本里带秘密时只存脱敏后的版本；脱敏后
+           什么都不剩时 status="failed"（不存一条空记忆）。
+        4. 用 mem0.update() 原地替换（同一 id），新记忆来源记 user、
+           user_confirmed=True（BOOS 亲口纠正的）、confidence=1.0。
+           mem0.update 不支持 metadata 参数的老版本会报 TypeError，
+           这时退一步：只传 text 再改（来源还是旧的，记一条警告；
+           FakeMemory 和 mem0 2.2.1 都支持 metadata，不会走到这步）。
+        5. 验：重新读库——id 还在、新文本对得上、搜 old_text 找不回
+           旧文本，三条都过才算改好。验不过时，把旧文本和旧 metadata
+           写回去（回滚），status="failed"，并在结果里写清哪一步没过。
+        返回字典（不抛异常，调用方按 status 处理）：
+          {"status": "updated" | "ambiguous" | "not_found" |
+                     "unchanged" | "failed",
+           "memory_id": id 或 None,
+           "old_text": 旧文本或 None, "new_text": 新文本或 None,
+           "candidates": 候选列表（ambiguous / not_found 时给调用方看）,
+           "reason": 失败/未改的原因（给人看的，不含敏感内容）}
+        注意：改不经过提取、不调 DeepSeek（新文本是 BOOS 给的原话，
+        不用模型再判断一遍）；改只换当前文本，history.db 的 UPDATE
+        审计行会留着旧文本——那是审计记录，不是“当前事实”，
+        和“忘”要求的清历史是两回事（见 delete_memory）。
+        """
+        if not isinstance(old_text, str) or not old_text.strip():
+            return {
+                "status": "not_found",
+                "memory_id": None,
+                "old_text": None,
+                "new_text": new_text,
+                "candidates": [],
+                "reason": "没给旧内容，不知道改哪条。",
+            }
+        if not isinstance(new_text, str) or not new_text.strip():
+            return {
+                "status": "failed",
+                "memory_id": None,
+                "old_text": old_text,
+                "new_text": None,
+                "candidates": [],
+                "reason": "没给新内容，没法改。",
+            }
+        with _WRITE_LOCK:
+            candidates = self._find_correction_candidates(old_text)
+            target = None
+            normalized_old = _normalize_memory_text(old_text)
+            for item in candidates:
+                if _normalize_memory_text(item.get("text") or "") == normalized_old:
+                    target = item
+                    break
+            if target is None:
+                if len(candidates) == 1:
+                    target = candidates[0]
+                elif len(candidates) == 0:
+                    return {
+                        "status": "not_found",
+                        "memory_id": None,
+                        "old_text": old_text,
+                        "new_text": new_text,
+                        "candidates": [],
+                        "reason": "库里没有和旧内容对得上的记忆，没改任何东西。",
+                    }
+                else:
+                    return {
+                        "status": "ambiguous",
+                        "memory_id": None,
+                        "old_text": old_text,
+                        "new_text": new_text,
+                        "candidates": candidates,
+                        "reason": (
+                            f"有 {len(candidates)} 条相似记忆，分不清改哪条，"
+                            "请 BOOS 指明是哪条再改。"
+                        ),
+                    }
+            mem_id = target["id"]
+            old_stored_text = target["text"]
+            old_metadata = target.get("metadata") or _normalize_metadata(None)
+            if _normalize_memory_text(old_stored_text) == _normalize_memory_text(new_text):
+                return {
+                    "status": "unchanged",
+                    "memory_id": mem_id,
+                    "old_text": old_stored_text,
+                    "new_text": new_text,
+                    "candidates": [],
+                    "reason": "旧内容和新内容一样，不用改。",
+                }
+            # 脱敏新文本（纠正的话是 BOOS 亲口说的，但万一里面带了秘密，
+            # 还是只存脱敏后的版本；脱敏后什么都不剩就不存）。
+            safe_new = _redact_sensitive(new_text.strip())
+            if not _meaningful_after_redaction(safe_new):
+                return {
+                    "status": "failed",
+                    "memory_id": mem_id,
+                    "old_text": old_stored_text,
+                    "new_text": new_text,
+                    "candidates": [],
+                    "reason": "新内容脱敏后什么都不剩，没改。",
+                }
+            new_metadata = _provenance(SOURCE_USER, CONFIDENCE_USER, True)
+            try:
+                try:
+                    self._memory.update(mem_id, text=safe_new, metadata=new_metadata)
+                except TypeError:
+                    logger.warning(
+                        "纠错：底层 update 不支持 metadata 参数，只改文本。"
+                    )
+                    self._memory.update(mem_id, text=safe_new)
+            except Exception as exc:
+                logger.warning("纠错失败：记忆 %s 未改动。", mem_id, exc_info=True)
+                return {
+                    "status": "failed",
+                    "memory_id": mem_id,
+                    "old_text": old_stored_text,
+                    "new_text": new_text,
+                    "candidates": [],
+                    "reason": f"更新失败（{type(exc).__name__}），原记忆未动。",
+                }
+            # 验：id 还在、新文本对得上、搜旧内容找不回旧文本。
+            verified = self._verify_correction(mem_id, safe_new, old_stored_text)
+            if not verified["ok"]:
+                # 回滚：把旧文本和旧 metadata 写回去，再报失败。
+                try:
+                    self._memory.update(
+                        mem_id, text=old_stored_text, metadata=_provenance(
+                            old_metadata.get("source") or SOURCE_INFERRED,
+                            old_metadata.get("confidence")
+                            if isinstance(old_metadata.get("confidence"), (int, float))
+                            else CONFIDENCE_INFERRED,
+                            bool(old_metadata.get("user_confirmed")),
+                            created_at=old_metadata.get("created_at"),
+                        )
+                    )
+                except Exception:
+                    logger.warning("纠错回滚失败：记忆 %s 可能处于新旧混合状态。", mem_id, exc_info=True)
+                return {
+                    "status": "failed",
+                    "memory_id": mem_id,
+                    "old_text": old_stored_text,
+                    "new_text": new_text,
+                    "candidates": [],
+                    "reason": "更新后校验没过（%s），已尝试恢复原记忆。"
+                    % verified.get("reason", "未知原因"),
+                }
+            logger.info("已纠正记忆：id=%s。", mem_id)
+            return {
+                "status": "updated",
+                "memory_id": mem_id,
+                "old_text": old_stored_text,
+                "new_text": safe_new,
+                "candidates": [],
+                "reason": "",
+            }
+
+    def _verify_correction(self, mem_id, new_text, old_text):
+        """验纠错结果：id 还在、新文本对得上、搜旧内容找不回旧文本。
+
+        返回 {"ok": bool, "reason": 没过的原因}。搜旧内容时只看
+        “旧文本本身”还在不在结果里（新文本里可能也提到旧词，
+        比如“以前喜欢 Python，现在喜欢 Go”这种写法，那不算旧记忆还在）。
+        """
+        try:
+            current = {
+                item["id"]: item
+                for item in self.get_all(include_sensitive=True)
+            }
+        except Exception:
+            return {"ok": False, "reason": "校验时读库失败"}
+        item = current.get(mem_id)
+        if item is None:
+            return {"ok": False, "reason": "改完记忆不见了"}
+        if _normalize_memory_text(item.get("text") or "") != _normalize_memory_text(new_text):
+            return {"ok": False, "reason": "改完文本和新内容对不上"}
+        try:
+            found = self.search(old_text, top_k=5)
+        except Exception:
+            return {"ok": False, "reason": "校验时检索失败"}
+        for hit in found:
+            if _normalize_memory_text(hit.get("text") or "") == _normalize_memory_text(old_text):
+                return {"ok": False, "reason": "旧文本还能检索到"}
+        return {"ok": True, "reason": ""}
+
+    # ---------- 删除范围展示 / 删除日志（深度删除的配套工具） ----------
+
+    def deletion_scope(self, memory_id):
+        """展示一条记忆的删除范围（删之前给 BOOS 看、让他确认用）。
+
+        返回字典：
+          {"found": 是否找得到这条记忆,
+           "memory": {"id", "text", "metadata"} 或 None,
+           "history_entries": 这条记忆的审计行（history() 的原样返回）,
+           "history_count": 审计行数,
+           "in_scope": [在删除范围内的位置：向量库、history 表审计行],
+           "out_of_scope": [不在删除范围内的位置及原因：
+             history.db 的 messages 表（原始对话记录，不是记忆本身，
+             删记忆不动它；它也不会被重新提取——提取只对新轮次跑）；
+             日志文件（适配器日志只记 id 和条数，不记记忆原文，
+             所以没什么可删的）；BOOS 自己在 Agent 之外做的备份
+             （Agent 管不着，得 BOOS 自己处理）；Chroma 底层文件碎片
+             （delete 后查不到，但文件层的清理归 Chroma 管）]}
+        这个方法只读不删；删不删、删哪条，由 BOOS 看了范围之后决定，
+        再调 delete_memory(approve=True)。
+        """
+        owned = {
+            item["id"]: item
+            for item in self.get_all(include_sensitive=True)
+        }
+        memory = owned.get(memory_id) if memory_id else None
+        entries = self.history(memory_id) if memory_id else []
+        return {
+            "found": memory is not None,
+            "memory": memory,
+            "history_entries": entries,
+            "history_count": len(entries),
+            "in_scope": [
+                {
+                    "where": "向量库（Chroma，memory/mem0_chroma）",
+                    "what": "这条记忆的向量（1 条）",
+                },
+                {
+                    "where": "history.db 的 history 表",
+                    "what": f"这条记忆的审计行（{len(entries)} 条，含 ADD/UPDATE/DELETE 行，DELETE 行里还留着被删记忆的全文）",
+                },
+            ],
+            "out_of_scope": [
+                {
+                    "where": "history.db 的 messages 表",
+                    "what": "原始对话记录（说过什么话）",
+                    "why": "那是对话记录，不是记忆本身；删记忆不动它。它也不会被重新提取——提取只对新轮次跑，不会回头读旧对话。",
+                },
+                {
+                    "where": "日志文件（logs/）",
+                    "what": "运行日志",
+                    "why": "适配器日志只记记忆 id 和条数，不记记忆原文，所以日志里没有这条记忆的内容可删。",
+                },
+                {
+                    "where": "BOOS 自己在 Agent 之外做的备份",
+                    "what": "比如手动拷走的 memory/ 副本、旧 memories.json",
+                    "why": "Agent 管不着这些文件，删不掉；要清得 BOOS 自己处理。",
+                },
+                {
+                    "where": "Chroma 底层文件碎片",
+                    "what": "向量文件删除后留下的磁盘碎片",
+                    "why": "delete 后 get/search 都查不到，但文件层的彻底清理归 Chroma 管，适配器只能保证“查不到”，不能保证磁盘碎片里一个字节都不剩。",
+                },
+            ],
+        }
+
+    def _journal_path(self):
+        """删除日志的路径：history.db 同目录下的 delete-journal.json。
+
+        日志里只记 memory_id、文本的 SHA-256（不记原文）、审计行数
+        和开始时间——删了一半时能凭它查到“哪条没删完”，又不会因为
+        记日志反而把要忘掉的文本又留一份。
+        """
+        return Path(self.history_db_path).parent / "delete-journal.json"
+
+    def _journal_add(self, memory_id, text, history_count):
+        """删之前记一笔删除日志（删完验干净了再由 _journal_remove 清掉）。"""
+        try:
+            path = self._journal_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            pending = data.get("pending") or []
+            pending = [e for e in pending if e.get("memory_id") != memory_id]
+            pending.append(
+                {
+                    "memory_id": memory_id,
+                    "text_sha256": hashlib.sha256(
+                        (text or "").encode("utf-8")
+                    ).hexdigest(),
+                    "history_rows": history_count,
+                    "started_at": _now_iso(),
+                }
+            )
+            path.write_text(
+                json.dumps({"pending": pending}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("删除日志写入失败：继续删，但崩了会查不到这次删除。", exc_info=True)
+
+    def _journal_remove(self, memory_id):
+        """删完验干净了，清掉这条的删除日志。清不掉时只记日志，不报错
+        （删本身已经验干净了，日志残留不影响“已删干净”这个结论；
+        残留的日志里也没有原文，只有 id 和哈希）。"""
+        try:
+            path = self._journal_path()
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pending = [e for e in (data.get("pending") or []) if e.get("memory_id") != memory_id]
+            path.write_text(
+                json.dumps({"pending": pending}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("删除日志清理失败。", exc_info=True)
+
+    def list_pending_deletes(self):
+        """列出“删了一半”的删除日志（上次删除中途崩了、或删失败了留下的）。
+
+        返回列表，每项 {"memory_id", "text_sha256", "history_rows",
+        "started_at"}——只有 id 和哈希，没有原文。空列表就是没有
+        未完成的删除。调用方看到有未完成的，可以对那个 id 再调一次
+        delete_memory(approve=True) 补删（已删干净的会返回 False，
+        表示“已经没了”；history 还没清干净的会继续清）。
+        读不到/格式不对时返回 []，不抛异常。
+        """
+        try:
+            path = self._journal_path()
+            if not path.exists():
+                return []
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pending = data.get("pending") or []
+            return [e for e in pending if isinstance(e, dict) and e.get("memory_id")]
+        except (OSError, ValueError):
+            return []
+
+    def _purge_history_rows(self, memory_id):
+        """清掉 history.db 里这条记忆的全部审计行（深度删除的第二步）。
+
+        分两路（都要做，缺一路都不算清干净）：
+        1. 底层 memory 对象如果有 purge_history 方法（测试用的
+           FakeMemory 有），调它——返回删掉的行数。
+        2. 真实的 history.db 是个 sqlite 文件（表 history，列 memory_id /
+           old_memory / new_memory / event / is_deleted……）：直接连上去
+           DELETE WHERE memory_id=?，再 VACUUM 一下（把删掉的文本从
+           文件空闲页里也清掉，不然文本还躺在文件碎片里）。VACUUM
+           失败时（比如别的连接正占着库）只记日志、不报错，但结果里
+           vacuum_ok 记 False，调用方知道“行没了，但文件碎片不保证”。
+        history.db 文件不存在、或里面没有 history 表时，sqlite 这路
+        返回 0 行（没什么可清的，不算失败——FakeMemory 测试就是这样）。
+        返回 {"rows_removed": int, "rows_remaining": int, "vacuum_ok": bool}。
+        删 sqlite 行时万一报错，抛 RuntimeError（调用方按“删失败”处理，
+        绝不谎称删干净了）。
+        """
+        removed = 0
+        try:
+            purge = getattr(self._memory, "purge_history", None)
+            if callable(purge):
+                removed += int(purge(memory_id) or 0)
+        except Exception as exc:
+            raise RuntimeError(f"清审计行失败（内存里的审计记录）：{exc}") from exc
+        vacuum_ok = True
+        remaining = 0
+        db_path = Path(self.history_db_path)
+        if db_path.is_file():
+            try:
+                con = sqlite3.connect(str(db_path), timeout=5)
+                try:
+                    tables = {
+                        row[0]
+                        for row in con.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()
+                    }
+                    if "history" in tables:
+                        cols = {
+                            row[1]
+                            for row in con.execute("PRAGMA table_info(history)").fetchall()
+                        }
+                        if "memory_id" in cols:
+                            cur = con.execute(
+                                "DELETE FROM history WHERE memory_id = ?",
+                                (memory_id,),
+                            )
+                            removed += cur.rowcount or 0
+                            con.commit()
+                            remaining = con.execute(
+                                "SELECT COUNT(*) FROM history WHERE memory_id = ?",
+                                (memory_id,),
+                            ).fetchone()[0]
+                finally:
+                    con.close()
+                # VACUUM：把删掉的文本从文件空闲页里也清掉。失败时
+                # （比如别的连接占着库）不报错，只记 vacuum_ok=False。
+                try:
+                    con = sqlite3.connect(str(db_path), timeout=5)
+                    try:
+                        con.execute("VACUUM")
+                        con.commit()
+                    finally:
+                        con.close()
+                except Exception:
+                    vacuum_ok = False
+                    logger.warning("深度删除：history.db VACUUM 失败，文件碎片里可能还留着文本。", exc_info=True)
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"清审计行失败（history.db）：{exc}") from exc
+        return {
+            "rows_removed": removed,
+            "rows_remaining": remaining,
+            "vacuum_ok": vacuum_ok,
+        }
+
+    def verify_forgotten(self, memory_id, old_text=None):
+        """验一条记忆是不是真的忘干净了（深度删除的第三步）。
+
+        查三处：向量库里没有这个 id；history() 查不到审计行；
+        用旧内容搜，搜不到旧文本本身。返回
+        {"ok": bool, "vector_gone": bool, "history_clean": bool,
+         "search_empty": bool, "history_rows_remaining": int}。
+        搜旧内容时只看“旧文本本身”在不在（新文本里提到旧词不算）。
+        出错时对应项记 False（验不出来就当没干净，不谎称干净）。
+        """
+        vector_gone = True
+        try:
+            vector_gone = not any(
+                item["id"] == memory_id
+                for item in self.get_all(include_sensitive=True)
+            )
+        except Exception:
+            vector_gone = False
+        history_clean = False
+        history_rows = 0
+        try:
+            history_rows = len(self.history(memory_id))
+            history_clean = history_rows == 0
+        except Exception:
+            history_rows = -1
+        search_empty = True
+        if old_text:
+            try:
+                for hit in self.search(old_text, top_k=5):
+                    if _normalize_memory_text(hit.get("text") or "") == _normalize_memory_text(old_text):
+                        search_empty = False
+                        break
+            except Exception:
+                search_empty = False
+        return {
+            "ok": bool(vector_gone and history_clean and search_empty),
+            "vector_gone": vector_gone,
+            "history_clean": history_clean,
+            "search_empty": search_empty,
+            "history_rows_remaining": history_rows,
+        }
 
     def delete_memory(self, memory_id, approve=False):
-        """删一条记忆（两道关，缺一个都不删）。
+        """删一条记忆（深度删除：向量 + history 审计行都清掉）。
 
+        三道关，缺一个都不删：
         第一道：归属校验——这条记忆必须属于当前用户（在 get_all() 里
         能找到这个 id），别人的记忆删不掉（mem0 的 delete(id) 本身
         不校验归属，这里补上）。
         第二道：BOOS 明确同意——调用方必须传 approve=True，否则报
         PermissionError。删除记忆必须经过 BOOS 同意，不能悄悄删。
-        两道都过了才调 mem0.delete(id)。返回 True；找不到记忆时
-        返回 False（已经没了，也算删干净了）；mem0 报错时抛异常，
+        调用方在传 approve=True 之前，必须先调 deletion_scope()
+        把删除范围展示给 BOOS 看（删哪条、删几行历史、哪些地方
+        不在删除范围内），BOOS 看过、点了确认，才算同意。
+        第三道：验干净——向量删掉、history 行清掉之后，验三处都干净
+        （见 verify_forgotten）才返回 True；验不过、或中间哪步报错，
+        抛 RuntimeError（并在异常信息里写清“向量删了没有、history
+        还剩几行”），绝不返回 True 谎称删干净了。
+        流程（删之前先写删除日志，见 _journal_add）：
+        1. 归属校验 + 记删除日志（只含 id 和文本哈希，不含原文）；
+        2. 调 mem0.delete(id) 删向量；
+        3. 清 history 行（内存审计 + history.db，见 _purge_history_rows）；
+        4. 验三处都干净，清删除日志，返回 True。
+        返回 True（删干净了）；找不到记忆时返回 False（已经没了，
+        也算删干净了）；mem0 报错、清 history 失败、验不过时抛异常，
         调用方决定怎么处理。
         注意：归属校验要用 include_sensitive=True 的 get_all——
         旧库里已有的敏感记忆也要能删掉，不能因为它含敏感信息
         就查不到、删不掉。
         注意：现在还没有删除的网页界面/命令行入口，这个方法是给以后
-        的删除入口准备的；任何入口调它之前，都必须先问 BOOS。
+        的删除入口准备的；任何入口调它之前，都必须先问 BOOS，
+        并先展示 deletion_scope()。
+        注意：删完不会“复活”——提取只对新轮次的对话跑（add_turn 只
+        处理传进来的最近几轮消息），不会回头把旧对话、旧 history
+        再提取一遍；所以一条被忘掉的记忆，只有 BOOS 重新说起它，
+        才会被重新记下来。不要另建一个后台整理任务去重提旧内容，
+        那会把忘掉的东西捞回来。
         """
         if not approve:
             raise PermissionError("删除记忆需要 BOOS 同意：请先确认再删。")
         if not memory_id:
             return False
         with _WRITE_LOCK:
-            owned_ids = {item["id"] for item in self.get_all(include_sensitive=True)}
-            if memory_id not in owned_ids:
+            owned = {
+                item["id"]: item
+                for item in self.get_all(include_sensitive=True)
+            }
+            if memory_id not in owned:
                 logger.warning("删除被拒：记忆 %s 不属于当前用户。", memory_id)
                 return False
-            self._memory.delete(memory_id)
-            logger.info("已删除记忆：id=%s。", memory_id)
+            old_text = owned[memory_id].get("text") or ""
+            history_count = len(self.history(memory_id))
+            self._journal_add(memory_id, old_text, history_count)
+            try:
+                self._memory.delete(memory_id)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"删除失败：向量没删掉（{type(exc).__name__}），"
+                    "记忆还在库里，history 也没动。"
+                ) from exc
+            logger.info("已删除记忆向量：id=%s。", memory_id)
+            try:
+                purge = self._purge_history_rows(memory_id)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"删除了一半：向量已删，但清 history 失败（{exc}），"
+                    f"history 可能还剩审计行。请对 {memory_id} 再删一次补清，"
+                    "或手动检查 history.db。"
+                ) from exc
+            verified = self.verify_forgotten(memory_id, old_text)
+            if not verified["ok"]:
+                raise RuntimeError(
+                    "删除了一半：向量已删，但校验没过——"
+                    f"向量已清={verified['vector_gone']}，"
+                    f"history 已清={verified['history_clean']}，"
+                    f"检索已空={verified['search_empty']}，"
+                    f"history 还剩 {verified['history_rows_remaining']} 行。"
+                    f"请对 {memory_id} 再删一次补清，或手动检查 history.db。"
+                )
+            if not purge["vacuum_ok"]:
+                logger.warning(
+                    "删除已验干净，但 history.db VACUUM 没成，文件碎片里可能还留着文本。"
+                )
+            self._journal_remove(memory_id)
+            logger.info(
+                "已深度删除记忆：id=%s，history 清掉 %d 行。",
+                memory_id,
+                purge["rows_removed"],
+            )
             return True
 
     def history(self, memory_id):
@@ -1042,7 +1836,10 @@ class Mem0Store:
 
         返回：历史条目列表（每项含 old/new 内容与时间戳），
         查不到或出错时返回空列表，不抛异常。
-        删除过的记忆，历史里仍能查到（is_deleted=True），有据可查。
+        注意：用 delete_memory() 深度删过的记忆，历史行也被清掉了，
+        这里查不到（返回 []）——“删过的记忆历史里还能查到”是旧行为，
+        深度删除改掉了它。只改过（correct_memory）的记忆，历史里
+        还留着 UPDATE 审计行（旧文本在 old_memory 里），有据可查。
         """
         try:
             result = self._memory.history(memory_id)

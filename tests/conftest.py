@@ -35,11 +35,18 @@ class FakeMemory:
     """模拟 mem0 2.2.1 的 Memory 对象（离线假对象）。
 
     只实现 Mem0Store 用到的几个方法，签名和返回形状和真实 mem0 对齐：
-      - add(messages, user_id=None, infer=True) -> {"results": [{"id", "memory", "event"}]}
-      - search(query, filters=None, top_k=5) -> {"results": [{"id", "memory", "score"}]}
-      - get_all(filters=None) -> {"results": [{"id", "memory"}]}
+      - add(messages, user_id=None, infer=True, metadata=None) -> {"results": [{"id", "memory", "event"}]}
+      - search(query, filters=None, top_k=5) -> {"results": [{"id", "memory", "score", "metadata"}]}
+      - get_all(filters=None) -> {"results": [{"id", "memory", "metadata"}]}
+      - update(memory_id, text=None, metadata=None) -> {"message": "Memory updated successfully!"}
       - delete(memory_id) -> {"deleted": True}
-      - history(memory_id) -> [审计条目]（这里只记 ADD 事件）
+      - history(memory_id) -> [审计条目]（ADD / UPDATE / DELETE 事件）
+      - purge_history(memory_id) -> 删掉的审计行数（适配器做深度删除时调，
+        对应真实 mem0 里直接清 history.db 里该 memory_id 的行——真实
+        mem0 没有这个方法，见 _purge_history_rows）
+    每条记忆都带一份 metadata（来源/时间/置信度/是否用户确认），
+    add 时传进来的 metadata 原样存下来，search/get_all 原样返回；
+    没传 metadata 就存 None（模拟 2026-11-09 之前存的旧记忆）。
     另有测试辅助属性：
       - add_calls：每次 add() 的 (messages, user_id, infer) 记录，
         供测试断言“某流程确实调了 add / 没调 add”。
@@ -75,18 +82,25 @@ class FakeMemory:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._items = []  # 每项 {"id", "memory"}，按存入顺序
+        self._items = []  # 每项 {"id", "memory", "metadata"}，按存入顺序
         self._history = {}  # id -> [审计条目]
         self._next_id = 1
         self.add_calls = []  # 每次 add() 的 (messages, user_id, infer)
+        self.update_calls = []  # 每次 update() 的 (memory_id, text, metadata) 记录
 
     # ---------- 内部工具 ----------
 
-    def _store(self, text):
-        """存一条记忆文本，返回新 id。调用方需已持有锁。"""
+    def _store(self, text, metadata=None):
+        """存一条记忆文本，返回新 id。调用方需已持有锁。
+
+        metadata 原样存下来（不做校验——适配器负责拼好它）；
+        没传就是 None，模拟旧记忆“没有来源信息”的样子。
+        """
         mem_id = f"fake-{self._next_id}"
         self._next_id += 1
-        self._items.append({"id": mem_id, "memory": text})
+        self._items.append(
+            {"id": mem_id, "memory": text, "metadata": dict(metadata) if metadata else None}
+        )
         self._history.setdefault(mem_id, []).append({"event": "ADD", "memory": text})
         return mem_id
 
@@ -107,9 +121,14 @@ class FakeMemory:
 
     # ---------- mem0 Memory 接口 ----------
 
-    def add(self, messages, user_id=None, infer=True):
+    def add(self, messages, user_id=None, infer=True, metadata=None):
         """存记忆。infer=False 时把消息内容原文各存一条；infer=True 时
-        按上面的提取规则从 user 消息里提事实句再存。"""
+        按上面的提取规则从 user 消息里提事实句再存。
+
+        metadata（有就原样存到每条新记忆上，没传就存 None）：
+        真实 mem0 2.2.1 的 add 接受 metadata 字典，提取出的每条记忆
+        都带上它，search 再把它原样返回（见 mem0_store 的来源说明）。
+        """
         with self._lock:
             self.add_calls.append((list(messages or []), user_id, infer))
             stored = []
@@ -118,7 +137,7 @@ class FakeMemory:
                 if not infer:
                     # 原文存入：infer=False 不提取、不改写，内容是什么就存什么。
                     if content.strip():
-                        mem_id = self._store(content.strip())
+                        mem_id = self._store(content.strip(), metadata=metadata)
                         stored.append({"id": mem_id, "memory": content.strip(), "event": "ADD"})
                     continue
                 if (message or {}).get("role") != "user":
@@ -126,7 +145,7 @@ class FakeMemory:
                     # 第 3 条：不要把模型的建议/判断存成用户事实）。
                     continue
                 for sentence in self._extract_sentences(content):
-                    mem_id = self._store(sentence)
+                    mem_id = self._store(sentence, metadata=metadata)
                     stored.append({"id": mem_id, "memory": sentence, "event": "ADD"})
             return {"results": stored}
 
@@ -149,29 +168,89 @@ class FakeMemory:
                         "id": item["id"],
                         "memory": item["memory"],
                         "score": hits / denom,
+                        "metadata": dict(item["metadata"]) if item.get("metadata") else None,
                     }
                 )
             scored.sort(key=lambda entry: entry["score"], reverse=True)
             return {"results": scored[:top_k]}
 
     def get_all(self, filters=None):
-        """返回全部已存记忆（id + 文本）。"""
+        """返回全部已存记忆（id + 文本 + metadata）。"""
         with self._lock:
             return {
                 "results": [
-                    {"id": item["id"], "memory": item["memory"]} for item in self._items
+                    {
+                        "id": item["id"],
+                        "memory": item["memory"],
+                        "metadata": dict(item["metadata"]) if item.get("metadata") else None,
+                    }
+                    for item in self._items
                 ]
             }
 
-    def delete(self, memory_id):
-        """删掉一条记忆（按 id）。找不到时什么也不做。"""
+    def update(self, memory_id, text=None, metadata=None):
+        """改一条记忆的文本（和/或 metadata），保留同一 id。
+
+        行为对齐真实 mem0 2.2.1（试跑 Test 5 实测）：改完检索到的是
+        新文本；history 里多一条 UPDATE 审计（old_memory 是旧文本，
+        new_memory 是新文本）；找不到的 id 抛 ValueError。
+        metadata 传了就替换整份（不是合并），不传就保留旧的。
+        """
         with self._lock:
-            self._items = [item for item in self._items if item["id"] != memory_id]
-            self._history.pop(memory_id, None)
-            return {"deleted": True}
+            self.update_calls.append((memory_id, text, metadata))
+            for item in self._items:
+                if item["id"] == memory_id:
+                    old_text = item["memory"]
+                    new_text = text if text is not None else old_text
+                    item["memory"] = new_text
+                    if metadata is not None:
+                        item["metadata"] = dict(metadata)
+                    self._history.setdefault(memory_id, []).append(
+                        {
+                            "event": "UPDATE",
+                            "old_memory": old_text,
+                            "new_memory": new_text,
+                        }
+                    )
+                    return {"message": "Memory updated successfully!"}
+            raise ValueError(f"Memory with id {memory_id} not found")
+
+    def delete(self, memory_id):
+        """删掉一条记忆（按 id）。
+
+        对齐真实 mem0 2.2.1（试跑 Test 5、lifecycle 实测）：向量删掉、
+        检索查不到，但 history 里留一条 DELETE 审计（old_memory 是
+        被删的全文，is_deleted=True）——这正是深度删除要补的缺口：
+        光调 delete()，文本还留在 history.db 里。所以适配器的
+        delete_memory() 删完向量还要再清 history（见 purge_history
+        和 mem0_store._purge_history_rows）。找不到的 id 抛 ValueError
+        （真实 mem0 也是这样，见 Test 5 步骤 7c）；适配器在调之前
+        先做归属校验，不会把不存在的 id 传进来。
+        """
+        with self._lock:
+            for item in list(self._items):
+                if item["id"] == memory_id:
+                    self._items.remove(item)
+                    self._history.setdefault(memory_id, []).append(
+                        {"event": "DELETE", "old_memory": item["memory"], "is_deleted": True}
+                    )
+                    return {"deleted": True}
+            raise ValueError(f"Memory with id {memory_id} not found")
+
+    def purge_history(self, memory_id):
+        """删掉一条记忆的全部审计行（模拟适配器清 history.db 的那一步）。
+
+        真实 mem0 没有这个方法：真实的清法是直接对 history.db 的
+        history 表 DELETE WHERE memory_id=?（见 mem0_store
+        的 _purge_history_rows）。假对象没有 sqlite 文件，所以用
+        这个方法模拟“审计行已被清掉”的结果，返回值是删掉的行数。
+        """
+        with self._lock:
+            removed = len(self._history.pop(memory_id, []))
+            return removed
 
     def history(self, memory_id):
-        """返回一条记忆的审计记录（这里只记了 ADD 事件）；没有时返回 []。"""
+        """返回一条记忆的审计记录（ADD / UPDATE / DELETE 事件）；没有时返回 []。"""
         with self._lock:
             return list(self._history.get(memory_id, []))
 
@@ -217,5 +296,13 @@ def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4):
 #    Chroma + history.db 里，重启还在。持久化靠真实 API 测试（试跑 Test 6）覆盖。
 # 5. 没有用量：FakeMemory.add 不调 LLM、不产生 Token；用量包装测试用的
 #    是另一个带假 LLM 客户端的对象（见 tests/test_mem0_store.py）。
-# 6. history 只有 ADD 事件：真实 mem0 的 history.db 记每次修改/删除；
-#    FakeMemory 只记了存入事件，够测“history() 返回列表、不抛异常”即可。
+# 6. history 记 ADD / UPDATE / DELETE 三种事件：真实 mem0 的 history.db
+#    也记这三种（UPDATE 行留 old_memory，DELETE 行留 old_memory 全文、
+#    is_deleted=True）；适配器的深度删除（delete_memory）就是要把这些
+#    行清掉，假对象用 purge_history() 模拟那一步（真实 mem0 没有这个
+#    方法，清法是直接对 history.db 做 DELETE，见 mem0_store）。
+# 7. delete 找不到的 id 时抛 ValueError（对齐真实 mem0，见试跑 Test 5
+#    步骤 7c）；适配器在调之前先做归属校验，不会把不存在的 id 传进来。
+# 8. update / metadata 是假的“够测流程”的近似：真实 mem0 的 update
+#    会重新算向量、写 UPDATE 审计行，metadata 是随记忆一起存进 Chroma
+#    的；假对象只改内存里的文本和 metadata 字典，不算向量。
