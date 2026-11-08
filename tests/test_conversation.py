@@ -14,6 +14,7 @@ import requests
 
 from config import BudgetTracker
 from main import chat_loop, is_exit_command, main, run_question
+from memory.memories import MemoryStore
 from providers.deepseek import DeepSeekProvider
 from providers.muse import MuseProvider
 
@@ -360,8 +361,9 @@ def test_chat_loop_demo_mode_does_not_call_api(monkeypatch, tmp_path):
 def test_main_with_arg_is_single_question(monkeypatch, tmp_path):
     """main() 带参数时为单次问答：python main.py "你好" 只问一次，不进入循环。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    store = MemoryStore(file_path=tmp_path / "memories.json")
     with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
-        assert main(["你好"]) == 0
+        assert main(["你好"], memory_store=store) == 0
         mock_post.assert_called_once()
         assert mock_post.call_args.kwargs["json"]["messages"] == [
             {"role": "user", "content": "你好"}
@@ -371,11 +373,12 @@ def test_main_with_arg_is_single_question(monkeypatch, tmp_path):
 def test_main_without_arg_enters_chat_loop(monkeypatch, tmp_path):
     """main() 不带参数时进入连续对话：python main.py 后可多轮对话，exit 结束。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    store = MemoryStore(file_path=tmp_path / "memories.json")
     with (
         patch("builtins.input", side_effect=["你好", "exit"]),
         patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post,
     ):
-        assert main([]) == 0
+        assert main([], memory_store=store) == 0
         mock_post.assert_called_once()
 
 
