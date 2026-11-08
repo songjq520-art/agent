@@ -22,6 +22,21 @@
 #                        "usage": Token 用量}；
 #                        出错时返回 {"error": 原因}。
 #   POST /api/reset   → 清空本轮对话历史，返回 {"ok": true}。
+#   GET  /api/memories → 已存记忆列表（JSON {"memories": [...], "mem0_enabled": bool}，
+#                        每条含 id、text、metadata：source/created_at/confidence/
+#                        user_confirmed/confirmed；记忆未启用时列表为空）。
+#   GET  /api/memories/<id>/scope → 删除范围预览（deletion_scope 的原样返回：
+#                        删哪条、删几行 history、哪些地方不在删除范围内）。
+#   POST /api/memories/<id>/forget → 忘一条记忆，请求 JSON {"confirmed": true}，
+#                        只有 confirmed 为 true 才调 delete_memory(approve=True)；
+#                        没确认时回 400、什么都不删。
+#   POST /api/memories/correct → 纠正一条记忆，请求 JSON
+#                        {"memory_id": id（页面上选的那条，优先用它）,
+#                         "old_text": 旧内容（没选 id 时用它找）,
+#                         "new_text": 正确的说法}，
+#                        返回 correct_memory 的状态字典（updated / ambiguous /
+#                        not_found / unchanged / failed）；ambiguous 时带候选列表，
+#                        由页面让 BOOS 选一条再提交，不猜。
 #
 # 注意（给以后看代码的人）：
 #   - 对话历史只保存在内存里（ChatState.messages），重启服务后清空；
@@ -47,6 +62,7 @@ import traceback
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 # 让直接运行 python web/server.py 也能找到项目根目录的 main.py、config.py。
 # 用 python -m web.server 运行时本来就不需要这一行，加上也不影响。
@@ -198,6 +214,97 @@ class ChatState:
                 "usage": result.get("usage"),
             }
 
+    # ---------- 长期记忆管理（“长期记忆”页面用） ----------
+    # 原则：网页层只做“传话”——列出、展示范围、把 BOOS 的确认传下去；
+    # 真正的忘（深度删除）和改（纠错）都在 Mem0Store 里，
+    # 走同一套删除两道关（归属校验 + approve=True）和纠错流程，
+    # 网页层不自己实现删除/纠正，也绝不绕过它们。
+
+    def list_memories(self):
+        """返回已存记忆列表（供页面展示用）。
+
+        每项是 get_all() 的原样返回：{"id", "text", "metadata"}，
+        metadata 里有 source（user/inferred/unconfirmed）、created_at
+        （形成时间）、confidence、user_confirmed/confirmed。
+        记忆未启用时返回空列表；读失败时也返回空列表（页面显示“暂无记忆”，
+        不拦聊天）。
+        """
+        with self._lock:
+            if self.mem0_store is None:
+                return []
+            try:
+                return self.mem0_store.get_all()
+            except Exception:
+                logger.warning("读记忆列表失败。", exc_info=True)
+                return []
+
+    def memory_scope(self, memory_id):
+        """返回一条记忆的删除范围（deletion_scope 的原样返回）。
+
+        记忆未启用时返回 None；其他错误时也返回 None（调用方按“找不到”处理）。
+        这个方法只读不删——删不删由 BOOS 看了范围、点了确认之后，
+        再调 forget_memory() 决定。
+        """
+        with self._lock:
+            if self.mem0_store is None:
+                return None
+            try:
+                return self.mem0_store.deletion_scope(memory_id)
+            except Exception:
+                logger.warning("取删除范围失败：id=%s。", memory_id, exc_info=True)
+                return None
+
+    def forget_memory(self, memory_id, confirmed):
+        """忘一条记忆（深度删除）。
+
+        confirmed 必须是 True——BOOS 在页面上看了删除范围、点了“确认删除”，
+        才算同意。没确认时抛 PermissionError，什么都不删；
+        适配器里 delete_memory(approve=True) 那道关也还在，
+        两道关缺一个都不删。
+        记忆未启用时抛 RuntimeError。
+        返回 True（删干净了）或 False（这条记忆已经不在库里了）；
+        删了一半、验不过时抛 RuntimeError（信息里写清删到哪一步了，
+        调用方把原话展示给 BOOS，让他决定补删还是手动检查）。
+        """
+        with self._lock:
+            if not confirmed:
+                raise PermissionError("删除记忆需要先确认删除范围。")
+            if self.mem0_store is None:
+                raise RuntimeError("记忆未启用。")
+            return self.mem0_store.delete_memory(memory_id, approve=True)
+
+    def correct_memory(self, old_text, new_text, memory_id=None):
+        """纠正一条记忆（返回 correct_memory 的状态字典）。
+
+        memory_id 是页面上选的那条记忆的 id：给了就先按 id 取准旧文本
+        再纠正——原文对上了就不用猜，多条相似也不怕；
+        没给时按 old_text 找（找不到/对上多条时返回 not_found/ambiguous，
+        让页面问 BOOS，不猜、不改）。
+        记忆未启用时抛 RuntimeError。
+        """
+        with self._lock:
+            if self.mem0_store is None:
+                raise RuntimeError("记忆未启用。")
+            if memory_id:
+                # 按 id 取准旧文本：get_all 里找得到才纠，找不到说明
+                # 这条已经被删了，直接报 not_found，不凭空改。
+                owned = {
+                    item["id"]: item
+                    for item in self.mem0_store.get_all(include_sensitive=True)
+                }
+                item = owned.get(memory_id)
+                if item is None:
+                    return {
+                        "status": "not_found",
+                        "memory_id": None,
+                        "old_text": None,
+                        "new_text": new_text,
+                        "candidates": [],
+                        "reason": "库里没有这条记忆，可能已经被删了。",
+                    }
+                old_text = item["text"]
+            return self.mem0_store.correct_memory(old_text, new_text)
+
 
 def make_handler(state, authenticator=None):
     """按给定的对话状态，生成一个请求处理类。
@@ -213,7 +320,12 @@ def make_handler(state, authenticator=None):
     """
 
     class ChatHandler(BaseHTTPRequestHandler):
-        """处理网页请求的类：只认下面四个地址，其他一律 404。"""
+        """处理网页请求的类：只认下面列出的地址，其他一律 404。
+
+        聊天：GET /、GET /api/status、POST /api/chat、POST /api/reset；
+        记忆管理：GET /api/memories、GET /api/memories/<id>/scope、
+        POST /api/memories/<id>/forget、POST /api/memories/correct。
+        """
 
         # 日志只写到 Python 的 logging（不往页面里写），保持安静：
         # 每次请求只记一行方法和地址，不记消息内容（消息里可能有隐私）。
@@ -270,14 +382,60 @@ def make_handler(state, authenticator=None):
         def do_GET(self):  # noqa: N802 - 标准库要求的名字
             self._handle_safely(self._do_get)
 
+        def _read_json_body(self):
+            """读 POST 请求体并解析成 JSON 对象。
+
+            返回 (payload, error, status)：成功时 payload 是字典、
+            error 是 None；失败时 payload 是 None、error 是给前端看的
+            错误信息、status 是对应的 HTTP 状态码。
+            Content-Length 无效、请求体不是合法 JSON、或解析出来不是
+            JSON 对象时，都在这里拦住（和 /api/chat 原来那套校验一致）。
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return None, "请求头 Content-Length 无效。", 400
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return None, "请求不是合法的 JSON。", 400
+            if not isinstance(payload, dict):
+                return None, '请求内容必须是 JSON 对象，例如 {"message": "你好"}。', 400
+            return payload, None, 200
+
         def _do_get(self):
             if not self._check_auth():
                 self._send_json({"error": "未授权：请先通过身份验证。"}, status=401)
                 return
-            if self.path in ("/", "/index.html"):
+            # 问号后面是查询参数（比如 ?x=1），路由只看问号前面的路径。
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
                 self._send_html()
-            elif self.path == "/api/status":
+            elif path == "/api/status":
                 self._send_json(state.status())
+            elif path == "/api/memories":
+                # 记忆列表：记忆未启用时 mem0_enabled 为 False、列表为空，
+                # 页面据此显示“记忆未启用”，不报错。
+                self._send_json(
+                    {
+                        "mem0_enabled": state.mem0_store is not None,
+                        "memories": state.list_memories(),
+                    }
+                )
+            elif path.startswith("/api/memories/") and path.endswith("/scope"):
+                # 删除范围预览：GET /api/memories/<id>/scope。
+                # id 在路径中间那段（可能含 URL 编码，先解码再查）。
+                memory_id = unquote(path[len("/api/memories/") : -len("/scope")].strip("/"))
+                if state.mem0_store is None:
+                    self._send_json({"error": "记忆未启用。"}, status=503)
+                    return
+                scope = state.memory_scope(memory_id)
+                if scope is None or not scope.get("found"):
+                    self._send_json(
+                        {"error": "找不到这条记忆，可能已经被删了。"}, status=404
+                    )
+                    return
+                self._send_json(scope)
             else:
                 # 中文错误信息放 JSON 正文里（UTF-8 安全），不用 send_error，
                 # 因为它的状态行只能用 latin-1，中文放不进去。
@@ -290,11 +448,80 @@ def make_handler(state, authenticator=None):
             if not self._check_auth():
                 self._send_json({"error": "未授权：请先通过身份验证。"}, status=401)
                 return
-            if self.path == "/api/reset":
+            path = self.path.split("?", 1)[0]
+            if path == "/api/reset":
                 state.reset()
                 self._send_json({"ok": True})
                 return
-            if self.path != "/api/chat":
+            if path.startswith("/api/memories/") and path.endswith("/forget"):
+                # 忘一条记忆：POST /api/memories/<id>/forget，请求 {"confirmed": true}。
+                # confirmed 不是 true 时回 400、什么都不删——删除的确认必须
+                # 是 BOOS 在页面上看了范围之后点的，不能靠前端默认带上。
+                memory_id = unquote(path[len("/api/memories/") : -len("/forget")].strip("/"))
+                payload, error, status = self._read_json_body()
+                if error is not None:
+                    self._send_json({"error": error}, status=status)
+                    return
+                if payload.get("confirmed") is not True:
+                    self._send_json(
+                        {"error": "删除前请先确认删除范围：请先查看删除范围，再点“确认删除”。"},
+                        status=400,
+                    )
+                    return
+                if state.mem0_store is None:
+                    self._send_json({"error": "记忆未启用。"}, status=503)
+                    return
+                try:
+                    deleted = state.forget_memory(memory_id, confirmed=True)
+                except PermissionError as exc:
+                    # 理论上走不到（上面已确认、这里传 approve=True），
+                    # 万一适配器那道关拦住了，按 403 回，不删。
+                    self._send_json({"error": str(exc)}, status=403)
+                    return
+                except RuntimeError as exc:
+                    # 删了一半、验不过：把适配器写清的进度原样告诉 BOOS
+                    # （只含 id 和行数，不含记忆原文），让他决定补删还是手动检查。
+                    self._send_json({"error": f"删除失败：{exc}"}, status=500)
+                    return
+                if deleted:
+                    self._send_json({"ok": True, "deleted": True})
+                else:
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "deleted": False,
+                            "reason": "这条记忆已经不在库里了。",
+                        }
+                    )
+                return
+            if path == "/api/memories/correct":
+                # 纠正一条记忆：POST /api/memories/correct，请求
+                # {"memory_id": id（页面上选的那条）, "old_text": 旧内容,
+                #  "new_text": 正确的说法}。memory_id 和 old_text 至少给一个；
+                # new_text 不能为空。返回 correct_memory 的状态字典，
+                # ambiguous 时带候选列表，页面让 BOOS 选一条再提交。
+                payload, error, status = self._read_json_body()
+                if error is not None:
+                    self._send_json({"error": error}, status=status)
+                    return
+                memory_id = str(payload.get("memory_id") or "").strip() or None
+                old_text = str(payload.get("old_text") or "").strip()
+                new_text = str(payload.get("new_text") or "").strip()
+                if not new_text:
+                    self._send_json({"error": "请输入纠正后的内容。"}, status=400)
+                    return
+                if not memory_id and not old_text:
+                    self._send_json(
+                        {"error": "请先选一条要纠正的记忆，或写明旧内容。"}, status=400
+                    )
+                    return
+                if state.mem0_store is None:
+                    self._send_json({"error": "记忆未启用。"}, status=503)
+                    return
+                result = state.correct_memory(old_text, new_text, memory_id=memory_id)
+                self._send_json(result)
+                return
+            if path != "/api/chat":
                 self._send_json({"error": "没有这个地址。"}, status=404)
                 return
             try:

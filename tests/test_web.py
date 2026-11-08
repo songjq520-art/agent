@@ -730,3 +730,316 @@ def test_main_refuses_non_loopback_without_auth(capsys, monkeypatch):
     assert "启动失败" in captured.err
     assert "不是本机回环地址" in captured.err
     assert "身份验证" in captured.err
+
+
+# ---------- 长期记忆管理（忘记 / 纠正的网页界面） ----------
+
+
+@pytest.fixture
+def running_server_with_real_mem0(tmp_path):
+    """启动一个带真实 Mem0Store（底下是 FakeMemory，见 tests/conftest.py）
+    的测试服务，供记忆管理接口的测试用。
+
+    库里已种好三条记忆（都是 BOOS 亲口说的、已确认）：
+    “我喜欢喝咖啡。”（fake-1）、“我喜欢喝茶。”（fake-2）、
+    “我叫小宋。”（fake-3）。
+    返回 (port, state, store)：测试里可以直接看 store.get_all()
+    核对记忆到底变没变。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我喜欢喝咖啡。")
+    store.add_memory_text("我喜欢喝茶。")
+    store.add_memory_text("我叫小宋。")
+    server, port, state = _start_test_server(tmp_path, mem0_store=store)
+    try:
+        yield port, state, store
+    finally:
+        _stop_test_server(server)
+
+
+def _memory_texts(port):
+    """GET /api/memories，返回当前库里的记忆文本列表（按返回顺序）。"""
+    status, _ct, data = _request(port, "GET", "/api/memories")
+    assert status == 200
+    return [item["text"] for item in data["memories"]]
+
+
+def test_memories_list_returns_memories_with_metadata(running_server_with_real_mem0):
+    """GET /api/memories：返回全部三条记忆，每条带 id、文本和来源元数据
+    （source/created_at/confidence/user_confirmed/confirmed）。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(port, "GET", "/api/memories")
+    assert status == 200
+    assert data["mem0_enabled"] is True
+    assert [item["text"] for item in data["memories"]] == [
+        "我喜欢喝咖啡。",
+        "我喜欢喝茶。",
+        "我叫小宋。",
+    ]
+    assert [item["id"] for item in data["memories"]] == ["fake-1", "fake-2", "fake-3"]
+    for item in data["memories"]:
+        meta = item["metadata"]
+        assert meta["source"] == "user"
+        assert meta["user_confirmed"] is True
+        assert meta["confirmed"] is True
+        assert meta["confidence"] == 1.0
+        assert meta["created_at"]  # 形成时间有值
+
+
+def test_memories_list_without_store_returns_empty_and_disabled(running_server):
+    """没带记忆库启动时：GET /api/memories 返回 mem0_enabled False、列表为空，
+    不报错，页面据此显示“记忆未启用”。"""
+    port, _state = running_server
+    status, _ct, data = _request(port, "GET", "/api/memories")
+    assert status == 200
+    assert data["mem0_enabled"] is False
+    assert data["memories"] == []
+
+
+def test_memory_scope_returns_deletion_scope(running_server_with_real_mem0):
+    """GET /api/memories/<id>/scope：返回删除范围——找得到这条记忆、
+    有 1 条 history 审计行、删的范围和不删的范围都列出来了。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(port, "GET", "/api/memories/fake-1/scope")
+    assert status == 200
+    assert data["found"] is True
+    assert data["memory"]["id"] == "fake-1"
+    assert data["memory"]["text"] == "我喜欢喝咖啡。"
+    assert data["history_count"] == 1
+    assert len(data["history_entries"]) == 1
+    assert data["history_entries"][0]["event"] == "ADD"
+    # 删的范围：向量库 + history 审计行。
+    assert len(data["in_scope"]) == 2
+    assert "向量库" in data["in_scope"][0]["where"]
+    # 不删的范围：原始对话记录、日志、BOOS 自己的备份、Chroma 文件碎片。
+    assert len(data["out_of_scope"]) == 4
+    assert "messages" in data["out_of_scope"][0]["where"]
+    assert "备份" in data["out_of_scope"][2]["where"]
+
+
+def test_memory_scope_unknown_id_returns_404(running_server_with_real_mem0):
+    """删除范围预览查一个不存在的 id：返回 404，说明这条记忆已经不在库里了。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(port, "GET", "/api/memories/fake-999/scope")
+    assert status == 404
+    assert "找不到这条记忆" in data["error"]
+
+
+def test_memory_scope_without_store_returns_503(running_server):
+    """没带记忆库时：删除范围预览返回 503“记忆未启用”，不崩。"""
+    port, _state = running_server
+    status, _ct, data = _request(port, "GET", "/api/memories/fake-1/scope")
+    assert status == 503
+    assert "记忆未启用" in data["error"]
+
+
+def test_forget_without_confirmation_returns_400_and_keeps_memory(
+    running_server_with_real_mem0,
+):
+    """忘一条记忆但没确认（confirmed 不是 true / 干脆没传）时：
+    返回 400，记忆还在库里，一条都没少——没确认就不删。"""
+    port, _state, store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port, "POST", "/api/memories/fake-1/forget", {"confirmed": False}
+    )
+    assert status == 400
+    assert "确认" in data["error"]
+    status, _ct, data = _request(port, "POST", "/api/memories/fake-1/forget", {})
+    assert status == 400
+    assert "确认" in data["error"]
+    assert "我喜欢喝咖啡。" in _memory_texts(port)
+    assert len(store.get_all()) == 3
+
+
+def test_forget_with_confirmation_deletes_memory(running_server_with_real_mem0):
+    """忘一条记忆且确认了（confirmed 为 true）时：返回 deleted True，
+    列表里没这条了，删除范围预览也查不到了（404）。"""
+    port, _state, store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port, "POST", "/api/memories/fake-1/forget", {"confirmed": True}
+    )
+    assert status == 200
+    assert data["ok"] is True
+    assert data["deleted"] is True
+    assert "我喜欢喝咖啡。" not in _memory_texts(port)
+    assert "我喜欢喝茶。" in _memory_texts(port)
+    assert "我叫小宋。" in _memory_texts(port)
+    assert len(store.get_all()) == 2
+    # 删完验干净了：history 也清了，scope 查不到。
+    assert store.history("fake-1") == []
+    status, _ct, _body = _request(port, "GET", "/api/memories/fake-1/scope")
+    assert status == 404
+
+
+def test_forget_unknown_memory_returns_not_deleted(running_server_with_real_mem0):
+    """忘一条已经不在库里的记忆：返回 ok True、deleted False，
+    不报错，其他记忆不受影响。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port, "POST", "/api/memories/fake-999/forget", {"confirmed": True}
+    )
+    assert status == 200
+    assert data["ok"] is True
+    assert data["deleted"] is False
+    assert len(_memory_texts(port)) == 3
+
+
+def test_forget_without_store_returns_503(running_server):
+    """没带记忆库时：忘记接口返回 503“记忆未启用”，不删任何东西。"""
+    port, _state = running_server
+    status, _ct, data = _request(
+        port, "POST", "/api/memories/fake-1/forget", {"confirmed": True}
+    )
+    assert status == 503
+    assert "记忆未启用" in data["error"]
+
+
+def test_correct_success_updates_memory(running_server_with_real_mem0):
+    """纠正一条记忆（页面上选了 id、给了新说法）：返回 updated，
+    列表里旧文本没了、新文本在同一条 id 上。"""
+    port, _state, store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port,
+        "POST",
+        "/api/memories/correct",
+        {"memory_id": "fake-1", "new_text": "我喜欢喝白开水。"},
+    )
+    assert status == 200
+    assert data["status"] == "updated"
+    assert data["memory_id"] == "fake-1"
+    assert data["old_text"] == "我喜欢喝咖啡。"
+    assert data["new_text"] == "我喜欢喝白开水。"
+    texts = _memory_texts(port)
+    assert "我喜欢喝咖啡。" not in texts
+    assert "我喜欢喝白开水。" in texts
+    assert "我喜欢喝茶。" in texts
+    # 纠正后来源变成 user、已确认（BOOS 亲口纠正的）。
+    corrected = [item for item in store.get_all() if item["id"] == "fake-1"][0]
+    assert corrected["metadata"]["source"] == "user"
+    assert corrected["metadata"]["confirmed"] is True
+
+
+def test_correct_ambiguous_returns_candidates_and_changes_nothing(
+    running_server_with_real_mem0,
+):
+    """只给旧内容、没选 id，且旧内容对上两条相似记忆时：
+    返回 ambiguous、带两条候选，库里一条都没改——不猜、不改。"""
+    port, _state, store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port,
+        "POST",
+        "/api/memories/correct",
+        {"old_text": "我喜欢喝点热的", "new_text": "我喜欢喝白开水。"},
+    )
+    assert status == 200
+    assert data["status"] == "ambiguous"
+    assert {cand["id"] for cand in data["candidates"]} == {"fake-1", "fake-2"}
+    assert data["memory_id"] is None
+    # 一条都没改：三条原文都在。
+    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+    assert len(store.get_all()) == 3
+
+
+def test_correct_with_memory_id_resolves_ambiguity(running_server_with_real_mem0):
+    """ambiguous 之后，页面让 BOOS 挑了一条、按 id 再提交：
+    只改挑中的那条，另一条相似记忆不动。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port,
+        "POST",
+        "/api/memories/correct",
+        {"old_text": "我喜欢喝点热的", "new_text": "我喜欢喝白开水。"},
+    )
+    assert data["status"] == "ambiguous"
+    # 挑候选里的“喝茶”那条改。
+    tea_id = next(
+        cand["id"] for cand in data["candidates"] if "茶" in cand["text"]
+    )
+    status, _ct, data = _request(
+        port,
+        "POST",
+        "/api/memories/correct",
+        {"memory_id": tea_id, "new_text": "我喜欢喝白开水。"},
+    )
+    assert status == 200
+    assert data["status"] == "updated"
+    assert data["memory_id"] == tea_id
+    texts = _memory_texts(port)
+    assert "我喜欢喝茶。" not in texts
+    assert "我喜欢喝白开水。" in texts
+    # 没挑中的“喝咖啡”那条原样不动。
+    assert "我喜欢喝咖啡。" in texts
+
+
+def test_correct_not_found_returns_status_and_changes_nothing(
+    running_server_with_real_mem0,
+):
+    """纠正一个库里没有的旧内容：返回 not_found，库里一条都没改。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port,
+        "POST",
+        "/api/memories/correct",
+        {"old_text": "今天天气真不错", "new_text": "今天下雨了。"},
+    )
+    assert status == 200
+    assert data["status"] == "not_found"
+    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+
+
+def test_correct_unchanged_returns_status(running_server_with_real_mem0):
+    """新内容和旧内容一样：返回 unchanged，不用改，库里不动。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port,
+        "POST",
+        "/api/memories/correct",
+        {"memory_id": "fake-1", "new_text": "我喜欢喝咖啡。"},
+    )
+    assert status == 200
+    assert data["status"] == "unchanged"
+    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+
+
+def test_correct_missing_new_text_returns_400(running_server_with_real_mem0):
+    """纠正时没给新内容：返回 400，库里不动。"""
+    port, _state, _store = running_server_with_real_mem0
+    status, _ct, data = _request(
+        port, "POST", "/api/memories/correct", {"memory_id": "fake-1", "new_text": "  "}
+    )
+    assert status == 400
+    assert "纠正后的内容" in data["error"]
+    status, _ct, data = _request(
+        port, "POST", "/api/memories/correct", {"old_text": "我喜欢喝咖啡。"}
+    )
+    assert status == 400
+    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+
+
+def test_correct_without_store_returns_503(running_server):
+    """没带记忆库时：纠正接口返回 503“记忆未启用”。"""
+    port, _state = running_server
+    status, _ct, data = _request(
+        port,
+        "POST",
+        "/api/memories/correct",
+        {"old_text": "我喜欢喝咖啡。", "new_text": "我喜欢喝茶。"},
+    )
+    assert status == 503
+    assert "记忆未启用" in data["error"]
+
+
+def test_root_page_contains_memory_panel(running_server):
+    """聊天页面里有长期记忆面板：侧边栏按钮、面板容器、
+    指向 /api/memories 的加载逻辑都在，页面样式和原来一致。"""
+    port, _state = running_server
+    status, content_type, body = _request(port, "GET", "/")
+    assert status == 200
+    assert "长期记忆" in body
+    assert 'id="memoriesBtn"' in body
+    assert 'id="memoriesPanel"' in body
+    assert 'id="backToChat"' in body
+    assert "/api/memories" in body
+    assert "/scope" in body
+    assert "/forget" in body
+    assert "/api/memories/correct" in body
