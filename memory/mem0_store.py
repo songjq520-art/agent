@@ -21,6 +21,17 @@
 #       找准了才用 mem0.update() 原地替换（同一 id），再验旧文本确实
 #       检索不到；改失败时原记忆不动、报失败，绝不谎称改好了。改过的
 #       记忆来源变成 user（BOOS 亲口纠正的）、user_confirmed=True。
+#       多个候选分不清时（比如“都喜欢…”的句式分数都差不多），
+#       请 DeepSeek 按槽位判断改哪条（见 _judge_correction）：新说法
+#       是在替换哪个语义槽位里的内容就选那条，上下文是意思分不开
+#       时的决胜依据，第一次截断或“分不清”时用 2000 再试一次；
+#       模型判选中后、真正替换之前，还有一道本地安全网：用 bge 向量
+#       算旧记忆和新说法的相似度，话题不像就不换、改问 BOOS（见
+#       _old_new_similarity、CORRECTION_TOPIC_MIN_SIMILARITY）；
+#       前面都定不下来时才问 BOOS。第 1 层直接定已经去掉（2026-11-09
+#       新方案，BOOS 定的）：上下文里恰好只有 1 条也不直接定，C3
+#       证明那样会静默改错。correct_memory 的返回里有 "layer" 字段
+#       标明哪一层定的，还有 "resolution" 和 "audit"（审计信息）。
 #       注意：改只换向量库里的当前文本，history.db 里的 UPDATE 审计行
 #       会留着旧文本——那是“改过什么”的审计记录，有意保留，和“忘”不同。
 # 深度删除（忘）：delete_memory() 删的不只是向量——向量删掉之后，还要
@@ -72,11 +83,13 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import threading
 import unicodedata
+from collections import deque
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -117,6 +130,43 @@ RETRIEVAL_THRESHOLD = 0.4
 # ≥ 2 才算命中（至少一个两字关键词）。补充信号只排在语义结果后面，
 # 且不超过 top_k 总数；召回不够时再调，不够时再考虑融合。
 KEYWORD_MIN_WEIGHT = 2
+
+# CONTEXT_IDS_MAX（最近对话上下文记多少条记忆 id）：note_context 记的
+# 最近几轮提问时检索到的记忆 id 上限（deque，满了旧的自动挤掉）。
+# 20 条够覆盖最近几轮对话（每轮最多 5 条），又不会把很久以前的
+# 话题一直留在“当前在聊什么”里。
+CONTEXT_IDS_MAX = 20
+
+# JUDGE_MAX_TOKENS（纠错判断调用的输出上限）：模型只回一个 JSON
+# （{"choice": "<id>" 或 "none"}），答案本身只要约 30 Token；但
+# deepseek-flash 默认开着思考，思考先占 100–200 个 Token，200 的
+# 上限经常在答案写出来之前就截断（2026-11-09 实测判断调用 5 次只
+# 对了 2 次）。提到 1000，留足思考的余量；思考保持开启，判断哪条
+# 旧记忆冲突需要想一想。模型用多少算多少，上限只是防截断，不多花钱。
+JUDGE_MAX_TOKENS = 1000
+
+# JUDGE_RETRY_MAX_TOKENS（纠错判断重试的输出上限）：第一次判断调用
+# （JUDGE_MAX_TOKENS = 1000）被截断（finish_reason == "length"），
+# 或者模型回 none 但原因是 "similar"（两条都像、分不清）时，用
+# 2000 再试一次——同一个提示，只重试一次，绝不无限循环。第一次回
+# none 且原因是 "unrelated"（哪个都不像、没关系）时不重试，直接问
+# BOOS；调用异常（网络等）也不重试。2000 再试还是不行（截断或
+# none）→ 返回 None，走问 BOOS。思考保持开启，temperature=0 不变。
+JUDGE_RETRY_MAX_TOKENS = 2000
+
+# CORRECTION_TOPIC_MIN_SIMILARITY（纠错安全网：旧-新话题相似度下限）：
+# 模型判选中一条候选后、真正替换之前，用本地 bge 模型算旧记忆文本
+# 和新说法的余弦相似度；低于这个值就不换，改问 BOOS（见
+# Mem0Store._old_new_similarity）。2026-11-09 实测校准
+# （bge-small-zh-v1.5，短句都是“我喜欢…”结构，所以分数整体偏高）：
+# 同话题都在 0.59 以上——科幻电影→纪录片 0.629、纪录片→恐怖电影
+# 0.719、恐怖电影→纪录片 0.595、喜剧电影→纪录片 0.641；跨话题都在
+# 0.54 以下——Go 写代码→纪录片 0.531、Go 写代码→恐怖电影 0.443。
+# 0.56 是两边的中点（最坏边距约 0.03）。分得开但边距很窄——这道网
+# 只是第二层，主防线是去掉第 1 层直接定 + 模型按槽位判；阈值偏高
+# 只会多问 BOOS 一次（安全方向），偏低才可能漏过。换 embedding
+# 模型要重测这个值。
+CORRECTION_TOPIC_MIN_SIMILARITY = 0.56
 
 # CUSTOM_INSTRUCTIONS_VERSION（自定义提取规则的版本号）：
 # 规则文本改了就改这个版本号，方便以后追踪“哪版规则存的记忆”。
@@ -704,7 +754,13 @@ def _correction_result(outcome):
 
     {"status", "memory_id", "old_text", "new_text",
      "candidates": [{"id", "text"}]（ambiguous 时给调用方展示用）,
-     "reason": 没改成的原因（给人看的）}。
+     "reason": 没改成的原因（给人看的）,
+     "layer": 哪一层定的（exact/single/judge/judge_blocked/ask/none，
+     见 correct_memory）,
+     "resolution": 这次纠正的结果（updated/judge_blocked/ask/
+     not_found/unchanged/failed，见 correct_memory）,
+     "audit": 审计信息（picked_id/judge_reason/old_new_similarity/
+     candidate_scores/context_ids，见 correct_memory）}。
     """
     outcome = outcome or {}
     return {
@@ -717,6 +773,9 @@ def _correction_result(outcome):
             for c in (outcome.get("candidates") or [])
         ],
         "reason": outcome.get("reason") or "",
+        "layer": outcome.get("layer") or "none",
+        "resolution": outcome.get("resolution") or "failed",
+        "audit": outcome.get("audit") or {},
     }
 
 
@@ -759,6 +818,84 @@ def _parse_pending_selection(text, candidates):
     if len(matched) == 1:
         return matched[0]
     return None
+
+
+def _parse_judge_choice(content, candidates):
+    """从 DeepSeek 纠错判断的返回里抠出它选的候选 id（供 _judge_correction 用）。
+
+    认三种写法：{"choice": "<候选 id>"}（标准）、{"choice": "none"}
+    （分不清/没有冲突的）、直接写 id 本身（或第几条的数字序号）。
+    返回 (id 或 None, reason)：
+    - 选中的 id 时 reason 是 None；
+    - choice 是 none 时 reason 是 "similar"（两条都像、分不开）或
+      "unrelated"（哪个都不像、没关系），取自返回里的 "reason" 字段；
+      reason 缺失或认不出时默认 "similar"——重试一次是安全的，
+      最坏也只是多调一次然后问 BOOS。
+    分不清、格式不对、选的 id 不在候选里时 id 都是 None，调用方
+    走问 BOOS 的流程，绝不猜。模型有时会在 JSON 外面包一层
+    ```json 围栏，先剥掉再解析。
+    """
+    if not isinstance(content, str) or not content.strip():
+        return None, "similar"
+    text = content.strip()
+    # 去掉 ```json ... ``` 这种围栏（模型有时会包一层）。
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    ids = {(c or {}).get("id") for c in candidates or []}
+    choice = None
+    reason = None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            choice = data.get("choice")
+            reason = data.get("reason")
+        elif isinstance(data, (str, int)) and not isinstance(data, bool):
+            # 整段就是答案本身（比如直接写了个 id，或写了个数字序号）。
+            choice = data
+    except ValueError:
+        # 不是 JSON：整段就是它写的答案（比如直接写了个 id）。
+        choice = text
+    if isinstance(reason, str):
+        reason = reason.strip().lower()
+        if reason not in ("similar", "unrelated"):
+            reason = None
+    else:
+        reason = None
+    if isinstance(choice, int) and not isinstance(choice, bool):
+        # 数字序号也认（1 → 第 1 条）。
+        if 1 <= choice <= len(candidates or []):
+            return (candidates[choice - 1] or {}).get("id"), None
+        return None, "similar"
+    if not isinstance(choice, str):
+        return None, "similar"
+    choice = choice.strip().strip("\"'")
+    if choice.lower() in ("none", "unclear", "不知道", "分不清", ""):
+        return None, reason or "similar"
+    if choice in ids:
+        return choice, None
+    if choice.isdigit():
+        n = int(choice)
+        if 1 <= n <= len(candidates or []):
+            return (candidates[n - 1] or {}).get("id"), None
+    return None, "similar"
+
+
+def _cosine_similarity(vec_a, vec_b):
+    """两个向量的余弦相似度（纠错安全网用，纯函数）。
+
+    返回 -1 到 1 之间：1 是同一方向、0 是无关、-1 是相反。
+    任一向量是空的或零向量时返回 0.0（没法比，就当中立）。
+    自己做归一化，不依赖 embedding 模型有没有归一化过。
+    """
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(float(x) * float(y) for x, y in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(float(x) * float(x) for x in vec_a))
+    norm_b = math.sqrt(sum(float(y) * float(y) for y in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 # ---------- 版本文件（embedding 模型 + 维度记录） ----------
@@ -892,6 +1029,12 @@ class Mem0Store:
         # 哪条（见 add_turn / _parse_pending_selection）。
         # 只放内存里，重启就没了——对话里的追问本来就是临时的。
         self._pending_correction = None
+        # _recent_context_ids（最近对话上下文）：最近几轮提问时检索到、
+        # 拼进提示的记忆 id（deque，最多 CONTEXT_IDS_MAX 条，旧的自动挤掉）。
+        # 纠错时拿它当“当前在聊什么”的提示（见 note_context /
+        # _judge_correction）。只放内存里，重启就没了——和
+        # _pending_correction 一样，对话上下文本来就是临时的。
+        self._recent_context_ids = deque(maxlen=CONTEXT_IDS_MAX)
         if self._memory is None:
             # 真实 mem0：先校验版本文件，再建 Memory（建的时候会加载
             # embedding 模型，约 25 秒，常驻服务只付一次）。
@@ -1096,6 +1239,32 @@ class Mem0Store:
             logger.info("检索：%d 条记忆含敏感信息，已跳过，不注入。", skipped_sensitive)
         return results
 
+    def note_context(self, memories):
+        """记下本轮提问时检索到的记忆 id（最近对话上下文）。
+
+        main.py / web/server.py 提问前 search() 完调一次，传 search
+        返回的列表（或 id 列表）。纠错时拿它当“当前在聊什么”的提示：
+        候选里有在上下文里的，模型判断时优先考虑它（见 _judge_correction）。
+        只放内存里（deque，最多 CONTEXT_IDS_MAX 条，旧的自动挤掉，
+        重启就没了——和 _pending_correction 一样，对话上下文本来就是临时的）。
+        注意：_find_correction_candidates 内部的 search 不调这里——
+        找候选的那次检索不能污染上下文（不然候选自己就成了“上下文”，
+        提示就没意义了）。传空列表/None 时什么都不记；记失败
+        （比如传了奇怪的东西）也不抛异常、不拦聊天。
+        """
+        try:
+            ids = []
+            for item in memories or []:
+                if isinstance(item, dict):
+                    mem_id = item.get("id")
+                else:
+                    mem_id = item
+                if mem_id:
+                    ids.append(mem_id)
+            self._recent_context_ids.extend(ids)
+        except Exception:
+            logger.warning("记对话上下文失败：本次上下文未记录。", exc_info=True)
+
     def get_all(self, include_sensitive=False):
         """返回当前用户的所有记忆（列表，每项 {"id", "text", "metadata"}，
         metadata 是规整过的来源信息，见 _normalize_metadata）。
@@ -1267,7 +1436,7 @@ class Mem0Store:
         存记忆失败不能把已经拿到的聊天回答搞崩。
         纠错路径返回的字典里多一个 "correction" 键：
         {"status", "memory_id", "old_text", "new_text", "candidates",
-         "reason"}，调用方（main.py / web/server.py）按它告诉 BOOS
+         "reason", "layer"}，调用方（main.py / web/server.py）按它告诉 BOOS
         改好了、还是要他挑一条、还是改失败了。
         """
         if not messages:
@@ -1594,6 +1763,176 @@ class Mem0Store:
             logger.warning("纠错：关键词找候选失败。", exc_info=True)
         return candidates
 
+    def _judge_correction(self, new_text, candidates):
+        """请 DeepSeek 判断：新说法到底在纠正候选里的哪一条。
+
+        什么时候调：correct_memory 里候选 ≥2 条、又没有原文完全相同的
+        时候——光靠相似度分数分不开（比如“都喜欢…”的句式互相都像），
+        请模型按意思判断。第 1 层直接定已经去掉（2026-11-09 新方案：
+        上下文里恰好只有 1 条也不直接定，C3 证明那样会静默改错），
+        这里是 ≥2 候选时唯一的定夺路径。模型是最终裁判：
+        - 判断按“槽位”做：每条旧记忆占一个语义槽位（比如“电影喜好”
+          是一个槽位、“编程语言喜好”是另一个槽位）；新说法是在替换
+          哪个槽位里的内容，就选那条。必须在同一个槽位上才构成替换，
+          不在同一个槽位的候选即使最近聊过、分数再高也不选。
+          还有一条：和新说法意思几乎一样的那条不用改（它说的已经
+          是新说法的意思了），别选它；要选的是被新说法取代的那条
+          ——和新说法意思不同、但在同一个槽位上的那条（2026-11-09
+          v7 复测发现：不加这句，模型会把和新说法最像的那条（比如
+          已有“用户喜欢看恐怖电影。”时说“我喜欢看恐怖电影。”）
+          当成要改的那条，其实该改的是同一槽位里意思不同的那条）。
+        - 每条候选都带上文本、分数、和“在不在最近对话上下文里”
+          （note_context 记的，本轮刚提到过的标出来）当提示；
+        - 上下文是决胜依据：按槽位分不开、两条都像时，看刚聊的是
+          哪一个，刚聊的那个又是同一槽位，就选它；只有刚聊的也分
+          不出来，才说 none。但别硬套：如果新说法明明在说另一件
+          旧事，不要因为它最近没提到就硬选刚提到的那条。
+        - 重试：第一次被截断（finish_reason == "length"）或回 none
+          且原因是 "similar"（分不清）时，用 2000 同一个提示再试
+          一次；回 none 且原因是 "unrelated"（不知道）时不重试；
+          调用异常也不重试；重试还是不行就回 (None, reason)。最多调两次。
+        - 不加任何关键词/启发式打分层：价值判断由 DeepSeek 自己做
+          （BOOS 的规矩），这里只把候选原样递给模型。
+        返回 (挑中的候选原字典, None)，或 (None, reason)：
+        reason 是 "similar"（分不清）或 "unrelated"（不知道），
+        没做判断时（候选里有敏感内容、调用失败、重试也被截断、
+        模型选的 id 不在候选里）reason 是 None。调用方拿到 None
+        就走问 BOOS 的流程，绝不猜、绝不谎称改好了。
+        调用：走 mem0 的 LLM 客户端（self._memory.llm.client，和提取
+        同一路，模型 deepseek-flash，温度 0，输出只够回一个 JSON）；
+        用量包装（_attach_usage_wrapper）建库时已经包住了它的 create，
+        所以这次调用的 Token 也会记进 BudgetTracker；没包住
+        （假对象、没传 tracker）时至少记一条日志，不崩。
+        日志里只记条数和结果（挑中/没挑中），不记候选原文——
+        日志不记记忆内容（见文件头“安全与隐私”）。
+        """
+        if not candidates:
+            return None, None
+        # 候选里有敏感内容时不判断：敏感文本不能发给模型做判断，
+        # 直接回 None，让 BOOS 自己挑（问 BOOS 的流程不经过模型）。
+        for cand in candidates:
+            if _contains_sensitive((cand or {}).get("text") or ""):
+                logger.info("纠错判断：候选里有敏感内容，本次不请模型判断，改问 BOOS。")
+                return None, None
+        context_ids = set(self._recent_context_ids)
+        lines = []
+        for i, cand in enumerate(candidates, start=1):
+            cand = cand or {}
+            in_context = cand.get("id") in context_ids
+            hint = "本轮对话刚提到过" if in_context else "最近对话没提到"
+            score = cand.get("score")
+            score_text = f"，相似度 {score:.3f}" if isinstance(score, (int, float)) else ""
+            lines.append(
+                f"{i}. id={cand.get('id')}（{hint}{score_text}）：{cand.get('text') or ''}"
+            )
+        prompt = (
+            "用户纠正了一条旧记忆，请判断新说法到底在纠正下面哪一条旧记忆。\n"
+            "按“槽位”判断：每条旧记忆都占一个语义槽位（比如“电影喜好”\n"
+            "是一个槽位、“编程语言喜好”是另一个槽位）；新说法是在替换\n"
+            "哪个槽位里的内容，就选那条——新说法和旧记忆必须在同一个\n"
+            "槽位上才构成替换，不在同一个槽位的候选即使最近聊过、分\n"
+            "数再高也不选。\n"
+            "注意：和新说法意思几乎一样的那条不用改（它说的已经是新说\n"
+            "法的意思了），别选它；要选的是被新说法取代的那条——和新\n"
+            "说法意思不同、但在同一个槽位上的那条。\n"
+            "如果按槽位分不开、两条以上都像：看‘本轮对话刚提到过’——\n"
+            "刚聊的那条如果和新说法是同一话题，就选刚聊的那条；上下\n"
+            "文就是这时候的决胜依据。只有刚聊的也分不出来（比如刚聊\n"
+            "的和新说法不是同一话题、或者两条刚聊的都像），才选 none。\n"
+            "但别硬套上下文：如果新说法明明在说另一件旧事，不要因为\n"
+            "它最近没提到就硬选刚提到的那条。\n"
+            "选 none 时要说明是哪种：两条都像、分不开是 \"similar\"；\n"
+            "哪个都不像、没关系是 \"unrelated\"。只返回一个 JSON，不要解释，\n"
+            "格式：\n"
+            '{"choice": "<候选 id>" 或 "none", "reason": "similar" 或 "unrelated"（只有 choice 是 none 时才写）}\n'
+            f"新说法：{new_text}\n"
+            "候选：\n" + "\n".join(lines)
+        )
+        # 最多调两次：第一次 JUDGE_MAX_TOKENS（1000），思考保持开启，
+        # temperature=0；第一次被截断（finish_reason == "length"）或
+        # 回 none 且原因是 "similar"（分不清）时，用
+        # JUDGE_RETRY_MAX_TOKENS（2000）同一个提示再试一次。第一次
+        # 回 none 且原因是 "unrelated"（不知道）时不重试；调用异常
+        # 也不重试。重试还是不行（截断或 none）→ 返回 None，走问 BOOS。
+        max_tokens = JUDGE_MAX_TOKENS
+        for attempt in (1, 2):
+            try:
+                client = self._memory.llm.client
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": "你是记忆纠错的判断助手，只返回 JSON。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0,
+                    max_tokens=max_tokens,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                finish_reason = getattr(resp.choices[0], "finish_reason", None)
+            except Exception:
+                logger.warning("纠错判断：调 DeepSeek 失败，改走问 BOOS 的流程。", exc_info=True)
+                return None, None
+            if finish_reason == "length":
+                if attempt == 1:
+                    logger.info("纠错判断：第一次调用被截断，用 2000 再试一次。")
+                    max_tokens = JUDGE_RETRY_MAX_TOKENS
+                    continue
+                logger.info("纠错判断：重试也被截断，改问 BOOS。")
+                return None, None
+            choice, reason = _parse_judge_choice(content, candidates)
+            if choice is not None:
+                for cand in candidates:
+                    if (cand or {}).get("id") == choice:
+                        logger.info("纠错判断：模型挑中一条，继续按它改。")
+                        return cand, None
+                return None, None
+            if reason == "unrelated":
+                logger.info("纠错判断：模型说哪个都不像，改问 BOOS（不重试）。")
+                return None, "unrelated"
+            # reason == "similar"（分不清）：第一次就用 2000 再试一次。
+            if attempt == 1:
+                logger.info("纠错判断：模型分不清（两条都像），用 2000 再试一次。")
+                max_tokens = JUDGE_RETRY_MAX_TOKENS
+                continue
+            logger.info("纠错判断：重试还是分不清，改问 BOOS。")
+            return None, "similar"
+        return None, None
+
+    def _embed_text(self, text):
+        """用本地 embedding 模型把一段文本嵌成向量（纠错安全网用）。
+
+        走 mem0 的本地 embedding 模型（self._memory.embedding_model，
+        bge-small-zh-v1.5，不联网、不花钱），和检索是同一路。返回
+        list[float]；模型不可用（比如离线测试的假对象没装 embedding
+        模型）或出错时返回 None——调用方跳过话题校验、不拦纠正：
+        安全网坏了不该把纠错也堵死，主防线是模型判本身。
+        """
+        try:
+            embedder = getattr(self._memory, "embedding_model", None)
+            if embedder is None:
+                return None
+            vec = embedder.embed(text, "search")
+            if not isinstance(vec, (list, tuple)) or not vec:
+                return None
+            return [float(x) for x in vec]
+        except Exception:
+            logger.warning("纠错安全网：本地嵌文本失败，跳过话题校验。", exc_info=True)
+            return None
+
+    def _old_new_similarity(self, old_text, new_text):
+        """旧记忆文本 vs 新说法的余弦相似度（纠错安全网用）。
+
+        返回 -1 到 1 之间的 float；嵌不出来（模型不可用/出错）时
+        返回 None，调用方跳过校验。相似度高说明新说法和旧记忆是
+        同一话题（一次正常的纠正本来就该在同一个槽位里换），低
+        说明模型可能挑错了槽位（比如把 Go 写代码改成纪录片）。
+        """
+        vec_old = self._embed_text(old_text)
+        vec_new = self._embed_text(new_text)
+        if vec_old is None or vec_new is None:
+            return None
+        return _cosine_similarity(vec_old, vec_new)
+
     def correct_memory(self, old_text, new_text):
         """纠错：把一条记错的记忆换成正确的（原地替换，同一 id）。
 
@@ -1607,18 +1946,33 @@ class Mem0Store:
            - 恰好 1 个候选：改它。
            - 0 个候选：status="not_found"，什么都不改（调用方可以问
              BOOS、或改走“记住”新存一条，绝不凭空造一条“纠正”）。
-           - ≥2 个候选、又没有原文完全相同的：status="ambiguous"，
-             把候选列表原样返回，让调用方问 BOOS 到底是哪条——
-             绝不猜一条改掉。
+           - ≥2 个候选、又没有原文完全相同的：请模型按槽位判（见
+             _judge_correction，模型按意思 + 槽位挑，上下文是意思
+             分不开时的决胜依据）；分不清/调用失败时
+             status="ambiguous"，把候选列表原样返回，让调用方问
+             BOOS 到底是哪条——绝不猜一条改掉。
+           - 第 1 层直接定已经去掉（2026-11-09 新方案，BOOS 定的）：
+             上下文里恰好只有 1 条也不直接定——C3 证明那样会静默
+             改错（上下文只有 Go、要改的是科幻，直接定就把 Go 改
+             成了纪录片，科幻没动还报成功）。慢一点没关系，安全优先。
         2. 新文本和旧文本规整后相同：status="unchanged"，不用改。
         3. 脱敏新文本：新文本里带秘密时只存脱敏后的版本；脱敏后
            什么都不剩时 status="failed"（不存一条空记忆）。
-        4. 用 mem0.update() 原地替换（同一 id），新记忆来源记 user、
+        4. 安全网（只拦模型判挑中的目标）：真正替换之前，用本地
+           bge 向量算旧记忆和新说法的相似度
+           （_old_new_similarity）；低于
+           CORRECTION_TOPIC_MIN_SIMILARITY 说明新说法和这条旧记忆
+           不是同一话题——模型可能挑错了槽位，不换，改问 BOOS
+           （status="ambiguous"、layer="judge_blocked"）。嵌不出来
+           时不拦（安全网坏了不该堵死纠正，主防线是模型判本身）。
+           exact / single 不走这道网：原文对上了没歧义、单候选没
+           别的能挑错。
+        5. 用 mem0.update() 原地替换（同一 id），新记忆来源记 user、
            user_confirmed=True（BOOS 亲口纠正的）、confidence=1.0。
            mem0.update 不支持 metadata 参数的老版本会报 TypeError，
            这时退一步：只传 text 再改（来源还是旧的，记一条警告；
            FakeMemory 和 mem0 2.2.1 都支持 metadata，不会走到这步）。
-        5. 验：重新读库——id 还在、新文本对得上、搜 old_text 找不回
+        6. 验：重新读库——id 还在、新文本对得上、搜 old_text 找不回
            旧文本，三条都过才算改好。验不过时，把旧文本和旧 metadata
            写回去（回滚），status="failed"，并在结果里写清哪一步没过。
         返回字典（不抛异常，调用方按 status 处理）：
@@ -1627,12 +1981,44 @@ class Mem0Store:
            "memory_id": id 或 None,
            "old_text": 旧文本或 None, "new_text": 新文本或 None,
            "candidates": 候选列表（ambiguous / not_found 时给调用方看）,
-           "reason": 失败/未改的原因（给人看的，不含敏感内容）}
-        注意：改不经过提取、不调 DeepSeek（新文本是 BOOS 给的原话，
-        不用模型再判断一遍）；改只换当前文本，history.db 的 UPDATE
-        审计行会留着旧文本——那是审计记录，不是“当前事实”，
-        和“忘”要求的清历史是两回事（见 delete_memory）。
+           "reason": 失败/未改的原因（给人看的，不含敏感内容）,
+           "layer": 哪一层定的——"exact"（原文完全相同）、"single"
+             （单候选）、"judge"（模型判中并通过了安全网）、
+             "judge_blocked"（模型判挑中了、但安全网拦下来了，
+             ambiguous 时用这个）、"ask"（模型分不清、走问 BOOS，
+             ambiguous 时用这个）、"none"（not_found 时用这个）；
+             failed/unchanged 时填实际选了目标的那一层，没有目标
+             就填 "none"。
+           "resolution": 这次纠正的结果——"updated"（换好了）、
+             "judge_blocked"（安全网拦下、问 BOOS）、"ask"（分不清、
+             问 BOOS）、"not_found"、"unchanged"、"failed"。
+             layer 说“靠什么定的”，resolution 说“最后怎么样了”。
+           "audit": 审计信息（每次纠正都有，改错了靠它查、靠它回滚）——
+             {"picked_id": 挑中的那条 id、"judge_reason": 模型说
+              none 时的原因（"similar"/"unrelated"，挑中时是 None）、
+              "old_new_similarity": 安全网算的旧-新相似度（没算时
+              是 None）、"candidate_scores": 各候选的检索分数
+              （关键词捞回的是 None）、"context_ids": 当时最近对话
+              上下文里的记忆 id}。}
+        注意：改不经过提取（新文本是 BOOS 给的原话，不用模型再判断
+        一遍）；但多个候选分不清时，会请 DeepSeek 判断改哪条
+        （只判断、不改写新文本，见 _judge_correction）。改只换当前文本，
+        history.db 的 UPDATE 审计行会留着旧文本——那是审计记录，
+        不是“当前事实”，和“忘”要求的清历史是两回事（见 delete_memory）。
         """
+        def _audit(picked_id=None, judge_reason=None, similarity=None, cands=None):
+            """拼一份审计信息（每次纠正的返回里都带，见上面 docstring）。
+            cands 不传时用本次找出的候选（早于找候选的返回用空列表）。"""
+            return {
+                "picked_id": picked_id,
+                "judge_reason": judge_reason,
+                "old_new_similarity": similarity,
+                "candidate_scores": {
+                    (c or {}).get("id"): (c or {}).get("score")
+                    for c in (cands if cands is not None else [])
+                },
+                "context_ids": list(self._recent_context_ids),
+            }
         if not isinstance(old_text, str) or not old_text.strip():
             return {
                 "status": "not_found",
@@ -1641,6 +2027,9 @@ class Mem0Store:
                 "new_text": new_text,
                 "candidates": [],
                 "reason": "没给旧内容，不知道改哪条。",
+                "layer": "none",
+                "resolution": "not_found",
+                "audit": _audit(),
             }
         if not isinstance(new_text, str) or not new_text.strip():
             return {
@@ -1650,18 +2039,26 @@ class Mem0Store:
                 "new_text": None,
                 "candidates": [],
                 "reason": "没给新内容，没法改。",
+                "layer": "none",
+                "resolution": "failed",
+                "audit": _audit(),
             }
         with _WRITE_LOCK:
             candidates = self._find_correction_candidates(old_text)
             target = None
+            layer = "none"
+            judge_reason = None
+            similarity = None
             normalized_old = _normalize_memory_text(old_text)
             for item in candidates:
                 if _normalize_memory_text(item.get("text") or "") == normalized_old:
                     target = item
+                    layer = "exact"
                     break
             if target is None:
                 if len(candidates) == 1:
                     target = candidates[0]
+                    layer = "single"
                 elif len(candidates) == 0:
                     return {
                         "status": "not_found",
@@ -1670,19 +2067,36 @@ class Mem0Store:
                         "new_text": new_text,
                         "candidates": [],
                         "reason": "库里没有和旧内容对得上的记忆，没改任何东西。",
+                        "layer": "none",
+                        "resolution": "not_found",
+                        "audit": _audit(cands=candidates),
                     }
                 else:
-                    return {
-                        "status": "ambiguous",
-                        "memory_id": None,
-                        "old_text": old_text,
-                        "new_text": new_text,
-                        "candidates": candidates,
-                        "reason": (
-                            f"有 {len(candidates)} 条相似记忆，分不清改哪条，"
-                            "请 BOOS 指明是哪条再改。"
-                        ),
-                    }
+                    # ≥2 个候选、又没有原文完全相同的：请模型按槽位判
+                    # （见 _judge_correction）——模型按意思 + 槽位挑，
+                    # 上下文是意思分不开时的决胜依据；分不清/调用失败
+                    # 时走问 BOOS。第 1 层直接定已经去掉：上下文里恰好
+                    # 只有 1 条也不直接定（C3 教训：上下文只有 Go、要
+                    # 改的是科幻，直接定会静默改错 Go）。慢一点没关系。
+                    judged, judge_reason = self._judge_correction(new_text, candidates)
+                    if judged is not None:
+                        target = judged
+                        layer = "judge"
+                    else:
+                        return {
+                            "status": "ambiguous",
+                            "memory_id": None,
+                            "old_text": old_text,
+                            "new_text": new_text,
+                            "candidates": candidates,
+                            "reason": (
+                                f"有 {len(candidates)} 条相似记忆，分不清改哪条，"
+                                "请 BOOS 指明是哪条再改。"
+                            ),
+                            "layer": "ask",
+                            "resolution": "ask",
+                            "audit": _audit(judge_reason=judge_reason, cands=candidates),
+                        }
             mem_id = target["id"]
             old_stored_text = target["text"]
             old_metadata = target.get("metadata") or _normalize_metadata(None)
@@ -1694,6 +2108,9 @@ class Mem0Store:
                     "new_text": new_text,
                     "candidates": [],
                     "reason": "旧内容和新内容一样，不用改。",
+                    "layer": layer,
+                    "resolution": "unchanged",
+                    "audit": _audit(picked_id=mem_id, judge_reason=judge_reason, cands=candidates),
                 }
             # 脱敏新文本（纠正的话是 BOOS 亲口说的，但万一里面带了秘密，
             # 还是只存脱敏后的版本；脱敏后什么都不剩就不存）。
@@ -1706,7 +2123,45 @@ class Mem0Store:
                     "new_text": new_text,
                     "candidates": [],
                     "reason": "新内容脱敏后什么都不剩，没改。",
+                    "layer": layer,
+                    "resolution": "failed",
+                    "audit": _audit(picked_id=mem_id, judge_reason=judge_reason, cands=candidates),
                 }
+            # 安全网（只拦模型判挑中的目标）：真正替换之前，用本地
+            # bge 向量算旧记忆和新说法的相似度。低于
+            # CORRECTION_TOPIC_MIN_SIMILARITY 说明新说法和这条旧记忆
+            # 不是同一话题——模型可能挑错了槽位（C3 就是这样：把 Go
+            # 写代码改成纪录片），不换，改问 BOOS。嵌不出来
+            # （similarity 是 None）时不拦：安全网坏了不该堵死纠正，
+            # 主防线是模型判本身。exact / single 不走这道网。
+            if layer == "judge":
+                similarity = self._old_new_similarity(old_stored_text, safe_new)
+                if similarity is not None and similarity < CORRECTION_TOPIC_MIN_SIMILARITY:
+                    logger.info(
+                        "纠错安全网：模型挑中的旧记忆和新说法话题不像"
+                        "（相似度 %.3f，低于 %.2f），不换，改问 BOOS。",
+                        similarity,
+                        CORRECTION_TOPIC_MIN_SIMILARITY,
+                    )
+                    return {
+                        "status": "ambiguous",
+                        "memory_id": None,
+                        "old_text": old_stored_text,
+                        "new_text": safe_new,
+                        "candidates": candidates,
+                        "reason": (
+                            "模型挑中的那条记忆和新说法不是同一话题，"
+                            "可能是挑错了，请 BOOS 指明改哪条再改。"
+                        ),
+                        "layer": "judge_blocked",
+                        "resolution": "judge_blocked",
+                        "audit": _audit(
+                            picked_id=mem_id,
+                            judge_reason=judge_reason,
+                            similarity=similarity,
+                            cands=candidates,
+                        ),
+                    }
             new_metadata = _provenance(SOURCE_USER, CONFIDENCE_USER, True)
             try:
                 try:
@@ -1725,6 +2180,14 @@ class Mem0Store:
                     "new_text": new_text,
                     "candidates": [],
                     "reason": f"更新失败（{type(exc).__name__}），原记忆未动。",
+                    "layer": layer,
+                    "resolution": "failed",
+                    "audit": _audit(
+                        picked_id=mem_id,
+                        judge_reason=judge_reason,
+                        similarity=similarity,
+                        cands=candidates,
+                    ),
                 }
             # 验：id 还在、新文本对得上、搜旧内容找不回旧文本。
             verified = self._verify_correction(mem_id, safe_new, old_stored_text)
@@ -1751,6 +2214,14 @@ class Mem0Store:
                     "candidates": [],
                     "reason": "更新后校验没过（%s），已尝试恢复原记忆。"
                     % verified.get("reason", "未知原因"),
+                    "layer": layer,
+                    "resolution": "failed",
+                    "audit": _audit(
+                        picked_id=mem_id,
+                        judge_reason=judge_reason,
+                        similarity=similarity,
+                        cands=candidates,
+                    ),
                 }
             logger.info("已纠正记忆：id=%s。", mem_id)
             return {
@@ -1760,6 +2231,14 @@ class Mem0Store:
                 "new_text": safe_new,
                 "candidates": [],
                 "reason": "",
+                "layer": layer,
+                "resolution": "updated",
+                "audit": _audit(
+                    picked_id=mem_id,
+                    judge_reason=judge_reason,
+                    similarity=similarity,
+                    cands=candidates,
+                ),
             }
 
     def _verify_correction(self, mem_id, new_text, old_text):

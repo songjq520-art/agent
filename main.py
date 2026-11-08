@@ -313,6 +313,9 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     if mem0_store is not None:
         try:
             memories = mem0_store.search(prompt, top_k=5)
+            # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
+            # “当前在聊什么”的提示（见 Mem0Store.note_context）。
+            mem0_store.note_context(memories)
         except Exception:
             # 记忆检索失败也不拦聊天，只记一条日志，原样提问。
             logger.warning("记忆检索失败，本次不带记忆继续。", exc_info=True)

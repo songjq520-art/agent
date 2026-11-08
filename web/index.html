@@ -226,6 +226,26 @@
   .mem-cand { display: block; margin: 6px 0; font-size: 14px; line-height: 1.6; cursor: pointer; }
   .mem-cand input { margin-right: 6px; }
 
+  /* ---------- 聊天里的纠错提示 ---------- */
+  /* 后端 /api/chat 返回的 correction 在这里展示：样式和长期记忆面板
+     的 .mem-box 保持一致（白底、细边框），左边一条主色竖线，标明这是
+     一条“记忆纠错”的提示，不是普通的回答气泡。 */
+  .correction {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 14px; line-height: 1.7;
+    word-break: break-word;
+  }
+  .correction.err { border-left-color: var(--danger); }
+  .correction-cand { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; }
+  .correction-cand .cand-text { flex: 1; }
+  .correction-cand .btn-small { flex: none; }
+  .correction-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .btn-small:disabled { opacity: 0.55; cursor: default; }
+
   /* ---------- 手机上：侧边栏收起来，只留聊天 ---------- */
   @media (max-width: 640px) {
     .sidebar { display: none; }
@@ -346,13 +366,19 @@
     }
   }
 
-  async function send() {
-    const text = inputEl.value.trim();
+  // send(presetText)：发一条消息。平时从输入框取值；
+  // 纠错候选按钮点“选第 N 条”时，直接传 "第 N 条" 发出去，
+  // 走同一条 /api/chat，后端按待确认的纠错把它认成“挑候选”
+  // （见 memory/mem0_store.py 的 _parse_pending_selection）。
+  async function send(presetText) {
+    const text = (presetText !== undefined ? presetText : inputEl.value).trim();
     if (!text || busy) return;
     busy = true;
     sendBtn.disabled = true;
-    inputEl.value = '';
-    inputEl.style.height = 'auto';
+    if (presetText === undefined) {
+      inputEl.value = '';
+      inputEl.style.height = 'auto';
+    }
     addMsg('user', text);
     const typing = addMsg('ai', '正在想…');
     typing.classList.add('typing');
@@ -373,6 +399,10 @@
           ? '成本未知'
           : ('本次 $' + Number(data.cost_usd).toFixed(6));
         addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+        // 本轮是聊天纠错时，后端在返回里多带一个 "correction" 键：
+        // 改好了、要挑一条、还是改失败了，都在这里告诉 BOOS；
+        // 没这个键时页面和原来一模一样。
+        if (data.correction) renderCorrection(data.correction);
       }
     } catch (e) {
       typing.remove();
@@ -382,6 +412,61 @@
     sendBtn.disabled = false;
     inputEl.focus();
     refreshStatus();
+  }
+
+  // ---------- 聊天里的纠错提示 ----------
+  // 后端 /api/chat 返回的 correction：{"status", "memory_id",
+  // "old_text", "new_text", "candidates", "reason"}；
+  // status 是 updated / ambiguous / not_found / unchanged / failed。
+  // ambiguous 时把候选列出来，点“选第 N 条”就把 "第 N 条" 当成
+  // 下一条聊天消息发出去（走 send()，不走新接口），后端认得这个
+  // 格式、会按挑中的那条改；也可以直接在输入框里回“第 N 条”
+  // 或引用候选内容。失败时只显示后端给的 reason（通用原因，
+  // 不含记忆原文以外的敏感内容），不把别的东西拼进来。
+  function renderCorrection(correction) {
+    const status = (correction || {}).status || '';
+    const oldText = correction.old_text || '';
+    const newText = correction.new_text || '';
+    // 提示放在 .msg.ai 里：和 Agent 的消息一样靠左、占同样的宽度，
+    // 新对话清空时（.msg 全删）它也会一起清掉。
+    const wrap = el('div', 'msg ai');
+    const box = el('div', 'correction');
+    if (status === 'updated') {
+      box.appendChild(el('div', '', oldText
+        ? '已更正：把“' + oldText + '”改成“' + newText + '”'
+        : '已更正：' + newText));
+    } else if (status === 'unchanged') {
+      box.appendChild(el('div', '', '这条已经记对了，不用改。'));
+    } else if (status === 'not_found') {
+      box.appendChild(el('div', '', '没找到要改的旧记忆，已把新说法当成一条新记忆存下来了。'));
+    } else if (status === 'failed') {
+      box.classList.add('err');
+      box.appendChild(el('div', '', '没改成：' + (correction.reason || '原因不明，请稍后再试。')));
+    } else if (status === 'ambiguous') {
+      const cands = correction.candidates || [];
+      if (newText) {
+        box.appendChild(el('div', '', '要改成：“' + newText + '”'));
+      }
+      box.appendChild(el('div', '', '有 ' + cands.length + ' 条相似记忆，分不清改哪条，请选一条：'));
+      cands.forEach((cand, i) => {
+        const row = el('div', 'correction-cand');
+        row.appendChild(el('span', 'cand-text', (i + 1) + '. ' + (cand.text || '')));
+        row.appendChild(smallBtn('选第 ' + (i + 1) + ' 条', 'primary', () => {
+          // 点了就定下来：先把这块提示里的按钮都锁住，免得重复点；
+          // 再把 "第 N 条" 当成聊天消息发出去，等后端改好后回的
+          // 新 correction 会再显示一条提示。
+          box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+          send('第 ' + (i + 1) + ' 条');
+        }));
+        box.appendChild(row);
+      });
+      box.appendChild(el('div', 'correction-hint', '也可以直接在输入框回复“第 1 条”或引用某条候选的内容。'));
+    } else {
+      box.appendChild(el('div', '', '纠错结果：' + (status || '未知') + '。'));
+    }
+    wrap.appendChild(box);
+    chatEl.appendChild(wrap);
+    chatEl.scrollTop = chatEl.scrollHeight;
   }
 
   sendBtn.addEventListener('click', send);
