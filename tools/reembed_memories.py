@@ -63,7 +63,12 @@ def main():
         embedding_dims=old_dims,
         mem0_version=old_mem0,
     )
-    memories = old_store.get_all()
+    memories = old_store.get_all(include_sensitive=True)
+    # 注意：这里必须用 include_sensitive=True——重嵌是本地维护操作，
+    # 备份要一字不落地保住库里所有记忆；用默认的 get_all() 会把旧库里
+    # 已有的敏感记忆悄悄丢掉，备份就不全了。备份文件只存在本地
+    # （memory/memories-backup-*.json，.gitignore 已忽略，不上传），
+    # 存回去时走 add_memory_text，还会再脱敏一次。
     print(f"读到 {len(memories)} 条记忆。")
     backup_path = MEMORY_DIR / f"memories-backup-{date.today().isoformat()}.json"
     backup_path.write_text(

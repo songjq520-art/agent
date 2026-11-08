@@ -3,14 +3,29 @@
 #       都只调这里，不直接 import mem0。以后换记忆后端，只改这一个文件。
 # 原理：mem0 负责三件事——每轮对话后自动提取记忆、存进本地 Chroma 向量库、
 #       提问时语义检索。这里只做薄薄一层包装：配好 DeepSeek + 本地
-#       embedding + 本地 Chroma、关掉遥测、加阈值过滤、加写锁、记账。
+#       embedding + 本地 Chroma、强制关遥测、加阈值过滤、加写锁、记账、
+#       存前脱敏（隐私过滤）、直接存入时去重。
 # 关系：main.py 的 run_question() 提问前调 search()、回答后调 add_turn()；
 #       web/server.py 常驻服务里建一个 Mem0Store；命令行默认不建（见下）。
 # 安全与隐私：
-#   - 遥测默认是开的（mem0 会把使用情况发到 PostHog），这里在 import mem0
-#     之前就把 MEM0_TELEMETRY 设成 False，彻底关掉，一点都不往外发。
-#     注意顺序：mem0 在 import 时就读这个环境变量，建好 Memory 之后再关
-#     就晚了，所以必须在 import 之前设。
+#   - 遥测是强制关的（mem0 会把使用情况发到 PostHog），这里在 import mem0
+#     之前就把 MEM0_TELEMETRY 强制设成 False，一点都不往外发；就算环境
+#     里事先把它设成了 True，也会被盖掉。注意顺序：mem0 在 import 时就读
+#     这个环境变量，建好 Memory 之后再关就晚了，所以必须在 import 之前设。
+#     遥测和“提取要调 DeepSeek”是两回事：遥测是 mem0 自己往 PostHog
+#     发使用情况（已关）；提取是把最近几轮对话发给 DeepSeek 做提取
+#     （这是记忆功能本身，必须调 API，见下）。
+#   - 敏感信息三层过滤（密码、API Key、令牌、身份证号、银行卡号）：
+#     存之前先脱敏（秘密换成占位符再发给 DeepSeek 提取，见
+#     _redact_sensitive）；用之前再拦一道（旧库里已有的敏感记忆不注入
+#     提示，见 search）；导出/迁移时不带敏感内容（见 get_all、
+#     migrate_from_v1）。日志里也绝不出现敏感原文。
+#   - 什么会离开本地（实话）：每轮对话后做提取的那几轮消息会发给
+#     DeepSeek（这是唯一一次记忆内容离开本地）；提问时拼进问题的相关
+#     记忆也会发给模型。Chroma 向量库、history.db、embedding 模型
+#     都在本地，不往外发。脱敏是按正则模式匹配的，不是万无一失——
+#     没见过的密钥格式、中间带空格的多词密码可能漏网，所以这层是
+#     “减少泄露面”，不是“保证绝不泄露”；真的密钥还是不要往对话里发。
 #   - API Key 只从环境变量读（config.get_api_key，.env 里那个），绝不写进代码。
 #   - 记忆数据只保存在本地（memory/mem0_chroma/ + memory/history.db），
 #     .gitignore 已忽略，不上传。
@@ -28,6 +43,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 from datetime import date
 from pathlib import Path
 
@@ -35,10 +51,11 @@ logger = logging.getLogger("agent")
 
 # ---------- 遥测开关（必须在 import mem0 之前设置） ----------
 # mem0 的 telemetry.py 在 import 时读 MEM0_TELEMETRY，默认 True。
-# 这里先设成 False，再 import mem0，确保整个进程里遥测都是关的。
-# setdefault：用户自己显式设了 MEM0_TELEMETRY=1 时不覆盖（方便调试），
-# 但项目正常使用时永远是 False（create_mem0_store 里也会再强制设一次）。
-os.environ.setdefault("MEM0_TELEMETRY", "False")
+# 这里强制设成 False，再 import mem0，确保整个进程里遥测都是关的。
+# 注意是强制设（不是 setdefault）：就算环境里事先有人把
+# MEM0_TELEMETRY 设成了 True，也照样盖掉——遥测没有“调试时开一下”
+# 的例外；_build_memory 里建 Memory 之前还会再强制设一次（见下）。
+os.environ["MEM0_TELEMETRY"] = "False"
 
 # ---------- 版本与配置常量（钉死的版本号，升级 = 重新试跑） ----------
 # mem0ai==2.2.1、chromadb==1.5.9、sentence-transformers==6.2.0、
@@ -229,6 +246,212 @@ def _keyword_weight(text, keywords):
     lower = (text or "").lower()
     matched = [kw for kw in keywords if kw.lower() in lower]
     return sum(len(kw) for kw in matched), matched
+
+
+# ---------- 敏感信息过滤（隐私三层过滤：存前脱敏 / 用时拦截 / 导出排除） ----------
+# 为什么要有这一层：记忆里可能出现密码、API Key、身份证号、银行卡号——
+# 这些东西一旦进了记忆，有三条路会往外漏：提取时发给 DeepSeek、
+# 使用时拼进发给模型的问题、导出/迁移时被整批读出来。
+# 所以过滤做在三个地方（见 Mem0Store 里各方法的注释），日志里也绝不
+# 出现原文。注意：脱敏是按正则模式匹配的，不是万无一失——没见过的
+# 密钥格式、中间带空格的多词密码可能漏网；这层是“减少泄露面”，
+# 不是“保证绝不泄露”；真的密钥还是不要往对话里发。
+
+# _REDACTED（脱敏占位符）：秘密被替换成的文字。占位符本身不含任何
+# 原文信息，提取器看到它也不会把它当成事实存下来。
+_REDACTED = "【已隐藏敏感信息】"
+
+# _PRIVATE_KEY_RE（私钥块）：-----BEGIN ... PRIVATE KEY----- 整块都是秘密，
+# 整块替换，不留一行。
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+# _JWT_RE（JWT 令牌）：eyJ 开头的三段式（header.payload.signature）。
+_JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+)
+
+# _KNOWN_KEY_RES（已知密钥格式，不带标签也认得）：
+# OpenAI/Anthropic 风格的 sk-、GitHub 的 ghp_/gho_/github_pat_、
+# AWS 的 AKIA、Google 的 AIza、Slack 的 xox、HuggingFace 的 hf_。
+# 前面的 (?<![A-Za-z0-9...]) 是为了不把长单词里的一段误当成密钥
+# （比如 task-abcdef... 里的 "sk-..."）。
+_KNOWN_KEY_RES = [
+    re.compile(r"(?<![A-Za-z0-9-])sk-(?:ant|proj)-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9-])sk-[A-Za-z0-9]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9_])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}"),
+    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{20,}"),
+]
+
+# _ID18_RE（18 位身份证号）：6 位地区 + 8 位生日 + 3 位顺序 + 1 位校验。
+# 只认生日像生日的（19/20 年开头、月份 01–12、日期 01–31），
+# 再加校验位验算（见 _id18_check_ok），避免把 18 位订单号误伤。
+# 注意不用 \b：身份证号前面常直接跟中文（“身份证号是11010...”），
+# 中文和数字之间没有 \b；改用“前后不能是数字”来定界。
+_ID18_RE = re.compile(
+    r"(?<![0-9])\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9])"
+)
+# _ID15_RE（15 位老身份证号）：6 位地区 + 6 位生日（YYMMDD）+ 3 位顺序。
+_ID15_RE = re.compile(
+    r"(?<![0-9])\d{6}\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}(?![0-9])"
+)
+# _CARD_CANDIDATE_RE（银行卡号候选）：13–19 位数字，中间可带空格或短横。
+# 光长度不够，还要过 Luhn 校验（见 _luhn_ok）才算，避免把手机号、
+# 订单号这种长数字串误伤。
+_CARD_CANDIDATE_RE = re.compile(r"(?<![0-9])\d(?:[ -]?\d){12,18}(?![0-9])")
+
+# _SECRET_LABELS（带标签的秘密）：中文/英文里“某某是/为/：秘密”的说法。
+# 标签后面跟的才是秘密值，只替换值、保留标签和前面的正常内容，
+# 这样“喜欢喝咖啡，密码是 xxx”脱敏后还剩“喜欢喝咖啡”这句有用的。
+# 值至少 3 个字符（“密码是多少”这种问句里的“多少”只有 2 个字，不会误伤），
+# 遇到空格、逗号、句号就停（值里带空格的多词密码脱不干净，是已知局限，
+# 见文件头“实话”）。
+_SECRET_LABELS = (
+    r"密码|口令|passwd|password|pwd",
+    r"api[_ -]?key|api[_ -]?密钥|密钥|秘钥",
+    r"secret|token|令牌|access[_ -]?key|auth[_ -]?token",
+    r"身份证(?:号)?|银行卡号|信用卡号|卡号",
+)
+_LABELED_SECRET_RE = re.compile(
+    r"(?:"
+    + "|".join(_SECRET_LABELS)
+    + r")\s*(?:是|为|is|=|:|：)\s*([^\s，,、；;。！？\n]{3,})",
+    re.IGNORECASE,
+)
+
+# _GENERIC_TOKEN_RE（没见过的长令牌）：32 位以上、同时含大小写字母和
+# 数字的连续字符串（字母数字 _ -），大概率是某种 token/key。
+# 要求混搭（纯小写十六进制的 git hash 不算、纯数字不算），且前面不能是
+# / . : 或字母数字（网址、路径里的长段不算，避免把链接误伤）。
+_GENERIC_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_/.:-])"
+    r"(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\d)"
+    r"[A-Za-z0-9_-]{32,}"
+)
+
+_ID18_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+_ID18_CHECK_CHARS = "10X98765432"
+
+
+def _id18_check_ok(number):
+    """验算 18 位身份证号的校验位（GB 11643 加权求和取模）。"""
+    if len(number) != 18:
+        return False
+    total = sum(int(digit) * weight for digit, weight in zip(number[:17], _ID18_WEIGHTS))
+    return _ID18_CHECK_CHARS[total % 11] == number[17].upper()
+
+
+def _luhn_ok(number):
+    """Luhn 校验（银行卡号用的校验算法）：从右往左隔位翻倍、减 9，
+    各位相加能被 10 整除就是合法卡号。"""
+    digits = [int(ch) for ch in number if ch.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for i, digit in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def _redact_sensitive(text):
+    """把一段文本里的敏感信息替换成占位符（只换秘密本身，保留其他内容）。
+
+    顺序有讲究：先换整块/定格式的（私钥块、JWT、已知密钥格式、
+    身份证号、银行卡号），再换带标签的（“密码是 xxx”——标签值里
+    也可能是一串卡号，先换卡号能把带空格的卡号整段换掉），
+    最后换没见过的长令牌。没有敏感信息时原样返回。
+    注意：这个函数绝不能记日志、绝不能把原文写进任何地方——
+    它处理的就是不能外泄的东西。
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    redacted = _PRIVATE_KEY_RE.sub(_REDACTED, text)
+    redacted = _JWT_RE.sub(_REDACTED, redacted)
+    for pattern in _KNOWN_KEY_RES:
+        redacted = pattern.sub(_REDACTED, redacted)
+    redacted = _ID18_RE.sub(
+        lambda m: _REDACTED if _id18_check_ok(m.group(0)) else m.group(0), redacted
+    )
+    redacted = _ID15_RE.sub(_REDACTED, redacted)
+    redacted = _CARD_CANDIDATE_RE.sub(
+        lambda m: _REDACTED if _luhn_ok(m.group(0)) else m.group(0), redacted
+    )
+    redacted = _LABELED_SECRET_RE.sub(
+        lambda m: m.group(0)[: m.start(1) - m.start(0)] + _REDACTED, redacted
+    )
+    redacted = _GENERIC_TOKEN_RE.sub(_REDACTED, redacted)
+    return redacted
+
+
+def _contains_sensitive(text):
+    """一段文本里是否含有敏感信息（按上面的模式判断）。"""
+    if not isinstance(text, str) or not text:
+        return False
+    return _redact_sensitive(text) != text
+
+
+# _MEANINGLESS_RES（脱敏后判断“还剩不剩有用的内容”时去掉的东西）：
+# 占位符、标签词（密码/密钥/……）、虚词和标点都不算内容——
+# “我的密码是 xxx”脱敏后只剩“我的密码是”，这不叫“有用的记忆”，
+# 不值得存；“我喜欢喝咖啡，我的密码是 xxx”脱敏后还剩“喜欢喝咖啡”，
+# 这才叫有用的记忆，要留下来。注意这三个正则只用来判断“还剩不剩”，
+# 不用来改要存的文本。
+_MEANINGLESS_RES = [
+    re.compile(re.escape(_REDACTED)),
+    re.compile(
+        "|".join(_SECRET_LABELS),
+        re.IGNORECASE,
+    ),
+    re.compile(r"[我的为有在和与了呢吗是：:，,、；;。！？\s]+"),
+]
+
+
+def _meaningful_after_redaction(text):
+    """脱敏后的文本里还剩不剩有用的内容（去掉占位符、标签词、虚词后
+    还有东西才算有）。纯秘密（“我的密码是 xxx”）脱敏后什么都不剩，
+    返回 False，调用方直接不存；混合内容（“喜欢喝咖啡，密码是 xxx”）
+    还剩“喜欢喝咖啡”，返回 True，调用方存脱敏后的版本。"""
+    if not isinstance(text, str):
+        return False
+    rest = text
+    for pattern in _MEANINGLESS_RES:
+        rest = pattern.sub("", rest)
+    return bool(rest.strip())
+
+
+def _normalize_memory_text(text):
+    """把一条记忆文本规整成可比的形状（供直接存入的去重用）：
+    全角转半角（Ａ→A）、去所有空白、去末尾句末标点、英文转小写。
+    “我每天晚上都读半小时书。”和“我每天晚上都读半小时书”
+    （只差一个句号）算同一条，不重复存。"""
+    if not isinstance(text, str):
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = re.sub(r"\s+", "", normalized)
+    normalized = normalized.rstrip("。！？；，、.!?;,")
+    return normalized.lower()
+
+
+def _find_duplicate_memory(text, existing_items):
+    """在已有记忆里找和 text 相同（或只差标点/空白/大小写）的那条，
+    找到返回那一项（{"id", "text"}），找不到返回 None。"""
+    normalized = _normalize_memory_text(text)
+    if not normalized:
+        return None
+    for item in existing_items or []:
+        if _normalize_memory_text(item.get("text") or "") == normalized:
+            return item
+    return None
 
 
 # ---------- 版本文件（embedding 模型 + 维度记录） ----------
@@ -480,9 +703,14 @@ class Mem0Store:
            语义万一漏了，关键词能捞回来。
         3. 总数不超过 top_k；任何一步出错都只记日志、返回已拿到的结果，
            不抛异常、不拦聊天。
+        4. 敏感过滤（用时拦截）：不管哪路信号拿到的记忆，只要含有敏感
+           信息（密码、密钥、身份证号、银行卡号……）就整条跳过、不注入——
+           旧库里在过滤加上之前就已存下的敏感记忆，也绝不能拼进发给模型
+           的问题里。跳过几条只记个数，不记内容。
         """
         results = []
         seen_texts = set()
+        skipped_sensitive = 0
         try:
             raw = self._memory.search(query, filters={"user_id": self.user_id}, top_k=top_k)
             for item in (raw or {}).get("results", []):
@@ -492,6 +720,9 @@ class Mem0Store:
                     continue
                 text = item.get("memory") or ""
                 if not text:
+                    continue
+                if _contains_sensitive(text):
+                    skipped_sensitive += 1
                     continue
                 results.append(
                     {
@@ -516,6 +747,9 @@ class Mem0Store:
                         text = item.get("memory") or ""
                         if not text or text in seen_texts:
                             continue
+                        if _contains_sensitive(text):
+                            skipped_sensitive += 1
+                            continue
                         weight, _matched = _keyword_weight(text, keywords)
                         if weight >= KEYWORD_MIN_WEIGHT:
                             results.append(
@@ -529,20 +763,30 @@ class Mem0Store:
                             seen_texts.add(text)
             except Exception:
                 logger.warning("mem0 关键词补充检索失败。", exc_info=True)
+        if skipped_sensitive:
+            logger.info("检索：%d 条记忆含敏感信息，已跳过，不注入。", skipped_sensitive)
         return results
 
-    def get_all(self):
+    def get_all(self, include_sensitive=False):
         """返回当前用户的所有记忆（列表，每项 {"id", "text"}）。
 
-        供迁移、删除校验、种子检查用。出问题时返回空列表，不抛异常。
+        默认不含敏感信息：导出、迁移、展示用的都是这个默认口径，
+        旧库里已有的敏感记忆不会从这里漏出去。
+        include_sensitive=True 只给内部用：删除归属校验（敏感记忆
+        也要能删掉）和重嵌备份（本地维护，不能悄悄丢数据）——
+        这两个地方不把记忆发给模型、也不导出，只是在本地处理。
+        出问题时返回空列表，不抛异常。
         """
         try:
             raw = self._memory.get_all(filters={"user_id": self.user_id})
             out = []
             for item in (raw or {}).get("results", []):
                 text = item.get("memory") or ""
-                if text:
-                    out.append({"id": item.get("id"), "text": text})
+                if not text:
+                    continue
+                if not include_sensitive and _contains_sensitive(text):
+                    continue
+                out.append({"id": item.get("id"), "text": text})
             return out
         except Exception:
             logger.warning("mem0 取全部记忆失败。", exc_info=True)
@@ -557,34 +801,109 @@ class Mem0Store:
         mem0 自己调 DeepSeek 提取（自动存，BOOS 已同意不用确认），
         再去重、存进向量库。整个写入走全局写锁，一次只让一个写，
         防止并发写出重复记忆。
+        隐私（存前脱敏 + 存后复查，两道）：
+        提取要把对话原文发给 DeepSeek，秘密不能跟着原文一起发出去——
+        所以先把每条消息里的敏感信息换成占位符，再调提取；脱敏后
+        什么有用的内容都不剩（比如整轮只说了一个密码）时，直接不调
+        提取，省一次调用。提取回来之后再复查一遍：万一哪条提取出的
+        记忆还带着敏感信息（比如模型把没见过的密钥格式复述出来了），
+        立刻删掉、不留库里（见 _drop_sensitive_results）。
         返回：mem0.add() 的结果（字典），失败时返回 {}，绝不抛异常——
         存记忆失败不能把已经拿到的聊天回答搞崩。
         """
         if not messages:
             return {}
         with _WRITE_LOCK:
+            safe_messages = [
+                {
+                    "role": (m or {}).get("role"),
+                    "content": _redact_sensitive((m or {}).get("content") or ""),
+                }
+                for m in messages
+            ]
+            if not any(
+                _meaningful_after_redaction(m["content"]) for m in safe_messages
+            ):
+                return {}
             try:
-                result = self._memory.add(messages, user_id=self.user_id)
-                return result or {}
+                result = self._memory.add(safe_messages, user_id=self.user_id)
             except Exception:
                 logger.warning("mem0 自动存记忆失败：本轮对话未存入长期记忆。", exc_info=True)
                 return {}
+            return self._drop_sensitive_results(result or {})
+
+    def _drop_sensitive_results(self, result):
+        """提取后二次过滤：检查本次提取出的记忆，万一哪条还带着敏感信息
+        （比如模型把没见过的密钥格式复述出来了），立刻删掉、不留库里，
+        也不返回给调用方。删失败时只记日志（不记内容），不影响其他记忆。
+        返回过滤后的结果（删掉的条目不在 results 里）。"""
+        items = (result or {}).get("results") or []
+        if not items:
+            return result
+        kept = []
+        dropped = 0
+        for item in items:
+            text = (item or {}).get("memory") or ""
+            mem_id = (item or {}).get("id")
+            if text and _contains_sensitive(text):
+                dropped += 1
+                if mem_id:
+                    try:
+                        self._memory.delete(mem_id)
+                    except Exception:
+                        logger.warning(
+                            "提取后过滤：删除含敏感信息的记忆失败。", exc_info=True
+                        )
+                continue
+            kept.append(item)
+        if dropped:
+            logger.info("提取后过滤：%d 条提取出的记忆含敏感信息，已删除。", dropped)
+        if len(kept) == len(items):
+            return result
+        filtered = dict(result)
+        filtered["results"] = kept
+        return filtered
 
     def add_memory_text(self, text, layers=None, source="user"):
         """手动存一条记忆原文（CLI“记住：内容”用，不经过提取）。
 
         参数 text：记忆内容原文；layers/source：保留给以后用，
         mem0 的 infer=False 路径不吃这两个字段，这里只记日志。
-        走全局写锁。返回：mem0.add() 的结果，失败返回 {}，不抛异常。
+        走全局写锁。
+        隐私（存前脱敏）：直接存的原文不经过提取，没有模型把关，
+        秘密会原样进库——所以存之前先把秘密换成占位符；脱敏后
+        什么有用的内容都不剩（整条就是一个密码）时，直接不存。
+        混合内容（“喜欢喝咖啡，密码是 xxx”）只脱敏秘密部分，
+        有用的那句照常存下来，不整条丢掉。
+        去重：库里已有相同（或只差标点/空白/大小写）的记忆时不重复存，
+        返回已有的那条（event=NONE，和 mem0“没变化”的意思一致，
+        顶层再带一个 duplicate=True，方便迁移脚本数数）。
+        返回：mem0.add() 的结果，失败返回 {}，不抛异常。
         layers/source 现在不用（mem0 的 infer=False 直接存原文，
         不分层、不标来源），参数留着是为了调用方不用改签名。
         """
         if not isinstance(text, str) or not text.strip():
             return {}
         with _WRITE_LOCK:
+            safe_text = _redact_sensitive(text.strip())
+            if not _meaningful_after_redaction(safe_text):
+                return {}
+            duplicate = _find_duplicate_memory(safe_text, self.get_all())
+            if duplicate is not None:
+                logger.info("手动存记忆：库里已有相同记忆，本次未重复存。")
+                return {
+                    "results": [
+                        {
+                            "id": duplicate["id"],
+                            "memory": duplicate["text"],
+                            "event": "NONE",
+                        }
+                    ],
+                    "duplicate": True,
+                }
             try:
                 result = self._memory.add(
-                    [{"role": "user", "content": text.strip()}],
+                    [{"role": "user", "content": safe_text}],
                     user_id=self.user_id,
                     infer=False,
                 )
@@ -605,6 +924,9 @@ class Mem0Store:
         （FIRST_MEMORIES 里的第 3 条），并记一条日志说明改过；
         其他记忆一律一字不改。
         已在库里的（按原文完全相同算）跳过，不重复存。
+        隐私（导出过滤）：旧文件里的记忆先脱敏再迁——混合内容只脱敏
+        秘密部分、有用的那句照常迁；整条只有敏感信息（比如整条就是
+        一个密码）时跳过不迁。日志里不出现记忆原文。
         返回：本次新存入的条数。文件不存在或读不出时返回 0，不抛异常。
         """
         path = (
@@ -621,7 +943,9 @@ class Mem0Store:
             logger.warning("迁移：旧记忆文件里不是一个列表，跳过迁移。")
             return 0
         existing_texts = {item["text"] for item in self.get_all()}
+        existing_normalized = {_normalize_memory_text(t) for t in existing_texts}
         added = 0
+        skipped_sensitive = 0
         for item in data:
             if not isinstance(item, dict):
                 continue
@@ -629,17 +953,29 @@ class Mem0Store:
             if not text:
                 continue
             # 已作废的旧预算规则：迁移时改成新规矩，并记日志。
+            # 日志里不写原文（这句是固定文本，但规矩是“日志不记记忆内容”，
+            # 以后万一有人把别的记忆也记进日志，至少这一处是干净的）。
             if text == _OUTDATED_BUDGET_TEXT:
-                new_text = FIRST_MEMORIES[2]["text"]
-                logger.info("迁移：旧预算记忆已按新规矩改写（%s → %s）。", text, new_text)
-                text = new_text
-            if text in existing_texts:
+                text = FIRST_MEMORIES[2]["text"]
+                logger.info("迁移：旧预算记忆已按新规矩改写。")
+            # 先脱敏再迁：混合内容只脱敏秘密部分，整条只有秘密时跳过。
+            text = _redact_sensitive(text)
+            if not _meaningful_after_redaction(text):
+                skipped_sensitive += 1
+                continue
+            if _normalize_memory_text(text) in existing_normalized:
                 continue
             result = self.add_memory_text(text)
-            if result:
+            if result and not result.get("duplicate"):
                 added += 1
                 existing_texts.add(text)
-        logger.info("迁移完成：从 %s 新存入 %d 条记忆。", path, added)
+                existing_normalized.add(_normalize_memory_text(text))
+        logger.info(
+            "迁移完成：从 %s 新存入 %d 条记忆（%d 条只有敏感信息，已跳过）。",
+            path,
+            added,
+            skipped_sensitive,
+        )
         return added
 
     def ensure_first_memories(self):
@@ -682,6 +1018,9 @@ class Mem0Store:
         两道都过了才调 mem0.delete(id)。返回 True；找不到记忆时
         返回 False（已经没了，也算删干净了）；mem0 报错时抛异常，
         调用方决定怎么处理。
+        注意：归属校验要用 include_sensitive=True 的 get_all——
+        旧库里已有的敏感记忆也要能删掉，不能因为它含敏感信息
+        就查不到、删不掉。
         注意：现在还没有删除的网页界面/命令行入口，这个方法是给以后
         的删除入口准备的；任何入口调它之前，都必须先问 BOOS。
         """
@@ -690,7 +1029,7 @@ class Mem0Store:
         if not memory_id:
             return False
         with _WRITE_LOCK:
-            owned_ids = {item["id"] for item in self.get_all()}
+            owned_ids = {item["id"] for item in self.get_all(include_sensitive=True)}
             if memory_id not in owned_ids:
                 logger.warning("删除被拒：记忆 %s 不属于当前用户。", memory_id)
                 return False
