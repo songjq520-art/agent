@@ -13,8 +13,8 @@ import pytest
 import requests
 
 from config import BudgetTracker
+from conftest import make_fake_store
 from main import chat_loop, is_exit_command, main, run_question
-from memory.memories import MemoryStore
 from providers.deepseek import DeepSeekProvider
 from providers.muse import MuseProvider
 
@@ -111,12 +111,13 @@ def test_chat_messages_rejects_bad_history(tmp_path):
 
 # ---------- 预算预估覆盖完整历史 ----------
 def test_deepseek_estimate_covers_full_history_not_just_latest(tmp_path):
-    """预算预估覆盖完整历史：历史很长、最新问题很短时，仍按完整历史预估拦截。
+    """预算预估覆盖完整历史：历史很长、最新问题很短时，预估仍按完整历史算。
 
     累计 $4.998、只剩 $0.002。历史里第一轮有 10000 个汉字（约 15000 Token），
-    完整历史预估约 $0.00348，超过剩余 $0.002，应拦截；如果只算最新问题
-    “你好吗”（3 个汉字），预估只有约 $0.00123，不会拦截。
-    所以被拦截就证明预估算的是完整历史，不是最新问题。
+    完整历史预估约 $0.00348，超过剩余 $0.002；如果只算最新问题
+    “你好吗”（3 个汉字），预估只有约 $0.00123。
+    新规矩（BOOS 2026-11-08 定）：预估只作参考、不再拦截——所以这里
+    只验证预估数本身算的是完整历史，并验证 chat_messages 照常发请求。
     """
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(4.998)
@@ -128,15 +129,21 @@ def test_deepseek_estimate_covers_full_history_not_just_latest(tmp_path):
     ]
     # 只算最新问题时预估约 $0.00123，远小于剩余 $0.002，不会拦截。
     assert tracker.estimate_cost("你好吗", provider="deepseek") < 0.002
-    # 算完整历史时预估约 $0.00348，超过剩余 $0.002，应拦截。
-    with patch("providers.deepseek.requests.post") as mock_post:
-        with pytest.raises(RuntimeError, match="预估成本可能超过"):
-            provider.chat_messages(history)
-        mock_post.assert_not_called()
+    # 算完整历史时预估约 $0.00348，超过剩余 $0.002——证明预估算的是
+    # 完整历史，不是最新问题（这里把历史内容拼起来算，和旧版
+    # chat_messages 内部的算法一致）。
+    history_text = "\n".join(item["content"] for item in history)
+    assert tracker.estimate_cost(history_text, provider="deepseek") == pytest.approx(0.00348)
+    # 预估超了也不拦截：chat_messages 照常发请求。
+    with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
+        result = provider.chat_messages(history)
+        mock_post.assert_called_once()
+    assert result["text"] == "你好，我是 DeepSeek。"
 
 
-def test_deepseek_chat_messages_budget_block_before_api_request(tmp_path):
-    """超预算时请求前拦截（多轮）：累计到 $5 后，chat_messages 应抛错，且不发请求。"""
+def test_deepseek_chat_messages_no_block_after_reaching_budget(tmp_path):
+    """到 $5 只提醒、不拦截（多轮）：累计到 $5 后，chat_messages 仍正常
+    发请求、拿到回答（BOOS 2026-11-08 定：到 5 美元提醒、永不自动停）。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(5.0)
     provider = DeepSeekProvider(api_key="fake-key-for-test", budget_tracker=tracker)
@@ -145,10 +152,10 @@ def test_deepseek_chat_messages_budget_block_before_api_request(tmp_path):
         {"role": "assistant", "content": "你好。"},
         {"role": "user", "content": "再见"},
     ]
-    with patch("providers.deepseek.requests.post") as mock_post:
-        with pytest.raises(RuntimeError, match="预算上限"):
-            provider.chat_messages(history)
-        mock_post.assert_not_called()
+    with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
+        result = provider.chat_messages(history)
+        mock_post.assert_called_once()
+    assert result["text"] == "你好，我是 DeepSeek。"
 
 
 # ---------- API 错误不会伪造成功回答 ----------
@@ -216,9 +223,11 @@ def test_run_question_with_messages_does_not_mutate_history(monkeypatch, tmp_pat
     assert messages == [{"role": "user", "content": "你好"}]
 
 
-def test_multi_turn_unknown_cost_protection_still_works(monkeypatch, tmp_path):
-    """多轮未知成本保护：第二轮模型没返回 usage 时，成本为 None，
-    标记未知成本、暂停后续调用，不能当成零成本继续。"""
+def test_multi_turn_unknown_cost_reminds_only(monkeypatch, tmp_path):
+    """多轮未知成本只提醒、不暂停：第二轮模型没返回 usage 时，成本为 None，
+    标记未知成本、只打印提醒，之后仍可调用（BOOS 2026-11-08 定：
+    成本未知只提醒、不停），不能当成零成本继续——标记还在，
+    要去官方后台核对。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     messages = []
@@ -239,7 +248,7 @@ def test_multi_turn_unknown_cost_protection_still_works(monkeypatch, tmp_path):
         outcome2 = run_question("再见", budget_tracker=tracker, messages=messages)
         assert outcome2["result"]["cost_usd"] is None
     assert tracker.unknown_cost is True
-    assert tracker.can_call() is False
+    assert tracker.can_call() is True  # 只提醒，不暂停
 
 
 # ---------- 退出命令不会调用 API ----------
@@ -359,11 +368,16 @@ def test_chat_loop_demo_mode_does_not_call_api(monkeypatch, tmp_path):
 
 # ---------- main() 入口分发 ----------
 def test_main_with_arg_is_single_question(monkeypatch, tmp_path):
-    """main() 带参数时为单次问答：python main.py "你好" 只问一次，不进入循环。"""
+    """main() 带参数时为单次问答：python main.py "你好" 只问一次，不进入循环。
+
+    注意：新版 main() 的命令行入口不带记忆库（B 号工人的设计：
+    命令行默认不加载 mem0，记忆只在网页服务里启用，或“记住……”时
+    才懒加载；main() 的 memory_store 参数只是兼容旧调用，传了也不用）。
+    所以这里不传 store，只验证单次问答的分发。
+    """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
-    store = MemoryStore(file_path=tmp_path / "memories.json")
     with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
-        assert main(["你好"], memory_store=store) == 0
+        assert main(["你好"]) == 0
         mock_post.assert_called_once()
         assert mock_post.call_args.kwargs["json"]["messages"] == [
             {"role": "user", "content": "你好"}
@@ -371,14 +385,16 @@ def test_main_with_arg_is_single_question(monkeypatch, tmp_path):
 
 
 def test_main_without_arg_enters_chat_loop(monkeypatch, tmp_path):
-    """main() 不带参数时进入连续对话：python main.py 后可多轮对话，exit 结束。"""
+    """main() 不带参数时进入连续对话：python main.py 后可多轮对话，exit 结束。
+
+    同上：命令行入口不带记忆库，这里不传 store，只验证进入循环的分发。
+    """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
-    store = MemoryStore(file_path=tmp_path / "memories.json")
     with (
         patch("builtins.input", side_effect=["你好", "exit"]),
         patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post,
     ):
-        assert main([], memory_store=store) == 0
+        assert main([]) == 0
         mock_post.assert_called_once()
 
 
@@ -445,3 +461,43 @@ def test_budget_accumulates_across_turns_in_one_chat_loop(monkeypatch, tmp_path)
     assert tracker2.corrupted is False
     assert tracker2.total_cost_usd == pytest.approx(0.00009)
     assert tracker2.cost_for_model("deepseek-flash") == pytest.approx(0.00009)
+
+
+# ---------- 连续对话接 mem0（新接口，见 tests/conftest.py 的 make_fake_store） ----------
+
+
+def test_chat_loop_with_mem0_store_saves_turn_after_answer(monkeypatch, tmp_path):
+    """连续对话 + mem0：成功回答后把本轮对话存进长期记忆（add_turn），
+    FakeMemory 能从 user 消息里提出“我叫小宋”这条事实。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    store = make_fake_store(tmp_path)
+    with (
+        patch("builtins.input", side_effect=["我叫小宋。", "exit"]),
+        patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post,
+    ):
+        assert chat_loop(budget_tracker=tracker, mem0_store=store) == 0
+        mock_post.assert_called_once()
+    texts = [item["text"] for item in store.get_all()]
+    assert any("小宋" in text for text in texts)
+
+
+def test_chat_loop_remember_command_saves_text_via_mem0(monkeypatch, tmp_path):
+    """连续对话“记住：内容”：懒加载 get_mem0_store 后调 add_memory_text，
+    原文存进长期记忆，不用再确认（mem0 自动存，BOOS 已同意）。
+
+    输入里多给一个 "exit"：旧版 main.py 的“记住”还要 input() 问一次 y/n，
+    会把第二个 "exit" 当确认回答吃掉；新版不问，直接存，第二个 "exit" 退出循环。
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    store = make_fake_store(tmp_path)
+    # main.py 里是 `from memory import mem0_store`（模块），再调模块上的
+    # get_mem0_store() 懒加载；所以补丁要打在模块属性上，不是 main.get_mem0_store。
+    monkeypatch.setattr(
+        "main.mem0_store.get_mem0_store", lambda budget_tracker=None: store
+    )
+    with patch("builtins.input", side_effect=["记住：我喜欢喝咖啡。", "exit", "exit"]):
+        assert chat_loop(budget_tracker=tracker) == 0
+    texts = [item["text"] for item in store.get_all()]
+    assert "我喜欢喝咖啡。" in texts

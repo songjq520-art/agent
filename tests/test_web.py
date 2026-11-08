@@ -1,20 +1,65 @@
 # tests/test_web.py（本地网页入口的测试）
-# 作用：验证 web/server.py 的四个接口和对话历史逻辑。
+# 作用：验证 web/server.py 的接口、对话历史逻辑和 mem0 记忆接线。
 # 原理：用临时端口（port 0，系统自动分配）和临时预算文件启动真实服务，
 #       再用标准库 http.client 发请求验证，不调用真实模型 API。
 #       需要“真实调用成功”的场景时，用 monkeypatch 把 run_question 换成
 #       返回假结果的函数，不产生费用。
+#       记忆用下面就地定义的 FakeMem0Store（最小的假 store），不碰真实 mem0。
 # 注意：这些测试不依赖网络、不依赖 API Key；无 Key 时走演示模式。
 
 import http.client
 import json
 import threading
 import time
+from unittest.mock import Mock, patch
 
 import pytest
 
 from config import BudgetTracker
-from web.server import ServerConfig, create_server
+from conftest import make_fake_store
+from web.server import ChatState, ServerConfig, create_server
+
+
+def _fake_ok_response(text="你好，我是 DeepSeek。", prompt_tokens=100, completion_tokens=50):
+    """模拟的成功 API 返回（带 usage），供真实 run_question 的测试用。"""
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": text}}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    fake_response.raise_for_status.return_value = None
+    return fake_response
+
+
+class FakeMem0Store:
+    """最小的 mem0 假 store：只实现 web 层用到的三个方法，不碰真实 mem0。
+
+    memories 是 search() 固定返回的记忆文本列表；saved_turns 记下每次
+    add_turn() 收到的消息，供测试核对“回答后存了本轮对话”。
+    """
+
+    def __init__(self, memories=None):
+        self.memories = list(memories or [])
+        self.saved_turns = []
+
+    def search(self, query, top_k=5):
+        """返回固定的记忆列表（每项和真实 Mem0Store.search() 的格式一致）。"""
+        return [
+            {"id": f"m{i}", "text": text, "score": 0.9, "source": "semantic"}
+            for i, text in enumerate(self.memories[:top_k])
+        ]
+
+    def add_turn(self, messages):
+        """记下收到的消息（复制一份，免得调用方之后改了历史影响核对）。"""
+        self.saved_turns.append(list(messages))
+        return {}
+
+    def get_all(self):
+        return [{"id": f"m{i}", "text": text} for i, text in enumerate(self.memories)]
 
 
 def _request(port, method, path, body=None):
@@ -36,12 +81,12 @@ def _request(port, method, path, body=None):
     return resp.status, content_type, raw.decode("utf-8", errors="replace")
 
 
-def _start_test_server(tmp_path, authenticator=None):
+def _start_test_server(tmp_path, authenticator=None, mem0_store=None):
     """用临时端口和临时预算文件启动一个测试服务，返回 (server, port, state)。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     config = ServerConfig(host="127.0.0.1", port=0)
     server, state = create_server(
-        config=config, budget_tracker=tracker, authenticator=authenticator
+        config=config, budget_tracker=tracker, authenticator=authenticator, mem0_store=mem0_store
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -59,6 +104,7 @@ def running_server(tmp_path):
 
     返回 (port, state)：port 是实际监听的端口，state 是 ChatState，
     测试里可以直接看 state.messages 验证历史有没有追加。
+    默认不带记忆库（mem0_store=None）。
     """
     server, port, state = _start_test_server(tmp_path)
     try:
@@ -67,8 +113,34 @@ def running_server(tmp_path):
         _stop_test_server(server)
 
 
+@pytest.fixture
+def running_server_with_mem0(tmp_path):
+    """启动一个带假 mem0 记忆库的测试服务，测试完关掉。
+
+    返回 (port, state, mem0_store)：记忆库里已有一条“用户叫 BOOS。”，
+    供测试核对提问时有没有把记忆带给模型、回答后有没有存本轮对话。
+    """
+    mem0_store = FakeMem0Store(memories=["用户叫 BOOS。"])
+    server, port, state = _start_test_server(tmp_path, mem0_store=mem0_store)
+    try:
+        yield port, state, mem0_store
+    finally:
+        _stop_test_server(server)
+
+
+def _fake_success_run_question(prompt, budget_tracker=None, messages=None, **kwargs):
+    """假的 run_question：直接返回一轮成功的假回答，不调用真实模型。"""
+    return {
+        "mode": "real",
+        "route": {"task_type": "question", "provider": "deepseek", "model": "deepseek-flash"},
+        "result": {"text": "假回答", "model": "deepseek-flash", "cost_usd": 0.0001, "usage": {"total_tokens": 10}},
+        "message": "真实调用完成。",
+        "model_status": {},
+    }
+
+
 def test_get_root_serves_chat_page(running_server):
-    """GET / 返回聊天页面：200、HTML、里面有标题和输入框。"""
+    """GET / 返回聊天页面：200、HTML、里面有标题和输入框，没有提议侧边栏。"""
     port, _state = running_server
     status, content_type, body = _request(port, "GET", "/")
     assert status == 200
@@ -76,10 +148,17 @@ def test_get_root_serves_chat_page(running_server):
     assert "我的 Agent" in body
     assert 'id="input"' in body
     assert 'id="send"' in body
+    # 提议侧边栏已删除：页面里不该再有提议区块和指向 /api/proposals 的请求。
+    assert "待确认的记忆提议" not in body
+    assert "proposalList" not in body
+    assert "/api/proposals" not in body
 
 
 def test_get_status_returns_models_and_budget(running_server):
-    """GET /api/status 返回模型状态和本月预算：有 deepseek、预算 5 美元、剩余 5 美元。"""
+    """GET /api/status 返回模型状态和本月预算：有 deepseek、预算 5 美元、剩余 5 美元。
+
+    默认不带记忆库，mem0_enabled 是 False。
+    """
     port, _state = running_server
     status, content_type, data = _request(port, "GET", "/api/status")
     assert status == 200
@@ -89,6 +168,15 @@ def test_get_status_returns_models_and_budget(running_server):
     assert data["total_cost_usd"] == 0.0
     assert data["remaining_usd"] == 5.0
     assert data["budget_corrupted"] is False
+    assert data["mem0_enabled"] is False
+
+
+def test_get_status_reports_mem0_enabled(running_server_with_mem0):
+    """带假 mem0 记忆库启动时：GET /api/status 返回 mem0_enabled 为 True。"""
+    port, _state, _mem0_store = running_server_with_mem0
+    status, _ct, data = _request(port, "GET", "/api/status")
+    assert status == 200
+    assert data["mem0_enabled"] is True
 
 
 def test_chat_demo_mode_returns_demo_message_and_keeps_history_empty(running_server, monkeypatch):
@@ -108,17 +196,7 @@ def test_chat_demo_mode_returns_demo_message_and_keeps_history_empty(running_ser
 def test_chat_success_appends_history(running_server, monkeypatch):
     """真实调用成功（用假结果模拟）时：返回回答，历史追加一问一答。"""
     port, state = running_server
-
-    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
-        return {
-            "mode": "real",
-            "route": {"task_type": "question", "provider": "deepseek", "model": "deepseek-flash"},
-            "result": {"text": "假回答", "model": "deepseek-flash", "cost_usd": 0.0001, "usage": {"total_tokens": 10}},
-            "message": "真实调用完成。",
-            "model_status": {},
-        }
-
-    monkeypatch.setattr("web.server.run_question", _fake_run_question)
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
     status, _ct, data = _request(port, "POST", "/api/chat", {"message": "你好"})
     assert status == 200
     assert data["mode"] == "real"
@@ -135,7 +213,7 @@ def test_chat_failure_returns_error_and_keeps_history(running_server, monkeypatc
     """调用抛 RuntimeError 时：返回 502 和通用错误，不泄露内部信息，历史不动。"""
     port, state = running_server
 
-    def _boom(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
+    def _boom(prompt, budget_tracker=None, messages=None, **kwargs):
         # 模拟服务商报错里夹带内部信息：接口地址、内部请求号、假密钥片段。
         raise RuntimeError(
             "DeepSeek API 调用失败：401 Client Error for url: "
@@ -178,17 +256,7 @@ def test_chat_bad_json_returns_400(running_server):
 def test_reset_clears_history(running_server, monkeypatch):
     """POST /api/reset 清空对话历史：先攒一轮问答，再清空，历史变回空。"""
     port, state = running_server
-
-    def _fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
-        return {
-            "mode": "real",
-            "route": {"task_type": "question", "provider": "deepseek", "model": "deepseek-flash"},
-            "result": {"text": "假回答", "model": "deepseek-flash", "cost_usd": 0.0001, "usage": {"total_tokens": 10}},
-            "message": "真实调用完成。",
-            "model_status": {},
-        }
-
-    monkeypatch.setattr("web.server.run_question", _fake_run_question)
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
     _request(port, "POST", "/api/chat", {"message": "你好"})
     assert len(state.messages) == 2
     status, _ct, data = _request(port, "POST", "/api/reset")
@@ -204,6 +272,140 @@ def test_unknown_path_returns_404(running_server):
     assert status == 404
     status, _ct, _body = _request(port, "POST", "/api/no-such", {"message": "你好"})
     assert status == 404
+
+
+# ---------- mem0 长期记忆 ----------
+
+
+def test_ask_without_mem0_store_chats_normally(tmp_path, monkeypatch):
+    """mem0_store=None 时 ask() 仍能正常聊天：不带记忆，原样提问，历史正常追加。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    state = ChatState(budget_tracker=tracker, mem0_store=None)
+    seen = {}
+
+    def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["prompt"] = prompt
+        return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _capturing_fake)
+    result = state.ask("你好")
+    assert result["mode"] == "real"
+    assert result["reply"] == "假回答"
+    # 没带记忆库：发给模型的和用户原话一样，没拼记忆块。
+    assert seen["prompt"] == "你好"
+    assert state.messages == [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "假回答"},
+    ]
+
+
+def test_ask_with_mem0_injects_memory_and_saves_turn(tmp_path, monkeypatch):
+    """有 mem0 记忆库时：提问前把搜到的记忆拼进发给模型的问题里，回答后存本轮对话。
+
+    历史里仍记用户原话（不带记忆块）；存记忆时带的是本轮及最近的消息，
+    含刚追加的新问答。
+    """
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    mem0_store = FakeMem0Store(memories=["用户叫 BOOS。"])
+    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    seen = {}
+
+    def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["prompt"] = prompt
+        return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _capturing_fake)
+    result = state.ask("你记得我叫什么吗？")
+    assert result["mode"] == "real"
+    assert result["reply"] == "假回答"
+    # 发给模型的问题里带上了记忆块（main._memory_block 拼的格式）。
+    assert "用户叫 BOOS。" in seen["prompt"]
+    assert "仅供参考" in seen["prompt"]
+    assert seen["prompt"].endswith("你记得我叫什么吗？")
+    # 历史里记的是原话，不带记忆块。
+    assert state.messages == [
+        {"role": "user", "content": "你记得我叫什么吗？"},
+        {"role": "assistant", "content": "假回答"},
+    ]
+    # 回答成功后调了一次 add_turn，带上了刚追加的新问答。
+    assert len(mem0_store.saved_turns) == 1
+    assert mem0_store.saved_turns[0] == state.messages
+
+
+def test_ask_with_mem0_but_no_results_asks_plainly(tmp_path, monkeypatch):
+    """记忆库里搜不到相关记忆时：原样提问，不拼空的记忆块；回答后仍存本轮对话。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    mem0_store = FakeMem0Store(memories=[])
+    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    seen = {}
+
+    def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["prompt"] = prompt
+        return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _capturing_fake)
+    result = state.ask("今天天气怎么样？")
+    assert result["mode"] == "real"
+    assert seen["prompt"] == "今天天气怎么样？"
+    assert len(mem0_store.saved_turns) == 1
+    assert mem0_store.saved_turns[0] == state.messages
+
+
+def test_proposals_endpoint_is_gone(running_server):
+    """提议端点已删除：GET /api/proposals 和确认/拒绝地址都回 404。"""
+    port, _state = running_server
+    status, _ct, _body = _request(port, "GET", "/api/proposals")
+    assert status == 404
+    status, _ct, _body = _request(port, "POST", "/api/proposals/abc123/confirm", {"ok": True})
+    assert status == 404
+    status, _ct, _body = _request(port, "POST", "/api/proposals/abc123/reject", {"ok": True})
+    assert status == 404
+
+
+def test_ask_with_real_mem0_store_searches_and_saves(tmp_path, monkeypatch):
+    """ChatState + 真实 Mem0Store（注了 FakeMemory，见 tests/conftest.py）：
+    提问前经 Mem0Store.search 检索到名字记忆并拼进发给模型的问题里，
+    回答后经 add_turn 把本轮对话存进记忆（FakeMemory 提出“我叫小宋”）。
+
+    和上面用 FakeMem0Store 的测试不同，这里走的是真实适配层逻辑
+    （阈值过滤 + 关键词补充 + 提取），只把底下的 mem0 换成假的。
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我叫小宋，昵称小宋，请称呼我小宋。")
+    state = ChatState(budget_tracker=tracker, mem0_store=store)
+    with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
+        result = state.ask("我叫小宋。")
+    assert result["mode"] == "real"
+    assert result["reply"] == "你好，我是 DeepSeek。"
+    # 发给模型的问题里带上了检索到的名字记忆。
+    sent = mock_post.call_args.kwargs["json"]["messages"]
+    assert "小宋" in sent[-1]["content"]
+    # 历史里记的是用户原话，不带记忆块。
+    assert state.messages == [
+        {"role": "user", "content": "我叫小宋。"},
+        {"role": "assistant", "content": "你好，我是 DeepSeek。"},
+    ]
+    # 回答后存了本轮对话：原来种下的 1 条 + 新提出的“我叫小宋”1 条。
+    texts = [item["text"] for item in store.get_all()]
+    assert len([text for text in texts if "小宋" in text]) == 2
+    assert "我叫小宋" in texts
+
+
+def test_ask_demo_mode_with_mem0_does_not_save_turn(tmp_path, monkeypatch):
+    """演示模式（无 Key）+ 有 mem0 记忆库：返回演示提示，历史不动，
+    也不调 add_turn 存记忆。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("MUSE_API_KEY", raising=False)
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    store = make_fake_store(tmp_path)
+    state = ChatState(budget_tracker=tracker, mem0_store=store)
+    result = state.ask("我叫小宋。")
+    assert result["mode"] == "demo"
+    assert state.messages == []
+    assert store._memory.add_calls == []
 
 
 # ---------- ServerConfig（监听配置） ----------
@@ -273,7 +475,7 @@ def test_unexpected_error_returns_generic_500(running_server, monkeypatch):
     """run_question 抛非 RuntimeError 时：返回 500 通用错误，不泄露内部信息。"""
     port, state = running_server
 
-    def _boom(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
+    def _boom(prompt, budget_tracker=None, messages=None, **kwargs):
         raise ValueError("内部秘密：数据库连接串 abc123")
 
     monkeypatch.setattr("web.server.run_question", _boom)
@@ -330,7 +532,7 @@ def test_authenticator_error_is_treated_as_deny(tmp_path):
 # ---------- 并发安全 ----------
 
 
-def _slow_fake_run_question(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
+def _slow_fake_run_question(prompt, budget_tracker=None, messages=None, **kwargs):
     """假的 run_question：故意拖 0.2 秒，让两个请求重叠；回答里带上问题本身，方便核对配对。"""
     time.sleep(0.2)
     return {
@@ -406,7 +608,7 @@ def test_concurrent_chat_calls_are_isolated(running_server, monkeypatch):
     seen = {}
     started = threading.Event()
 
-    def _timed_fake(prompt, budget_tracker=None, messages=None, memory_store=None, **kwargs):
+    def _timed_fake(prompt, budget_tracker=None, messages=None, **kwargs):
         if prompt == "慢":
             started.set()  # 告诉测试：慢请求已经进来了，锁已拿到。
         time.sleep(0.4 if prompt == "慢" else 0.1)

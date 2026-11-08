@@ -185,7 +185,9 @@ def test_muse_provider_cost_only_when_usage_returned(tmp_path):
 
 def test_muse_provider_no_usage_means_cost_unknown(tmp_path):
     """模型接口：模型没返回 usage 时，成本为 None，绝不编造；
-    同时要标记成本未知、暂停后续付费调用，不能当成零成本继续调用。"""
+    同时要标记成本未知、只打印提醒，不暂停后续调用（BOOS 2026-11-08 定：
+    成本未知只提醒、不停）；标记还在，不能当成零成本继续调用，
+    要去官方后台核对实际消费。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好"}}],
@@ -199,19 +201,23 @@ def test_muse_provider_no_usage_means_cost_unknown(tmp_path):
     assert result["cost_usd"] is None
     assert tracker.total_cost_usd == 0.0
     assert tracker.unknown_cost is True
-    assert tracker.can_call() is False  # 已暂停，等人工核对
+    assert tracker.can_call() is True  # 只提醒，不暂停
 
 
-def test_budget_tracker_warn_and_block(tmp_path):
-    """预算控制：达 80%（$4）警告，达 100%（$5）拒绝后续付费调用。"""
+def test_budget_tracker_warn_at_full_budget_no_block(tmp_path):
+    """预算控制：到 100%（$5）提醒，永不自动停（BOOS 2026-11-08 定）。
+
+    提醒比例已从 80% 改成 100%：$4 时不提醒、也不拦截；到 $5 时
+    提醒一次，之后调用照常进行。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     assert tracker.can_call() is True
     tracker.add_cost(4.0)
-    assert tracker.is_over_warn() is True
-    assert tracker.can_call() is True  # 80% 只警告，不拦截
+    assert tracker.is_over_warn() is False  # 未到 $5，不提醒
+    assert tracker.can_call() is True
     tracker.add_cost(1.0)
     assert tracker.is_over_budget() is True
-    assert tracker.can_call() is False  # 100% 拦截
+    assert tracker.is_over_warn() is True  # 到 $5，提醒
+    assert tracker.can_call() is True  # 只提醒，永不拦截
 
 
 def test_budget_tracker_monthly_reset(tmp_path):
@@ -363,15 +369,23 @@ def test_normal_budget_file_reads_fine(tmp_path):
     assert saved["unknown_cost"] is False
 
 
-def test_budget_block_happens_before_api_request(tmp_path):
-    """预算拦截在请求前：累计到 $5 后，chat() 应抛错，且 requests.post 一次也不能被调用。"""
+def test_budget_no_block_after_reaching_budget(tmp_path):
+    """到 $5 只提醒、不拦截：累计到 $5 后，chat() 仍正常发请求、拿到回答。
+
+    BOOS 2026-11-08 定：到 5 美元（100%）提醒，永不自动停。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(5.0)
     provider = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker)
-    with patch("providers.muse.requests.post") as mock_post:
-        with pytest.raises(RuntimeError, match="预算上限"):
-            provider.chat("你好")
-        mock_post.assert_not_called()
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
+    with patch("providers.muse.requests.post", return_value=fake_response) as mock_post:
+        result = provider.chat("你好")
+        mock_post.assert_called_once()
+    assert result["text"] == "你好"
 
 
 def test_muse_provider_cached_cost(tmp_path):
@@ -418,16 +432,17 @@ def test_budget_tracker_monthly_reset_while_running(tmp_path):
 
 
 def test_unknown_cost_survives_month_rollover(tmp_path):
-    """未知成本跨月保留：上个月产生未知成本，进入新月份后仍然不能发起付费请求。
-    跨月只重置当月累计，不自动解除暂停。"""
+    """未知成本跨月保留：上个月产生未知成本，进入新月份后标记仍在，
+    但只提醒、不暂停（BOOS 2026-11-08 定：成本未知只提醒、不停）。
+    跨月只重置当月累计，不自动清除标记。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(4.5)
     tracker.mark_unknown_cost()
     assert tracker.unknown_cost is True
-    assert tracker.can_call() is False
+    assert tracker.can_call() is True  # 只提醒，不暂停
     # 模拟跨月：只改内存里的月份，不重建 Tracker。
     tracker.month = "2000-01"
-    assert tracker.can_call() is False  # 仍暂停，不能发起付费请求
+    assert tracker.can_call() is True  # 仍可调用
     assert tracker.total_cost_usd == 0.0  # 当月累计已重置
     assert tracker.month == datetime.now().strftime("%Y-%m")
     assert tracker.unknown_cost is True  # 未核对的未知成本必须保留
@@ -437,29 +452,40 @@ def test_unknown_cost_survives_month_rollover(tmp_path):
 
 
 def test_unknown_cost_cleared_only_by_manual_confirmation(tmp_path):
-    """未知成本只能人工清除：接上一个场景，人工核对并清除标记后才恢复调用。"""
+    """未知成本只能人工清除：接上一个场景，人工核对并清除标记后，
+    unknown_cost 才恢复为 False；跨月本身不会清除它。
+    注意：新规矩下成本未知只提醒、不暂停，所以跨月前后 can_call()
+    一直是 True；这个测试只验证“标记只能人工清除”。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.mark_unknown_cost()
     tracker.month = "2000-01"
-    assert tracker.can_call() is False  # 跨月后仍暂停
-    # 人工核对后清除标记，才恢复可调用。
+    assert tracker.can_call() is True  # 不暂停
+    assert tracker.unknown_cost is True  # 跨月后标记仍在
+    # 人工核对后清除标记，才恢复。
     tracker.clear_unknown_cost()
     assert tracker.unknown_cost is False
     assert tracker.can_call() is True
 
 
-def test_estimated_cost_blocks_before_api_request(tmp_path):
-    """单次预估拦截：累计 $4.998、只剩 $0.002 时，长 prompt 的预估成本
-    超过剩余预算，chat() 应抛错且 requests.post 一次也不能被调用；
-    累计为 0、短 prompt 时，预估检查应通过，能正常走到 post。"""
+def test_estimated_cost_no_block_before_api_request(tmp_path):
+    """单次预估只作参考、不拦截：累计 $4.998、只剩 $0.002 时，长 prompt 的
+    预估成本超过剩余预算，chat() 仍正常发请求（BOOS 2026-11-08 定：
+    到 $5 提醒、永不自动停，预估也不再拦截）；累计为 0、短 prompt 时
+    也能正常走到 post。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(4.998)
     provider = MuseProvider(api_key="fake-key-for-test", budget_tracker=tracker)
-    long_prompt = "你好" * 5000  # 10000 个汉字，新估算为 15000 Token，旧算法只估 2500
-    with patch("providers.muse.requests.post") as mock_post:
-        with pytest.raises(RuntimeError, match="预估成本可能超过"):
-            provider.chat(long_prompt)
-        mock_post.assert_not_called()
+    long_prompt = "你好" * 5000  # 10000 个汉字，预估约 $0.027，超过剩余 $0.002
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
+    with patch("providers.muse.requests.post", return_value=fake_response) as mock_post:
+        result = provider.chat(long_prompt)
+        mock_post.assert_called_once()
+    assert result["text"] == "你好"
 
     # 累计为 0、短 prompt 时，预估应通过。
     tracker2 = BudgetTracker(file_path=tmp_path / "budget2.json")
@@ -517,10 +543,10 @@ def test_max_output_tokens_is_sent_in_request(tmp_path):
     assert sent_payload["model"] == "muse-spark-1.3"
 
 
-def test_unknown_cost_pauses_and_clears(tmp_path):
-    """usage 缺失暂停：模拟返回无 usage，chat() 返回 cost None，
-    之后 can_call() 为 False；再调一次应在请求前被拦截，post 不被调用；
-    人工清除标记后 can_call() 恢复为 True。"""
+def test_unknown_cost_reminds_and_clears(tmp_path):
+    """usage 缺失只提醒、不暂停：模拟返回无 usage，chat() 返回 cost None，
+    标记未知成本、只打印提醒，之后 can_call() 仍为 True；
+    再调一次照常发请求；人工清除标记后 unknown_cost 恢复为 False。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好"}}],
@@ -533,13 +559,15 @@ def test_unknown_cost_pauses_and_clears(tmp_path):
         result = provider.chat("你好")
         assert result["cost_usd"] is None
         assert mock_post.call_count == 1
-        # 成本未知已暂停：再调一次应在请求前被拦截，不会再发 post。
-        with pytest.raises(RuntimeError, match="未知成本"):
-            provider.chat("你好")
-        assert mock_post.call_count == 1
-    assert tracker.can_call() is False
+        # 成本未知只提醒、不暂停：再调一次照常发请求，不会被拦截。
+        result2 = provider.chat("你好")
+        assert result2["cost_usd"] is None
+        assert mock_post.call_count == 2
+    assert tracker.unknown_cost is True
+    assert tracker.can_call() is True
     # 人工核对后清除标记，恢复可调用。
     tracker.clear_unknown_cost()
+    assert tracker.unknown_cost is False
     assert tracker.can_call() is True
 
 

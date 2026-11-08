@@ -1,6 +1,28 @@
 # requirements.txt（Python 依赖清单）
-# 只用 Python 自带库 + requests，尽量少，方便学习和维护。
-# 版本号放宽（>=），避免因小版本不同装不上。
+# 版本是钉死的（==），不要只改数字就升级：mem0 这些库还在快速变，
+# 换一个版本号就可能改行为（试跑已经碰到过字段名不存在、接口报错的情况）。
+# 升级 = 先在试跑目录重新跑一遍测试，通过了再改这里，
+# 再改 memory/mem0_store.py 里对应的版本号常量。
+# torch 要走 CPU 专用源：torch==2.15.0+cpu 这个带 +cpu 的版本不在普通 PyPI 上，
+# 只能从 PyTorch 自己的 CPU 源下载，所以下面加了 --extra-index-url。
+# 安装命令还是同一句：pip install -r requirements.txt（不用加别的参数）。
+# 注意：第一次安装要下载约 1.8GB（torch 等大包），还要再从网上下载
+# embedding 模型约 96MB，需要一点时间和网络，装一次就行，以后不用重复下载。
+
+# torch 的 CPU 构建只在这个源上有，普通 PyPI 上没有。
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 requests>=2.31
 pytest>=8.0
+
+# 长期记忆（mem0，2026-11-08 试跑实测通过的版本，全部钉死）：
+mem0ai==2.2.1
+chromadb==1.5.9
+sentence-transformers==6.2.0
+torch==2.15.0+cpu
+transformers==5.22.2
+openai==3.46.0
+onnxruntime==1.31.1
+huggingface-hub==2.4.0
+posthog==7.86.0
+pydantic==2.14.3

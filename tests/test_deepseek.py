@@ -141,7 +141,7 @@ def test_deepseek_provider_cost_only_when_usage_returned(tmp_path):
 
 def test_deepseek_provider_no_usage_means_cost_unknown(tmp_path):
     """模型接口：模型没返回 usage 时，成本为 None，绝不编造；
-    同时要标记成本未知、暂停后续付费调用，不能当成零成本继续调用。"""
+    同时要标记成本未知并提醒，不拦后续付费调用，不能当成零成本继续调用。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好"}}],
@@ -155,7 +155,7 @@ def test_deepseek_provider_no_usage_means_cost_unknown(tmp_path):
     assert result["cost_usd"] is None
     assert tracker.total_cost_usd == 0.0
     assert tracker.unknown_cost is True
-    assert tracker.can_call() is False  # 已暂停，等人工核对
+    assert tracker.can_call() is True  # 成本未知只提醒，不拦后续调用
 
 
 def test_deepseek_provider_pro_model_switch(tmp_path):
@@ -188,33 +188,50 @@ def test_deepseek_provider_unknown_model_raises():
         DeepSeekProvider(api_key="fake-key-for-test", model="deepseek-chat")
 
 
-def test_deepseek_budget_block_happens_before_api_request(tmp_path):
-    """预算拦截在请求前：累计到 $5 后，chat() 应抛错，且 requests.post 一次也不能被调用。"""
+def test_deepseek_budget_no_block_after_reaching_budget(tmp_path):
+    """到 $5 不停：累计到 $5 后，chat() 不应抛错，应正常发请求、拿到回答。
+
+    新规矩（BOOS 2026-11-08 定）：到 5 美元（100%）只提醒一次，永不自动停。
+    提醒由 add_cost() 在刚跨过 $5 时打印，这里只验证调用本身不被拦住。"""
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(5.0)
+    assert tracker.is_over_budget() is True
+    assert tracker.can_call() is True  # 到 $5 也不拦
     provider = DeepSeekProvider(api_key="fake-key-for-test", budget_tracker=tracker)
-    with patch("providers.deepseek.requests.post") as mock_post:
-        with pytest.raises(RuntimeError, match="预算上限"):
-            provider.chat("你好")
-        mock_post.assert_not_called()
+    with patch("providers.deepseek.requests.post", return_value=fake_response) as mock_post:
+        result = provider.chat("你好")
+        mock_post.assert_called_once()
+    assert result["text"] == "你好"
 
 
-def test_deepseek_estimated_cost_blocks_before_api_request(tmp_path):
-    """单次预估拦截：累计 $4.998、只剩 $0.002 时，长 prompt 的预估成本
-    超过剩余预算，chat() 应抛错且 requests.post 一次也不能被调用。
+def test_deepseek_estimated_cost_no_block_before_api_request(tmp_path):
+    """单次预估不拦截：累计 $4.998、只剩 $0.002 时，长 prompt 的预估成本
+    超过剩余预算，chat() 也不应抛错，应正常发请求、拿到回答。
 
     DeepSeek 闲时价预估：10000 个汉字估 15000 Token，
-    15000/1e6*0.15 + 2048/1e6*0.60 = 0.0034788 美元，超过剩余 $0.002。
-    """
+    15000/1e6*0.15 + 2048/1e6*0.60 = 0.0034788 美元，超过剩余 $0.002，
+    但新规矩下预估只作参考，不在请求前拦截。"""
+    fake_response = Mock()
+    fake_response.json.return_value = {
+        "choices": [{"message": {"content": "你好"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    fake_response.raise_for_status.return_value = None
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(4.998)
     provider = DeepSeekProvider(api_key="fake-key-for-test", budget_tracker=tracker)
     long_prompt = "你好" * 5000  # 10000 个汉字
     assert tracker.estimate_cost(long_prompt, provider="deepseek") == pytest.approx(0.0034788)
-    with patch("providers.deepseek.requests.post") as mock_post:
-        with pytest.raises(RuntimeError, match="预估成本可能超过"):
-            provider.chat(long_prompt)
-        mock_post.assert_not_called()
+    with patch("providers.deepseek.requests.post", return_value=fake_response) as mock_post:
+        result = provider.chat(long_prompt)
+        mock_post.assert_called_once()
+    assert result["text"] == "你好"
 
 
 # ---------- 模拟测试：按模型记账 ----------
@@ -231,14 +248,14 @@ def test_budget_per_model_breakdown(tmp_path):
         "deepseek-flash": pytest.approx(0.1),
         "muse-spark-1.3": pytest.approx(0.2),
     }
-    # 封顶只看总数：总数 0.3，没到 $4 警告线，也没到 $5 上限。
+    # 封顶只看总数：总数 0.3，没到 $5 提醒线。
     assert tracker.is_over_warn() is False
     assert tracker.can_call() is True
-    # 总数到 $5 就拦截，哪怕单个模型的小计都没到 $5。
+    # 总数到 $5 也不拦截，只提醒一次（提醒由 add_cost 在刚跨过 $5 时打印）。
     tracker.add_cost(4.7, model="deepseek-flash")
     assert tracker.total_cost_usd == pytest.approx(5.0)
     assert tracker.is_over_budget() is True
-    assert tracker.can_call() is False
+    assert tracker.can_call() is True
 
 
 def test_budget_file_with_breakdown_round_trips(tmp_path):
@@ -285,7 +302,7 @@ def test_budget_breakdown_resets_on_month_rollover(tmp_path):
     tracker.add_cost(0.2, model="muse-spark-1.3")
     tracker.mark_unknown_cost()
     tracker.month = "2000-01"  # 模拟程序一直运行、跨过自然月
-    assert tracker.can_call() is False  # 未知成本未核对，仍暂停
+    assert tracker.can_call() is True  # 成本未知只提醒，不拦；跨月不清除标记
     assert tracker.total_cost_usd == 0.0
     assert tracker.model_breakdown() == {}
     assert tracker.unknown_cost is True  # 跨月不清除

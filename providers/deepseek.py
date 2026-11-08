@@ -33,7 +33,8 @@ class DeepSeekProvider:
 
     def __init__(self, api_key=None, budget_tracker=None, model=None):
         # api_key：从环境变量读进来，不要在这里写死真实 Key。
-        # budget_tracker：预算跟踪器（config.py 里的 BudgetTracker），用来记账和拦截超预算调用。
+        # budget_tracker：预算跟踪器（config.py 里的 BudgetTracker），用来记账；
+        #        超预算、成本未知时只提醒、不拦截（只有预算文件损坏时才拦）。
         # model：想用的 DeepSeek 模型名，不传时用配置里的默认模型 deepseek-flash；
         #        传 "deepseek-v4-pro" 时切换到 Pro 模型，价格也跟着换成 Pro 价。
         cfg = MODEL_CONFIG["deepseek"]
@@ -65,7 +66,7 @@ class DeepSeekProvider:
                   "cost_usd": 成本（美元）或 None, "model": 模型名}
         本方法是 chat_messages() 的单次问答包装：只发一条 user 消息，
         行为与原来完全一致。多轮对话请用 chat_messages(messages)。
-        其余行为（无 Key、超预算、预估拦截、usage 缺失）见 chat_messages()。
+        其余行为（无 Key、预算文件损坏、usage 缺失）见 chat_messages()。
         """
         return self.chat_messages([{"role": "user", "content": prompt}])
 
@@ -77,13 +78,11 @@ class DeepSeekProvider:
         应包含本轮及之前所有轮次的消息。
         返回格式与 chat() 相同。
         - 无 Key 时：抛出明确错误，不返回假成功。
-        - 超预算时：抛出明确错误，等待用户确认，不偷偷调用。
-        - 预估成本超过剩余预算时：也在请求前拦截。注意：预估覆盖本次
-          实际发送的完整消息历史（所有消息内容拼接估算），不只算最新
-          问题；这只是粗略预估，不能保证单次请求绝对不超支，
-          实际费用以官方后台为准。
+        - 预算文件损坏时：抛出明确错误（原因见 status_reason），不偷偷调用。
+          超预算、有未核对的未知成本时只提醒、不拦截（BOOS 定的新规矩：
+          到 $5 提醒，永不自动停），不会在这里抛错。
         - 模型没返回 usage 时：cost_usd 为 None，绝不编造 Token 或成本，
-          并标记成本未知，暂停后续付费调用，等人工核对。
+          并标记成本未知、打印提醒，等人工核对，不拦后续调用。
         """
         # 0. 先验证消息历史格式：必须是非空列表，每项都有 role 和 content。
         if not messages or not isinstance(messages, list):
@@ -97,9 +96,6 @@ class DeepSeekProvider:
                 raise ValueError(
                     "消息历史格式错误，每项应为 {'role': 'user'/'assistant', 'content': 文本}。"
                 )
-        # 本次实际发送的完整历史文本（所有消息内容拼接），用于调用前费用预估。
-        # 包含之前各轮的 user 问题和 assistant 回答，不只算最新问题。
-        history_text = "\n".join(str(msg.get("content", "")) for msg in messages)
         # 1. 先检查 Key，没有 Key 就明确说“未完成”，不要假装调用成功。
         if not self.api_key:
             raise RuntimeError(
@@ -108,37 +104,19 @@ class DeepSeekProvider:
                 "或设置环境变量 DEEPSEEK_API_KEY 后再运行。"
             )
 
-        # 2. 再检查预算，超了、有未核对的未知成本或预算文件损坏时，
-        #    停下来等用户确认。损坏时用 status_reason() 给出具体原因。
+        # 2. 再检查预算：只有预算文件损坏时才拦（can_call() 只在损坏时
+        #    返回 False）。超预算、有未核对的未知成本时只提醒、不拦截
+        #    （BOOS 定的新规矩：到 $5 提醒，永不自动停），这里不抛错。
+        #    损坏时用 status_reason() 给出具体原因。
         if self.budget_tracker is not None and not self.budget_tracker.can_call():
             reason = ""
             if hasattr(self.budget_tracker, "status_reason"):
                 reason = self.budget_tracker.status_reason(provider="deepseek")
             raise RuntimeError(
-                reason
-                or "已达到每月预算上限（$5）或有未核对的未知成本，"
-                "已暂停后续付费调用，请确认后再继续。"
+                reason or "预算记录异常，付费调用暂不可用，请人工检查 logs/budget_usage.json 后再恢复。"
             )
 
-        # 3. 调用前费用预估：预估成本超过剩余预算时也在请求前拦截。
-        #    注意：这是粗略预估（输入分中英文估算，中文按 1.5 倍留余量；
-        #    输出按 MAX_OUTPUT_TOKENS=2048 Token 估算，且该值同时是
-        #    请求里实际生效的输出上限），不能保证单次请求绝对不超支。
-        #    本次预估用完整历史文本（history_text）估算，覆盖所有已发送消息，
-        #    不只算最新问题。
-        #    另外 DeepSeek 按闲时价预估，高峰时段实际价格是闲时的 2 倍，
-        #    高峰时预估可能低于实际成本，实际费用以 DeepSeek 官方后台为准。
-        if self.budget_tracker is not None and not self.budget_tracker.can_afford_estimated(
-            history_text, provider="deepseek", model=self.model
-        ):
-            raise RuntimeError(
-                "预估成本可能超过本月剩余预算，已在请求前拦截："
-                f"预估约 ${self.budget_tracker.estimate_cost(history_text, provider='deepseek', model=self.model):.6f}，"
-                f"本月剩余约 ${self.budget_tracker.remaining_usd():.6f}。"
-                "这是粗略预估，不是保证，实际费用以 DeepSeek 官方后台为准。"
-            )
-
-        # 4. 发真实请求。timeout（超时）设为 60 秒，避免一直等下去。
+        # 3. 发真实请求。timeout（超时）设为 60 秒，避免一直等下去。
         #    注意：DeepSeek 的端点是 /chat/completions，base_url 里没有 /v1，
         #    不要写成 /v1/chat/completions。
         url = f"{self.base_url}/chat/completions"
@@ -164,17 +142,17 @@ class DeepSeekProvider:
 
         data = response.json()
 
-        # 5. 解析回答。choices[0].message.content 是回答文本。
+        # 4. 解析回答。choices[0].message.content 是回答文本。
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"DeepSeek API 返回格式异常，无法解析回答：{data}") from exc
 
-        # 6. 解析 Token 使用量。只有模型返回了 usage 才计算成本，否则 cost 为 None。
+        # 5. 解析 Token 使用量。只有模型返回了 usage 才计算成本，否则 cost 为 None。
         #    缓存 Token（cached_tokens）按缓存价计，普通输入按普通价计；
         #    completion_tokens 里已包含推理 Token（如果有的话），它是输出的子集，
         #    不要重复加，只按 completion_tokens 计输出价。
-        #    注意：usage 缺失时不能当成零成本，要标记成本未知、暂停后续付费调用。
+        #    注意：usage 缺失时不能当成零成本，要标记成本未知并提醒，等人工核对。
         usage = data.get("usage")
         cost_usd = None
         if not usage:

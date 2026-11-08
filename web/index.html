@@ -92,41 +92,6 @@
     white-space: pre-line;
   }
   .status .warn { color: var(--danger); }
-  .proposals {
-    border-top: 1px solid var(--border);
-    padding-top: 12px;
-  }
-  .proposals-title { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
-  .proposals-title .count { color: var(--muted); font-weight: 400; }
-  .proposal-empty { font-size: 12px; color: var(--muted); line-height: 1.6; }
-  .proposal {
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 10px;
-    margin-bottom: 8px;
-    background: var(--bg);
-  }
-  .proposal-text { font-size: 13px; line-height: 1.6; word-break: break-word; }
-  .proposal-reason { font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 6px; }
-  .proposal-meta { font-size: 11px; color: var(--muted); margin-top: 6px; }
-  .proposal-actions { display: flex; gap: 8px; margin-top: 8px; }
-  .proposal-actions button {
-    flex: 1;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 7px 0;
-    font-size: 13px;
-    cursor: pointer;
-    background: var(--panel);
-    color: var(--text);
-  }
-  .proposal-actions button.confirm {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-    font-weight: 600;
-  }
-  .proposal-actions button:disabled { opacity: 0.55; cursor: default; }
   .sidebar-foot { margin-top: auto; font-size: 11px; color: var(--muted); line-height: 1.6; }
 
   /* ---------- 右侧聊天区 ---------- */
@@ -216,10 +181,6 @@
     </div>
     <button class="btn btn-primary" id="newChat">＋ 新对话</button>
     <div class="status" id="status">正在加载状态…</div>
-    <div class="proposals" id="proposals">
-      <div class="proposals-title">待确认的记忆提议 <span class="count" id="proposalCount"></span></div>
-      <div id="proposalList"><div class="proposal-empty">正在加载…</div></div>
-    </div>
     <div class="sidebar-foot">
       只在你自己的电脑上运行（<span id="origin">本机</span>），不上云，别人打不开。<br>
       对话历史只保存在内存里，重启服务后清空。<br>
@@ -290,7 +251,8 @@
         .join('、');
       let text = '模型：' + (models || '无') +
         '\n本月成本：$' + s.total_cost_usd.toFixed(4) + ' / $' + s.monthly_budget_usd.toFixed(2) +
-        '，剩余 $' + s.remaining_usd.toFixed(4);
+        '，剩余 $' + s.remaining_usd.toFixed(4) +
+        '\n记忆：' + (s.mem0_enabled ? '已启用' : '未启用');
       if (s.budget_corrupted) text += '\n⚠️ 预算记录异常，已暂停付费调用';
       else if (s.unknown_cost) text += '\n⚠️ 有未核对的未知成本，已暂停付费调用';
       statusEl.textContent = text;
@@ -339,7 +301,6 @@
     sendBtn.disabled = false;
     inputEl.focus();
     refreshStatus();
-    refreshProposals();
   }
 
   sendBtn.addEventListener('click', send);
@@ -357,88 +318,10 @@
     addMsg('ai', '已开始新对话，之前的记录清空了。');
   });
 
-  // ---------- 待确认的记忆提议 ----------
-  // 每轮聊天成功后，后端会跑一次独立的记忆提取，把候选建成提议；
-  // 这里只展示后端创建的提议（有真实 ID 和 pending 状态），
-  // 用户点“保存”才写进长期记忆，点“不要”就不保存。
-  // 提议只存在内存里，重启服务后未确认的会丢弃。
-  const proposalListEl = document.getElementById('proposalList');
-  const proposalCountEl = document.getElementById('proposalCount');
-
-  async function refreshProposals() {
-    try {
-      const res = await fetch('/api/proposals');
-      const data = await res.json();
-      const proposals = data.proposals || [];
-      proposalCountEl.textContent = proposals.length ? '（' + proposals.length + ' 条）' : '';
-      proposalListEl.textContent = '';
-      if (!proposals.length) {
-        const empty = document.createElement('div');
-        empty.className = 'proposal-empty';
-        empty.textContent = '暂无待确认的提议。聊天后，值得长期记住的信息会出现在这里。';
-        proposalListEl.appendChild(empty);
-        return;
-      }
-      proposals.forEach((p) => {
-        const card = document.createElement('div');
-        card.className = 'proposal';
-        const text = document.createElement('div');
-        text.className = 'proposal-text';
-        text.textContent = p.text;
-        card.appendChild(text);
-        if (p.reason) {
-          const reason = document.createElement('div');
-          reason.className = 'proposal-reason';
-          reason.textContent = '建议理由：' + p.reason;
-          card.appendChild(reason);
-        }
-        const meta = document.createElement('div');
-        meta.className = 'proposal-meta';
-        meta.textContent = (p.layers || []).join('、') + ' · ' + (p.date || '');
-        card.appendChild(meta);
-        const actions = document.createElement('div');
-        actions.className = 'proposal-actions';
-        const confirmBtn = document.createElement('button');
-        confirmBtn.className = 'confirm';
-        confirmBtn.textContent = '保存';
-        confirmBtn.addEventListener('click', () => decideProposal(p.id, 'confirm', confirmBtn, rejectBtn));
-        const rejectBtn = document.createElement('button');
-        rejectBtn.textContent = '不要';
-        rejectBtn.addEventListener('click', () => decideProposal(p.id, 'reject', confirmBtn, rejectBtn));
-        actions.appendChild(confirmBtn);
-        actions.appendChild(rejectBtn);
-        card.appendChild(actions);
-        proposalListEl.appendChild(card);
-      });
-    } catch (e) {
-      proposalListEl.textContent = '';
-      const err = document.createElement('div');
-      err.className = 'proposal-empty';
-      err.textContent = '提议加载失败：服务没连上？';
-      proposalListEl.appendChild(err);
-    }
-  }
-
-  async function decideProposal(id, action, confirmBtn, rejectBtn) {
-    confirmBtn.disabled = true;
-    rejectBtn.disabled = true;
-    try {
-      const res = await fetch('/api/proposals/' + encodeURIComponent(id) + '/' + action, { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        alert('操作失败：' + (data.error || ('HTTP ' + res.status)));
-      }
-    } catch (e) {
-      alert('操作失败：连不上服务，请确认服务还在运行。');
-    }
-    refreshProposals();
-  }
-
   // 侧边栏显示当前实际地址（端口改了也能对上，不用在 HTML 里写死地址）。
   document.getElementById('origin').textContent = window.location.origin;
 
   refreshStatus();
-  refreshProposals();
   inputEl.focus();
 </script>
 </body>
