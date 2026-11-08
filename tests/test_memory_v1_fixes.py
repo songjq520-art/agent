@@ -242,7 +242,8 @@ def test_long_keyword_outranks_short_window(tmp_path):
 
 def test_recall_log_records_keywords_scores_and_recalled(tmp_path, caplog):
     """召回日志：召回记忆时记一条日志，含关键词、每条候选记忆的匹配得分
-    与命中的关键词、最终召回了哪些；只用于排查和调优，不改变检索行为。"""
+    与命中的关键词、最终召回了哪些；只用于排查和调优，不改变检索行为。
+    隐私：日志里用本次检索序号（memory_1、memory_2）作标识，不记记忆原文。"""
     import logging
 
     caplog.set_level(logging.INFO, logger="agent")
@@ -259,8 +260,11 @@ def test_recall_log_records_keywords_scores_and_recalled(tmp_path, caplog):
     assert "分=8" in text  # DeepSeek 那条匹配“DeepSeek”得 8 分
     assert "分=2" in text  # 预算那条匹配“预算”得 2 分
     assert "召回" in text
-    assert "DeepSeek 已接通" in text
-    assert "预算有限" in text
+    # 记忆用本次检索序号作标识（memory_1 是最相关的一条），不记原文（隐私）。
+    assert "memory_1" in text
+    assert "memory_2" in text
+    assert "DeepSeek 已接通" not in text
+    assert "预算有限" not in text
     # 检索结果本身不受日志影响（最相关的仍排第一）。
     assert "DeepSeek" in found[0]["text"]
 
@@ -276,8 +280,9 @@ def test_recall_log_not_written_when_nothing_recalled(tmp_path, caplog):
     assert [r for r in caplog.records if "记忆召回" in r.getMessage()] == []
 
 
-def test_recall_log_uses_text_excerpt_as_identifier(tmp_path, caplog):
-    """v1 的记忆没有 id 字段，召回日志用记忆内容的前 30 字作标识。"""
+def test_recall_log_uses_sequence_number_not_memory_text(tmp_path, caplog):
+    """召回日志用本次检索序号（memory_1、memory_2）作标识，不记记忆原文（隐私保护）。
+    v1 的记忆没有 id 字段，日志里用序号代替，不重构数据结构；序号按相关性排名从 1 开始编号。"""
     import logging
 
     caplog.set_level(logging.INFO, logger="agent")
@@ -287,9 +292,11 @@ def test_recall_log_uses_text_excerpt_as_identifier(tmp_path, caplog):
     found = _find_relevant_memories(store, "预算")
     assert len(found) == 1
     text = caplog.records[0].getMessage()
-    # 日志里有前 30 字 + 省略号，没有整段长文（避免日志行过长）。
-    assert long_text[:30] in text
-    assert "…" in text
+    # 日志里有序号标识，没有记忆原文（哪怕只记前 30 字也不行）。
+    assert "memory_1" in text
+    assert long_text not in text
+    assert long_text[:30] not in text
+    assert "预算很重要" not in text
 
 
 # ---------- 提示词组装顺序（第五条补充检查） ----------
