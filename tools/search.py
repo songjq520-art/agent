@@ -39,6 +39,19 @@ _CJK_RE = re.compile(r"[\u2e80-\ua4cf\uff00-\uffef]")
 # 一段连续的 Latin-1 字符（0x80–0xFF）：双重编码的 UTF-8 字节读出来就是这个样子。
 _MOJIBAKE_RUN_RE = re.compile(r"[\x80-\xff]+")
 
+# 只有 AnySearch 需要先把中文查询翻成英文：它中文相关性差（实测“广州天气”
+# 返回的全是法院文书），英文结果才对题。Tavily 和 Parallel 中文结果是好的，
+# 不用翻。翻译器由调用方注入（接进聊天时用 DeepSeek 翻）；不传就不翻译。
+_TRANSLATE_TO_ENGLISH_PROVIDERS = {"anysearch"}
+# 翻回来时只翻标题和摘要的前 200 字：全文太长，翻全了费 token；十二自己
+# 看英文就行，翻回来是给 BOOS 看的。
+_TRANSLATE_BACK_SNIPPET_CHARS = 200
+
+
+def _contains_cjk(text):
+    """这段文字里有没有中文（中文查询才需要翻成英文再搜）。"""
+    return bool(_CJK_RE.search(text or ""))
+
 
 def _repair_mojibake(text):
     """修双重编码的中文：UTF-8 字节被当成 Latin-1 读了（比如“天气”变成“å¤©æ°”）。
@@ -601,14 +614,43 @@ class SearchService:
 
     providers 可注入（测试用假服务模拟失败，直接测备选链路）；
     不传就用默认的三个真实服务（Key 从环境变量读）。
+    translator(text, target)：把 text 翻成 target（"en" 或 "zh"）。
+    接进聊天时由调用方传一个 DeepSeek 翻译器；不传就不翻译，行为不变。
     """
 
-    def __init__(self, anysearch=None, tavily=None, parallel=None):
+    def __init__(self, anysearch=None, tavily=None, parallel=None, translator=None):
         self.providers = {
             "anysearch": anysearch or AnySearchProvider(),
             "tavily": tavily or TavilyProvider(),
             "parallel": parallel or ParallelProvider(),
         }
+        self.translator = translator
+
+    def _translate_back(self, outcome):
+        """把翻成英文搜回来的结果，标题和摘要翻回中文给 BOOS 看。
+
+        只翻中过英文的那一路（AnySearch）赢来的结果；Tavily、Parallel
+        中文直接搜回来的不用翻。翻不成功不影响结果本身。
+        """
+        if self.translator is None:
+            return False
+        for result in outcome.results:
+            if result.title:
+                try:
+                    translated = self.translator(result.title, "zh")
+                except Exception:
+                    translated = None
+                if translated:
+                    result.title = translated
+            if result.snippet:
+                head = result.snippet[:_TRANSLATE_BACK_SNIPPET_CHARS]
+                try:
+                    translated = self.translator(head, "zh")
+                except Exception:
+                    translated = None
+                if translated:
+                    result.snippet = translated + result.snippet[_TRANSLATE_BACK_SNIPPET_CHARS:]
+        return True
 
     def available_providers(self):
         """每个服务是否可用、不可用是什么原因。"""
@@ -637,6 +679,7 @@ class SearchService:
             chain = _CHAINS[kind]
         attempts = []
         outcome = None
+        winning_translated = False
         for name in chain:
             provider = self.providers[name]
             if not provider.available:
@@ -648,8 +691,20 @@ class SearchService:
                     }
                 )
                 continue
+            send_query = query
+            if (
+                self.translator is not None
+                and name in _TRANSLATE_TO_ENGLISH_PROVIDERS
+                and _contains_cjk(query)
+            ):
+                try:
+                    translated = self.translator(query, "en")
+                except Exception:
+                    translated = None
+                if translated and translated.strip() and translated.strip() != query.strip():
+                    send_query = translated.strip()
             try:
-                candidate = provider.search(query, max_results=max_results)
+                candidate = provider.search(send_query, max_results=max_results)
             except QuotaExhausted as exc:
                 attempts.append(
                     {"provider": name, "status": "failed", "reason": exc.message}
@@ -666,7 +721,12 @@ class SearchService:
                 )
                 continue
             outcome = candidate
-            attempts.append({"provider": name, "status": "ok"})
+            outcome.query = query
+            attempt = {"provider": name, "status": "ok"}
+            if send_query != query:
+                attempt["translated_query"] = send_query
+                winning_translated = True
+            attempts.append(attempt)
             break
         if outcome is None:
             failed = [a for a in attempts if a["status"] == "failed"]
@@ -691,6 +751,9 @@ class SearchService:
         if not outcome.fetched_at:
             outcome.fetched_at = _now_iso()
         outcome.attempts = attempts
+        translated_back = False
+        if winning_translated:
+            translated_back = self._translate_back(outcome)
         corroborated = []
         if cross_check:
             partner_name = _CROSS_CHECK_PARTNER.get(outcome.provider)
@@ -727,7 +790,12 @@ class SearchService:
             "with_url": sum(1 for r in outcome.results if r.url),
             "unique_domains": len({_domain_of(r.url) for r in outcome.results if r.url}),
             "corroborated_domains": corroborated,
+            "translated_back": translated_back,
             "notes": _quality_notes(outcome.results, corroborated),
         }
+        if translated_back:
+            outcome.quality["notes"].append(
+                "查询先翻成英文再搜（AnySearch 中文不准），标题和摘要已翻回中文"
+            )
         outcome.attempts = attempts
         return outcome

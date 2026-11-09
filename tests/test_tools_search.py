@@ -702,3 +702,147 @@ def test_mojibake_repair_keeps_normal_text():
     assert _repair_mojibake("café naïve") == "café naïve"
     assert _repair_mojibake("hello world") == "hello world"
     assert _repair_mojibake("") == ""
+
+
+# ---------- 翻译（中文查询翻成英文再搜，结果翻回中文） ----------
+
+
+class FakeTranslator:
+    """假翻译器：按词典翻，没在词典里的原样返回。记下每次调用。"""
+
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.calls = []
+
+    def __call__(self, text, target):
+        self.calls.append((text, target))
+        return self.mapping.get((text, target), text)
+
+
+def test_translator_translates_chinese_query_for_anysearch_only():
+    # 中文查询：AnySearch 那路翻成英文再搜；Tavily 不翻。
+    translator = FakeTranslator({("广州天气", "en"): "Guangzhou weather"})
+    anysearch = FakeProvider(
+        "anysearch", [ok_outcome("Guangzhou weather", "anysearch", ["https://a.com/1"])]
+    )
+    service = SearchService(
+        anysearch=anysearch,
+        tavily=FakeProvider("tavily", []),
+        parallel=FakeProvider("parallel", []),
+        translator=translator,
+    )
+    outcome = service.search("广州天气")
+    assert outcome.status == "ok"
+    assert outcome.provider == "anysearch"
+    assert anysearch.calls == ["Guangzhou weather"]
+    assert ("广州天气", "en") in translator.calls
+    assert outcome.attempts[0]["translated_query"] == "Guangzhou weather"
+    assert outcome.query == "广州天气"
+    assert outcome.quality["translated_back"] is True
+
+
+def test_translator_skips_tavily_chinese_query():
+    # 结构化查询走 Tavily 优先：Tavily 中文直接搜，不翻。
+    translator = FakeTranslator({("广州天气", "en"): "Guangzhou weather"})
+    tavily = FakeProvider(
+        "tavily", [ok_outcome("广州天气", "tavily", ["https://t.com/1"])]
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+        translator=translator,
+    )
+    outcome = service.search("广州天气", kind="structured")
+    assert outcome.provider == "tavily"
+    assert tavily.calls == ["广州天气"]
+    assert translator.calls == []
+
+
+def test_translator_skips_english_query():
+    # 英文查询不用翻。
+    translator = FakeTranslator({})
+    anysearch = FakeProvider(
+        "anysearch", [ok_outcome("Guangzhou weather", "anysearch", ["https://a.com/1"])]
+    )
+    service = SearchService(
+        anysearch=anysearch,
+        tavily=FakeProvider("tavily", []),
+        parallel=FakeProvider("parallel", []),
+        translator=translator,
+    )
+    outcome = service.search("Guangzhou weather")
+    assert anysearch.calls == ["Guangzhou weather"]
+    assert translator.calls == []
+    assert outcome.quality["translated_back"] is False
+
+
+def test_translator_translates_results_back_to_chinese():
+    # 翻成英文搜回来的结果，标题和摘要翻回中文。
+    translator = FakeTranslator(
+        {
+            ("广州天气", "en"): "Guangzhou weather",
+            ("Sunny day", "zh"): "晴天",
+            ("Warm and clear", "zh"): "温暖晴朗",
+        }
+    )
+    results = SearchOutcome(
+        query="Guangzhou weather",
+        provider="anysearch",
+        status="ok",
+        results=[
+            SearchResult(title="Sunny day", url="https://a.com/1", snippet="Warm and clear"),
+        ],
+    )
+    anysearch = FakeProvider("anysearch", [results])
+    service = SearchService(
+        anysearch=anysearch,
+        tavily=FakeProvider("tavily", []),
+        parallel=FakeProvider("parallel", []),
+        translator=translator,
+    )
+    outcome = service.search("广州天气")
+    assert outcome.results[0].title == "晴天"
+    assert outcome.results[0].snippet == "温暖晴朗"
+    assert outcome.quality["translated_back"] is True
+    assert any("翻回中文" in note for note in outcome.quality["notes"])
+
+
+def test_translator_failure_falls_back_to_original_query():
+    # 翻译器炸了也不影响搜索：用原查询照常搜。
+    def broken_translator(text, target):
+        raise RuntimeError("翻译服务挂了")
+
+    anysearch = FakeProvider(
+        "anysearch", [ok_outcome("广州天气", "anysearch", ["https://a.com/1"])]
+    )
+    service = SearchService(
+        anysearch=anysearch,
+        tavily=FakeProvider("tavily", []),
+        parallel=FakeProvider("parallel", []),
+        translator=broken_translator,
+    )
+    outcome = service.search("广州天气")
+    assert outcome.status == "ok"
+    assert anysearch.calls == ["广州天气"]
+    assert outcome.quality["translated_back"] is False
+
+
+def test_translator_cross_check_partner_gets_original_query():
+    # 交叉验证的搭档拿原查询（中文），不拿翻过的英文。
+    translator = FakeTranslator({("广州天气", "en"): "Guangzhou weather"})
+    anysearch = FakeProvider(
+        "anysearch", [ok_outcome("Guangzhou weather", "anysearch", ["https://a.com/1"])]
+    )
+    tavily = FakeProvider(
+        "tavily", [ok_outcome("广州天气", "tavily", ["https://a.com/1"])]
+    )
+    service = SearchService(
+        anysearch=anysearch,
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+        translator=translator,
+    )
+    outcome = service.search("广州天气", cross_check=True)
+    assert tavily.calls == ["广州天气"]
+    assert len(outcome.results) == 1
