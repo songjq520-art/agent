@@ -248,6 +248,71 @@ def test_rename_updates_same_slot_no_coexistence(tmp_path):
     assert "十二" in name_texts[0]
 
 
+def test_rename_updates_legacy_unmarked_name_no_coexistence(tmp_path):
+    """Plan C 之前存的旧名字记忆（没打 slot 标记）：改名时也要原地
+    更新，不并存——槽位是从旧文本里认出来的，不是猜的。
+    旧记忆用 add_memory_text 模拟（来源是 user、已确认，但没有 slot，
+    就是 Plan C 之前存下来的样子）。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("Agent 的名字是十二，你叫十二")
+    legacy = store.get_all()[0]
+    # 规整后的 metadata 总带 slot 键，没标记时是 None。
+    assert (legacy["metadata"] or {}).get("slot") is None
+    legacy_id = legacy["id"]
+    store.add_turn([{"role": "user", "content": "现在你叫十三。"}])
+    store.flush_pending()
+    name_texts = [
+        text for text in store._memory.all_texts() if "Agent 的名字是" in text
+    ]
+    assert len(name_texts) == 1
+    assert "十三" in name_texts[0]
+    assert not any("十二" in text for text in name_texts)
+    item = store.get_all()[0]
+    assert item["id"] == legacy_id  # 原地更新，id 不变
+    assert item["metadata"]["slot"] == "agent_name"
+
+
+def test_seed_marks_legacy_unmarked_name(tmp_path):
+    """种子遇到 Plan C 之前存的同一槽位同一值旧记忆时，不新增，
+    顺手给它打上槽位标记（文本不动）——以后改名走槽位找得到它。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("Agent 的名字是十二，你叫十二")
+    seeded = store.ensure_identity_memories()
+    assert seeded["agent_name"]["status"] == "unchanged"
+    items = store.get_all()
+    assert len(items) == 2  # 名字（旧的）+ SOUL（新种的），没重复
+    name_item = [i for i in items if "十二" in i["text"]][0]
+    assert name_item["metadata"]["slot"] == "agent_name"
+    assert name_item["text"] == "Agent 的名字是十二，你叫十二"
+    # 打过标记之后，改名走槽位原地更新，不并存。
+    legacy_id = name_item["id"]
+    store.add_turn([{"role": "user", "content": "现在你叫十三。"}])
+    store.flush_pending()
+    renamed = [i for i in store.get_all() if "十三" in i["text"]]
+    assert len(renamed) == 1
+    assert renamed[0]["id"] == legacy_id
+    assert not any("十二" in t for t in store._memory.all_texts())
+
+
+def test_rename_updates_legacy_unmarked_user_name(tmp_path):
+    """称呼也一样：Plan C 之前存的“我叫小宋”（没打标记），
+    改成“我叫大明”时原地更新，不并存。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我叫小宋")
+    legacy = store.get_all()[0]
+    assert (legacy["metadata"] or {}).get("slot") is None
+    legacy_id = legacy["id"]
+    store.add_turn([{"role": "user", "content": "我叫大明。"}])
+    store.flush_pending()
+    texts = store._memory.all_texts()
+    assert len(texts) == 1
+    assert "大明" in texts[0]
+    assert not any("小宋" in t for t in texts)
+    item = store.get_all()[0]
+    assert item["id"] == legacy_id
+    assert item["metadata"]["slot"] == "user_name"
+
+
 def test_correction_of_name_keeps_slot(tmp_path):
     """纠错路径也不丢槽位：“不对，你叫十二。”走纠错改名之后，
     槽位标记还在，下次再改名仍是同槽位 UPDATE、不并存。"""

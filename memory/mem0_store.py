@@ -1687,13 +1687,12 @@ class Mem0Store:
                 return item
         return None
 
-    def _find_slot_memory_by_value(self, slot, value):
-        """兜底：Plan C 之前存的同槽位记忆没有 slot 标记——按关键词
-        找回，文本里认出同一槽位、同一值时才算（只做去重用：值相同
-        就不用再存；值不同时不碰它，见 _upsert_slot_memory）。
-
-        soul 槽位没有“值”的说法：文本里同时有 "SOUL.md" 和
-        “十条原则”时算同一条。找不到返回 None。
+    def _find_slot_memories_by_text(self, slot):
+        """按文本找同槽位旧记忆（Plan C 之前存的、没打 slot 标记）：
+        文本里认出同一槽位就算——槽位是从文本里认出来的
+        （_detect_identity_statement），不是猜的。soul 槽位没有“值”
+        的说法：文本里同时有 "SOUL.md" 和“十条原则”时算同一条。
+        返回按检索顺序排好的候选列表（可能多条），找不到返回 []。
         """
         queries = {
             SLOT_AGENT_NAME: "Agent 的名字",
@@ -1702,23 +1701,47 @@ class Mem0Store:
         }
         query = queries.get(slot)
         if not query:
-            return None
+            return []
         try:
             candidates = self.search(query, top_k=5) or []
         except Exception:
             logger.warning("找同槽位记忆失败，本次按没有处理。", exc_info=True)
-            return None
+            return []
+        found = []
         for cand in candidates:
             text = (cand or {}).get("text") or ""
             if slot == SLOT_SOUL:
                 if "SOUL.md" in text and "十条原则" in text:
-                    return cand
+                    found.append(cand)
                 continue
             detected = _detect_identity_statement(text)
             if detected is not None and detected["slot"] == slot:
-                if detected["value"] == value:
-                    return cand
+                found.append(cand)
+        return found
+
+    def _find_slot_memory_by_value(self, slot, value):
+        """兜底：Plan C 之前存的同槽位记忆没有 slot 标记——按关键词
+        找回，文本里认出同一槽位、同一值时才算（只做去重用：值相同
+        就不用再存）。
+
+        soul 槽位没有“值”的说法：文本里同时有 "SOUL.md" 和
+        “十条原则”时算同一条。找不到返回 None。
+        """
+        for cand in self._find_slot_memories_by_text(slot):
+            if slot == SLOT_SOUL:
+                return cand
+            detected = _detect_identity_statement((cand or {}).get("text") or "")
+            if detected is not None and detected["value"] == value:
+                return cand
         return None
+
+    def _find_slot_memory_by_slot_text(self, slot):
+        """找同槽位旧记忆，不管值新旧（改名时用）：文本里认出同一槽位
+        就算，返回第一条；找不到返回 None。只认第一条——同槽位旧记忆
+        有多条时（极少见），只原地更新第一条，其余的要走面板手动清理。
+        """
+        found = self._find_slot_memories_by_text(slot)
+        return found[0] if found else None
 
     def _upsert_slot_memory(self, slot, value, text):
         """同槽位 UPDATE（Plan C 闸门 3 的冲突兜底）。
@@ -1731,7 +1754,10 @@ class Mem0Store:
           是固定的：已有 soul 槽位记忆就不动。
         - 没有 slot 标记、但按关键词找回同一槽位同一值的旧记忆：
           也不动（unchanged，只是没标记——Plan C 之前存的）。
-          值不同时不碰它（不敢猜那条是不是同一槽位），直接新增。
+        - 没有 slot 标记、但文本认得出是同一槽位、值是旧的：
+          原地 update 成新值（updated）——槽位是从文本里认出来的
+          （_detect_identity_statement），不是猜的，所以敢更新；
+          soul 不走这里（种子文本固定，upsert 本来就不改 soul）。
         - 都没有→ 新增一条（added），来源记 user、已确认、置信度 1.0。
         返回 {"slot", "value", "status", "memory_id"}，
         存失败时 status="failed"。
@@ -1792,6 +1818,33 @@ class Mem0Store:
                 "status": "unchanged",
                 "memory_id": duplicate["id"],
             }
+        # Plan C 之前存的同槽位旧记忆（没打 slot 标记、值是旧的）：
+        # 文本里认得出是同一槽位，就原地更新成新值，不并存。
+        if slot != SLOT_SOUL:
+            legacy = self._find_slot_memory_by_slot_text(slot)
+            if legacy is not None:
+                try:
+                    self._memory.update(
+                        memory_id=legacy["id"],
+                        text=text,
+                        metadata=_provenance(
+                            SOURCE_USER, CONFIDENCE_USER, True, slot=slot
+                        ),
+                    )
+                except Exception:
+                    logger.warning("同槽位旧记忆更新失败：旧值保留。", exc_info=True)
+                    return {
+                        "slot": slot,
+                        "value": value,
+                        "status": "failed",
+                        "memory_id": legacy["id"],
+                    }
+                return {
+                    "slot": slot,
+                    "value": value,
+                    "status": "updated",
+                    "memory_id": legacy["id"],
+                }
         result = self._add_text_with_metadata(
             text, _provenance(SOURCE_USER, CONFIDENCE_USER, True, slot=slot)
         )
@@ -1817,7 +1870,9 @@ class Mem0Store:
 
         已有同槽位记忆（带 slot 标记，或按关键词找回同一槽位同一值）
         时返回 unchanged；都没有时新增一条（added），来源记 user、
-        已确认、置信度 1.0。只在写锁里调。
+        已确认、置信度 1.0。按关键词找回的旧记忆（Plan C 之前存的、
+        没打标记）顺手打上槽位标记，文本不动——以后改名走槽位找得到它。
+        只在写锁里调。
         """
         if slot not in KNOWN_SLOTS or not value:
             return {
@@ -1836,6 +1891,19 @@ class Mem0Store:
             }
         duplicate = self._find_slot_memory_by_value(slot, value)
         if duplicate is not None:
+            # Plan C 之前存的同一槽位同一值旧记忆（没打 slot 标记）：
+            # 文本不动，只给它打上槽位标记——以后改名走槽位找得到它，
+            # 不会并存。打标记失败也不影响种子本身，照常返回 unchanged。
+            try:
+                self._memory.update(
+                    memory_id=duplicate["id"],
+                    text=duplicate["text"],
+                    metadata=_provenance(
+                        SOURCE_USER, CONFIDENCE_USER, True, slot=slot
+                    ),
+                )
+            except Exception:
+                logger.warning("给同槽位旧记忆打标记失败：保持原样。", exc_info=True)
             return {
                 "slot": slot,
                 "value": value,
