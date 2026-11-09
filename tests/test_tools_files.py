@@ -159,3 +159,75 @@ def test_atomic_write_failure_keeps_original(ws, monkeypatch):
     monkeypatch.setattr(os, "replace", real_replace)
     assert ws.read_text("a.txt")["lines"] == ["original"]
     assert not list((ws.root).glob(".tmp-*"))  # 没留下临时文件
+
+
+# ---------- 本次安全修复新增 ----------
+
+def test_env_file_not_backed_up(ws):
+    # .env 覆盖时不备份：旧内容绝不能躺在 .backups 里等着被人读出来。
+    ws.write_text(".env", "TAVILY_API_KEY=tvly-fake-old\n", overwrite=True, confirmed=True)
+    ws.write_text(".env", "TAVILY_API_KEY=tvly-fake-new\n", overwrite=True, confirmed=True)
+    backups = list((ws.root / ".backups").glob("*")) if (ws.root / ".backups").exists() else []
+    assert backups == []
+    with pytest.raises(PermissionDenied):
+        ws.read_text(".env")
+
+
+def test_env_edit_does_not_back_up(ws):
+    # 改 .env 也不备份：edit 走的也是同一份备份逻辑。
+    ws.write_text(".env", "TAVILY_API_KEY=tvly-fake-old\n", confirmed=True)
+    ws.edit_text(".env", "tvly-fake-old", "tvly-fake-new", confirmed=True)
+    backups = list((ws.root / ".backups").glob("*")) if (ws.root / ".backups").exists() else []
+    assert backups == []
+
+
+def test_backup_named_like_env_cannot_be_read(ws):
+    # 有人手动把 .env 的备份塞进 .backups：按它备份的原文件判断，照样读不了。
+    backup_dir = ws.root / ".backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    (backup_dir / ".env_20260101T000000000000.bak").write_text(
+        "TAVILY_API_KEY=tvly-fake-leaked\n", encoding="utf-8"
+    )
+    with pytest.raises(PermissionDenied):
+        ws.read_text(".backups/.env_20260101T000000000000.bak")
+
+
+def test_symlink_to_env_cannot_be_read(ws):
+    # 工作区里放一个指到 .env 的符号链接：读链接名就是读 .env，必须拦住。
+    target = ws.root / ".env"
+    target.write_text("TAVILY_API_KEY=tvly-fake-secret\n", encoding="utf-8")
+    link = ws.root / "link_to_env"
+    link.symlink_to(target)
+    with pytest.raises(PermissionDenied):
+        ws.read_text("link_to_env")
+
+
+def test_symlink_to_secret_inside_workspace_cannot_be_read(ws):
+    target = ws.root / "real_key.pem"
+    target.write_text("FAKE-PEM-CONTENT\n", encoding="utf-8")
+    link = ws.root / "innocent_name.txt"
+    link.symlink_to(target)
+    with pytest.raises(PermissionDenied):
+        ws.read_text("innocent_name.txt")
+
+
+def test_external_origin_write_refused(ws):
+    # 外部文件/网页里读到的“写文件”指令不直接执行。
+    with pytest.raises(PermissionDenied):
+        ws.write_text("evil.txt", "x", origin="external")
+
+
+def test_external_origin_delete_refused(ws):
+    ws.write_text("keep.txt", "别删我", overwrite=True, confirmed=True)
+    with pytest.raises(PermissionDenied):
+        ws.delete("keep.txt", permanent=True, confirmed=True, origin="external")
+    assert (ws.root / "keep.txt").exists()
+
+
+def test_scoped_confirmation_rejects_wrong_file(ws):
+    # 确认是给另一个文件的，顶不了这一次覆盖：必须重新问 BOOS。
+    ws.write_text("a.txt", "旧内容", overwrite=True, confirmed=True)
+    wrong_scope = {"by": "cli", "scope": "write:b.txt"}
+    with pytest.raises(NeedsConfirmation):
+        ws.write_text("a.txt", "新内容", overwrite=True, confirmed=wrong_scope)
+    assert (ws.root / "a.txt").read_text(encoding="utf-8") == "旧内容"

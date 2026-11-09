@@ -1,8 +1,11 @@
 # tools/files.py（第一批工具：读写文件）
 # 作用：十二在固定工作区里读写文件的工具，安全边界按新方案的代码层做：
 #   - 固定工作区目录 + 真实路径比对防穿越（../、绝对路径、符号链接逃逸）。
-#   - 密钥黑名单（.git/、.ssh/、*.pem、*.key、id_rsa*）一律不可碰。
-#   - .env 只写不读（Hermes 的做法）：能创建、能改，读不回里面的值。
+#   - 密钥黑名单（.git/、.ssh/、*.pem、*.key、id_rsa*）一律不可碰；
+#     密钥/.env 的判断看解析后的真实路径，不只看用户输入的名字，
+#     符号链接指到 .env 也拦得住；.backups/ 下的备份按它备份的原文件判断。
+#   - .env 只写不读（Hermes 的做法）：能创建、能改，读不回里面的值；
+#     密钥文件和 .env 不备份，备份、审计、报错里都不许带密钥内容。
 #   - 读分页（一次最多 2,000 行），超大文件（>10MB）/ 二进制文件先拒绝。
 #   - 写默认不覆盖；覆盖必须显式说要覆盖，且覆盖前先备份。
 #   - 改要求旧串在文件里只出现一次，不唯一或找不到都失败。
@@ -24,7 +27,14 @@ from pathlib import Path
 
 from tools.audit import AuditLog, sha256_bytes, sha256_file
 from tools.errors import NeedsConfirmation, PermissionDenied, ToolError
-from tools.permissions import classify_path, resolve_in_workspace
+from tools.permissions import (
+    _is_env_file,
+    _is_secret_blocked,
+    classify_path,
+    confirmation_scope_for_file,
+    resolve_confirmation,
+    resolve_in_workspace,
+)
 
 _MAX_READ_LINES = 2000
 _MAX_FILE_BYTES = 10 * 1024 * 1024  # 10MB：更大的文件先拒绝，别一次读爆上下文
@@ -52,9 +62,26 @@ class Workspace:
         if not allowed:
             raise PermissionDenied(reason)
 
-    def _confirm(self, action, rel_path, description, confirmed, actor):
-        """重要操作确认关：初期默认要 BOOS 点头，没确认就拒绝并记审计。"""
-        if self.require_confirmation and not confirmed:
+    def _confirm(self, action, rel_path, description, confirmed, actor, origin="agent"):
+        """重要操作确认关：初期默认要 BOOS 点头，没确认就拒绝并记审计。
+        （写、改、删都要确认——跑顺了再按路径放宽。）
+        确认必须当场、当次、来自 BOOS 本人（见 resolve_confirmation）：
+        带作用域的确认必须和本次操作完全一致，对不上就拒绝；
+        布尔值 True 只是调用方的担保，审计里记为 caller-attested。
+        origin 是操作内容的来历："user"（BOOS 原话）或 "agent"
+        （agent 自己推理）；"external"（从文件/网页/记忆里读到的）
+        绝不能直接拿来删/改/写——外部内容里的指令性文字不能指挥
+        agent 做事，路径只能来自 BOOS 原话或 agent 自己的正常推理。
+        返回确认来源（"user-scoped" / "caller-attested" / "not-required"）。"""
+        if origin not in ("user", "agent"):
+            raise PermissionDenied(
+                f"外部来源的操作不直接执行：{origin}（路径只能来自 BOOS 原话或 agent 自己的推理）"
+            )
+        if not self.require_confirmation:
+            return "not-required"
+        scope = confirmation_scope_for_file(action, rel_path)
+        status, reason = resolve_confirmation(confirmed, scope)
+        if status is None:
             self.audit_log.record(
                 tool="files",
                 action=action,
@@ -62,12 +89,22 @@ class Workspace:
                 actor=actor,
                 confirmed=False,
                 success=False,
-                reason="需要 BOOS 确认后才能做",
+                reason=reason,
+                origin=origin,
             )
-            raise NeedsConfirmation(description)
+            raise NeedsConfirmation(f"{description}（{reason}）")
+        return status
 
     def _backup(self, path, rel_path):
-        """覆盖/改之前，把原文件备份到 .backups/，只留最近 5 份。"""
+        """覆盖/改之前，把原文件备份到 .backups/，只留最近 5 份。
+        密钥文件和 .env 不备份——备份就是一份能读的密钥副本，
+        反而成了漏密钥的口子。返回 (备份路径或 None, 是否因密钥跳过备份)。"""
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError:
+            relative = path
+        if _is_secret_blocked(relative) or _is_env_file(relative):
+            return None, True
         backup_dir = self.root / ".backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         safe_name = str(rel_path).replace("/", "__").replace("\\", "__")
@@ -80,7 +117,7 @@ class Workspace:
                 stale.unlink()
             except OSError:
                 pass
-        return backup_path
+        return backup_path, False
 
     def _atomic_write(self, path, content):
         """先写临时文件、再原子改名：写一半失败，原文件不动。"""
@@ -195,21 +232,23 @@ class Workspace:
 
     # ---------- 写 / 改 / 删 ----------
 
-    def write_text(self, rel_path, content, overwrite=False, confirmed=False, actor="agent"):
-        """写文件：默认不覆盖已存在的文件；覆盖必须显式说，且覆盖前先备份。"""
+    def write_text(self, rel_path, content, overwrite=False, confirmed=False, actor="agent", origin="agent"):
+        """写文件：默认不覆盖已存在的文件；覆盖必须显式说，且覆盖前先备份
+        （密钥文件和 .env 不备份）。origin 见 _confirm。"""
         self._check(rel_path, "write")
         path = resolve_in_workspace(self.root, rel_path)
         if path.exists() and not path.is_file():
             raise ToolError(f"目标不是文件：{rel_path}")
         if path.exists() and not overwrite:
             raise ToolError(f"文件已存在，默认不覆盖（先读再决定，或显式说要覆盖）：{rel_path}")
-        self._confirm(
-            "write", rel_path, f"写文件 {rel_path}（{'覆盖' if path.exists() else '新建'}）", confirmed, actor
+        confirm_source = self._confirm(
+            "write", rel_path, f"写文件 {rel_path}（{'覆盖' if path.exists() else '新建'}）", confirmed, actor, origin
         )
         before_sha = sha256_file(path) if path.exists() else None
         backup = None
+        backup_skipped = False
         if path.exists():
-            backup = self._backup(path, rel_path)
+            backup, backup_skipped = self._backup(path, rel_path)
         self._atomic_write(path, content)
         after_sha = sha256_file(path)
         self.audit_log.record(
@@ -221,7 +260,9 @@ class Workspace:
             success=True,
             before_sha256=before_sha,
             after_sha256=after_sha,
-            extra={"bytes": len(content.encode("utf-8")), "backup": str(backup) if backup else None},
+            extra={"bytes": len(content.encode("utf-8")), "backup": str(backup) if backup else None, "backup_skipped": backup_skipped},
+            confirmation_source=confirm_source,
+            origin=origin,
         )
         return {
             "path": str(rel_path),
@@ -230,8 +271,8 @@ class Workspace:
             "backup": str(backup) if backup else None,
         }
 
-    def edit_text(self, rel_path, old, new, confirmed=False, actor="agent"):
-        """按“旧串换新串”改文件：旧串在文件里必须只出现一次。"""
+    def edit_text(self, rel_path, old, new, confirmed=False, actor="agent", origin="agent"):
+        """按“旧串换新串”改文件：旧串在文件里必须只出现一次。origin 见 _confirm。"""
         self._check(rel_path, "edit")
         path = resolve_in_workspace(self.root, rel_path)
         if not path.is_file():
@@ -245,9 +286,9 @@ class Workspace:
             raise ToolError(f"旧串在文件里找不到，没改：{rel_path}")
         if count > 1:
             raise ToolError(f"旧串在文件里出现了 {count} 次，不唯一，没改（请写更具体的旧串）：{rel_path}")
-        self._confirm("edit", rel_path, f"改文件 {rel_path}", confirmed, actor)
+        confirm_source = self._confirm("edit", rel_path, f"改文件 {rel_path}", confirmed, actor, origin)
         before_sha = sha256_file(path)
-        backup = self._backup(path, rel_path)
+        backup, backup_skipped = self._backup(path, rel_path)
         self._atomic_write(path, text.replace(old, new, 1))
         after_sha = sha256_file(path)
         self.audit_log.record(
@@ -259,14 +300,17 @@ class Workspace:
             success=True,
             before_sha256=before_sha,
             after_sha256=after_sha,
-            extra={"backup": str(backup)},
+            extra={"backup": str(backup) if backup else None, "backup_skipped": backup_skipped},
+            confirmation_source=confirm_source,
+            origin=origin,
         )
-        return {"path": str(rel_path), "sha256": after_sha, "backup": str(backup)}
+        return {"path": str(rel_path), "sha256": after_sha, "backup": str(backup) if backup else None}
 
-    def delete(self, rel_path, permanent=False, recursive=False, confirmed=False, actor="agent"):
+    def delete(self, rel_path, permanent=False, recursive=False, confirmed=False, actor="agent", origin="agent"):
         """删文件：默认进回收站（.trash/，能找回来）；彻底删要显式说。
         删目录默认拒绝，要删必须显式说递归。工作区根目录和 .backups/、
-        .trash/、.audit/ 本身不让删。"""
+        .trash/、.audit/ 本身不让删。origin 见 _confirm——删用的路径只能
+        来自 BOOS 原话或 agent 自己的推理，外部文件里读到的路径不直接拿来删。"""
         self._check(rel_path, "delete")
         path = resolve_in_workspace(self.root, rel_path)
         if path == self.root:
@@ -277,12 +321,13 @@ class Workspace:
             raise ToolError(f"文件不存在：{rel_path}")
         if path.is_dir() and not recursive:
             raise ToolError(f"删目录必须显式说递归：{rel_path}")
-        self._confirm(
+        confirm_source = self._confirm(
             "delete",
             rel_path,
             f"删{'目录' if path.is_dir() else '文件'} {rel_path}（{'彻底删除' if permanent else '进回收站'}）",
             confirmed,
             actor,
+            origin,
         )
         before_sha = sha256_file(path) if path.is_file() else None
         if permanent:
@@ -306,6 +351,8 @@ class Workspace:
             before_sha256=before_sha,
             after_sha256=None,
             extra={"permanent": permanent, "destination": str(destination) if destination else None},
+            confirmation_source=confirm_source,
+            origin=origin,
         )
         return {
             "path": str(rel_path),

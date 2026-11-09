@@ -27,7 +27,21 @@ from tools.cleanup import build_preview, delete_preview, format_summary, scan
 from tools.commands import CommandRunner
 from tools.errors import NeedsConfirmation, PermissionDenied, ToolError
 from tools.files import Workspace
+from tools.permissions import confirmation_scope_for_command, confirmation_scope_for_file
 from tools.search import SearchService
+
+
+def _confirmation(action, path_or_argv, yes):
+    """--yes 的确认：带作用域的确认，scope 就是本次操作的精确描述。
+    命令行是 BOOS 当场敲的 --yes，针对的就是这一条命令/这一个文件，
+    所以直接按这个格式写 scope；没加 --yes 就是没确认。"""
+    if not yes:
+        return False
+    if action == "run":
+        scope = confirmation_scope_for_command(path_or_argv)
+    else:
+        scope = confirmation_scope_for_file(action, path_or_argv)
+    return {"by": "cli", "scope": scope}
 
 
 def _workspace_root(args):
@@ -86,7 +100,8 @@ def cmd_file_write(args):
         content = sys.stdin.read()
     try:
         result = workspace.write_text(
-            args.path, content, overwrite=args.overwrite, confirmed=args.yes
+            args.path, content, overwrite=args.overwrite,
+            confirmed=_confirmation("write", args.path, args.yes),
         )
     except NeedsConfirmation as exc:
         _fail(f"{exc.description}（加 --yes 表示确认）", code=2)
@@ -98,7 +113,10 @@ def cmd_file_write(args):
 def cmd_file_edit(args):
     workspace = Workspace(_workspace_root(args))
     try:
-        result = workspace.edit_text(args.path, args.old, args.new, confirmed=args.yes)
+        result = workspace.edit_text(
+            args.path, args.old, args.new,
+            confirmed=_confirmation("edit", args.path, args.yes),
+        )
     except NeedsConfirmation as exc:
         _fail(f"{exc.description}（加 --yes 表示确认）", code=2)
     except (ToolError, PermissionDenied) as exc:
@@ -113,7 +131,7 @@ def cmd_file_delete(args):
             args.path,
             permanent=args.permanent,
             recursive=args.recursive,
-            confirmed=args.yes,
+            confirmed=_confirmation("delete", args.path, args.yes),
         )
     except NeedsConfirmation as exc:
         _fail(f"{exc.description}（加 --yes 表示确认）", code=2)
@@ -126,7 +144,10 @@ def cmd_run(args):
     workspace = _workspace_root(args)
     runner = CommandRunner(workspace)
     try:
-        result = runner.run(args.argv, timeout=args.timeout, confirmed=args.yes)
+        result = runner.run(
+            args.argv, timeout=args.timeout,
+            confirmed=_confirmation("run", args.argv, args.yes),
+        )
     except NeedsConfirmation as exc:
         _fail(f"{exc.description}（加 --yes 表示确认）", code=2)
     except (ToolError, PermissionDenied) as exc:

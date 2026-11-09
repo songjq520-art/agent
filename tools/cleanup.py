@@ -14,20 +14,29 @@
 # 三道保护（GPT 的建议，采纳）：
 #   - 分类置信度：低置信度的种类（大文件、拿不准）绝不直接删，先进回收站。
 #   - 删除预览：删除只认冻结的预览清单（build_preview 的那一份），
-#     扫描到删除之间新增的文件、改动过的文件都不会被删；删除时还要
-#     二次校验每个路径仍在扫描根目录内，越界的直接拒绝。
+#     预览里冻的不只是路径，还有每个文件的大小和修改时间；删除时逐个
+#     重新验证（仍在扫描根目录内、不是密钥文件、大小/修改时间没变过），
+#     对不上的跳过不删；扫描到删除之间新增的文件、改动过的文件都不会被删；
+#     .audit、.backups、.trash 这类重要目录不扫、也不删。
+#     预览存成 JSON 再读回来时，靠校验和发现有没有被改过。
 #   - 删除后核对：实际删了几个、挪进回收站几个、腾出多少空间、
-#     失败几个、跳过几个，都如实汇报。
+#     失败几个、跳过几个，都如实汇报；删完还要复查文件是不是真的没了。
+# 删除清单只认冻结的预览 + BOOS 点过头的种类：绝不认外部文件/网页里
+# 读到的路径——调用方必须只把 BOOS 确认过的种类传进来。
 #
 # 扫文件、算大小、删文件都是代码在本地跑，不花 token；花 token 的只有
 # 十二看汇总结果、跟 BOOS 说话那几句。
 
+import hashlib
+import hmac
+import json
 import os
 import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tools.errors import ToolError
 from tools.permissions import _is_env_file, _is_secret_blocked
 
 # 种类定义：id → 大白话名字 / 这是什么 / 删了有什么影响 / 置信度。
@@ -79,6 +88,14 @@ CATEGORIES = {
 
 _INSTALLER_SUFFIXES = {".msi", ".exe", ".dmg", ".pkg", ".deb", ".rpm", ".apk"}
 _MAX_FILES_PER_CATEGORY = 200
+
+# 重要目录：扫描时整个跳过，删除时绝不碰（哪怕预览里有也不删）。
+_PROTECTED_DIR_NAMES = (".audit", ".backups", ".trash")
+
+
+def _is_protected_path(path):
+    """路径是不是在 .audit/.backups/.trash 这类重要目录里（或就是它本身）。"""
+    return any(part in _PROTECTED_DIR_NAMES for part in Path(path).parts)
 
 
 def human_size(num_bytes):
@@ -139,11 +156,11 @@ def scan(root, root_kind="other", large_threshold_mb=500, max_files_per_category
     scanned = 0
     skipped_secrets = 0
     for dirpath, dirnames, filenames in os.walk(root):
-        # .git/.ssh 目录整个跳过；符号链接目录逃出根目录的也跳过。
+        # .git/.ssh/.audit/.backups/.trash 目录整个跳过；符号链接目录逃出根目录的也跳过。
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in (".git", ".ssh")
+            if d not in (".git", ".ssh", *_PROTECTED_DIR_NAMES)
             and _is_inside(Path(dirpath) / d, root)
         ]
         for name in filenames:
@@ -154,18 +171,20 @@ def scan(root, root_kind="other", large_threshold_mb=500, max_files_per_category
             if file_path.is_symlink() and not _is_inside(file_path, root):
                 continue
             try:
-                size = file_path.stat().st_size
+                stat = file_path.stat()
             except OSError:
                 continue
             scanned += 1
-            category = _classify_file(file_path, root_kind, size, large_threshold_bytes)
+            category = _classify_file(file_path, root_kind, stat.st_size, large_threshold_bytes)
             bucket = categories.setdefault(
                 category, {"files": [], "file_count": 0, "total_bytes": 0, "capped": False}
             )
             bucket["file_count"] += 1
-            bucket["total_bytes"] += size
+            bucket["total_bytes"] += stat.st_size
             if len(bucket["files"]) < max_files_per_category:
-                bucket["files"].append({"path": str(file_path), "size": size})
+                bucket["files"].append(
+                    {"path": str(file_path), "size": stat.st_size, "mtime": stat.st_mtime}
+                )
             else:
                 bucket["capped"] = True
     return {
@@ -202,9 +221,28 @@ def scan_many(roots):
     return merged
 
 
+def preview_checksum(preview):
+    """算预览的校验和：对去掉 checksum 字段后的预览做规范 JSON 再算 SHA-256。
+    预览存成 JSON 再读回来时，靠这个发现有没有被改过。"""
+    payload = {key: value for key, value in preview.items() if key != "checksum"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_preview(preview):
+    """校验预览完整性：没有 checksum、或 checksum 对不上，都返回 False。
+    删之前必须先过这一关——清单要是被改过，宁可不删，让 BOOS 重新扫一遍。"""
+    checksum = preview.get("checksum")
+    if not isinstance(checksum, str):
+        return False
+    return hmac.compare_digest(checksum, preview_checksum(preview))
+
+
 def build_preview(scan_result):
     """把扫描结果冻成一份删除预览：删除只认这一份清单，之后新增、
-    改动的文件都不会被删。返回预览字典（可存成 JSON，删的时候再读回来）。"""
+    改动的文件都不会被删。预览里每个文件都冻了路径、大小和修改时间，
+    删除时逐个比对；最后盖上校验和，存成 JSON 再读回来也能发现被改过。
+    返回预览字典（可存成 JSON，删的时候再读回来）。"""
     roots = scan_result.get("roots") or [scan_result["root"]]
     categories = {}
     for category_id, bucket in scan_result["categories"].items():
@@ -216,15 +254,20 @@ def build_preview(scan_result):
             "confidence": definition["confidence"],
             "file_count": bucket["file_count"],
             "total_bytes": bucket["total_bytes"],
-            "files": [f["path"] for f in bucket["files"]],
+            "files": [
+                {"path": f["path"], "size": f["size"], "mtime": f["mtime"]}
+                for f in bucket["files"]
+            ],
             "capped": bucket.get("capped", False),
         }
-    return {
+    preview = {
         "preview_id": uuid.uuid4().hex[:8],
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "roots": roots,
         "categories": categories,
     }
+    preview["checksum"] = preview_checksum(preview)
+    return preview
 
 
 def format_summary(preview):
@@ -251,11 +294,19 @@ def format_summary(preview):
 def delete_preview(preview, confirmed_categories, trash_dir, actor="agent", audit_log=None):
     """按冻结的预览删：只有 BOOS 点过头的种类才删。
 
+    动手前核对：先验预览的校验和（对不上就拒绝，宁可重新扫），再逐个文件
+    重新验证——仍在扫描根目录内、不是密钥文件、不在重要目录里、
+    大小和修改时间跟预览时一致；对不上的跳过不删，记进报告。
     高置信度的种类直接彻底删；低置信度的（大文件、拿不准）先进回收站。
-    删除时二次校验每个路径仍在扫描根目录内、且不是密钥文件，越界的拒绝。
     预览之后文件已经没了的，记跳过（不算失败）。
+    动手后核对：删完复查文件是不是真的没了，挪进回收站的复查是不是真的
+    在回收站里；复查不过的算失败，不算删成功。
     返回删除后核对：删了几个、进回收站几个、腾出多少空间、失败几个、跳过几个。
+    删除清单只认冻结的预览 + BOOS 点过头的种类，不认外部文件/网页里
+    读到的路径——调用方必须只把 BOOS 确认过的种类传进来。
     """
+    if not verify_preview(preview):
+        raise ToolError("预览校验和对不上，拒绝删除（预览可能被改过，请重新扫描）")
     trash_dir = Path(trash_dir)
     trash_dir.mkdir(parents=True, exist_ok=True)
     roots = [Path(r) for r in preview.get("roots", [])]
@@ -280,11 +331,16 @@ def delete_preview(preview, confirmed_categories, trash_dir, actor="agent", audi
             }
             continue
         counts = {"deleted": 0, "moved_to_trash": 0, "failed": 0, "skipped": 0}
-        for path_text in bucket["files"]:
+        for entry in bucket["files"]:
+            path_text = entry["path"] if isinstance(entry, dict) else entry
             path = Path(path_text)
             if not any(_is_inside(path, root) for root in roots):
                 counts["failed"] += 1
                 report["failed"].append({"path": path_text, "reason": "不在扫描范围内，拒绝删除"})
+                continue
+            if _is_protected_path(path):
+                counts["failed"] += 1
+                report["failed"].append({"path": path_text, "reason": "重要目录（.audit/.backups/.trash），拒绝删除"})
                 continue
             if _is_secret_blocked(path) or _is_env_file(path):
                 counts["failed"] += 1
@@ -295,17 +351,33 @@ def delete_preview(preview, confirmed_categories, trash_dir, actor="agent", audi
                 report["skipped"].append(path_text)
                 continue
             try:
-                size = path.stat().st_size if path.is_file() else 0
+                stat = path.stat()
             except OSError:
-                size = 0
+                counts["skipped"] += 1
+                report["skipped"].append(path_text)
+                continue
+            if isinstance(entry, dict):
+                if stat.st_size != entry.get("size") or abs(stat.st_mtime - entry.get("mtime", 0)) > 0.01:
+                    counts["skipped"] += 1
+                    report["skipped"].append(path_text)
+                    continue
+            size = stat.st_size if path.is_file() else 0
             try:
                 if bucket["confidence"] == "low":
                     destination = trash_dir / f"{path.name}_{uuid.uuid4().hex[:8]}"
                     shutil.move(str(path), str(destination))
+                    if not destination.exists() or path.exists():
+                        counts["failed"] += 1
+                        report["failed"].append({"path": path_text, "reason": "挪进回收站后复查不过，算失败"})
+                        continue
                     counts["moved_to_trash"] += 1
                     report["moved_to_trash"] += 1
                 else:
                     path.unlink()
+                    if path.exists():
+                        counts["failed"] += 1
+                        report["failed"].append({"path": path_text, "reason": "删除后文件还在，算失败"})
+                        continue
                     counts["deleted"] += 1
                     report["deleted"] += 1
                     report["freed_bytes"] += size

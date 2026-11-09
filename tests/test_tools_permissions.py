@@ -146,6 +146,11 @@ def test_tier1_needs_confirmation():
     cases = [
         ["pip", "install", "requests"],
         ["python", "-m", "pip", "install", "requests"],
+        ["python", "-c", "print('hi')"],
+        ["python", "-m", "pytest", "tests/", "-q"],
+        ["python", "-m", "http.server"],
+        ["node", "-e", "console.log(1)"],
+        ["ruby", "-e", "puts 1"],
         ["git", "push", "--force"],
         ["git", "push", "-f"],
         ["git", "reset", "--hard"],
@@ -166,12 +171,12 @@ def test_tier1_needs_confirmation():
 def test_tier0_auto_allowed():
     cases = [
         ["python", "script.py"],
-        ["python", "-m", "pytest", "tests/", "-q"],
+        ["node", "server.js"],
+        ["pytest", "tests/", "-q"],
         ["git", "status"],
         ["git", "log", "--oneline"],
         ["git", "diff"],
         ["ls", "-la"],
-        ["python", "-c", "print('hi')"],
     ]
     for argv in cases:
         tier, reason = classify_command(argv)

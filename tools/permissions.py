@@ -3,8 +3,13 @@
 # 都调这里，不各写一套：
 #   - 路径权限：固定工作区 + 真实路径比对防穿越 + 密钥黑名单 +
 #     .env 只写不读（Hermes 的做法）+ 审计日志不可直接改。
+#     密钥/.env 的判断看解析后的真实路径，不只看用户输入的名字；
+#     .backups/ 下的备份按它备份的原文件判断。
 #   - 命令分级：Tier 2 硬禁 / Tier 1 需确认 / Tier 0 自动放行，
-#     校验在执行前跑，字符归一化 + 按 | && || ; 拆段逐段查。
+#     校验在执行前跑，字符归一化 + 按 | && || ; 拆段逐段查；
+#     解释器内联代码（python -c / -m、node -e 等）是 Tier 1。
+#   - 确认有效性：确认必须当场、当次、来自 BOOS 本人；带作用域的确认
+#     必须和本次操作完全一致，一次确认只顶一次操作。
 #
 # 诚实说明：这套分级防的是误操作和提示注入下的灾难命令，不是防存心
 # 绕过的——有决心绕过总能找到办法（Hermes 官方文档原话：终端能绕过
@@ -44,6 +49,19 @@ def _is_env_file(path):
     return False
 
 
+# 备份文件名：<原路径（/ 换成 __）>_<时间戳>.bak，时间戳是 %Y%m%dT%H%M%S%f。
+_BACKUP_NAME_RE = re.compile(r"^(.*)_(\d{8}T\d{12})\.bak$")
+
+
+def _original_from_backup_name(filename):
+    """把 .backups/ 里的备份文件名还原成它备份的原路径（工作区里的相对路径）。
+    还原不出来（不是我们生成的备份名）返回 None。"""
+    match = _BACKUP_NAME_RE.match(filename)
+    if not match:
+        return None
+    return match.group(1).replace("__", "/")
+
+
 def resolve_in_workspace(workspace_root, rel_path):
     """把一个相对路径解析成工作区内的真实路径（跟随符号链接再比对）。
 
@@ -71,20 +89,29 @@ def classify_path(workspace_root, rel_path, action):
       3. .env 类文件 → 只写不读：读拒绝，写/改/删允许。
       4. .audit/ 目录 → 只读不写：审计日志不能用文件工具直接改。
       5. 其他 → 允许。
+    密钥/.env 的判断看解析后的真实路径（工作区里的相对部分），
+    不只看用户输入的名字——不然工作区里放一个指到 .env 的符号链接，
+    读链接名就把 .env 读出来了。备份文件（.backups/ 下的 .bak）
+    按它备份的原文件来判断，免得 .env 的备份成了漏密钥的口子。
     """
     try:
         resolved = resolve_in_workspace(workspace_root, rel_path)
     except PermissionDenied as exc:
         return False, str(exc)
-    if _is_secret_blocked(rel_path):
-        return False, f"密钥文件，禁止{action}：{rel_path}"
-    if _is_env_file(rel_path) and action == "read":
-        return False, f".env 文件只写不读，禁止读取：{rel_path}"
     root = Path(workspace_root).resolve()
     try:
         relative = resolved.relative_to(root)
     except ValueError:
         return False, f"路径超出工作区，拒绝：{rel_path}"
+    check_rel = relative
+    if relative.parts and relative.parts[0] == ".backups" and len(relative.parts) == 2:
+        original = _original_from_backup_name(relative.parts[1])
+        if original is not None:
+            check_rel = Path(original)
+    if _is_secret_blocked(check_rel):
+        return False, f"密钥文件，禁止{action}：{rel_path}"
+    if _is_env_file(check_rel) and action == "read":
+        return False, f".env 文件只写不读，禁止读取：{rel_path}"
     if relative.parts and relative.parts[0] == ".audit" and action in ("write", "edit", "delete"):
         return False, "审计日志不可直接改写，请走审计接口"
     return True, ""
@@ -113,6 +140,30 @@ _TIER2_SEGMENT_RES = [
     re.compile(r"^\s*del\s+.*/s\b", re.IGNORECASE),
     re.compile(r"^\s*Remove-Item\b.*-Recurse\b.*\s(/|C:\\|C:/|C:)\s*$", re.IGNORECASE),
 ]
+
+# 内联代码解释器：python -c / python -m、node -e 这类“现拼的代码”
+# 不经过文件，直接跑——必须当 Tier 1（要 BOOS 确认）。
+# 注意：python script.py（跑已经写好的脚本文件）还是 Tier 0，
+# 因为文件写进去的时候已经要过一次确认；内联代码没经过这一关。
+# 完整路径也认（比如 .venv/bin/python）：只看可执行文件的基本名。
+_INTERPRETER_INLINE_FLAGS = {
+    "python": {"-c", "-m", "-"},
+    "python3": {"-c", "-m", "-"},
+    "py": {"-c", "-m", "-"},
+    "node": {"-e", "--eval"},
+    "ruby": {"-e"},
+    "perl": {"-e"},
+    "php": {"-r"},
+}
+
+
+def _program_name(token):
+    """取命令头的可执行文件名（去路径、去 .exe、小写），比如
+    "C:/x/.venv/Scripts/python.exe" → "python"。"""
+    name = Path(str(token)).name.lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
 
 
 def _normalize_arg(arg):
@@ -181,6 +232,14 @@ def _check_segment(segment):
     for pattern in _TIER2_SEGMENT_RES:
         if pattern.search(segment):
             return 2, f"硬禁命令：{segment.strip()}"
+    # 解释器内联代码（python -c / -m、node -e 等）：现拼的代码直接跑，
+    # 没经过“写文件要确认”那一关，必须当 Tier 1。
+    # 注意：内联代码的内容不做静态分析（Python 代码没法用命令规则查），
+    # 所以只升到 Tier 1 而不是 Tier 2——确认时 BOOS 能看到完整命令原文，
+    # 由他判断；想彻底堵住要靠 OS 层隔离（Box 上测 gVisor）。
+    inline_flags = _INTERPRETER_INLINE_FLAGS.get(_program_name(tokens[0]))
+    if inline_flags is not None and any(tok in inline_flags for tok in tokens[1:]):
+        return 1, "跑解释器内联代码，需要确认"
     # shell 解释器带自由代码：先按 Tier 1 处理，里面的内容另行逐段查。
     if head in _SHELLS:
         return 1, "跑 shell 自由代码，需要确认"
@@ -246,3 +305,44 @@ def classify_command(argv):
     if worst_tier == 1:
         return 1, worst_reason
     return 0, ""
+
+
+# ---------- 确认有效性（十一的做法） ----------
+
+# 确认必须当场、当次、来自 BOOS 本人：高风险操作要 BOOS 明确点头才行。
+# 工具层自己没法替 BOOS 点头，所以 confirmed 的含义是调用方的担保，
+# 不是工具层独立核实过的事实：
+#   - True（布尔值）：调用方担保“BOOS 在本轮、当场、针对这一次操作
+#     点过头了”。这是兼容旧调用的写法，审计里记为 caller-attested；
+#     调用方（聊天层/命令行）必须每次现问现拿，绝不能拿上一次的确认
+#     顶这一次的，也不能默认传 True。
+#   - dict {"by": ..., "scope": ...}：带作用域的确认，scope 必须和
+#     expected_scope（本次操作的精确描述，比如 "run:python -c ..."、
+#     "write:notes/a.txt"）完全一致才算数；对不上就拒绝——
+#     一次确认只能顶一次操作，这是推荐的写法。
+# 返回 (status, reason)：status 是 "user-scoped" / "caller-attested" /
+# None（None 表示没拿到有效确认）；reason 是拒绝时的原因。
+
+
+def resolve_confirmation(confirmed, expected_scope):
+    """判断一次确认是不是有效：返回 (status, reason)。"""
+    if isinstance(confirmed, dict):
+        scope = confirmed.get("scope")
+        if scope is None:
+            return None, "确认里没有写清是针对哪个操作，拒绝"
+        if str(scope) != str(expected_scope):
+            return None, "确认和本次操作对不上，拒绝（一次确认只顶一次操作）"
+        return "user-scoped", ""
+    if confirmed is True:
+        return "caller-attested", ""
+    return None, "需要 BOOS 确认后才能做"
+
+
+def confirmation_scope_for_command(argv):
+    """给一条命令算确认作用域：调用方拿 BOOS 的点头时，就按这个格式写 scope。"""
+    return "run:" + " ".join(str(arg) for arg in argv)
+
+
+def confirmation_scope_for_file(action, rel_path):
+    """给一个文件操作算确认作用域：action 是 write / edit / delete。"""
+    return f"{action}:{rel_path}"
