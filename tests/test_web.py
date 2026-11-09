@@ -402,10 +402,18 @@ def test_ask_with_real_mem0_store_searches_and_saves(tmp_path, monkeypatch):
         {"role": "user", "content": "我叫小宋。"},
         {"role": "assistant", "content": "你好，我是 DeepSeek。"},
     ]
-    # 回答后存了本轮对话：原来种下的 1 条 + 新提出的“我叫小宋”1 条。
+    # 回答后本轮对话先待定（Plan C），flush 时才提交：
+    # “我叫小宋”说的就是种下的那条名字记忆（同一槽位、同一值），
+    # upsert 判定为 unchanged、不重复存——库里还是原来那 1 条。
+    store.flush_pending()
     texts = [item["text"] for item in store.get_all()]
-    assert len([text for text in texts if "小宋" in text]) == 2
-    assert "我叫小宋" in texts
+    assert len([text for text in texts if "小宋" in text]) == 1
+    assert texts == ["我叫小宋，昵称小宋，请称呼我小宋。"]
+    # 再问一句非身份事实，flush 后正常存下来（待定区本身没坏）。
+    with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()):
+        state.ask("我喜欢喝咖啡。")
+    store.flush_pending()
+    assert "我喜欢喝咖啡" in [item["text"] for item in store.get_all()]
 
 
 def test_ask_demo_mode_with_mem0_does_not_save_turn(tmp_path, monkeypatch):

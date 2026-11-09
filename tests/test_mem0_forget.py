@@ -288,4 +288,7 @@ def test_forgotten_memory_not_reextracted_by_unrelated_turns(tmp_path):
     store.add_turn([{"role": "user", "content": "今天天气真好。我叫小宋。"}])
     assert not any("Go" in item["text"] for item in store.get_all())
     store.add_turn([{"role": "user", "content": "我喜欢用 Go 写代码。"}])
+    # Plan C：上一轮先待定，Go 这轮在 flush 时才提交（上一轮的“我叫小宋”
+    # 在 Go 这轮调 add_turn 时已提交，不会把删掉的 Go 捞回来）。
+    store.flush_pending()
     assert any("Go" in item["text"] for item in store.get_all())

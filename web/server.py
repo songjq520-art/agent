@@ -657,6 +657,20 @@ def main(argv=None):
     mem0_store = create_mem0_store(tracker)
     if mem0_store is None:
         print("⚠️ mem0 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
+    else:
+        # Plan C：把十二的名字和 SOUL.md 以“已确认”种进长期记忆
+        # （只加没有的，不覆盖已有的；失败只记日志、不拦启动）。
+        try:
+            seeded = mem0_store.ensure_identity_memories()
+            added = [
+                key
+                for key, outcome in (seeded or {}).items()
+                if (outcome or {}).get("status") == "added"
+            ]
+            if added:
+                print(f"长期记忆已确认：{', '.join(added)}。", flush=True)
+        except Exception:
+            logger.warning("种身份记忆失败：本次不带名字/SOUL 记忆启动。", exc_info=True)
     try:
         server, _state = create_server(
             config=config,
@@ -674,6 +688,13 @@ def main(argv=None):
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n服务已停止。")
+    # Plan C：服务停之前把待定区里最后一轮提交——否则最后一轮
+    # 永远待在内存里。撤回过的那轮在撤回时已经丢掉，不会捞回来。
+    if mem0_store is not None:
+        try:
+            mem0_store.flush_pending()
+        except Exception:
+            logger.warning("停服务时提交待定记忆失败。", exc_info=True)
     return 0
 
 

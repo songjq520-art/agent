@@ -63,9 +63,14 @@ def test_add_memory_text_passes_source_to_mem0(tmp_path):
 
 def test_add_turn_stores_inferred_provenance(tmp_path):
     """提取路径存的记忆带来源：source=inferred、user_confirmed=False、
-    confidence=0.7——用户明确说过的话，但 BOOS 没逐条确认过写法。"""
+    confidence=0.7——用户明确说过的话，但 BOOS 没逐条确认过写法。
+
+    注意：这里不用“我叫小宋。”——名字是身份陈述，走 Plan C 槽位
+    （source=user、已确认），测不到提取路径的来源；用喝咖啡测提取。
+    Plan C：本轮先待定，flush 后才提交。"""
     store = make_fake_store(tmp_path)
-    store.add_turn([{"role": "user", "content": "我叫小宋。"}])
+    store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
+    store.flush_pending()
     items = store.get_all()
     assert len(items) == 1
     metadata = items[0]["metadata"]
@@ -78,10 +83,15 @@ def test_add_turn_stores_inferred_provenance(tmp_path):
 
 def test_inferred_not_auto_upgraded_by_saving(tmp_path):
     """推断来的信息不会因为“存下来了”就自动变成已确认：
-    同一句话提取两次，存下来的两条来源都还是 inferred、未确认。"""
+    同一个意思两种说法各提取一次，存下来的两条来源都还是 inferred、未确认。
+
+    注意：不用同一句话说两次——Plan C 待定区按原文指纹去重，
+    同一句说两次只存一条（见 test_add_turn_dedup_preserved 的新语义）；
+    这里用两种说法，测的是“来源不升级”，不是“重复存”。"""
     store = make_fake_store(tmp_path)
-    for _ in range(2):
-        store.add_turn([{"role": "user", "content": "我叫小宋。"}])
+    store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
+    store.add_turn([{"role": "user", "content": "我喜欢喝咖啡，不加糖。"}])
+    store.flush_pending()
     items = store.get_all()
     assert len(items) == 2
     for item in items:
@@ -95,6 +105,7 @@ def test_search_returns_provenance(tmp_path):
     store = make_fake_store(tmp_path)
     store.add_memory_text("我叫小宋。")
     store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
+    store.flush_pending()
     found = store.search("我叫什么？喜欢喝什么？")
     by_text = {item["text"]: item for item in found}
     assert by_text["我叫小宋。"]["confirmed"] is True
@@ -203,8 +214,9 @@ def test_custom_instructions_value_judgement():
     """价值判断规则写进了提取提示（DeepSeek 自己判断，不另设机制、
     不多调一次模型）：只存值得长期记的；没确认/不值得记的直接不存；
     别人的事不是用户的事实；没被认可的 AI 观点不是用户立场；
-    过滤按事实做、不按整轮做。版本号也跟着改了。"""
-    assert CUSTOM_INSTRUCTIONS_VERSION == "2026-11-09-provenance"
+    过滤按事实做、不按整轮做。版本号也跟着改了（Plan C 第三版，
+    加第 13 条：玩笑/夸张/不可能的说法不存）。"""
+    assert CUSTOM_INSTRUCTIONS_VERSION == "2026-11-09-plan-c"
     assert "VALUE JUDGEMENT" in CUSTOM_INSTRUCTIONS
     assert "long-term goals" in CUSTOM_INSTRUCTIONS
     assert "Do NOT store trivial" in CUSTOM_INSTRUCTIONS
@@ -212,6 +224,8 @@ def test_custom_instructions_value_judgement():
     assert "other people's experiences" in CUSTOM_INSTRUCTIONS
     assert "explicitly endorses" in CUSTOM_INSTRUCTIONS
     assert "per fact, not per turn" in CUSTOM_INSTRUCTIONS
+    assert "jokes, exaggerations" in CUSTOM_INSTRUCTIONS
+    assert "When in doubt whether the user is joking" in CUSTOM_INSTRUCTIONS
 
 
 def test_trivial_chat_not_stored_but_fact_in_same_turn_is(tmp_path):
@@ -223,6 +237,7 @@ def test_trivial_chat_not_stored_but_fact_in_same_turn_is(tmp_path):
     store.add_turn([{"role": "user", "content": "今天天气真好。"}])
     assert store.get_all() == []
     store.add_turn([{"role": "user", "content": "今天天气真好。我叫小宋。"}])
+    store.flush_pending()
     texts = [item["text"] for item in store.get_all()]
     assert texts == ["我叫小宋"]  # 提取按句号拆句，存下来的句子没有句末句号
 
@@ -379,6 +394,7 @@ def test_correction_marks_user_confirmed(tmp_path):
     纠正过的事实以后可以直接当作事实回答。"""
     store = make_fake_store(tmp_path)
     store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
+    store.flush_pending()
     assert store.get_all()[0]["metadata"]["confirmed"] is False
     store.correct_memory("我喜欢喝咖啡", "我喜欢喝茶。")
     metadata = store.get_all()[0]["metadata"]
@@ -405,6 +421,7 @@ def test_user_expressed_beats_inferred_on_conflict(tmp_path):
     标签也不一样，模型先看到用户亲口说的。"""
     store = make_fake_store(tmp_path)
     store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
+    store.flush_pending()
     store.add_memory_text("我喜欢喝茶。")
     found = store.search("我喜欢喝什么？")
     by_text = {item["text"]: item for item in found}

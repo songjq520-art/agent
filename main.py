@@ -373,6 +373,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         )[-6:]
         saved = mem0_store.add_turn(recent)
         correction = _print_correction_result(saved)
+        # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
+        # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
+        if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
+            print("刚说的那句已经撤回，不记了。")
     return {
         "mode": "real",
         "route": routing,
@@ -457,6 +461,14 @@ def chat_loop(budget_tracker=None, mem0_store=None):
         print(result["text"])
         print(f"\nToken 使用量：{result.get('usage')}")
         print(f"本次成本：{result.get('cost_usd')} 美元（None 表示模型未返回 usage，成本未知）")
+    # Plan C：退出时把待定区里最后一轮提交——会话结束了，不会再有
+    # 下一轮、也不会再有撤回；不提交，最后一轮就永远丢了。
+    # “不不不”撤回过的那轮在撤回时已经丢掉，这里不会把它捞回来。
+    if mem0_store is not None:
+        try:
+            mem0_store.flush_pending()
+        except Exception:
+            logger.warning("退出时提交待定记忆失败。", exc_info=True)
     return 0
 
 
@@ -503,6 +515,13 @@ def main(argv=None, mem0_store=None):
         print(result["text"])
         print(f"\nToken 使用量：{result.get('usage')}")
         print(f"本次成本：{result.get('cost_usd')} 美元（None 表示模型未返回 usage，成本未知）")
+    # Plan C：单次问答没有下一轮，进程退出前把待定区提交，
+    # 否则本轮对话永远丢了（和 chat_loop 退出时一样）。
+    if mem0_store is not None:
+        try:
+            mem0_store.flush_pending()
+        except Exception:
+            logger.warning("退出时提交待定记忆失败。", exc_info=True)
     return 0
 
 

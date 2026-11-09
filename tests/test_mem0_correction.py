@@ -103,6 +103,8 @@ def test_chat_correction_replaces_old_memory(tmp_path):
         {"role": "user", "content": "我喜欢用 Python 写代码。"},
         {"role": "assistant", "content": "明白，你喜欢用 Python 写代码，我记下了。"},
     ])
+    # Plan C：第一轮先待定，flush 后才落库，纠错改的才是落库后的那条。
+    store.flush_pending()
     py_id = store.get_all()[0]["id"]
     result = store.add_turn([
         {"role": "user", "content": "你记错了，我喜欢用 Go 写代码。"},
@@ -224,13 +226,16 @@ def test_ambiguous_correction_abandoned_when_user_says_something_else(tmp_path):
 
 
 def test_ordinary_message_no_false_trigger(tmp_path):
-    """普通聊天走正常保存：没有 "correction" 键，记忆正常存下来。"""
+    """普通聊天走正常保存：没有 "correction" 键，记忆正常存下来。
+
+    Plan C：本轮先待定，flush 后才提交。"""
     store = make_fake_store(tmp_path)
     result = store.add_turn([
         {"role": "user", "content": "今天天气真好。我喜欢喝咖啡。"},
         {"role": "assistant", "content": "是啊，喝杯咖啡挺好的。"},
     ])
     assert "correction" not in result
+    store.flush_pending()
     assert [item["text"] for item in store.get_all()] == ["我喜欢喝咖啡"]
 
 
@@ -264,6 +269,9 @@ def test_correction_already_stored_is_unchanged(tmp_path):
         {"role": "user", "content": "我喜欢用 Go 写代码。"},
         {"role": "assistant", "content": "明白，你喜欢用 Go 写代码，我记下了。"},
     ])
+    # Plan C：第一轮先待定，flush 后才落库；before_calls 在落库后量，
+    # 纠错轮次本身不调提取（只改旧记忆），总数才不变。
+    store.flush_pending()
     before_calls = len(store._memory.add_calls)
     result = store.add_turn([
         {"role": "user", "content": "你记错了，我喜欢用 Go 写代码。"},
@@ -780,6 +788,8 @@ def test_ordinary_message_does_not_call_judge(tmp_path):
     ])
     assert "correction" not in result
     assert judge_calls == []
+    # Plan C：本轮先待定，flush 后才提交。
+    store.flush_pending()
     assert "我喜欢喝咖啡" in [item["text"] for item in store.get_all()]
 
 
@@ -863,6 +873,9 @@ def test_lifecycle_case_via_chat_turns_with_judge(tmp_path):
         {"role": "user", "content": "我现在喜欢用 Go 写代码。"},
         {"role": "assistant", "content": "明白，你喜欢用 Go 写代码，我记下了。"},
     ])
+    # Plan C：两轮都在待定区，flush 后才都落库（第二轮调 add_turn 时
+    # 第一轮已提交，第二轮在 flush 时提交）。
+    store.flush_pending()
     scifi_id = store.get_all()[0]["id"]
     go_id = store.get_all()[1]["id"]
     store.note_context([{"id": scifi_id}, {"id": go_id}])

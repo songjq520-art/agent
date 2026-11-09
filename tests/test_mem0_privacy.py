@@ -238,6 +238,9 @@ def test_add_turn_redacts_before_send(tmp_path):
             {"role": "assistant", "content": "好的。"},
         ]
     )
+    # Plan C：本轮先待定，flush 时才调提取——脱敏在 add_turn 入口做，
+    # 发给 mem0 的已经是脱敏后的消息。
+    store.flush_pending()
     sent_messages, _user_id, _infer = store._memory.add_calls[0]
     sent_text = " ".join(m.get("content") or "" for m in sent_messages)
     assert "hunter2" not in sent_text
@@ -300,9 +303,17 @@ def test_add_turn_post_call_filter_deletes_leaked_memory(tmp_path):
         version_path=tmp_path / "mem0_versions.json",
     )
     result = store.add_turn([{"role": "user", "content": "我叫小宋。"}])
+    assert result.get("pending") is True
+    # Plan C：名字是身份陈述，提交时走槽位 upsert（infer=False 原文存），
+    # 漏出来的秘密记忆在提交时已被二次过滤删掉。
+    result = store.flush_pending()
     assert _SECRET_KEY not in " ".join(store._memory.all_texts())
     assert store._memory.all_texts() == ["我叫小宋"]
-    assert [item["memory"] for item in result.get("results", [])] == ["我叫小宋"]
+    # 提交结果里也没有秘密：身份 upsert 的结果在 "identity" 里，
+    # 正常那条是 added；"results" 里是提取结果，本轮没有提取。
+    identity = result.get("identity") or []
+    assert len(identity) == 1 and identity[0]["status"] == "added"
+    assert _SECRET_KEY not in str(result)
 
 
 # ---------- 2b. 用时拦截：search ----------
@@ -538,6 +549,9 @@ def test_add_turn_dedup_preserved(tmp_path):
     ]
     store.add_turn(turn)
     store.add_turn(turn)
+    # Plan C：第二轮提交第一轮的待定内容（1 次 add），再把自己待定；
+    # flush 时按指纹去重、不再重复提——同一句话最终只存 1 条、只调 1 次 add。
+    store.flush_pending()
     assert store._memory.all_texts() == ["我喜欢每天早上喝黑咖啡"]
-    assert len(store._memory.add_calls) == 2
+    assert len(store._memory.add_calls) == 1
 

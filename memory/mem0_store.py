@@ -172,7 +172,8 @@ CORRECTION_TOPIC_MIN_SIMILARITY = 0.56
 # 规则文本改了就改这个版本号，方便以后追踪“哪版规则存的记忆”。
 # 2026-11-09 改到第二版：加了“价值判断”（只存值得长期记的）和
 # “不存未确认/不存别人的事/不存没被认可的 AI 观点”（见下文第 9–12 条）。
-CUSTOM_INSTRUCTIONS_VERSION = "2026-11-09-provenance"
+# 2026-11-09 Plan C 改到第三版：加第 13 条（玩笑/夸张/不可能的说法不存）。
+CUSTOM_INSTRUCTIONS_VERSION = "2026-11-09-plan-c"
 
 # CUSTOM_INSTRUCTIONS（自定义提取规则，BOOS 定的，最高优先级）：
 # 原文照抄试跑验证过的版本（~/workspace/mem0-spike/spike_common.py）。
@@ -226,7 +227,14 @@ CUSTOM_INSTRUCTIONS = """CUSTOM EXTRACTION RULES — HIGHEST PRIORITY, these ove
 12. Apply rules 9-11 per fact, not per turn: a turn may mix trivial chat
     with a real long-term fact — store the fact, drop the trivial part.
     Never drop a whole turn just because part of it is trivial, and never
-    keep a trivial sentence just because it shares a turn with a real fact."""
+    keep a trivial sentence just because it shares a turn with a real fact.
+13. NEVER store jokes, exaggerations, or claims that are plainly not
+    serious or not possible as settled facts (e.g. "I am 100 years old",
+    "I am a billionaire", "I can fly"). If a statement reads as a joke,
+    a boast, or an impossible claim rather than a sincere fact about the
+    user, do NOT store it. When in doubt whether the user is joking, do
+    NOT store it — a missed joke is harmless, a stored joke becomes a
+    false memory the user has to correct later."""
 
 # FIRST_MEMORIES（首批三条记忆，2026-11-07 BOOS 确认过）：
 # 从 memory/memories.py 原样搬过来，只改了一处：第 3 条的预算规则
@@ -302,19 +310,25 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _provenance(source, confidence, user_confirmed, created_at=None):
+def _provenance(source, confidence, user_confirmed, created_at=None, slot=None):
     """拼一份来源元数据（存记忆时传给 mem0.add 的 metadata 参数）。
 
     source 不是 "user" 时一律按 "inferred" 存（调用方传错也不让它
     进库）；user_confirmed 只在 source="user" 时才可能是 True。
+    slot（Plan C）：身份/称呼类记忆的槽位名（agent_name/user_name/
+    soul），只认 KNOWN_SLOTS 里的，其他值不进库——同槽位只留一条，
+    新值盖旧值时靠它找旧记忆。
     """
     source = SOURCE_USER if source == SOURCE_USER else SOURCE_INFERRED
-    return {
+    metadata = {
         "source": source,
         "created_at": created_at or _now_iso(),
         "confidence": confidence,
         "user_confirmed": bool(user_confirmed) and source == SOURCE_USER,
     }
+    if slot in KNOWN_SLOTS:
+        metadata["slot"] = slot
+    return metadata
 
 
 def _normalize_metadata(raw):
@@ -327,15 +341,18 @@ def _normalize_metadata(raw):
     - user_confirmed 只有明确是 True（布尔值）才算确认，写成
       "yes"/1 这类非布尔值不算——确认必须是明确的，不能靠猜；
     - confidence 不是 0–1 之间的数字时记成 None（不知道就是不知道）；
-    - created_at 不是字符串时记成 None。
+    - created_at 不是字符串时记成 None；
+    - slot 不是 KNOWN_SLOTS 里的已知槽位时记成 None（旧记忆、新旧
+      版本混用、损坏数据都走这条路——槽位只认这三个，别的都不认）。
     返回：{"source", "created_at", "confidence", "user_confirmed",
-           "confirmed"}，其中 confirmed 就是 user_confirmed（取了
-    个短名字，方便调用方判断“能不能当作事实用”）。
+           "confirmed", "slot"}，其中 confirmed 就是 user_confirmed
+    （取了个短名字，方便调用方判断“能不能当作事实用”）。
     """
     source = SOURCE_UNCONFIRMED
     created_at = None
     confidence = None
     user_confirmed = False
+    slot = None
     if isinstance(raw, dict):
         raw_source = raw.get("source")
         if raw_source in (SOURCE_USER, SOURCE_INFERRED):
@@ -348,12 +365,16 @@ def _normalize_metadata(raw):
             if 0 <= raw_conf <= 1:
                 confidence = float(raw_conf)
         user_confirmed = raw.get("user_confirmed") is True and source == SOURCE_USER
+        raw_slot = raw.get("slot")
+        if raw_slot in KNOWN_SLOTS:
+            slot = raw_slot
     return {
         "source": source,
         "created_at": created_at,
         "confidence": confidence,
         "user_confirmed": user_confirmed,
         "confirmed": user_confirmed,
+        "slot": slot,
     }
 
 
@@ -749,6 +770,181 @@ def _latest_user_content(messages):
     return ""
 
 
+# ---------- Plan C：记忆信任修复（2026-11-09，BOOS 批准动手） ----------
+# 问题：十二不敢信 BOOS 亲口说的名字和 SOUL.md——新对话里问名字，
+# 它说“未经逐条确认的信息”、SOUL.md“没有任何记录”。根因是确认
+# 模型太严，连用户亲口说的都不敢信。治本办法（三闸门 + 待定区 +
+# 冲突兜底），落地顺序见 add_turn / _commit_pending_turn：
+#   闸门 1（话语类型过滤）：假设句、玩笑夸张不存（见
+#     _filter_extraction_messages + CUSTOM_INSTRUCTIONS 第 13 条）；
+#   闸门 2（槽位分级）：名字/称呼/重要偏好是 BOOS 亲口说的，代码
+#     直接标 user_explicit（source="user"、user_confirmed=True、
+#     confidence=1.0），来源由代码定、不由模型定（见
+#     _detect_identity_statement + _upsert_slot_memory）；
+#   闸门 3（待定区 + 冲突检查）：新记忆先在内存里待一轮对话，
+#     下一轮不撤回才真正存入；“不不不”这类撤回信号直接丢掉待定
+#     的那轮，沉默（没有下一轮）则待定区清空、不存；同槽位新值
+#     来时原地 UPDATE，不并存（mem0 本身是 ADD-only，冲突处理
+#     必须在应用层做，见 _upsert_slot_memory）。
+# 记忆面板只做事后修正兜底，不当确认入口。
+
+# 槽位（slot）：身份/称呼类记忆在 metadata 里带的槽位名，
+# 同槽位只留一条（新值盖旧值）。KNOWN_SLOTS 之外的 slot 一律不认。
+SLOT_AGENT_NAME = "agent_name"  # Agent 自己的名字（十二）
+SLOT_USER_NAME = "user_name"  # BOOS 希望被怎么称呼
+SLOT_SOUL = "soul"  # Agent 的人格（灵魂，SOUL.md）
+KNOWN_SLOTS = frozenset([SLOT_AGENT_NAME, SLOT_USER_NAME, SLOT_SOUL])
+
+# 身份种子（Plan C 种进长期记忆的两条“已确认”记忆）：
+# 名字是 BOOS 2026-11-08 亲口定的、2026-11-09 亲口告诉十二的；
+# SOUL.md 是 BOOS 逐条定的十条原则。种子只在“没有时”才加，
+# 绝不覆盖已有的槽位值（比如 BOOS 以后在聊天里改了名字，
+# 下次启动不能把名字改回去）。
+AGENT_NAME_VALUE = "十二"
+# 种子文本里特意留了“你叫十二”：_detect_identity_statement 要能从
+# 这句里认出 agent_name=十二——以后 BOOS 在聊天里再说“你叫十二”，
+# upsert 比对旧值对得上，才不会误判成改名、把“是十一的弟弟”盖掉。
+AGENT_NAME_TEXT = "Agent 的名字是十二，你叫十二，是十一的弟弟。"
+AGENT_SOUL_TEXT = (
+    "Agent 的人格（灵魂）写在 SOUL.md 里：十条原则——"
+    "真诚帮忙不装样子、有主见、自己先想办法再问、重要的事先问、"
+    "亦师亦友、温暖不冷淡、记住并不断学习、诚实绝不编造、有原则、"
+    "BOOS 明确要求无条件服从时就服从。"
+)
+
+# _RETRACTION_SIGNALS（撤回信号）：整句只有这些词（加句末标点）时，
+# 意思是“刚说的那句撤回、不记了”——直接丢掉待定区里的上一轮，
+# 不存、不问。只认“整句只有信号”：“不对，我喜欢看纪录片。”这种
+# 带替换内容的不是撤回，走纠错。没有“没有”——光秃秃的“没有”常常
+# 是在回答助手刚问的问题（“你喜欢喝茶吗？”“没有。”），不是撤回
+# 上一句，误杀会丢掉刚说的重要事实。
+_RETRACTION_SIGNALS = frozenset(
+    [
+        "不不不",
+        "不对不对",
+        "不不",
+        "不对",
+        "不是",
+        "算了",
+        "别记",
+        "别记了",
+        "不要记",
+        "不要记了",
+        "不记了",
+        "别存",
+        "不要存",
+        "错了",
+        "说错了",
+        "收回",
+        "撤回",
+    ]
+)
+_RETRACTION_TRAILING_PUNCT = "。！？.!?~～ \t\n"
+
+# 条件句开头：不是既定事实，提取时整句去掉（和 FakeMemory 认同一套）。
+_CONDITIONAL_LEADS = ("如果", "假设", "假如", "要是", "万一")
+
+# 身份陈述的触发词：按“先 user、后 agent”试——“你叫我小宋”里的
+# “你叫”是叫“我”，不是在给 Agent 起名；每组内按触发词从长到短试。
+_IDENTITY_USER_TRIGGERS = ("我的名字是", "我的名字叫", "你叫我", "叫我", "我叫")
+_IDENTITY_AGENT_TRIGGERS = ("以后你叫", "现在你叫", "你的名字是", "你的名字叫", "你叫")
+_IDENTITY_VALUE_MAX_LEN = 12  # 名字值最多 12 字
+_IDENTITY_TRAILING_PARTICLES = "了啊呀呢"  # 名字末尾的语气词，去掉
+
+
+def _is_bare_retraction(text):
+    """整句只有撤回信号时返回 True（Plan C 待定区撤回）。
+
+    “不不不。”“不对。”“算了。”这种——只有信号加句末标点。
+    “不对，我喜欢看纪录片。”带替换内容，不是撤回，返回 False。
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip().strip(_RETRACTION_TRAILING_PUNCT).strip()
+    return stripped in _RETRACTION_SIGNALS
+
+
+def _detect_identity_statement(sentence):
+    """从一句话里认出“身份/称呼陈述句”（Plan C 闸门 2，代码定、不是模型定）。
+
+    只认陈述句：带“什么/吗/?”的一律不认（“你叫什么？”是提问，
+    不是在告诉名字）。认到返回 {"slot", "value", "text"}：
+    - agent_name（十二的名字）：“你叫十二”“以后你叫十二了”
+      → text "Agent 的名字是十二，你叫十二"（带“你叫”二字，
+      离线关键词召回问“你叫什么”时也能找着）；
+    - user_name（BOOS 的称呼）：“我叫小宋”→ 原句存（去句末标点）；
+      “叫我小宋”/“你叫我小宋”→ "我叫小宋，请称呼我小宋"。
+    名字值最多 12 字，末尾的“了/啊/呀/呢”语气词去掉。
+    认不到返回 None。
+    """
+    if not isinstance(sentence, str):
+        return None
+    text = sentence.strip().strip("。！？；，、.!?;,")
+    if not text:
+        return None
+    if any(q in text for q in ("什么", "吗", "？", "?")):
+        return None
+    for triggers, slot in (
+        (_IDENTITY_USER_TRIGGERS, SLOT_USER_NAME),
+        (_IDENTITY_AGENT_TRIGGERS, SLOT_AGENT_NAME),
+    ):
+        for trigger in triggers:
+            idx = text.find(trigger)
+            if idx < 0:
+                continue
+            rest = text[idx + len(trigger):]
+            # 值到第一个标点为止。
+            value = re.split(r"[，。！？、；;,\s]", rest, maxsplit=1)[0].strip()
+            value = value.rstrip(_IDENTITY_TRAILING_PARTICLES)
+            if not value or len(value) > _IDENTITY_VALUE_MAX_LEN:
+                continue
+            if slot == SLOT_USER_NAME:
+                if trigger in ("叫我", "你叫我"):
+                    canonical = f"我叫{value}，请称呼我{value}"
+                else:
+                    canonical = text  # “我叫小宋”这类原句直接存
+            else:
+                canonical = f"Agent 的名字是{value}，你叫{value}"
+            return {"slot": slot, "value": value, "text": canonical}
+    return None
+
+
+def _filter_extraction_messages(messages):
+    """Plan C 闸门 1：从待提交的对话里去掉不该进提取的东西，
+    返回过滤后的消息列表（assistant 的话原样透传，只当提取上下文）。
+
+    去掉两类 user 句子：
+    - 条件/假设句开头的（如果/假设/假如/要是/万一）——不是既定事实；
+    - 身份/称呼陈述句——身份事实只走确定性的槽位路径
+      （_upsert_slot_memory），不经过模型提取，避免同一事实存两份。
+    一条 user 消息里句子全被去掉时，整条消息不要了。
+    """
+    kept = []
+    for message in messages or []:
+        role = (message or {}).get("role")
+        content = (message or {}).get("content") or ""
+        if role != "user":
+            if role == "assistant":
+                kept.append({"role": "assistant", "content": content})
+            continue
+        sentences = re.split(r"[。！？\n]+", content)
+        kept_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if sentence.startswith(_CONDITIONAL_LEADS):
+                continue
+            if _detect_identity_statement(sentence) is not None:
+                continue
+            kept_sentences.append(sentence)
+        if kept_sentences:
+            kept.append(
+                {"role": "user", "content": "。".join(kept_sentences) + "。"}
+            )
+    return kept
+
+
 def _correction_result(outcome):
     """把 correct_memory 的返回收成调用方好用的样子（只留必要字段）。
 
@@ -1029,6 +1225,21 @@ class Mem0Store:
         # 哪条（见 add_turn / _parse_pending_selection）。
         # 只放内存里，重启就没了——对话里的追问本来就是临时的。
         self._pending_correction = None
+        # _pending_turn（Plan C 待定区）：上一轮对话先放这里，等下一轮
+        # 不撤回才真正存入（见 add_turn / _commit_pending_turn）。
+        # 结构 {"messages": [...], "identity": [{"slot","value","text"}]}，
+        # identity 是本轮最新一句 user 消息里认出的身份陈述（代码定的，
+        # 见 _detect_identity_statement）。只放内存里，重启就没了——
+        # 没来得及提交的对话本来就是临时的；沉默（没有下一轮）时，
+        # 待定区清空、不存（这是设计，不是丢数据：用户没给下一句，
+        # 就当那句还没说定）。
+        self._pending_turn = None
+        # _committed_user_keys（已提交过的 user 消息指纹）：add_turn
+        # 每次收到最近 6 条消息（约 3 轮），提交待定轮时只提没提交过
+        # 的 user 消息——指纹是内容去掉首尾空白后的哈希，deque 最多
+        # 200 条，旧的自动挤掉（重启后清空，旧轮次不会重复提交，
+        # 因为待定区本身也只放内存）。
+        self._committed_user_keys = deque(maxlen=200)
         # _recent_context_ids（最近对话上下文）：最近几轮提问时检索到、
         # 拼进提示的记忆 id（deque，最多 CONTEXT_IDS_MAX 条，旧的自动挤掉）。
         # 纠错时拿它当“当前在聊什么”的提示（见 note_context /
@@ -1404,8 +1615,301 @@ class Mem0Store:
             return {}
         return self._drop_sensitive_results(result or {})
 
+    # ---------- Plan C：待定区提交 + 同槽位 UPDATE + 身份种子 ----------
+
+    def _commit_pending_turn(self):
+        """提交待定区里上一轮对话（Plan C 闸门 3）。
+
+        只在写锁里调（add_turn / flush_pending 都持有锁）。
+        顺序：先把待定轮里的身份陈述按槽位 upsert（新值盖旧值），
+        再把剩下的、没提交过的 user 句子过闸门 1 过滤、调提取存入。
+        提交过的 user 消息指纹记进 _committed_user_keys——add_turn
+        每次收到最近 6 条消息（约 3 轮的滑动窗口），下次提交同一批
+        消息时，旧轮次的 user 消息不再重复提。
+        返回提交结果 {"results": [...], "identity": [...]}，
+        没提交任何东西时返回 {}。
+        """
+        pending = self._pending_turn
+        self._pending_turn = None
+        if pending is None:
+            return {}
+        identity_outcomes = []
+        for item in pending.get("identity") or []:
+            outcome = self._upsert_slot_memory(
+                item["slot"], item["value"], item["text"]
+            )
+            identity_outcomes.append(outcome)
+        # 提取：只留没提交过的 user 消息，及其后面跟着的那条
+        # assistant 回复（当提取上下文）；指纹先记下来——过滤后
+        # 什么都不剩、提取没调时，下次也不再重复处理这句。
+        messages = pending.get("messages") or []
+        fresh = []
+        for i, message in enumerate(messages):
+            if (message or {}).get("role") != "user":
+                continue
+            content = (message or {}).get("content") or ""
+            key = content.strip()
+            if key in self._committed_user_keys:
+                continue
+            self._committed_user_keys.append(key)
+            fresh.append({"role": "user", "content": content})
+            if i + 1 < len(messages) and (messages[i + 1] or {}).get(
+                "role"
+            ) == "assistant":
+                fresh.append(messages[i + 1])
+        results = []
+        filtered = _filter_extraction_messages(fresh)
+        if filtered:
+            extracted = self._extract_and_save_turn(filtered)
+            results = (extracted or {}).get("results") or []
+        if not results and not identity_outcomes:
+            return {}
+        return {"results": results, "identity": identity_outcomes}
+
+    def flush_pending(self):
+        """立刻提交待定区（Plan C）。
+
+        正常对话里待定轮由下一轮 add_turn 提交；这个方法给两处用：
+        测试里主动提交、服务停之前把最后一轮落库（否则最后一轮
+        永远待在内存里）。返回提交结果，没待定内容时返回 {}。
+        """
+        with _WRITE_LOCK:
+            return self._commit_pending_turn()
+
+    def _find_slot_memory_by_metadata(self, slot):
+        """按 metadata.slot 找同槽位记忆（Plan C 冲突兜底的主路）。
+
+        只认 _normalize_metadata 规整过的 slot（KNOWN_SLOTS 里的
+        三个）。找不到返回 None。内部用，含敏感也照常找（不导出）。
+        """
+        for item in self.get_all(include_sensitive=True):
+            if (item.get("metadata") or {}).get("slot") == slot:
+                return item
+        return None
+
+    def _find_slot_memory_by_value(self, slot, value):
+        """兜底：Plan C 之前存的同槽位记忆没有 slot 标记——按关键词
+        找回，文本里认出同一槽位、同一值时才算（只做去重用：值相同
+        就不用再存；值不同时不碰它，见 _upsert_slot_memory）。
+
+        soul 槽位没有“值”的说法：文本里同时有 "SOUL.md" 和
+        “十条原则”时算同一条。找不到返回 None。
+        """
+        queries = {
+            SLOT_AGENT_NAME: "Agent 的名字",
+            SLOT_USER_NAME: "我叫",
+            SLOT_SOUL: "SOUL.md",
+        }
+        query = queries.get(slot)
+        if not query:
+            return None
+        try:
+            candidates = self.search(query, top_k=5) or []
+        except Exception:
+            logger.warning("找同槽位记忆失败，本次按没有处理。", exc_info=True)
+            return None
+        for cand in candidates:
+            text = (cand or {}).get("text") or ""
+            if slot == SLOT_SOUL:
+                if "SOUL.md" in text and "十条原则" in text:
+                    return cand
+                continue
+            detected = _detect_identity_statement(text)
+            if detected is not None and detected["slot"] == slot:
+                if detected["value"] == value:
+                    return cand
+        return None
+
+    def _upsert_slot_memory(self, slot, value, text):
+        """同槽位 UPDATE（Plan C 闸门 3 的冲突兜底）。
+
+        mem0 是 ADD-only，同一槽位的新值必须在应用层盖掉旧值，
+        不能并存。只在写锁里调。
+        - 库里已有同槽位记忆（metadata.slot 对得上）：值相同→
+          不动（unchanged，留着旧文本）；值不同→ 原地 update
+          成新文本 + 用户已确认的来源（updated）。SOUL 种子文本
+          是固定的：已有 soul 槽位记忆就不动。
+        - 没有 slot 标记、但按关键词找回同一槽位同一值的旧记忆：
+          也不动（unchanged，只是没标记——Plan C 之前存的）。
+          值不同时不碰它（不敢猜那条是不是同一槽位），直接新增。
+        - 都没有→ 新增一条（added），来源记 user、已确认、置信度 1.0。
+        返回 {"slot", "value", "status", "memory_id"}，
+        存失败时 status="failed"。
+        """
+        if slot not in KNOWN_SLOTS or not value:
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "failed",
+                "memory_id": None,
+            }
+        existing = self._find_slot_memory_by_metadata(slot)
+        if existing is not None:
+            if slot == SLOT_SOUL:
+                # SOUL 种子文本是固定的：已有 soul 槽位记忆就不动。
+                return {
+                    "slot": slot,
+                    "value": value,
+                    "status": "unchanged",
+                    "memory_id": existing["id"],
+                }
+            old_detected = _detect_identity_statement(existing["text"])
+            old_value = old_detected["value"] if old_detected else None
+            if old_value == value:
+                return {
+                    "slot": slot,
+                    "value": value,
+                    "status": "unchanged",
+                    "memory_id": existing["id"],
+                }
+            try:
+                self._memory.update(
+                    memory_id=existing["id"],
+                    text=text,
+                    metadata=_provenance(
+                        SOURCE_USER, CONFIDENCE_USER, True, slot=slot
+                    ),
+                )
+            except Exception:
+                logger.warning("同槽位记忆更新失败：旧值保留。", exc_info=True)
+                return {
+                    "slot": slot,
+                    "value": value,
+                    "status": "failed",
+                    "memory_id": existing["id"],
+                }
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "updated",
+                "memory_id": existing["id"],
+            }
+        duplicate = self._find_slot_memory_by_value(slot, value)
+        if duplicate is not None:
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "unchanged",
+                "memory_id": duplicate["id"],
+            }
+        result = self._add_text_with_metadata(
+            text, _provenance(SOURCE_USER, CONFIDENCE_USER, True, slot=slot)
+        )
+        results = (result or {}).get("results") or []
+        if not results:
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "failed",
+                "memory_id": None,
+            }
+        return {
+            "slot": slot,
+            "value": value,
+            "status": "added",
+            "memory_id": results[0].get("id"),
+        }
+
+    def _seed_slot_memory(self, slot, value, text):
+        """种子专用：只加没有的，绝不覆盖已有值（和 _upsert_slot_memory
+        的区别：upsert 是“新值盖旧值”，种子是“有旧值就不动”——
+        BOOS 在聊天里改了名字之后，下次启动再种，不能把名字改回去）。
+
+        已有同槽位记忆（带 slot 标记，或按关键词找回同一槽位同一值）
+        时返回 unchanged；都没有时新增一条（added），来源记 user、
+        已确认、置信度 1.0。只在写锁里调。
+        """
+        if slot not in KNOWN_SLOTS or not value:
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "failed",
+                "memory_id": None,
+            }
+        existing = self._find_slot_memory_by_metadata(slot)
+        if existing is not None:
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "unchanged",
+                "memory_id": existing["id"],
+            }
+        duplicate = self._find_slot_memory_by_value(slot, value)
+        if duplicate is not None:
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "unchanged",
+                "memory_id": duplicate["id"],
+            }
+        result = self._add_text_with_metadata(
+            text, _provenance(SOURCE_USER, CONFIDENCE_USER, True, slot=slot)
+        )
+        results = (result or {}).get("results") or []
+        if not results:
+            return {
+                "slot": slot,
+                "value": value,
+                "status": "failed",
+                "memory_id": None,
+            }
+        return {
+            "slot": slot,
+            "value": value,
+            "status": "added",
+            "memory_id": results[0].get("id"),
+        }
+
+    def ensure_identity_memories(self):
+        """把十二的名字和 SOUL.md 以“已确认”种进长期记忆（Plan C）。
+
+        只加没有的，绝不覆盖已有的槽位值（见 _seed_slot_memory）。
+        网页服务启动时调一次（web/server.py）；CLI 不自动调
+        （命令行默认不加载 mem0）。失败时记日志、不抛异常——
+        种子没种上不能把服务搞崩。
+        返回 {"agent_name": {...}, "soul": {...}}，每项是
+        _seed_slot_memory 的返回（added/unchanged/failed）。
+        """
+        outcomes = {}
+        with _WRITE_LOCK:
+            try:
+                outcomes["agent_name"] = self._seed_slot_memory(
+                    SLOT_AGENT_NAME, AGENT_NAME_VALUE, AGENT_NAME_TEXT
+                )
+            except Exception:
+                logger.warning("种 Agent 名字记忆失败。", exc_info=True)
+                outcomes["agent_name"] = {
+                    "slot": SLOT_AGENT_NAME,
+                    "value": AGENT_NAME_VALUE,
+                    "status": "failed",
+                    "memory_id": None,
+                }
+            try:
+                outcomes["soul"] = self._seed_slot_memory(
+                    SLOT_SOUL, "soul", AGENT_SOUL_TEXT
+                )
+            except Exception:
+                logger.warning("种 SOUL 记忆失败。", exc_info=True)
+                outcomes["soul"] = {
+                    "slot": SLOT_SOUL,
+                    "value": "soul",
+                    "status": "failed",
+                    "memory_id": None,
+                }
+        return outcomes
+
     def add_turn(self, messages):
         """把本轮对话存进长期记忆（回答后调一次）。
+
+        Plan C（2026-11-09）：本轮不立即存，先放进待定区（_pending_turn），
+        下一轮 add_turn 时不撤回才真正提交（_commit_pending_turn）；
+        沉默（没有下一轮）时待定区清空、不存；“不不不”这类撤回信号
+        直接丢掉待定区里的上一轮。提交时身份陈述走槽位 upsert
+        （新值盖旧值），其余句子过闸门 1 过滤再提取。纠错轮次不进
+        待定区（避免重复存），见下面的接线说明。
+        返回里多两个键：正常轮次被待定时 {"pending": True, ...}；
+        撤回时 {"retracted": True, "dropped": n, "results": []}；
+        其余和以前一样（纠错时带 "correction" 键）。
 
         参数 messages：本轮及最近几轮的消息列表（user/assistant 交替）。
         mem0 自己调 DeepSeek 提取（自动存，BOOS 已同意不用确认），
@@ -1454,6 +1958,35 @@ class Mem0Store:
             ):
                 return {}
             latest_user = _latest_user_content(safe_messages)
+            # 0. Plan C 待定区撤回：本轮最新一句只有撤回信号时，丢掉
+            #    待定区里的上一轮（不存、不问），本轮自己也不存。
+            #    待确认的纠错也一并清掉（“算了”就是放弃这次纠错）。
+            #    注意：这一步在提交待定区之前——撤回就是不要提交。
+            #    例外：助手刚问了问题时，光秃秃的否定（“不是。”）更可能
+            #    是在回答那个问题，不是撤回上一句——这时不丢待定区，
+            #    正常提交上一轮、本轮照常待定。
+            if latest_user and _is_bare_retraction(latest_user):
+                pending = self._pending_turn
+                assistant_asked = False
+                if pending is not None:
+                    for m in reversed(pending.get("messages") or []):
+                        if (m or {}).get("role") == "assistant":
+                            content = (m or {}).get("content") or ""
+                            assistant_asked = "？" in content or "?" in content
+                            break
+                if pending is not None and not assistant_asked:
+                    self._pending_turn = None
+                    self._pending_correction = None
+                    dropped = sum(
+                        1
+                        for m in pending.get("messages") or []
+                        if (m or {}).get("role") == "user"
+                    )
+                    return {"retracted": True, "dropped": dropped, "results": []}
+                # 否则：当作普通轮次继续（下面先提交待定区、再待定本轮）。
+            # 0b. 提交上一轮待定区（在纠错判断之前——刚说的事实先落库，
+            #     再处理本轮的纠错；纠错改的才是落库后的那条）。
+            committed = self._commit_pending_turn()
             # 1. 先处理上一轮留下的待确认纠错：BOOS 这句是不是在挑候选？
             if self._pending_correction is not None and latest_user:
                 pending = self._pending_correction
@@ -1498,7 +2031,24 @@ class Mem0Store:
                     normal = dict(normal)
                     normal["correction"] = _correction_result(outcome)
                 return normal
-            return self._extract_and_save_turn(safe_messages)
+            # 3. 正常轮次：不立即存，放进待定区等下一轮。
+            #    身份陈述（名字/称呼）只在最新一句里认——旧轮次的
+            #    身份在它那轮已经认过、提交时已 upsert，不重复认。
+            identity_items = []
+            if latest_user:
+                for sentence in re.split(r"[。！？\n]+", latest_user):
+                    detected = _detect_identity_statement(sentence.strip())
+                    if detected is not None:
+                        identity_items.append(detected)
+            self._pending_turn = {
+                "messages": safe_messages,
+                "identity": identity_items,
+            }
+            return {
+                "pending": True,
+                "results": (committed or {}).get("results") or [],
+                "identity": [item["slot"] for item in identity_items],
+            }
 
     def _drop_sensitive_results(self, result):
         """提取后二次过滤：检查本次提取出的记忆，万一哪条还带着敏感信息
@@ -1536,6 +2086,10 @@ class Mem0Store:
         """原文存一条记忆（infer=False），带上来源元数据。
 
         只做“调 mem0.add”这一件事：脱敏、去重由调用方先做好。
+        返回前过一遍提取后二次过滤（_drop_sensitive_results）：
+        底层 add 的返回里万一混进一条含敏感信息的记忆（比如
+        实现 bug 多存了一条），立刻删掉、不留库里——Plan C 的
+        槽位 upsert 也走这里，和提取路径同一道防线。
         mem0 报错时记日志、返回 {}，不抛异常（存记忆失败不能把
         聊天搞崩，见 add_turn 的约定）。
         """
@@ -1546,7 +2100,7 @@ class Mem0Store:
                 False,
                 metadata,
             )
-            return result or {}
+            return self._drop_sensitive_results(result or {})
         except Exception:
             logger.warning("mem0 手动存记忆失败。", exc_info=True)
             return {}
@@ -2162,7 +2716,15 @@ class Mem0Store:
                             cands=candidates,
                         ),
                     }
-            new_metadata = _provenance(SOURCE_USER, CONFIDENCE_USER, True)
+            # Plan C：纠错换文本时保留旧记忆的槽位（slot）——名字/称呼
+            # 记忆被“不对，你叫十二”改过之后，槽位标记不能丢，不然
+            # 下次改名时按槽位找不到旧记忆，就会并存两条。
+            new_metadata = _provenance(
+                SOURCE_USER,
+                CONFIDENCE_USER,
+                True,
+                slot=old_metadata.get("slot"),
+            )
             try:
                 try:
                     self._memory.update(mem_id, text=safe_new, metadata=new_metadata)
@@ -2202,6 +2764,7 @@ class Mem0Store:
                             else CONFIDENCE_INFERRED,
                             bool(old_metadata.get("user_confirmed")),
                             created_at=old_metadata.get("created_at"),
+                            slot=old_metadata.get("slot"),
                         )
                     )
                 except Exception:
