@@ -364,3 +364,89 @@ def test_scan_skips_uppercase_protected_dirs(tmp_path):
     assert not any(
         ".BACKUPS" in p or ".TRASH" in p or ".GIT" in p for p in all_paths
     )
+
+
+# ---------- GPT 三次审查新增（2026-11-10）：拒绝记审计、roots 比对过 normcase ----------
+
+
+def test_delete_rejection_is_audited_checksum(tmp_path):
+    # 校验和那关不过、拒绝删除时，拒绝本身要进审计日志（成功=False），
+    # 不然事后查不到“有人改过清单”。
+    from tools.audit import AuditLog
+
+    root = build_tree(tmp_path / "tree")
+    preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
+    tampered = json.loads(json.dumps(preview))
+    tampered["categories"]["temp"]["files"].append(
+        {"path": str(tmp_path / "important.txt"), "size": 1, "mtime": 0}
+    )
+    audit_log = AuditLog(tmp_path / "audit.log")
+    with pytest.raises(ToolError):
+        delete_preview(tampered, ["temp"], trash_dir=tmp_path / "trash",
+                       roots=[str(root)], audit_log=audit_log)
+    events = audit_log.read()
+    assert len(events) == 1
+    assert events[0]["tool"] == "cleanup"
+    assert events[0]["action"] == "delete_preview"
+    assert events[0]["success"] is False
+    assert "校验和" in events[0]["reason"]
+    assert events[0]["extra"]["rejection"] == "checksum"
+
+
+def test_delete_rejection_is_audited_roots(tmp_path):
+    # 删除范围那关不过、拒绝删除时，拒绝本身也要进审计日志。
+    from tools.audit import AuditLog
+
+    root = build_tree(tmp_path / "tree")
+    victim_dir = tmp_path / "victim"
+    victim_dir.mkdir()
+    preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
+    forged = json.loads(json.dumps(preview))
+    forged["roots"] = [str(victim_dir)]
+    forged["checksum"] = preview_checksum(forged)
+    audit_log = AuditLog(tmp_path / "audit.log")
+    with pytest.raises(ToolError):
+        delete_preview(forged, ["temp"], trash_dir=tmp_path / "trash",
+                       roots=[str(root)], audit_log=audit_log)
+    events = audit_log.read()
+    assert len(events) == 1
+    assert events[0]["success"] is False
+    assert "删除范围" in events[0]["reason"]
+    assert events[0]["extra"]["rejection"] == "roots"
+
+
+def test_delete_rejection_without_audit_log_still_refuses(tmp_path):
+    # 没传 audit_log 也照常拒绝，不报错（拒绝不依赖审计）。
+    root = build_tree(tmp_path / "tree")
+    preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
+    tampered = json.loads(json.dumps(preview))
+    tampered["categories"]["temp"]["files"].append(
+        {"path": str(tmp_path / "important.txt"), "size": 1, "mtime": 0}
+    )
+    with pytest.raises(ToolError):
+        delete_preview(tampered, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
+
+
+def test_roots_compare_uses_normcase(monkeypatch):
+    # 在 Linux 上模拟 Windows 的 normcase（转小写、统一斜杠），验证 roots
+    # 比对走 normcase：大小写不同的 roots 视为同一个目录。
+    # 注意：这只能验“比对走了 normcase”这个逻辑；真正的 Windows 行为
+    # （同一个文件）要等 BOOS 笔记本上跑测试才算数。
+    from tools.cleanup import _normalize_root_set
+
+    def fake_windows_normcase(path):
+        return path.replace("/", "\\").lower()
+
+    monkeypatch.setattr("os.path.normcase", fake_windows_normcase)
+    assert _normalize_root_set(["D:/Downloads"]) == _normalize_root_set(["d:\\downloads"])
+    assert _normalize_root_set(["D:/Downloads"]) == _normalize_root_set(["D:/DOWNLOADS"])
+
+
+def test_roots_compare_keeps_case_on_posix():
+    # Linux 上 normcase 原样不动：/tmp/A 和 /tmp/a 是两个不同目录，
+    # 不能因为 Windows 上大小写不敏感就把它们当成同一个。
+    from tools.cleanup import _normalize_root_set
+
+    if os.name == "nt":
+        pytest.skip("只在 POSIX 上有意义")
+    assert _normalize_root_set(["/tmp/A"]) != _normalize_root_set(["/tmp/a"])

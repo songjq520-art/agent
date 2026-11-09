@@ -10,9 +10,11 @@
 #   python -m tools.cli run -- python -m pytest tests/ -q
 #   python -m tools.cli cleanup scan D:/下载 --kind downloads --out preview.json
 #   python -m tools.cli cleanup delete --preview preview.json --categories temp,logs --yes
+#   （清理流程必须用带钥匙的 HMAC 预览：扫描和删除用同一把 TWELVE_CLEANUP_KEY，
+#   只从环境变量读；缺钥匙时扫描就拒绝，普通 SHA-256 预览删除时也拒绝。）
 #
 # 工作区目录：--workspace 指定，或 TWELVE_WORKSPACE 环境变量，默认当前目录。
-# Key 只从环境变量读（ANYSEARCH_API_KEY、TAVILY_API_KEY），绝不在命令行传 Key
+# Key 只从环境变量读（ANYSEARCH_API_KEY、TAVILY_API_KEY、TWELVE_CLEANUP_KEY），绝不在命令行传 Key
 # （会进 shell 历史记录）；Parallel 不用 Key。
 # 写/改/删和 Tier 1 命令默认要确认，--yes 表示“我确认过了”。
 
@@ -158,11 +160,23 @@ def cmd_run(args):
 
 
 def cmd_cleanup_scan(args):
+    # 扫描要生成可删除的预览，必须有钥匙：没钥匙生成的只是普通 SHA-256 预览，
+    # 改了清单重算一个就能过，删的时候会被拒绝——与其让 BOOS 白走一趟确认流程，
+    # 不如扫描这一步就明确拒绝。钥匙只从 TWELVE_CLEANUP_KEY 环境变量读，
+    # 绝不在命令行传（会进 shell 历史记录）。
+    # 生成一把钥匙：python -c "import secrets; print(secrets.token_hex(16))"
+    key = os.environ.get("TWELVE_CLEANUP_KEY")
+    if not key:
+        _fail(
+            "扫描要生成可删除的预览，必须先设 TWELVE_CLEANUP_KEY 环境变量"
+            "（扫描和删除用同一把钥匙）。没有钥匙时，生成的预览只是普通"
+            " SHA-256，防不了篡改，删的时候会被拒绝。"
+        )
     try:
         result = scan(args.root, root_kind=args.kind, large_threshold_mb=args.large_mb)
     except ToolError as exc:
         _fail(str(exc))
-    preview = build_preview(result)
+    preview = build_preview(result, key=key)
     print(format_summary(preview))
     if args.out:
         Path(args.out).write_text(
@@ -182,16 +196,26 @@ def cmd_cleanup_delete(args):
     audit_log = AuditLog(Path(os.environ.get("TWELVE_WORKSPACE", os.getcwd())) / ".audit" / "audit.log")
     if not args.root:
         _fail("删文件必须加 --root 指明可信的扫描根目录（当初扫的那几个目录，可重复写），删除范围不从预览文件里读")
-    # 带钥匙的预览要删，钥匙放 TWELVE_CLEANUP_KEY 环境变量里，别写进命令行
-    # （命令行会被 shell 历史记下来）；没钥匙的普通预览只防手误，不防篡改。
-    report = delete_preview(
-        preview,
-        [c.strip() for c in args.categories.split(",") if c.strip()],
-        trash_dir=trash_dir,
-        roots=args.root,
-        key=os.environ.get("TWELVE_CLEANUP_KEY"),
-        audit_log=audit_log,
-    )
+    # 删除必须用扫描时那把钥匙验证：钥匙放 TWELVE_CLEANUP_KEY 环境变量里，
+    # 别写进命令行（命令行会被 shell 历史记下来）。缺钥匙拒绝删除；
+    # 普通 SHA-256 的预览（没钥匙生成的，防不了篡改）也明确拒绝，
+    # 请用带钥匙的 cleanup scan 重新扫一份。
+    key = os.environ.get("TWELVE_CLEANUP_KEY")
+    if not key:
+        _fail("删除必须用扫描时那把钥匙验证：请先设 TWELVE_CLEANUP_KEY 环境变量（和扫描时同一把），缺钥匙拒绝删除。")
+    if preview.get("checksum_algo", "sha256") != "hmac-sha256":
+        _fail("这份预览是普通 SHA-256 校验和，防不了篡改，拒绝删除；请用带钥匙的 cleanup scan 重新扫一份。")
+    try:
+        report = delete_preview(
+            preview,
+            [c.strip() for c in args.categories.split(",") if c.strip()],
+            trash_dir=trash_dir,
+            roots=args.root,
+            key=key,
+            audit_log=audit_log,
+        )
+    except ToolError as exc:
+        _fail(str(exc))
     _print_json(report)
 
 

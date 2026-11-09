@@ -20,12 +20,17 @@
 #     .audit、.backups、.trash 这类重要目录不扫、也不删。
 #     删除范围（roots）由调用方单独传可信的扫描根目录，不从预览里读——
 #     预览是能被改的 JSON 文件，里面的 roots 被改了删的范围就跟着跑了；
-#     预览里写的 roots 必须和调用方传的完全一致。
+#     预览里写的 roots 必须和调用方传的一致（比对时过 normcase，
+#     Windows 上大小写不敏感，Linux 上原样不动）。
 #     预览存成 JSON 再读回来时，靠校验和发现有没有被改过：不带钥匙的
 #     普通 SHA-256 只能防手误（改完重算一个就过了）；带钥匙的 HMAC
 #     （钥匙只放调用方内存里）改了清单重算也对不上。正常流程里预览
-#     只放内存、不落盘；要存成 JSON 跨进程用，最好传一把钥匙。
+#     只放内存、不落盘；要存成 JSON 跨进程用，必须传一把钥匙——
+#     命令行流程（tools/cli.py）缺钥匙时扫描就拒绝，普通 SHA-256 预览
+#     删除时也明确拒绝。
 #     预览里的文件条目必须是含大小/修改时间的 dict，字符串条目直接拒绝。
+#     校验和或范围那关不过、拒绝删除时，也记一笔审计（成功=False），
+#     不然事后查不到“有人改过清单”。
 #   - 删除后核对：实际删了几个、挪进回收站几个、腾出多少空间、
 #     失败几个、跳过几个，都如实汇报；删完还要复查文件是不是真的没了。
 # 删除清单只认冻结的预览 + BOOS 点过头的种类：绝不认外部文件/网页里
@@ -326,13 +331,42 @@ def format_summary(preview):
     return "\n".join(lines)
 
 
+def _normalize_root_set(roots):
+    """roots 比对用的规范形式：解析成绝对路径再过 normcase。
+    normcase 在 Windows 上转小写、统一斜杠（D:\\Downloads 和
+    d:\\downloads 是同一个目录），在 Linux 上原样不动（/tmp/A 和
+    /tmp/a 是两个不同目录），所以不能直接全转小写。"""
+    return {os.path.normcase(str(Path(r).resolve())) for r in roots}
+
+
+def _record_delete_rejection(audit_log, preview, actor, reason, rejection):
+    """拒绝删除时记一笔审计：校验和或范围那关不过，删没删成也要留痕，
+    不然事后查不到“有人改过清单”。记不进日志也不影响拒绝本身
+    （审计写失败了，拒绝照样生效）。"""
+    if audit_log is None:
+        return
+    try:
+        audit_log.record(
+            tool="cleanup",
+            action="delete_preview",
+            actor=actor,
+            confirmed=True,
+            success=False,
+            reason=reason,
+            extra={"preview_id": preview.get("preview_id"), "rejection": rejection},
+        )
+    except Exception:
+        pass
+
+
 def delete_preview(preview, confirmed_categories, trash_dir, *, roots, key=None, actor="agent", audit_log=None):
     """按冻结的预览删：只有 BOOS 点过头的种类才删。
 
     删除范围 roots 必须由调用方单独传可信的扫描根目录（就是当初扫的那几个
     目录），不从预览里读——预览是能被改的 JSON 文件，里面的 roots 要是被
     改成别的目录，删的范围就跟着跑了。预览里如果也写了 roots，必须和调用方
-    传的完全一致，对不上就拒绝，宁可重新扫。
+    传的一致（比对时过 normcase，Windows 上大小写不敏感），对不上就拒绝，
+    宁可重新扫；拒绝时如果传了 audit_log，先记一笔拒绝的审计再抛错。
     key 是建预览时那把钥匙（只放调用方内存里）：带钥匙的预览必须用同一把
     钥匙验，没钥匙或钥匙不对都拒绝；没钥匙的普通校验和只能防手误。
 
@@ -350,16 +384,20 @@ def delete_preview(preview, confirmed_categories, trash_dir, *, roots, key=None,
     读到的路径——调用方必须只把 BOOS 确认过的种类传进来。
     """
     if not roots:
-        raise ToolError("删除范围必须由调用方单独传入可信的扫描根目录，拒绝从预览里读")
+        reason = "删除范围必须由调用方单独传入可信的扫描根目录，拒绝从预览里读"
+        _record_delete_rejection(audit_log, preview, actor, reason, "no-roots")
+        raise ToolError(reason)
     trusted_roots = [Path(r) for r in roots]
     if not verify_preview(preview, key=key):
-        raise ToolError("预览校验和对不上，拒绝删除（预览可能被改过，请重新扫描）")
+        reason = "预览校验和对不上，拒绝删除（预览可能被改过，请重新扫描）"
+        _record_delete_rejection(audit_log, preview, actor, reason, "checksum")
+        raise ToolError(reason)
     preview_roots = preview.get("roots")
     if preview_roots is not None:
-        if {str(Path(r).resolve()) for r in preview_roots} != {
-            str(r.resolve()) for r in trusted_roots
-        }:
-            raise ToolError("预览里的删除范围和调用方传入的不一致，拒绝删除（请重新扫描）")
+        if _normalize_root_set(preview_roots) != _normalize_root_set(trusted_roots):
+            reason = "预览里的删除范围和调用方传入的不一致，拒绝删除（请重新扫描）"
+            _record_delete_rejection(audit_log, preview, actor, reason, "roots")
+            raise ToolError(reason)
     trash_dir = Path(trash_dir)
     trash_dir.mkdir(parents=True, exist_ok=True)
     roots = trusted_roots

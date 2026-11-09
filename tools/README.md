@@ -100,7 +100,8 @@ ws.delete("notes/old.txt", confirmed=True)  # 默认进回收站
   命令串不直接拿来跑（`origin="external"` 直接拒绝）。
 - 超时默认 60 秒、上限 300 秒，超时杀掉整个进程组（POSIX 上 `killpg`，
   Windows 上 `taskkill /F /T`），杀完复查进程是不是真的死了，结果里标
-  `verified`（复查过确实死了）还是 `assumed`（只信了 kill 的返回值）；
+  `verified`（复查过确实死了）、`assumed`（taskkill 成功且主进程死了，
+  树大概率死了）还是 `failed`（核对发现还活着，或 taskkill 失败、树没杀掉）；
   子进程占着管道会让收输出挂住，限时等、超时就关掉管道（输出丢掉、记下来）。
   输出截断（stdout/stderr 各截到 1 万字，标明截断了）；工作目录锁在工作区内；
   不把 API Key 等环境变量传给被跑的命令（只传最小白名单）。
@@ -125,11 +126,13 @@ runner.run(["pip", "install", "requests"], confirmed=True)  # Tier 1，要确认
 三道保护：分类置信度（低置信度绝不直接删）、删除预览（删除只认冻结的预览清单，
 预览里每个文件都冻了路径、大小和修改时间，扫描到删除之间新增、改动的文件不会被删；
 删除范围由调用方单独传可信的扫描根目录，不从预览里读，预览里写的 roots 必须和
-调用方传的完全一致；删除时逐个重新验证——仍在调用方给的根目录内、不是密钥文件、
+调用方传的一致（比对时过 normcase，Windows 上大小写不敏感）；删除时逐个重新验证——仍在调用方给的根目录内、不是密钥文件、
 大小/修改时间没变过；预览里的文件条目必须是含大小/修改时间的 dict，字符串条目
 直接拒绝；预览存成 JSON 再读回来靠校验和发现有没有被改过，校验和对不上整单拒绝，
-不带钥匙的普通 SHA-256 只能防手误，带钥匙的 HMAC（钥匙只放调用方内存里）改了
-清单重算也对不上；
+普通 SHA-256 只能防手误；命令行流程（存 JSON 跨进程）必须用带钥匙的 HMAC：
+扫描和删除用同一把 TWELVE_CLEANUP_KEY（只从环境变量读），缺钥匙时扫描就拒绝，
+普通 SHA-256 预览删除时也明确拒绝；
+校验和或范围那关不过、拒绝删除时也记一笔审计（成功=False），事后能查到清单被改过；
 `.audit`、`.backups`、`.trash` 这类重要目录不扫、也不删）、
 删除后核对（实际删了几个、进回收站几个、腾出多少空间、失败几个、跳过几个；
 删完复查文件是不是真的没了）。
@@ -152,12 +155,12 @@ python -m tools.cli search "纳斯达克最新收盘" --kind structured --cross-
 python -m tools.cli file read notes/a.txt
 python -m tools.cli file write notes/a.txt --content "你好" --yes
 python -m tools.cli run --yes -- python -m pytest tests/ -q   # python -m 是 Tier 1，--yes 要放在 -- 前面
-python -m tools.cli cleanup scan D:/下载 --kind downloads --out preview.json
-python -m tools.cli cleanup delete --preview preview.json --categories temp,logs --root D:/下载 --yes   # --root 是可信的扫描根目录，可重复写
+TWELVE_CLEANUP_KEY=... python -m tools.cli cleanup scan D:/下载 --kind downloads --out preview.json   # 清理必须带钥匙，缺钥匙扫描就拒绝
+TWELVE_CLEANUP_KEY=... python -m tools.cli cleanup delete --preview preview.json --categories temp,logs --root D:/下载 --yes   # --root 是可信的扫描根目录，可重复写；删除用扫描时同一把钥匙验
 ```
 
 工作区目录：`--workspace` 指定，或 `TWELVE_WORKSPACE` 环境变量，默认当前目录。
-Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`），绝不在命令行传 Key。
+Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`、`TWELVE_CLEANUP_KEY`），绝不在命令行传 Key。
 
 ## 测试
 
@@ -175,7 +178,8 @@ Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`），绝不�
 超时杀整棵进程树并复查、截断、工作目录锁、环境隔离、确认作用域、外部来源拒绝）；
 清理（按种类报、按种类确认、不确定的进回收站、删完核对、预览冻结大小/修改时间、
 校验和、改动过的文件跳过、重要目录拒绝、外部删除指令不执行、
-删除范围由调用方传、伪造 roots 拒绝、带钥匙校验和、字符串条目拒绝）；
+删除范围由调用方传、伪造 roots 拒绝、带钥匙校验和、字符串条目拒绝、
+拒绝删除记审计、roots 比对过 normcase、命令行 HMAC 往返与篡改拒绝）；
 审计（密钥打码、确认来源和来历记录）。
 
 ## 待办（本批没做的事）
@@ -212,16 +216,20 @@ Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`），绝不�
   只读到快捷方式本身，不会顺着它读到目标文件，所以 `.lnk` 目前不用特殊处理；
   真正要防的是符号链接（已处理：解析真实路径再查黑名单）。
 - 预览校验和：不带钥匙的普通 SHA-256 只能防手误改坏，不能防有意篡改
-  （改完清单自己重算一个就过了）；命令行跨进程用 `--root` 当可信范围 +
-  普通校验和，真防篡改要走进程内调用 + 带钥匙的 HMAC（钥匙放调用方内存，
-  删的时候用同一把钥匙验）。正常流程里预览只放内存、不落盘。
+  （改完清单自己重算一个就过了）；命令行流程（存 JSON 跨进程）必须走
+  带钥匙的 HMAC：扫描和删除用同一把 TWELVE_CLEANUP_KEY（只从环境变量读，
+  缺钥匙扫描就拒绝，普通 SHA-256 预览删除时也明确拒绝）。库里的进程内调用
+  仍可用普通 SHA-256（预览只放内存、不落盘时），那只是防手误，不是防篡改。
 - 路径保护比对一律大小写不敏感：Windows 文件系统不分大小写，`.ENV`
   就是 `.env`，`.GIT` 就是 `.git`；分类器函数是纯字符串逻辑，在 Linux
   上也能测大写输入，但 Linux 上同名不同大小写的文件本来就是两个文件，
   真正的 Windows 行为要等 BOOS 笔记本上跑测试才算数。
 - Windows 超时杀树：`taskkill /F /T` 杀完整棵树，但杀完只能复查主进程，
-  没法逐个复查孙子进程，所以 Windows 上的核对结果只能标 `assumed`；
-  POSIX 上能复查整个进程组，标 `verified`。
+  没法逐个复查孙子进程，所以 taskkill 成功、主进程死了时核对结果标 `assumed`；
+  taskkill 失败时标 `failed`（只补杀了主进程，树没杀掉），不能因为主进程死了
+  就标 assumed；POSIX 上能复查整个进程组，标 `verified`。
+- 拒绝删除也记审计：预览校验和或删除范围那关不过时，拒绝本身记一笔审计
+  （成功=False），事后能查到清单被改过；没传 audit_log 时照常拒绝，不报错。
 - 审计打码是模式匹配（`sk-…`、`tvly-…`、`as_sk_…`、Bearer、赋值串），
   格式没见过的密钥可能漏网；备份、报错、回答里不放密钥内容要靠调用方自觉。
 - 搜索免费额度是借来的，价格变得很快；正式接入前，务必再打开各家官网

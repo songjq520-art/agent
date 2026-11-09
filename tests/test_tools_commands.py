@@ -228,3 +228,28 @@ def test_windows_taskkill_kills_tree(runner, tmp_path):
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
+
+
+# ---------- GPT 三次审查新增（2026-11-10）：taskkill 失败时标 failed ----------
+
+
+def test_windows_tree_kill_status_taskkill_failure_is_failed():
+    # taskkill 失败 + 主进程死了 = failed，不是 assumed：杀树机制失败了，
+    # 退回 process.kill() 只杀了主进程，子进程很可能还在跑。
+    # 状态判定是纯逻辑，Linux 上也能测。
+    from tools.commands import _windows_tree_kill_status
+
+    assert _windows_tree_kill_status(False, True) == "failed"
+    assert _windows_tree_kill_status(False, False) == "failed"
+    assert _windows_tree_kill_status(False, None) == "failed"
+    assert _windows_tree_kill_status(None, True) == "failed"
+
+
+def test_windows_tree_kill_status_taskkill_success():
+    from tools.commands import _windows_tree_kill_status
+
+    # taskkill 报成功 + 主进程死了 = assumed（树大概率死了，但没法逐个复查孙子进程）。
+    assert _windows_tree_kill_status(True, True) == "assumed"
+    # taskkill 报成功但主进程还活着 = failed。
+    assert _windows_tree_kill_status(True, False) == "failed"
+    assert _windows_tree_kill_status(True, None) == "failed"
