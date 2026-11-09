@@ -11,6 +11,7 @@ import http.client
 import json
 import threading
 import time
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -36,15 +37,18 @@ def _fake_ok_response(text="你好，我是 DeepSeek。", prompt_tokens=100, com
 
 
 class FakeMem0Store:
-    """最小的 mem0 假 store：只实现 web 层用到的三个方法，不碰真实 mem0。
+    """最小的 mem0 假 store：只实现 web 层用到的四个方法，不碰真实 mem0。
 
     memories 是 search() 固定返回的记忆文本列表；saved_turns 记下每次
-    add_turn() 收到的消息，供测试核对“回答后存了本轮对话”。
+    add_turn() 收到的消息，供测试核对“回答后存了本轮对话”；
+    noted_context 记下每次 note_context() 收到的记忆 id，供测试核对
+    “提问前记了最近对话上下文”。
     """
 
     def __init__(self, memories=None):
         self.memories = list(memories or [])
         self.saved_turns = []
+        self.noted_context = []
 
     def search(self, query, top_k=5):
         """返回固定的记忆列表（每项和真实 Mem0Store.search() 的格式一致）。"""
@@ -57,6 +61,15 @@ class FakeMem0Store:
         """记下收到的消息（复制一份，免得调用方之后改了历史影响核对）。"""
         self.saved_turns.append(list(messages))
         return {}
+
+    def note_context(self, memories):
+        """记下本轮检索到的记忆 id（和真实 Mem0Store.note_context 一致，
+        假对象只记下来，供测试核对“提问前记了上下文”）。"""
+        self.noted_context = [
+            (item.get("id") if isinstance(item, dict) else item)
+            for item in (memories or [])
+            if (item.get("id") if isinstance(item, dict) else item)
+        ]
 
     def get_all(self):
         return [{"id": f"m{i}", "text": text} for i, text in enumerate(self.memories)]
@@ -330,6 +343,8 @@ def test_ask_with_mem0_injects_memory_and_saves_turn(tmp_path, monkeypatch):
     # 回答成功后调了一次 add_turn，带上了刚追加的新问答。
     assert len(mem0_store.saved_turns) == 1
     assert mem0_store.saved_turns[0] == state.messages
+    # 提问前记了一次上下文：搜到的那条记忆的 id（纠错时当“在聊什么”的提示）。
+    assert mem0_store.noted_context == ["m0"]
 
 
 def test_ask_with_mem0_but_no_results_asks_plainly(tmp_path, monkeypatch):
@@ -1043,3 +1058,234 @@ def test_root_page_contains_memory_panel(running_server):
     assert "/scope" in body
     assert "/forget" in body
     assert "/api/memories/correct" in body
+
+
+# ---------- 聊天里的纠错提示（correction 字段的展示） ----------
+# 后端 ChatState.ask 在纠错轮里给 /api/chat 的返回多带一个
+# "correction" 键；页面按它展示“改好了 / 请挑一条 / 改失败了”。
+# 下面是 HTTP 层的覆盖：返回形状、候选列表、挑候选的回复走正常
+# 聊天通道。页面 JS 的渲染逻辑本身没有浏览器跑不了，
+# 只做静态检查（关键文案和按钮逻辑在页面源码里）+ node 语法检查。
+
+
+class CorrectionFakeStore(FakeMem0Store):
+    """假 mem0 store：add_turn 返回预设的 correction 字典，
+    模拟一次聊天纠错的结果（updated / ambiguous 等），不碰真实 mem0。
+
+    correction_to_return 是完整的 correction 字典
+    （{"status", "memory_id", "old_text", "new_text", "candidates",
+    "reason"}）；设成 None 时按普通轮次处理（返回 {}，不带 correction）。
+    """
+
+    def __init__(self, correction=None, memories=None):
+        super().__init__(memories=memories)
+        self.correction_to_return = correction
+
+    def add_turn(self, messages):
+        self.saved_turns.append(list(messages))
+        if self.correction_to_return is None:
+            return {}
+        return {"correction": self.correction_to_return}
+
+
+_UPDATED_CORRECTION = {
+    "status": "updated",
+    "memory_id": "fake-1",
+    "old_text": "我喜欢喝咖啡。",
+    "new_text": "我喜欢喝茶。",
+    "candidates": [],
+    "reason": "",
+}
+
+
+@pytest.fixture
+def running_server_with_correction_store(tmp_path):
+    """启动一个带 CorrectionFakeStore 的测试服务，默认下一轮纠错
+    返回 updated（咖啡→茶）。测试里改 store.correction_to_return
+    就能换别的纠错结果。返回 (port, state, store)。"""
+    store = CorrectionFakeStore(correction=dict(_UPDATED_CORRECTION))
+    server, port, state = _start_test_server(tmp_path, mem0_store=store)
+    try:
+        yield port, state, store
+    finally:
+        _stop_test_server(server)
+
+
+def test_chat_response_carries_correction_updated(
+    running_server_with_correction_store, monkeypatch
+):
+    """纠错成功时：/api/chat 返回里带 correction（updated），
+    旧文本、新文本、id 都在，回答本身不受影响。"""
+    port, _state, _store = running_server_with_correction_store
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    status, _ct, data = _request(
+        port, "POST", "/api/chat", {"message": "你记错了，我喜欢喝茶。"}
+    )
+    assert status == 200
+    assert data["mode"] == "real"
+    assert data["reply"] == "假回答"
+    corr = data["correction"]
+    assert corr["status"] == "updated"
+    assert corr["memory_id"] == "fake-1"
+    assert corr["old_text"] == "我喜欢喝咖啡。"
+    assert corr["new_text"] == "我喜欢喝茶。"
+    assert corr["candidates"] == []
+
+
+def test_chat_response_carries_correction_ambiguous(
+    running_server_with_correction_store, monkeypatch
+):
+    """纠错分不清改哪条时：返回 correction（ambiguous），带两条候选
+    （每条有 id 和文本），库和回答本身不受影响。"""
+    port, _state, store = running_server_with_correction_store
+    store.correction_to_return = {
+        "status": "ambiguous",
+        "memory_id": None,
+        "old_text": "我喜欢喝点热的",
+        "new_text": "我喜欢喝白开水。",
+        "candidates": [
+            {"id": "fake-1", "text": "我喜欢喝咖啡。"},
+            {"id": "fake-2", "text": "我喜欢喝茶。"},
+        ],
+        "reason": "对上了多条相似记忆。",
+    }
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    status, _ct, data = _request(
+        port, "POST", "/api/chat", {"message": "你记错了，我喜欢喝白开水。"}
+    )
+    assert status == 200
+    corr = data["correction"]
+    assert corr["status"] == "ambiguous"
+    assert corr["memory_id"] is None
+    assert corr["new_text"] == "我喜欢喝白开水。"
+    assert [cand["id"] for cand in corr["candidates"]] == ["fake-1", "fake-2"]
+    assert [cand["text"] for cand in corr["candidates"]] == [
+        "我喜欢喝咖啡。",
+        "我喜欢喝茶。",
+    ]
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        ("failed", "改的时候出错了。"),
+        ("unchanged", ""),
+        ("not_found", "库里没有这条记忆。"),
+    ],
+)
+def test_chat_response_carries_other_correction_statuses(
+    running_server_with_correction_store, monkeypatch, status, reason
+):
+    """failed / unchanged / not_found 的纠错结果也原样带回给页面，
+    页面按 status 分别展示（失败时带 reason）。"""
+    port, _state, store = running_server_with_correction_store
+    store.correction_to_return = {
+        "status": status,
+        "memory_id": None,
+        "old_text": "我喜欢喝咖啡。",
+        "new_text": "我喜欢喝茶。",
+        "candidates": [],
+        "reason": reason,
+    }
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    _status, _ct, data = _request(
+        port, "POST", "/api/chat", {"message": "你记错了，我喜欢喝茶。"}
+    )
+    assert data["correction"]["status"] == status
+    assert data["correction"]["reason"] == reason
+
+
+def test_chat_response_without_correction_has_no_correction_key(
+    running_server_with_mem0, monkeypatch
+):
+    """普通轮次（add_turn 没返回 correction）时：返回里没有
+    correction 键，页面和原来一模一样，不多出任何提示。"""
+    port, _state, _store = running_server_with_mem0
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    status, _ct, data = _request(port, "POST", "/api/chat", {"message": "你好"})
+    assert status == 200
+    assert data["mode"] == "real"
+    assert "correction" not in data
+
+
+def test_chat_correction_selection_reply_flows_through_chat(
+    running_server_with_correction_store, monkeypatch
+):
+    """挑候选的回复走正常聊天通道：ambiguous 之后，BOOS 回“第 1 条”，
+    它就是一条普通的 /api/chat 消息——模型照常回答，
+    add_turn 也照常收到它（后端在那里认出这是挑候选）。
+    这是候选按钮实际发的文本（页面点“选第 1 条”发的也是这一句）。"""
+    port, _state, store = running_server_with_correction_store
+    store.correction_to_return = {
+        "status": "ambiguous",
+        "memory_id": None,
+        "old_text": "我喜欢喝点热的",
+        "new_text": "我喜欢喝白开水。",
+        "candidates": [
+            {"id": "fake-1", "text": "我喜欢喝咖啡。"},
+            {"id": "fake-2", "text": "我喜欢喝茶。"},
+        ],
+        "reason": "",
+    }
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    status, _ct, data = _request(
+        port, "POST", "/api/chat", {"message": "你记错了，我喜欢喝白开水。"}
+    )
+    assert status == 200
+    assert data["correction"]["status"] == "ambiguous"
+    # 下一轮直接回“第 1 条”：走正常聊天，回答照常，add_turn 收到这句。
+    status, _ct, data = _request(port, "POST", "/api/chat", {"message": "第 1 条"})
+    assert status == 200
+    assert data["mode"] == "real"
+    assert data["reply"] == "假回答"
+    assert len(store.saved_turns) == 2
+    assert store.saved_turns[-1][-2] == {"role": "user", "content": "第 1 条"}
+
+
+def test_root_page_renders_correction_field(running_server):
+    """聊天页面里有纠错提示的渲染逻辑：读到 correction 键才展示；
+    updated / ambiguous / failed 各有对应的中文文案；
+    候选按钮点下去发的是“第 N 条”（走已有的 send() 聊天通道，
+    不走新接口），并留了直接在输入框回复的文字提示。"""
+    port, _state = running_server
+    status, _ct, body = _request(port, "GET", "/")
+    assert status == 200
+    assert "renderCorrection" in body
+    assert "data.correction" in body
+    assert "已更正：把" in body
+    assert "这条已经记对了，不用改。" in body
+    assert "没找到要改的旧记忆" in body
+    assert "没改成：" in body
+    assert "分不清改哪条，请选一条" in body
+    assert "选第 ' + (i + 1) + ' 条" in body
+    assert "send('第 ' + (i + 1) + ' 条')" in body
+    assert "回复“第 1 条”" in body
+
+
+def test_page_script_syntax_is_valid(tmp_path):
+    """页面里 <script> 的 JS 语法能过 node --check。
+
+    这只是语法检查，不是浏览器行为测试：按钮点下去是不是真发
+    消息、候选列表是不是真显示出来，还得 BOOS 在本地浏览器里点一遍。
+    没装 node 的机器上跳过（不拦测试）。"""
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("没装 node，跳过页面 JS 语法检查。")
+    html = (Path(__file__).resolve().parent.parent / "web" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"<script>(.*?)</script>", html, re.S)
+    assert match is not None, "页面里没找到 <script> 块"
+    script_path = tmp_path / "page.js"
+    script_path.write_text(match.group(1), encoding="utf-8")
+    result = subprocess.run(
+        [node, "--check", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"页面 JS 语法错误：{result.stderr}"

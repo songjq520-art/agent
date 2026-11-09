@@ -130,8 +130,16 @@ def test_migration_assigns_user_source(tmp_path):
     assert by_text["我喜欢喝咖啡。"]["metadata"]["created_at"]
 
 
-def test_first_memories_seeded_as_user(tmp_path):
-    """首批三条种子记忆也是用户确认的（BOOS 2026-11-07 确认过）。"""
+def test_first_memories_seeded_as_user(tmp_path, monkeypatch):
+    """首批三条种子记忆也是用户确认的（BOOS 2026-11-07 确认过）。
+
+    迁移步骤在这里 stub 掉（返回 0，表示没有旧文件可迁），只测“空库种 3 条、
+    来源都是 user”这一路：ensure_first_memories() 会先试着从项目
+    memory/memories.json 迁移，本机跑过迁移后那个文件真实存在（6 条），
+    不隔离就会迁出 6 条、断言 3 条失败（BOOS 2026-11-09 本机实测）。
+    迁移本身在上面的 test_migration_assigns_user_source 里覆盖。
+    """
+    monkeypatch.setattr(Mem0Store, "migrate_from_v1", lambda self, memories_json_path=None: 0)
     store = make_fake_store(tmp_path)
     assert store.ensure_first_memories() == 3
     for item in store.get_all():
