@@ -92,41 +92,6 @@
     white-space: pre-line;
   }
   .status .warn { color: var(--danger); }
-  .proposals {
-    border-top: 1px solid var(--border);
-    padding-top: 12px;
-  }
-  .proposals-title { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
-  .proposals-title .count { color: var(--muted); font-weight: 400; }
-  .proposal-empty { font-size: 12px; color: var(--muted); line-height: 1.6; }
-  .proposal {
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 10px;
-    margin-bottom: 8px;
-    background: var(--bg);
-  }
-  .proposal-text { font-size: 13px; line-height: 1.6; word-break: break-word; }
-  .proposal-reason { font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 6px; }
-  .proposal-meta { font-size: 11px; color: var(--muted); margin-top: 6px; }
-  .proposal-actions { display: flex; gap: 8px; margin-top: 8px; }
-  .proposal-actions button {
-    flex: 1;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 7px 0;
-    font-size: 13px;
-    cursor: pointer;
-    background: var(--panel);
-    color: var(--text);
-  }
-  .proposal-actions button.confirm {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-    font-weight: 600;
-  }
-  .proposal-actions button:disabled { opacity: 0.55; cursor: default; }
   .sidebar-foot { margin-top: auto; font-size: 11px; color: var(--muted); line-height: 1.6; }
 
   /* ---------- 右侧聊天区 ---------- */
@@ -195,6 +160,92 @@
   #send:disabled { opacity: 0.55; cursor: default; }
   .hint { max-width: 860px; margin: 8px auto 0; font-size: 11px; color: var(--muted); text-align: center; }
 
+  /* ---------- 长期记忆面板 ---------- */
+  .memories {
+    flex: 1; overflow-y: auto;
+    padding: 18px;
+    max-width: 860px; width: 100%; margin: 0 auto;
+  }
+  .memories-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; margin-bottom: 12px;
+  }
+  .memories-title { font-size: 17px; font-weight: 700; }
+  .memories-sub { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.6; }
+  .memories-msg { font-size: 13px; color: var(--muted); margin-bottom: 12px; line-height: 1.6; white-space: pre-line; }
+  .memories-msg.err { color: var(--danger); }
+  .mem-item {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+  .mem-text { font-size: 15px; line-height: 1.65; word-break: break-word; }
+  .mem-meta { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.6; }
+  .mem-meta .ok { color: #15803d; }
+  .mem-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .btn-small {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .btn-small:hover { background: var(--bg); }
+  .btn-small.danger { color: var(--danger); border-color: #fecaca; }
+  .btn-small.danger:hover { background: #fef2f2; }
+  .btn-small.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .mem-box {
+    margin-top: 10px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px; line-height: 1.7;
+    background: var(--bg);
+  }
+  .mem-box b { font-size: 13px; }
+  .mem-box ul { margin: 4px 0 8px; padding-left: 18px; }
+  .mem-box li { margin-bottom: 2px; }
+  .mem-box .why { color: var(--muted); font-size: 12px; }
+  .mem-input {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 9px 10px;
+    font-size: 14px; line-height: 1.5;
+    font-family: inherit;
+    background: #fff;
+    color: var(--text);
+    outline: none;
+    margin-top: 8px;
+  }
+  .mem-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .mem-cand { display: block; margin: 6px 0; font-size: 14px; line-height: 1.6; cursor: pointer; }
+  .mem-cand input { margin-right: 6px; }
+
+  /* ---------- 聊天里的纠错提示 ---------- */
+  /* 后端 /api/chat 返回的 correction 在这里展示：样式和长期记忆面板
+     的 .mem-box 保持一致（白底、细边框），左边一条主色竖线，标明这是
+     一条“记忆纠错”的提示，不是普通的回答气泡。 */
+  .correction {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 14px; line-height: 1.7;
+    word-break: break-word;
+  }
+  .correction.err { border-left-color: var(--danger); }
+  .correction-cand { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; }
+  .correction-cand .cand-text { flex: 1; }
+  .correction-cand .btn-small { flex: none; }
+  .correction-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .btn-small:disabled { opacity: 0.55; cursor: default; }
+
   /* ---------- 手机上：侧边栏收起来，只留聊天 ---------- */
   @media (max-width: 640px) {
     .sidebar { display: none; }
@@ -215,11 +266,8 @@
       </div>
     </div>
     <button class="btn btn-primary" id="newChat">＋ 新对话</button>
+    <button class="btn" id="memoriesBtn">🧠 长期记忆</button>
     <div class="status" id="status">正在加载状态…</div>
-    <div class="proposals" id="proposals">
-      <div class="proposals-title">待确认的记忆提议 <span class="count" id="proposalCount"></span></div>
-      <div id="proposalList"><div class="proposal-empty">正在加载…</div></div>
-    </div>
     <div class="sidebar-foot">
       只在你自己的电脑上运行（<span id="origin">本机</span>），不上云，别人打不开。<br>
       对话历史只保存在内存里，重启服务后清空。<br>
@@ -245,7 +293,21 @@
       </div>
     </div>
 
-    <div class="composer">
+    <!-- 长期记忆面板：默认藏起来，点侧边栏“长期记忆”才显示；
+         打开时聊天区和输入区藏起来，点“返回对话”再回来。 -->
+    <div class="memories" id="memoriesPanel" hidden>
+      <div class="memories-head">
+        <div>
+          <div class="memories-title">长期记忆</div>
+          <div class="memories-sub">这里是我帮你记住的东西。点“忘记”会先给你看删除范围，确认了才删；点“纠正”可以改一句记错的，对不上哪条时我会先问你，不乱改。</div>
+        </div>
+        <button class="btn" id="backToChat">← 返回对话</button>
+      </div>
+      <div class="memories-msg" id="memoriesMsg"></div>
+      <div id="memoriesList"></div>
+    </div>
+
+    <div class="composer" id="composer">
       <div class="composer-inner">
         <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
         <button id="send">发送</button>
@@ -290,7 +352,8 @@
         .join('、');
       let text = '模型：' + (models || '无') +
         '\n本月成本：$' + s.total_cost_usd.toFixed(4) + ' / $' + s.monthly_budget_usd.toFixed(2) +
-        '，剩余 $' + s.remaining_usd.toFixed(4);
+        '，剩余 $' + s.remaining_usd.toFixed(4) +
+        '\n记忆：' + (s.mem0_enabled ? '已启用' : '未启用');
       if (s.budget_corrupted) text += '\n⚠️ 预算记录异常，已暂停付费调用';
       else if (s.unknown_cost) text += '\n⚠️ 有未核对的未知成本，已暂停付费调用';
       statusEl.textContent = text;
@@ -303,13 +366,19 @@
     }
   }
 
-  async function send() {
-    const text = inputEl.value.trim();
+  // send(presetText)：发一条消息。平时从输入框取值；
+  // 纠错候选按钮点“选第 N 条”时，直接传 "第 N 条" 发出去，
+  // 走同一条 /api/chat，后端按待确认的纠错把它认成“挑候选”
+  // （见 memory/mem0_store.py 的 _parse_pending_selection）。
+  async function send(presetText) {
+    const text = (presetText !== undefined ? presetText : inputEl.value).trim();
     if (!text || busy) return;
     busy = true;
     sendBtn.disabled = true;
-    inputEl.value = '';
-    inputEl.style.height = 'auto';
+    if (presetText === undefined) {
+      inputEl.value = '';
+      inputEl.style.height = 'auto';
+    }
     addMsg('user', text);
     const typing = addMsg('ai', '正在想…');
     typing.classList.add('typing');
@@ -330,6 +399,10 @@
           ? '成本未知'
           : ('本次 $' + Number(data.cost_usd).toFixed(6));
         addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+        // 本轮是聊天纠错时，后端在返回里多带一个 "correction" 键：
+        // 改好了、要挑一条、还是改失败了，都在这里告诉 BOOS；
+        // 没这个键时页面和原来一模一样。
+        if (data.correction) renderCorrection(data.correction);
       }
     } catch (e) {
       typing.remove();
@@ -339,7 +412,61 @@
     sendBtn.disabled = false;
     inputEl.focus();
     refreshStatus();
-    refreshProposals();
+  }
+
+  // ---------- 聊天里的纠错提示 ----------
+  // 后端 /api/chat 返回的 correction：{"status", "memory_id",
+  // "old_text", "new_text", "candidates", "reason"}；
+  // status 是 updated / ambiguous / not_found / unchanged / failed。
+  // ambiguous 时把候选列出来，点“选第 N 条”就把 "第 N 条" 当成
+  // 下一条聊天消息发出去（走 send()，不走新接口），后端认得这个
+  // 格式、会按挑中的那条改；也可以直接在输入框里回“第 N 条”
+  // 或引用候选内容。失败时只显示后端给的 reason（通用原因，
+  // 不含记忆原文以外的敏感内容），不把别的东西拼进来。
+  function renderCorrection(correction) {
+    const status = (correction || {}).status || '';
+    const oldText = correction.old_text || '';
+    const newText = correction.new_text || '';
+    // 提示放在 .msg.ai 里：和 Agent 的消息一样靠左、占同样的宽度，
+    // 新对话清空时（.msg 全删）它也会一起清掉。
+    const wrap = el('div', 'msg ai');
+    const box = el('div', 'correction');
+    if (status === 'updated') {
+      box.appendChild(el('div', '', oldText
+        ? '已更正：把“' + oldText + '”改成“' + newText + '”'
+        : '已更正：' + newText));
+    } else if (status === 'unchanged') {
+      box.appendChild(el('div', '', '这条已经记对了，不用改。'));
+    } else if (status === 'not_found') {
+      box.appendChild(el('div', '', '没找到要改的旧记忆，已把新说法当成一条新记忆存下来了。'));
+    } else if (status === 'failed') {
+      box.classList.add('err');
+      box.appendChild(el('div', '', '没改成：' + (correction.reason || '原因不明，请稍后再试。')));
+    } else if (status === 'ambiguous') {
+      const cands = correction.candidates || [];
+      if (newText) {
+        box.appendChild(el('div', '', '要改成：“' + newText + '”'));
+      }
+      box.appendChild(el('div', '', '有 ' + cands.length + ' 条相似记忆，分不清改哪条，请选一条：'));
+      cands.forEach((cand, i) => {
+        const row = el('div', 'correction-cand');
+        row.appendChild(el('span', 'cand-text', (i + 1) + '. ' + (cand.text || '')));
+        row.appendChild(smallBtn('选第 ' + (i + 1) + ' 条', 'primary', () => {
+          // 点了就定下来：先把这块提示里的按钮都锁住，免得重复点；
+          // 再把 "第 N 条" 当成聊天消息发出去，等后端改好后回的
+          // 新 correction 会再显示一条提示。
+          box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+          send('第 ' + (i + 1) + ' 条');
+        }));
+        box.appendChild(row);
+      });
+      box.appendChild(el('div', 'correction-hint', '也可以直接在输入框回复“第 1 条”或引用某条候选的内容。'));
+    } else {
+      box.appendChild(el('div', '', '纠错结果：' + (status || '未知') + '。'));
+    }
+    wrap.appendChild(box);
+    chatEl.appendChild(wrap);
+    chatEl.scrollTop = chatEl.scrollHeight;
   }
 
   sendBtn.addEventListener('click', send);
@@ -350,95 +477,270 @@
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + 'px';
   });
+  // ---------- 长期记忆面板 ----------
+  // 列表、忘记、纠正都走 /api/memories 这组接口；
+  // 真正的删和改在服务端 Mem0Store 里，页面只负责展示和传确认。
+  const memoriesPanel = document.getElementById('memoriesPanel');
+  const memoriesListEl = document.getElementById('memoriesList');
+  const memoriesMsgEl = document.getElementById('memoriesMsg');
+  const composerEl = document.getElementById('composer');
+
+  function setMemoriesMsg(text, isErr) {
+    memoriesMsgEl.textContent = text || '';
+    memoriesMsgEl.classList.toggle('err', !!isErr);
+  }
+
+  function showMemoriesPanel() {
+    chatEl.hidden = true;
+    composerEl.hidden = true;
+    memoriesPanel.hidden = false;
+    refreshMemories();
+  }
+
+  function showChatPanel() {
+    memoriesPanel.hidden = true;
+    chatEl.hidden = false;
+    composerEl.hidden = false;
+    inputEl.focus();
+  }
+
+  // 来源标签：user 是 BOOS 亲口说的/让记住的/亲口纠正的；
+  // inferred 是从对话里提取的、还没逐条确认过；
+  // unconfirmed 是 2026-11-09 之前存的旧记忆、没有来源信息。
+  function sourceLabel(meta) {
+    const source = (meta && meta.source) || 'unconfirmed';
+    if (source === 'user') return '你亲口说的 · 已确认';
+    if (source === 'inferred') return '从对话里提取的 · 未确认';
+    return '未确认（旧记忆）';
+  }
+
+  // 形成时间是 UTC 的 ISO 串，转成 Asia/Shanghai 的本地时间再显示；
+  // 转不了（或没有）就原样显示，没有就写“未知时间”。
+  function formatCreatedAt(createdAt) {
+    if (!createdAt) return '未知时间';
+    try {
+      return new Date(createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    } catch (e) {
+      return String(createdAt);
+    }
+  }
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function smallBtn(label, cls, onClick) {
+    const b = el('button', 'btn-small' + (cls ? ' ' + cls : ''), label);
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  async function refreshMemories() {
+    setMemoriesMsg('正在加载记忆…');
+    memoriesListEl.textContent = '';
+    try {
+      const res = await fetch('/api/memories');
+      const data = await res.json();
+      if (!res.ok) {
+        setMemoriesMsg('加载失败：' + (data.error || ('HTTP ' + res.status)), true);
+        return;
+      }
+      if (!data.mem0_enabled) {
+        setMemoriesMsg('记忆未启用：服务启动时没接上记忆库，所以这里是空的。先在 .env 里配好 DEEPSEEK_API_KEY 再重启服务。');
+        return;
+      }
+      const memories = data.memories || [];
+      if (!memories.length) {
+        setMemoriesMsg('还没有记忆。聊天里你明确说过的长期事实，我会自己记下来；也可以在对话里说“记住：……”让我记一条。');
+        return;
+      }
+      setMemoriesMsg('共 ' + memories.length + ' 条记忆。');
+      memories.forEach((mem) => memoriesListEl.appendChild(renderMemoryItem(mem)));
+    } catch (e) {
+      setMemoriesMsg('加载失败：连不上服务，请确认服务还在运行。', true);
+    }
+  }
+
+  function renderMemoryItem(mem) {
+    const meta = mem.metadata || {};
+    const item = el('div', 'mem-item');
+    item.appendChild(el('div', 'mem-text', mem.text || ''));
+    const metaLine = el('div', 'mem-meta');
+    metaLine.appendChild(document.createTextNode('来源：' + sourceLabel(meta)));
+    if (meta.confirmed) {
+      const ok = el('span', 'ok', ' ✓ 已确认');
+      metaLine.appendChild(ok);
+    }
+    metaLine.appendChild(document.createTextNode('　形成时间：' + formatCreatedAt(meta.created_at)));
+    item.appendChild(metaLine);
+
+    // 下面这块是“忘记 / 纠正”的操作区：点按钮后在这里展开，不跳新页面。
+    const workArea = el('div');
+    item.appendChild(workArea);
+
+    const actions = el('div', 'mem-actions');
+    actions.appendChild(smallBtn('纠正', '', () => showCorrectForm(mem, workArea)));
+    actions.appendChild(smallBtn('忘记', 'danger', () => showForgetScope(mem, workArea)));
+    item.appendChild(actions);
+    return item;
+  }
+
+  // ---------- 忘记：先看删除范围，确认了才删 ----------
+  async function showForgetScope(mem, workArea) {
+    workArea.textContent = '';
+    const box = el('div', 'mem-box', '正在查看删除范围…');
+    workArea.appendChild(box);
+    try {
+      const res = await fetch('/api/memories/' + encodeURIComponent(mem.id) + '/scope');
+      const scope = await res.json();
+      if (!res.ok) {
+        box.textContent = '看不到删除范围：' + (scope.error || ('HTTP ' + res.status)) + '，这次不删。';
+        return;
+      }
+      box.textContent = '';
+      box.appendChild(el('b', '', '要忘掉这条记忆：'));
+      box.appendChild(el('div', '', '“' + (scope.memory ? scope.memory.text : mem.text) + '”'));
+      const inList = el('ul');
+      (scope.in_scope || []).forEach((row) => {
+        inList.appendChild(el('li', '', row.where + '：' + row.what));
+      });
+      box.appendChild(el('b', '', '会删掉（共 ' + scope.history_count + ' 条历史记录）：'));
+      box.appendChild(inList);
+      const outList = el('ul');
+      (scope.out_of_scope || []).forEach((row) => {
+        const li = el('li', '', row.where + '：' + row.what);
+        const why = el('div', 'why', row.why || '');
+        li.appendChild(why);
+        outList.appendChild(li);
+      });
+      box.appendChild(el('b', '', '不会删（不在删除范围内）：'));
+      box.appendChild(outList);
+      const row = el('div', 'mem-actions');
+      row.appendChild(smallBtn('确认删除', 'danger', async () => {
+        box.textContent = '正在删除…';
+        try {
+          const delRes = await fetch('/api/memories/' + encodeURIComponent(mem.id) + '/forget', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirmed: true }),
+          });
+          const data = await delRes.json();
+          if (!delRes.ok) {
+            setMemoriesMsg('删除失败：' + (data.error || ('HTTP ' + delRes.status)), true);
+            return;
+          }
+          if (data.deleted) {
+            setMemoriesMsg('已忘掉这条记忆。');
+          } else {
+            setMemoriesMsg('这条记忆已经不在库里了。');
+          }
+          refreshMemories();
+        } catch (e) {
+          setMemoriesMsg('删除失败：连不上服务。', true);
+        }
+      }));
+      row.appendChild(smallBtn('取消', '', () => { workArea.textContent = ''; }));
+      box.appendChild(row);
+    } catch (e) {
+      box.textContent = '看不到删除范围：连不上服务，这次不删。';
+    }
+  }
+
+  // ---------- 纠正：选一条、写正确的说法；对不上多条时先让你挑 ----------
+  function showCorrectForm(mem, workArea) {
+    workArea.textContent = '';
+    const box = el('div', 'mem-box');
+    box.appendChild(el('b', '', '纠正这条记忆：'));
+    box.appendChild(el('div', '', '“' + (mem.text || '') + '”'));
+    const input = el('input', 'mem-input');
+    input.type = 'text';
+    input.placeholder = '输入正确的说法…';
+    input.value = mem.text || '';
+    box.appendChild(input);
+    const row = el('div', 'mem-actions');
+    row.appendChild(smallBtn('保存纠正', 'primary', () => submitCorrect(mem.id, input.value, box)));
+    row.appendChild(smallBtn('取消', '', () => { workArea.textContent = ''; }));
+    box.appendChild(row);
+    workArea.appendChild(box);
+    input.focus();
+    input.select();
+  }
+
+  async function submitCorrect(memoryId, newText, box, chosenId) {
+    const id = chosenId || memoryId;
+    const text = (newText || '').trim();
+    if (!text) {
+      setMemoriesMsg('请输入纠正后的内容。', true);
+      return;
+    }
+    box.textContent = '正在纠正…';
+    try {
+      const res = await fetch('/api/memories/correct', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ memory_id: id, new_text: text }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMemoriesMsg('纠正失败：' + (data.error || ('HTTP ' + res.status)), true);
+        return;
+      }
+      if (data.status === 'updated') {
+        setMemoriesMsg('已纠正：' + (data.new_text || text));
+        refreshMemories();
+      } else if (data.status === 'ambiguous') {
+        // 对上了多条、分不清改哪条：把候选列出来，让 BOOS 挑一条再提交，不猜。
+        box.textContent = '';
+        box.appendChild(el('b', '', '有 ' + (data.candidates || []).length + ' 条相似记忆，分不清改哪条，请选一条：'));
+        const cands = data.candidates || [];
+        cands.forEach((cand, i) => {
+          const label = el('label', 'mem-cand');
+          const radio = document.createElement('input');
+          radio.type = 'radio';
+          radio.name = 'correct-candidate';
+          radio.value = cand.id;
+          if (i === 0) radio.checked = true;
+          label.appendChild(radio);
+          label.appendChild(document.createTextNode(cand.text || ''));
+          box.appendChild(label);
+        });
+        const row = el('div', 'mem-actions');
+        row.appendChild(smallBtn('就改选中的这条', 'primary', () => {
+          const picked = box.querySelector('input[name="correct-candidate"]:checked');
+          submitCorrect(memoryId, text, box, picked ? picked.value : null);
+        }));
+        row.appendChild(smallBtn('取消', '', () => { refreshMemories(); }));
+        box.appendChild(row);
+      } else if (data.status === 'unchanged') {
+        setMemoriesMsg('旧内容和新内容一样，不用改。');
+      } else {
+        // not_found / failed：原因在 data.reason 里，原样告诉 BOOS。
+        setMemoriesMsg('没改成：' + (data.reason || data.status), true);
+      }
+    } catch (e) {
+      setMemoriesMsg('纠正失败：连不上服务。', true);
+    }
+  }
+
+  document.getElementById('memoriesBtn').addEventListener('click', showMemoriesPanel);
+  document.getElementById('backToChat').addEventListener('click', showChatPanel);
+
+  // ---------- 原来的聊天逻辑 ----------
   document.getElementById('newChat').addEventListener('click', async () => {
     if (busy) return;
+    showChatPanel();  // 正在看记忆时点了新对话：先回到聊天，再清空。
     await fetch('/api/reset', { method: 'POST' });
     chatEl.querySelectorAll('.msg').forEach((el) => el.remove());
     addMsg('ai', '已开始新对话，之前的记录清空了。');
   });
 
-  // ---------- 待确认的记忆提议 ----------
-  // 每轮聊天成功后，后端会跑一次独立的记忆提取，把候选建成提议；
-  // 这里只展示后端创建的提议（有真实 ID 和 pending 状态），
-  // 用户点“保存”才写进长期记忆，点“不要”就不保存。
-  // 提议只存在内存里，重启服务后未确认的会丢弃。
-  const proposalListEl = document.getElementById('proposalList');
-  const proposalCountEl = document.getElementById('proposalCount');
-
-  async function refreshProposals() {
-    try {
-      const res = await fetch('/api/proposals');
-      const data = await res.json();
-      const proposals = data.proposals || [];
-      proposalCountEl.textContent = proposals.length ? '（' + proposals.length + ' 条）' : '';
-      proposalListEl.textContent = '';
-      if (!proposals.length) {
-        const empty = document.createElement('div');
-        empty.className = 'proposal-empty';
-        empty.textContent = '暂无待确认的提议。聊天后，值得长期记住的信息会出现在这里。';
-        proposalListEl.appendChild(empty);
-        return;
-      }
-      proposals.forEach((p) => {
-        const card = document.createElement('div');
-        card.className = 'proposal';
-        const text = document.createElement('div');
-        text.className = 'proposal-text';
-        text.textContent = p.text;
-        card.appendChild(text);
-        if (p.reason) {
-          const reason = document.createElement('div');
-          reason.className = 'proposal-reason';
-          reason.textContent = '建议理由：' + p.reason;
-          card.appendChild(reason);
-        }
-        const meta = document.createElement('div');
-        meta.className = 'proposal-meta';
-        meta.textContent = (p.layers || []).join('、') + ' · ' + (p.date || '');
-        card.appendChild(meta);
-        const actions = document.createElement('div');
-        actions.className = 'proposal-actions';
-        const confirmBtn = document.createElement('button');
-        confirmBtn.className = 'confirm';
-        confirmBtn.textContent = '保存';
-        confirmBtn.addEventListener('click', () => decideProposal(p.id, 'confirm', confirmBtn, rejectBtn));
-        const rejectBtn = document.createElement('button');
-        rejectBtn.textContent = '不要';
-        rejectBtn.addEventListener('click', () => decideProposal(p.id, 'reject', confirmBtn, rejectBtn));
-        actions.appendChild(confirmBtn);
-        actions.appendChild(rejectBtn);
-        card.appendChild(actions);
-        proposalListEl.appendChild(card);
-      });
-    } catch (e) {
-      proposalListEl.textContent = '';
-      const err = document.createElement('div');
-      err.className = 'proposal-empty';
-      err.textContent = '提议加载失败：服务没连上？';
-      proposalListEl.appendChild(err);
-    }
-  }
-
-  async function decideProposal(id, action, confirmBtn, rejectBtn) {
-    confirmBtn.disabled = true;
-    rejectBtn.disabled = true;
-    try {
-      const res = await fetch('/api/proposals/' + encodeURIComponent(id) + '/' + action, { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        alert('操作失败：' + (data.error || ('HTTP ' + res.status)));
-      }
-    } catch (e) {
-      alert('操作失败：连不上服务，请确认服务还在运行。');
-    }
-    refreshProposals();
-  }
-
   // 侧边栏显示当前实际地址（端口改了也能对上，不用在 HTML 里写死地址）。
   document.getElementById('origin').textContent = window.location.origin;
 
   refreshStatus();
-  refreshProposals();
   inputEl.focus();
 </script>
 </body>
