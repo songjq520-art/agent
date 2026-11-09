@@ -192,6 +192,14 @@ def test_memory_block_with_memories_lists_texts():
     assert "仅供参考" in block
 
 
+def test_memory_block_tells_model_to_answer_important_first():
+    """回答方式：提示块里要教模型先说最重要的、简短说，别把来源和免责
+    都展开倒出来（BOOS 2026-11-10：十二回答太长太绕，要像十一一样挑重要的说）。"""
+    block = _memory_block([{"id": "fake-1", "text": "我叫小宋。", "score": 0.9, "source": "semantic"}])
+    assert "先说最重要的结论" in block
+    assert "不用每次都展开解释" in block
+
+
 # ---------- 真实 API 回归测试（默认跳过） ----------
 
 
