@@ -180,10 +180,16 @@ def cmd_cleanup_delete(args):
         _fail("删文件必须加 --yes 表示你确认过了（删的是彻底删除，低置信度的先进回收站）", code=2)
     trash_dir = args.trash or (Path(os.environ.get("TWELVE_WORKSPACE", os.getcwd())) / ".trash")
     audit_log = AuditLog(Path(os.environ.get("TWELVE_WORKSPACE", os.getcwd())) / ".audit" / "audit.log")
+    if not args.root:
+        _fail("删文件必须加 --root 指明可信的扫描根目录（当初扫的那几个目录，可重复写），删除范围不从预览文件里读")
+    # 带钥匙的预览要删，钥匙放 TWELVE_CLEANUP_KEY 环境变量里，别写进命令行
+    # （命令行会被 shell 历史记下来）；没钥匙的普通预览只防手误，不防篡改。
     report = delete_preview(
         preview,
         [c.strip() for c in args.categories.split(",") if c.strip()],
         trash_dir=trash_dir,
+        roots=args.root,
+        key=os.environ.get("TWELVE_CLEANUP_KEY"),
         audit_log=audit_log,
     )
     _print_json(report)
@@ -253,6 +259,8 @@ def build_parser():
     delete_parser = cleanup_sub.add_parser("delete")
     delete_parser.add_argument("--preview", required=True)
     delete_parser.add_argument("--categories", required=True, help="逗号分隔，比如 temp,logs")
+    delete_parser.add_argument("--root", action="append", default=None,
+                               help="可信的扫描根目录（当初扫的那几个目录），可重复写；删除范围以这个为准，不从预览文件里读")
     delete_parser.add_argument("--trash", default=None)
     delete_parser.add_argument("--yes", action="store_true")
     delete_parser.set_defaults(func=cmd_cleanup_delete)

@@ -15,10 +15,17 @@
 #   - 分类置信度：低置信度的种类（大文件、拿不准）绝不直接删，先进回收站。
 #   - 删除预览：删除只认冻结的预览清单（build_preview 的那一份），
 #     预览里冻的不只是路径，还有每个文件的大小和修改时间；删除时逐个
-#     重新验证（仍在扫描根目录内、不是密钥文件、大小/修改时间没变过），
+#     重新验证（仍在调用方给的根目录内、不是密钥文件、大小/修改时间没变过），
 #     对不上的跳过不删；扫描到删除之间新增的文件、改动过的文件都不会被删；
 #     .audit、.backups、.trash 这类重要目录不扫、也不删。
-#     预览存成 JSON 再读回来时，靠校验和发现有没有被改过。
+#     删除范围（roots）由调用方单独传可信的扫描根目录，不从预览里读——
+#     预览是能被改的 JSON 文件，里面的 roots 被改了删的范围就跟着跑了；
+#     预览里写的 roots 必须和调用方传的完全一致。
+#     预览存成 JSON 再读回来时，靠校验和发现有没有被改过：不带钥匙的
+#     普通 SHA-256 只能防手误（改完重算一个就过了）；带钥匙的 HMAC
+#     （钥匙只放调用方内存里）改了清单重算也对不上。正常流程里预览
+#     只放内存、不落盘；要存成 JSON 跨进程用，最好传一把钥匙。
+#     预览里的文件条目必须是含大小/修改时间的 dict，字符串条目直接拒绝。
 #   - 删除后核对：实际删了几个、挪进回收站几个、腾出多少空间、
 #     失败几个、跳过几个，都如实汇报；删完还要复查文件是不是真的没了。
 # 删除清单只认冻结的预览 + BOOS 点过头的种类：绝不认外部文件/网页里
@@ -94,8 +101,9 @@ _PROTECTED_DIR_NAMES = (".audit", ".backups", ".trash")
 
 
 def _is_protected_path(path):
-    """路径是不是在 .audit/.backups/.trash 这类重要目录里（或就是它本身）。"""
-    return any(part in _PROTECTED_DIR_NAMES for part in Path(path).parts)
+    """路径是不是在 .audit/.backups/.trash 这类重要目录里（或就是它本身）。
+    比对大小写不敏感：Windows 上 .BACKUPS 就是 .backups。"""
+    return any(part.lower() in _PROTECTED_DIR_NAMES for part in Path(path).parts)
 
 
 def human_size(num_bytes):
@@ -157,10 +165,11 @@ def scan(root, root_kind="other", large_threshold_mb=500, max_files_per_category
     skipped_secrets = 0
     for dirpath, dirnames, filenames in os.walk(root):
         # .git/.ssh/.audit/.backups/.trash 目录整个跳过；符号链接目录逃出根目录的也跳过。
+        # 目录名比对大小写不敏感：Windows 上 .GIT 就是 .git。
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in (".git", ".ssh", *_PROTECTED_DIR_NAMES)
+            if d.lower() not in (".git", ".ssh", *_PROTECTED_DIR_NAMES)
             and _is_inside(Path(dirpath) / d, root)
         ]
         for name in filenames:
@@ -221,27 +230,52 @@ def scan_many(roots):
     return merged
 
 
-def preview_checksum(preview):
-    """算预览的校验和：对去掉 checksum 字段后的预览做规范 JSON 再算 SHA-256。
-    预览存成 JSON 再读回来时，靠这个发现有没有被改过。"""
+def _canonical_preview_bytes(preview):
+    """预览的规范 JSON 字节（去掉 checksum 字段）：校验和算的就是这一份。"""
     payload = {key: value for key, value in preview.items() if key != "checksum"}
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return canonical.encode("utf-8")
 
 
-def verify_preview(preview):
+def preview_checksum(preview, key=None):
+    """算预览的校验和。
+    key 为 None 时是普通 SHA-256，只能发现手误改坏，不能防有意篡改
+    （改完清单自己重算一个就过了）；key 不为 None 时是 HMAC-SHA-256，
+    钥匙只放调用方内存里、不写进预览文件，改了清单重算也对不上。
+    带钥匙的预览没有钥匙算不出校验和，会直接报错。"""
+    algo = preview.get("checksum_algo", "sha256")
+    if algo == "hmac-sha256":
+        if key is None:
+            raise ToolError("这份预览是带钥匙校验的，算校验和必须给钥匙")
+        if isinstance(key, str):
+            key = key.encode("utf-8")
+        return hmac.new(key, _canonical_preview_bytes(preview), hashlib.sha256).hexdigest()
+    return hashlib.sha256(_canonical_preview_bytes(preview)).hexdigest()
+
+
+def verify_preview(preview, key=None):
     """校验预览完整性：没有 checksum、或 checksum 对不上，都返回 False。
-    删之前必须先过这一关——清单要是被改过，宁可不删，让 BOOS 重新扫一遍。"""
+    删之前必须先过这一关——清单要是被改过，宁可不删，让 BOOS 重新扫一遍。
+    带钥匙的预览（checksum_algo 是 hmac-sha256）必须用同一把钥匙验，
+    没钥匙或钥匙不对都算没通过；没钥匙的普通校验和只能防手误，不防篡改。"""
     checksum = preview.get("checksum")
     if not isinstance(checksum, str):
         return False
-    return hmac.compare_digest(checksum, preview_checksum(preview))
+    try:
+        expected = preview_checksum(preview, key=key)
+    except ToolError:
+        return False
+    return hmac.compare_digest(checksum, expected)
 
 
-def build_preview(scan_result):
+def build_preview(scan_result, *, key=None):
     """把扫描结果冻成一份删除预览：删除只认这一份清单，之后新增、
     改动的文件都不会被删。预览里每个文件都冻了路径、大小和修改时间，
     删除时逐个比对；最后盖上校验和，存成 JSON 再读回来也能发现被改过。
+    key 不为 None 时校验和是带钥匙的 HMAC（钥匙只放调用方内存里，
+    不写进预览文件），改了清单重算也对不上；key 为 None 时是普通
+    SHA-256，只能防手误改坏。正常流程里预览只放内存、不落盘；
+    要存成 JSON 跨进程用，最好传一把钥匙。
     返回预览字典（可存成 JSON，删的时候再读回来）。"""
     roots = scan_result.get("roots") or [scan_result["root"]]
     categories = {}
@@ -265,8 +299,9 @@ def build_preview(scan_result):
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "roots": roots,
         "categories": categories,
+        "checksum_algo": "hmac-sha256" if key is not None else "sha256",
     }
-    preview["checksum"] = preview_checksum(preview)
+    preview["checksum"] = preview_checksum(preview, key=key)
     return preview
 
 
@@ -291,12 +326,21 @@ def format_summary(preview):
     return "\n".join(lines)
 
 
-def delete_preview(preview, confirmed_categories, trash_dir, actor="agent", audit_log=None):
+def delete_preview(preview, confirmed_categories, trash_dir, *, roots, key=None, actor="agent", audit_log=None):
     """按冻结的预览删：只有 BOOS 点过头的种类才删。
 
+    删除范围 roots 必须由调用方单独传可信的扫描根目录（就是当初扫的那几个
+    目录），不从预览里读——预览是能被改的 JSON 文件，里面的 roots 要是被
+    改成别的目录，删的范围就跟着跑了。预览里如果也写了 roots，必须和调用方
+    传的完全一致，对不上就拒绝，宁可重新扫。
+    key 是建预览时那把钥匙（只放调用方内存里）：带钥匙的预览必须用同一把
+    钥匙验，没钥匙或钥匙不对都拒绝；没钥匙的普通校验和只能防手误。
+
     动手前核对：先验预览的校验和（对不上就拒绝，宁可重新扫），再逐个文件
-    重新验证——仍在扫描根目录内、不是密钥文件、不在重要目录里、
+    重新验证——仍在调用方给的根目录内、不是密钥文件、不在重要目录里、
     大小和修改时间跟预览时一致；对不上的跳过不删，记进报告。
+    预览里的文件条目必须是含大小/修改时间的 dict，字符串条目直接拒绝
+    （它会跳过大小/修改时间检查）。
     高置信度的种类直接彻底删；低置信度的（大文件、拿不准）先进回收站。
     预览之后文件已经没了的，记跳过（不算失败）。
     动手后核对：删完复查文件是不是真的没了，挪进回收站的复查是不是真的
@@ -305,11 +349,20 @@ def delete_preview(preview, confirmed_categories, trash_dir, actor="agent", audi
     删除清单只认冻结的预览 + BOOS 点过头的种类，不认外部文件/网页里
     读到的路径——调用方必须只把 BOOS 确认过的种类传进来。
     """
-    if not verify_preview(preview):
+    if not roots:
+        raise ToolError("删除范围必须由调用方单独传入可信的扫描根目录，拒绝从预览里读")
+    trusted_roots = [Path(r) for r in roots]
+    if not verify_preview(preview, key=key):
         raise ToolError("预览校验和对不上，拒绝删除（预览可能被改过，请重新扫描）")
+    preview_roots = preview.get("roots")
+    if preview_roots is not None:
+        if {str(Path(r).resolve()) for r in preview_roots} != {
+            str(r.resolve()) for r in trusted_roots
+        }:
+            raise ToolError("预览里的删除范围和调用方传入的不一致，拒绝删除（请重新扫描）")
     trash_dir = Path(trash_dir)
     trash_dir.mkdir(parents=True, exist_ok=True)
-    roots = [Path(r) for r in preview.get("roots", [])]
+    roots = trusted_roots
     report = {
         "preview_id": preview.get("preview_id"),
         "deleted": 0,
@@ -332,7 +385,19 @@ def delete_preview(preview, confirmed_categories, trash_dir, actor="agent", audi
             continue
         counts = {"deleted": 0, "moved_to_trash": 0, "failed": 0, "skipped": 0}
         for entry in bucket["files"]:
-            path_text = entry["path"] if isinstance(entry, dict) else entry
+            if not isinstance(entry, dict):
+                counts["failed"] += 1
+                report["failed"].append(
+                    {"path": str(entry), "reason": "条目格式不对（缺少大小/修改时间），拒绝删除"}
+                )
+                continue
+            if "size" not in entry or "mtime" not in entry:
+                counts["failed"] += 1
+                report["failed"].append(
+                    {"path": str(entry.get("path", entry)), "reason": "条目缺少大小/修改时间，拒绝删除"}
+                )
+                continue
+            path_text = entry["path"]
             path = Path(path_text)
             if not any(_is_inside(path, root) for root in roots):
                 counts["failed"] += 1
@@ -356,11 +421,10 @@ def delete_preview(preview, confirmed_categories, trash_dir, actor="agent", audi
                 counts["skipped"] += 1
                 report["skipped"].append(path_text)
                 continue
-            if isinstance(entry, dict):
-                if stat.st_size != entry.get("size") or abs(stat.st_mtime - entry.get("mtime", 0)) > 0.01:
-                    counts["skipped"] += 1
-                    report["skipped"].append(path_text)
-                    continue
+            if stat.st_size != entry["size"] or abs(stat.st_mtime - entry["mtime"]) > 0.01:
+                counts["skipped"] += 1
+                report["skipped"].append(path_text)
+                continue
             size = stat.st_size if path.is_file() else 0
             try:
                 if bucket["confidence"] == "low":

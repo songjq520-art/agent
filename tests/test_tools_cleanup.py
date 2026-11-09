@@ -65,7 +65,7 @@ def test_preview_is_frozen(tmp_path):
     # 预览之后新增的文件，不在冻结清单里，删的时候不会被删掉。
     (root / "temp" / "new.tmp").write_bytes(b"n" * 50)
     trash = tmp_path / "trash"
-    report = delete_preview(preview, ["temp"], trash_dir=trash)
+    report = delete_preview(preview, ["temp"], trash_dir=trash, roots=[str(root)])
     assert report["deleted"] == 1  # 只有预览里的 a.tmp
     assert (root / "temp" / "new.tmp").exists()
     assert not (root / "temp" / "a.tmp").exists()
@@ -75,7 +75,7 @@ def test_delete_high_confidence_permanent_and_verified(tmp_path):
     root = build_tree(tmp_path / "tree")
     preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
     trash = tmp_path / "trash"
-    report = delete_preview(preview, ["temp", "logs"], trash_dir=trash)
+    report = delete_preview(preview, ["temp", "logs"], trash_dir=trash, roots=[str(root)])
     assert report["deleted"] == 2  # a.tmp + app.log（b.txt 是 unknown，没确认不删）
     assert report["freed_bytes"] == 100 + 300
     assert report["failed"] == []
@@ -88,7 +88,7 @@ def test_delete_low_confidence_goes_to_trash(tmp_path):
     root = build_tree(tmp_path / "tree")
     preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
     trash = tmp_path / "trash"
-    report = delete_preview(preview, ["unknown"], trash_dir=trash)
+    report = delete_preview(preview, ["unknown"], trash_dir=trash, roots=[str(root)])
     assert report["moved_to_trash"] == 3  # b.txt、photo.jpg、big.iso 先进回收站
     assert not (root / "temp" / "b.txt").exists()
     assert not (root / "downloads" / "photo.jpg").exists()
@@ -100,7 +100,7 @@ def test_delete_skips_already_gone_files(tmp_path):
     root = build_tree(tmp_path / "tree")
     preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
     (root / "temp" / "a.tmp").unlink()  # 预览之后、删除之前，文件已经没了
-    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash")
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert report["deleted"] == 0
     assert len(report["skipped"]) == 1
 
@@ -117,7 +117,7 @@ def test_delete_refuses_paths_outside_preview_root(tmp_path):
     )
     preview["categories"]["temp"]["file_count"] += 1
     preview["checksum"] = preview_checksum(preview)
-    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash")
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert outside.exists()  # 根目录外的文件绝不能删
     assert len(report["failed"]) == 1
 
@@ -140,7 +140,7 @@ def test_per_category_confirmation_only_confirmed_deleted(tmp_path):
     # 按种类确认：只点了 logs，temp 的东西一动不动。
     root = build_tree(tmp_path / "tree")
     preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
-    report = delete_preview(preview, ["logs"], trash_dir=tmp_path / "trash")
+    report = delete_preview(preview, ["logs"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert report["deleted"] == 1  # 只有 app.log
     assert not (root / "logs" / "app.log").exists()
     assert (root / "temp" / "a.tmp").exists()
@@ -185,7 +185,7 @@ def test_delete_refuses_tampered_preview(tmp_path):
     important = tmp_path / "important.txt"
     important.write_text("别删我", encoding="utf-8")
     with pytest.raises(ToolError):
-        delete_preview(loaded, ["temp"], trash_dir=tmp_path / "trash")
+        delete_preview(loaded, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert important.exists()
 
 
@@ -195,7 +195,7 @@ def test_delete_skips_changed_file(tmp_path):
     # 预览之后文件被改过（内容变了，大小也变了）：跳过不删。
     changed = root / "temp" / "a.tmp"
     changed.write_text("改过的内容，变长了变长了", encoding="utf-8")
-    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash")
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert str(changed) in report["skipped"]
     assert changed.exists()
 
@@ -206,7 +206,7 @@ def test_delete_skips_file_with_changed_mtime_only(tmp_path):
     # 内容没变，只碰了一下修改时间：也跳过（宁可不删，让 BOOS 重新扫）。
     touched = root / "temp" / "a.tmp"
     os.utime(touched, (touched.stat().st_atime + 100, touched.stat().st_mtime + 100))
-    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash")
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert str(touched) in report["skipped"]
     assert touched.exists()
 
@@ -223,7 +223,7 @@ def test_delete_refuses_protected_dirs(tmp_path):
         {"path": str(victim), "size": stat.st_size, "mtime": stat.st_mtime}
     )
     preview["checksum"] = preview_checksum(preview)
-    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash")
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert victim.exists()
     assert any(str(victim) == f["path"] for f in report["failed"])
 
@@ -251,7 +251,7 @@ def test_external_delete_instruction_not_executed(tmp_path):
     # agent 只能按冻结的预览 + BOOS 点过头的种类删；外部文字里的路径
     # 不在预览里，所以删操作碰不到它。
     preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
-    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash")
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert important.exists()
     assert all(str(important) != f["path"] for f in report["failed"])
     assert str(important) not in report["skipped"]
@@ -261,5 +261,106 @@ def test_external_delete_instruction_not_executed(tmp_path):
         {"path": str(important), "size": 5, "mtime": 0}
     )
     with pytest.raises(ToolError):
-        delete_preview(tampered, ["temp"], trash_dir=tmp_path / "trash")
+        delete_preview(tampered, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
     assert important.exists()
+
+
+# ---------- GPT 二次审查新增（2026-11-10）：roots 信任、带钥匙校验和 ----------
+
+
+def test_delete_requires_caller_roots(tmp_path):
+    # 删除范围必须由调用方单独传，不从预览里读；不传就拒绝。
+    root = build_tree(tmp_path / "tree")
+    preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
+    with pytest.raises(ToolError):
+        delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=None)
+    with pytest.raises(ToolError):
+        delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[])
+
+
+def test_delete_refuses_forged_roots(tmp_path):
+    # GPT 二次审查的实测：改预览里的 roots 指向另一个目录、改路径、
+    # 重算校验和，旧代码真把那个目录里的文件删了。现在删除范围由
+    # 调用方单独传，预览里的 roots 必须和调用方传的完全一致。
+    root = build_tree(tmp_path / "tree")
+    victim_dir = tmp_path / "victim"
+    victim_dir.mkdir()
+    victim = victim_dir / "important.txt"
+    victim.write_text("别删我", encoding="utf-8")
+    preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
+    forged = json.loads(json.dumps(preview))
+    forged["roots"] = [str(victim_dir)]
+    forged["categories"]["temp"]["files"][0]["path"] = str(victim)
+    forged["categories"]["temp"]["files"][0]["size"] = victim.stat().st_size
+    forged["categories"]["temp"]["files"][0]["mtime"] = victim.stat().st_mtime
+    forged["checksum"] = preview_checksum(forged)  # 改完重算校验和也过不了 roots 这一关
+    assert verify_preview(forged) is True  # 校验和本身是对的，拦住它的是 roots 比对
+    with pytest.raises(ToolError):
+        delete_preview(forged, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
+    assert victim.exists()
+
+
+def test_keyed_preview_tamper_detected(tmp_path):
+    import hashlib
+
+    root = build_tree(tmp_path / "tree")
+    keyed = build_preview(scan(root, root_kind="other", large_threshold_mb=10), key=b"session-key")
+    assert keyed["checksum_algo"] == "hmac-sha256"
+    assert verify_preview(keyed, key=b"session-key") is True
+    assert verify_preview(keyed) is False  # 没钥匙验不过
+    assert verify_preview(keyed, key=b"wrong-key") is False  # 钥匙不对也验不过
+    # 带钥匙的预览，没钥匙连重算校验和都算不出来。
+    with pytest.raises(ToolError):
+        preview_checksum(keyed)
+    # 篡改清单，攻击者不知道钥匙，只能按旧办法重算一个普通 SHA-256：
+    tampered = json.loads(json.dumps(keyed))
+    tampered["categories"]["temp"]["files"][0]["path"] = "/tmp/evil.txt"
+    payload = {k: v for k, v in tampered.items() if k != "checksum"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    tampered["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert verify_preview(tampered, key=b"session-key") is False
+    with pytest.raises(ToolError):
+        delete_preview(tampered, ["temp"], trash_dir=tmp_path / "trash",
+                       roots=[str(root)], key=b"session-key")
+
+
+def test_keyed_preview_roundtrip(tmp_path):
+    root = build_tree(tmp_path / "tree")
+    keyed = build_preview(scan(root, root_kind="other", large_threshold_mb=10), key="session-key")
+    loaded = json.loads(json.dumps(keyed))  # 存成 JSON 再读回来
+    assert verify_preview(loaded, key="session-key") is True
+    report = delete_preview(loaded, ["temp"], trash_dir=tmp_path / "trash",
+                            roots=[str(root)], key="session-key")
+    assert report["deleted"] == 1
+    assert not (root / "temp" / "a.tmp").exists()
+
+
+def test_delete_refuses_string_entries(tmp_path):
+    root = build_tree(tmp_path / "tree")
+    preview = build_preview(scan(root, root_kind="other", large_threshold_mb=10))
+    # 字符串条目没有大小/修改时间，旧代码会跳过检查直接删：现在直接拒绝。
+    victim = root / "temp" / "a.tmp"
+    preview["categories"]["temp"]["files"] = [str(victim)]
+    preview["checksum"] = preview_checksum(preview)
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
+    assert victim.exists()
+    assert len(report["failed"]) == 1
+    assert report["deleted"] == 0
+
+
+def test_scan_skips_uppercase_protected_dirs(tmp_path):
+    # Windows 上 .BACKUPS 就是 .backups：大写的重要目录扫描时一样跳过。
+    root = build_tree(tmp_path / "tree")
+    (root / ".BACKUPS").mkdir(exist_ok=True)
+    (root / ".BACKUPS" / "old.bak").write_text("x" * 100, encoding="utf-8")
+    (root / ".TRASH").mkdir(exist_ok=True)
+    (root / ".TRASH" / "junk.txt").write_text("x" * 100, encoding="utf-8")
+    (root / ".GIT").mkdir(exist_ok=True)
+    (root / ".GIT" / "config").write_text("x" * 100, encoding="utf-8")
+    result = scan(root, root_kind="other", large_threshold_mb=10)
+    all_paths = [
+        f["path"] for bucket in result["categories"].values() for f in bucket["files"]
+    ]
+    assert not any(
+        ".BACKUPS" in p or ".TRASH" in p or ".GIT" in p for p in all_paths
+    )

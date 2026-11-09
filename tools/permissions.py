@@ -7,7 +7,11 @@
 #     .backups/ 下的备份按它备份的原文件判断。
 #   - 命令分级：Tier 2 硬禁 / Tier 1 需确认 / Tier 0 自动放行，
 #     校验在执行前跑，字符归一化 + 按 | && || ; 拆段逐段查；
-#     解释器内联代码（python -c / -m、node -e 等）是 Tier 1。
+#     命令头先归一化（去路径、去 .exe/.com/.bat/.cmd 后缀、小写）再比对，
+#     全路径和带后缀的写法绕不过硬禁；解释器内联代码
+#     （python -c / -m、node -e 等）是 Tier 1。
+#   - 路径保护比对一律大小写不敏感：Windows 文件系统不分大小写，
+#     .ENV 就是 .env，.GIT 就是 .git，大写写法绕不过保护。
 #   - 确认有效性：确认必须当场、当次、来自 BOOS 本人；带作用域的确认
 #     必须和本次操作完全一致，一次确认只顶一次操作。
 #
@@ -31,9 +35,10 @@ _SECRET_PREFIXES = ("id_rsa",)
 
 
 def _is_secret_blocked(path):
-    """是不是密钥文件（黑名单）：.git/、.ssh/、*.pem、*.key、id_rsa*。"""
+    """是不是密钥文件（黑名单）：.git/、.ssh/、*.pem、*.key、id_rsa*。
+    比对大小写不敏感：Windows 上 .GIT 就是 .git。"""
     for part in Path(path).parts:
-        if part in _SECRET_COMPONENTS:
+        if part.lower() in _SECRET_COMPONENTS:
             return True
         lower = part.lower()
         if lower.endswith(_SECRET_SUFFIXES) or lower.startswith(_SECRET_PREFIXES):
@@ -42,9 +47,11 @@ def _is_secret_blocked(path):
 
 
 def _is_env_file(path):
-    """是不是 .env 类文件：.env、.env.local、.env.production、.envrc。"""
+    """是不是 .env 类文件：.env、.env.local、.env.production、.envrc。
+    比对大小写不敏感：Windows 上 .ENV 就是 .env。"""
     for part in Path(path).parts:
-        if part == ".env" or part.startswith(".env.") or part == ".envrc":
+        low = part.lower()
+        if low == ".env" or low.startswith(".env.") or low == ".envrc":
             return True
     return False
 
@@ -104,7 +111,7 @@ def classify_path(workspace_root, rel_path, action):
     except ValueError:
         return False, f"路径超出工作区，拒绝：{rel_path}"
     check_rel = relative
-    if relative.parts and relative.parts[0] == ".backups" and len(relative.parts) == 2:
+    if relative.parts and relative.parts[0].lower() == ".backups" and len(relative.parts) == 2:
         original = _original_from_backup_name(relative.parts[1])
         if original is not None:
             check_rel = Path(original)
@@ -112,7 +119,7 @@ def classify_path(workspace_root, rel_path, action):
         return False, f"密钥文件，禁止{action}：{rel_path}"
     if _is_env_file(check_rel) and action == "read":
         return False, f".env 文件只写不读，禁止读取：{rel_path}"
-    if relative.parts and relative.parts[0] == ".audit" and action in ("write", "edit", "delete"):
+    if relative.parts and relative.parts[0].lower() == ".audit" and action in ("write", "edit", "delete"):
         return False, "审计日志不可直接改写，请走审计接口"
     return True, ""
 
@@ -120,13 +127,16 @@ def classify_path(workspace_root, rel_path, action):
 # ---------- 命令分级 ----------
 
 # Tier 2：写死在代码里的硬禁命令（不可改配置、不可被模型改掉）。
+# 只写基本名：比对前命令头会先归一化（去路径、去后缀、小写），
+# 所以 shutdown.exe、完整路径、大小写混写都落到同一个名字上。
 _TIER2_EXECUTABLES = {
     "sudo", "su", "runas",  # 提权
-    "wsl", "wsl.exe",  # WSL 逃逸
+    "wsl",  # WSL 逃逸
     "format", "shutdown", "reboot", "halt", "poweroff", "mkfs", "diskpart", "bcdedit",
 }
 # Tier 1：需要 BOOS 确认的命令（装东西、删东西、下载、跑自由代码）。
-_SHELLS = {"sh", "bash", "zsh", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh"}
+# 同样只写基本名，比对走归一化后的名字。
+_SHELLS = {"sh", "bash", "zsh", "cmd", "powershell", "pwsh"}
 # 下载即执行：curl/wget 的输出直接喂给 shell（整条命令上查，不按段查）。
 _DOWNLOAD_EXEC_RE = re.compile(
     r"\b(curl|wget)\b[^|;&]*\|\s*(sh|bash|powershell|pwsh)\b"
@@ -158,11 +168,19 @@ _INTERPRETER_INLINE_FLAGS = {
 
 
 def _program_name(token):
-    """取命令头的可执行文件名（去路径、去 .exe、小写），比如
-    "C:/x/.venv/Scripts/python.exe" → "python"。"""
-    name = Path(str(token)).name.lower()
-    if name.endswith(".exe"):
-        name = name[:-4]
+    """取命令头的可执行文件名（去路径、去后缀、小写），比如
+    "C:/x/.venv/Scripts/python.exe" → "python"，
+    "C:\\Windows\\System32\\shutdown.exe" → "shutdown"。
+    反斜杠先换成正斜杠再取最后一段：在 Linux 上跑 Windows 路径的
+    分类测试时，pathlib 会把反斜杠当普通字符，直接取 name 会拿到
+    整条路径，所以这里不用 Path。Windows 上可执行的后缀不只 .exe，
+    .com、.bat、.cmd 也去掉。"""
+    text = str(token).replace("\\", "/").strip()
+    name = text.rsplit("/", 1)[-1].lower()
+    for suffix in (".exe", ".com", ".bat", ".cmd"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
     return name
 
 
@@ -221,48 +239,90 @@ def _tokens(segment):
     return tokens
 
 
-def _check_segment(segment):
-    """检查一段命令，返回 (tier, reason)，tier 是 2 / 1 / 0。"""
-    tokens = _tokens(segment)
+# 根目标：rm -rf、Remove-Item -Recurse 删到这些地方就是删整盘。
+_ROOT_TARGETS = {"/", "/*", "*", "c:\\", "c:/", "c:"}
+
+
+def _rm_rf_root(lower_tokens):
+    """rm + -r/-f 组合 + 根目标 → 真删整盘。
+    拆开的 -r -f 也算（把所有 - 开头的词的字母拼起来看）。"""
+    flags = "".join(t[1:] for t in lower_tokens[1:] if t.startswith("-") and len(t) > 1)
+    if "r" not in flags or "f" not in flags:
+        return False
+    return any(t in _ROOT_TARGETS for t in lower_tokens[1:])
+
+
+def _remove_item_recurse_root(lower_tokens):
+    """Remove-Item -Recurse + 根目标 → 真删整盘。"""
+    if "-recurse" not in lower_tokens:
+        return False
+    return any(t in _ROOT_TARGETS for t in lower_tokens[1:])
+
+
+def _check_tokens(tokens):
+    """按词表检查一段命令，返回 (tier, reason)，tier 是 2 / 1 / 0。
+
+    命令头先归一化（去路径、去 .exe/.com/.bat/.cmd 后缀、小写）再比对，
+    Tier 2 和 Tier 1 的所有比对都走归一化后的名字：shutdown.exe、
+    完整路径、大小写混写都落到同一个名字上，绕不过硬禁。
+    """
     if not tokens:
         return 0, ""
-    head = tokens[0].lower()
-    if head in _TIER2_EXECUTABLES:
+    prog = _program_name(tokens[0])
+    lower_tokens = [t.lower() for t in tokens]
+    text = " ".join(tokens).strip()
+    if prog in _TIER2_EXECUTABLES:
         return 2, f"硬禁命令：{tokens[0]}"
+    # 危险组合也按归一化后的程序名查：全路径/带后缀的 rd、del、rm、
+    # Remove-Item 同样拦住。下面的 _TIER2_SEGMENT_RES 是第二道网
+    # （直接比整段文本），两道都留着。
+    if prog in {"rd", "rmdir", "del"} and "/s" in lower_tokens:
+        return 2, f"硬禁命令：{text}"
+    if prog == "rm" and _rm_rf_root(lower_tokens):
+        return 2, f"硬禁命令：{text}"
+    if prog == "remove-item" and _remove_item_recurse_root(lower_tokens):
+        return 2, f"硬禁命令：{text}"
     for pattern in _TIER2_SEGMENT_RES:
-        if pattern.search(segment):
-            return 2, f"硬禁命令：{segment.strip()}"
+        if pattern.search(text):
+            return 2, f"硬禁命令：{text}"
     # 解释器内联代码（python -c / -m、node -e 等）：现拼的代码直接跑，
     # 没经过“写文件要确认”那一关，必须当 Tier 1。
     # 注意：内联代码的内容不做静态分析（Python 代码没法用命令规则查），
     # 所以只升到 Tier 1 而不是 Tier 2——确认时 BOOS 能看到完整命令原文，
     # 由他判断；想彻底堵住要靠 OS 层隔离（Box 上测 gVisor）。
-    inline_flags = _INTERPRETER_INLINE_FLAGS.get(_program_name(tokens[0]))
+    inline_flags = _INTERPRETER_INLINE_FLAGS.get(prog)
     if inline_flags is not None and any(tok in inline_flags for tok in tokens[1:]):
         return 1, "跑解释器内联代码，需要确认"
     # shell 解释器带自由代码：先按 Tier 1 处理，里面的内容另行逐段查。
-    if head in _SHELLS:
+    if prog in _SHELLS:
         return 1, "跑 shell 自由代码，需要确认"
-    if "pip" in tokens and ("install" in tokens or "uninstall" in tokens):
+    if (prog == "pip" or "pip" in lower_tokens) and (
+        "install" in lower_tokens or "uninstall" in lower_tokens
+    ):
         return 1, "装/卸 Python 包，需要确认"
-    if head == "git":
-        if "push" in tokens and ("--force" in tokens or "-f" in tokens):
+    if prog == "git":
+        if "push" in lower_tokens and ("--force" in lower_tokens or "-f" in lower_tokens):
             return 1, "git 强制推送，需要确认"
-        if "reset" in tokens and "--hard" in tokens:
+        if "reset" in lower_tokens and "--hard" in lower_tokens:
             return 1, "git 硬重置，需要确认"
-        if "clean" in tokens and "-f" in tokens:
+        if "clean" in lower_tokens and "-f" in lower_tokens:
             return 1, "git 强制清理，需要确认"
-    if head in {"rm", "del", "rmdir", "rd", "Remove-Item", "unlink"}:
+    if prog in {"rm", "del", "rmdir", "rd", "remove-item", "unlink"}:
         return 1, "删除文件/目录，需要确认"
-    if head in {"curl", "curl.exe", "wget", "wget.exe", "Invoke-WebRequest"}:
+    if prog in {"curl", "wget", "invoke-webrequest"}:
         return 1, "联网下载，需要确认"
-    if head in {"npm", "pnpm", "yarn"} and (
-        "install" in tokens or "add" in tokens or "i" in tokens
+    if prog in {"npm", "pnpm", "yarn"} and (
+        "install" in lower_tokens or "add" in lower_tokens or "i" in lower_tokens
     ):
         return 1, "装 npm 包，需要确认"
-    if head == "reg" and len(tokens) > 1 and tokens[1] in {"add", "delete"}:
+    if prog == "reg" and len(lower_tokens) > 1 and lower_tokens[1] in {"add", "delete"}:
         return 1, "改注册表，需要确认"
     return 0, ""
+
+
+def _check_segment(segment):
+    """检查一段命令文本，返回 (tier, reason)：先按空白切词，再按词表查。"""
+    return _check_tokens(_tokens(segment))
 
 
 def classify_command(argv):
@@ -270,7 +330,9 @@ def classify_command(argv):
 
     argv 必须是命令列表（["python", "script.py"]），不接受拼好的字符串——
     模型拼 shell 字符串是 GPT 指出的隐患，结构化调用从源头上堵住它。
-    分级顺序：先查整条命令的“下载即执行”，再按段逐段查，先硬禁后需确认。
+    分级顺序：先查整条命令的“下载即执行”，再按 argv 原样查命令头
+    （带空格的完整路径不能先拼串再切词），再按段逐段查，最后查
+    shell -c 里面的自由代码；先硬禁后需确认。
     """
     if isinstance(argv, str) or not isinstance(argv, (list, tuple)):
         raise ToolError("命令必须用列表传，比如 [\"python\", \"script.py\"]，不接受拼好的字符串")
@@ -282,9 +344,13 @@ def classify_command(argv):
     joined = " ".join(normalized)
     if _DOWNLOAD_EXEC_RE.search(joined):
         return 2, "硬禁命令：下载即执行（curl/wget 的输出喂给 shell）"
-    # shell 解释器带 -c/-Command 时，把里面的自由代码也逐段查一遍。
-    worst_tier = 0
-    worst_reason = ""
+    # 先按 argv 原样查一遍命令头：带空格的完整路径（比如
+    # C:\Program Files\Git\bin\git.exe）拼成字符串再切词，会从空格处
+    # 把路径切断，命令头就认不出来了。
+    worst_tier, worst_reason = _check_tokens(normalized)
+    if worst_tier == 2:
+        return 2, worst_reason
+    # 再按 | && || ; 拆段逐段查（shell 链式命令、内嵌的第二条命令）。
     segments = _split_segments(joined)
     for segment in segments:
         tier, reason = _check_segment(segment)
@@ -293,8 +359,12 @@ def classify_command(argv):
             if tier == 2:
                 return 2, reason
     # sh/bash/cmd/powershell -c "..."：把引号里的内容也当命令查。
-    head = normalized[0].lower()
-    if head in _SHELLS and len(normalized) > 2 and normalized[1] in ("-c", "-Command", "/c"):
+    # 命令头同样先归一化（全路径的 cmd.exe 也认），-Command 大小写不敏感。
+    if (
+        _program_name(normalized[0]) in _SHELLS
+        and len(normalized) > 2
+        and normalized[1].lower() in ("-c", "-command", "/c")
+    ):
         inner = normalized[2]
         for segment in _split_segments(inner):
             tier, reason = _check_segment(segment)

@@ -231,3 +231,12 @@ def test_scoped_confirmation_rejects_wrong_file(ws):
     with pytest.raises(NeedsConfirmation):
         ws.write_text("a.txt", "新内容", overwrite=True, confirmed=wrong_scope)
     assert (ws.root / "a.txt").read_text(encoding="utf-8") == "旧内容"
+
+
+def test_delete_protected_dirs_case_insensitive(ws):
+    # Windows 上 .BACKUPS 就是 .backups：大写的重要目录本身一样不让删。
+    for name in (".BACKUPS", ".Trash", ".AUDIT"):
+        (ws.root / name).mkdir(parents=True, exist_ok=True)
+        with pytest.raises(ToolError):
+            ws.delete(name, recursive=True, confirmed=True)
+        assert (ws.root / name).exists()

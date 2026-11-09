@@ -186,3 +186,116 @@ def test_tier0_auto_allowed():
 def test_command_must_be_list():
     with pytest.raises(ToolError):
         classify_command("rm -rf /")
+
+
+# ---------- GPT 二次审查新增（2026-11-10）：全路径/后缀绕过、大小写绕过 ----------
+
+
+def test_tier2_full_path_and_suffix_bypass_blocked():
+    # 硬禁命令不能只认命令头的原样：带 .exe/.com 后缀、完整路径、
+    # 大小写混写都必须进 Tier 2。真实 Windows 路径（含 Program Files
+    # 里的空格）也要认——分类器按 argv 原样查命令头，不拼串再切词。
+    cases = [
+        ["shutdown.exe", "/s"],
+        ["Shutdown.EXE", "/s"],
+        ["SHUTDOWN", "/s"],
+        ["C:\\Windows\\System32\\shutdown.exe", "/s"],
+        ["C:/Windows/System32/shutdown.exe", "/s"],
+        ["format.exe", "C:"],
+        ["format.com", "C:"],
+        ["C:\\Windows\\System32\\format.com", "C:"],
+        ["C:\\Windows\\System32\\wsl.exe", "ls"],
+        ["C:\\Windows\\System32\\cmd.exe", "/c", "shutdown /s"],
+        ["C:\\Windows\\System32\\cmd.exe", "/c", "C:\\Windows\\System32\\shutdown.exe /s"],
+        ["powershell", "-Command", "C:\\Windows\\System32\\shutdown.exe /s"],
+        ["powershell", "-command", "shutdown /s"],
+        ["C:\\Windows\\System32\\rd.exe", "/s", "C:\\"],
+        ["C:\\Windows\\System32\\del.exe", "/s", "C:\\"],
+        ["C:\\tools\\rm.exe", "-r", "-f", "/"],
+        ["Remove-Item", "-Recurse", "C:\\"],
+        ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+         "-Command", "Remove-Item -Recurse C:\\"],
+    ]
+    for argv in cases:
+        tier, reason = classify_command(argv)
+        assert tier == 2, (argv, tier, reason)
+
+
+def test_tier1_full_path_needs_confirmation():
+    # 需要确认的命令也不能因为带了路径/后缀就放行。
+    cases = [
+        ["C:\\Program Files\\Git\\bin\\git.exe", "push", "--force"],
+        ["C:\\Program Files\\Git\\bin\\git.exe", "push", "-f"],
+        ["C:\\Program Files\\Git\\bin\\git.exe", "reset", "--hard"],
+        ["C:\\Windows\\System32\\curl.exe", "http://example.com/f.zip", "-o", "f.zip"],
+        ["C:\\tools\\pip.exe", "install", "requests"],
+        ["C:\\tools\\python.exe", "-c", "print(1)"],
+        ["C:\\tools\\python.exe", "-m", "pytest", "tests/", "-q"],
+        ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+         "-Command", "Get-ChildItem"],
+    ]
+    for argv in cases:
+        tier, reason = classify_command(argv)
+        assert tier == 1, (argv, tier, reason)
+
+
+def test_tier0_full_path_still_allowed():
+    # 归一化不能误伤正常命令：全路径的安全命令还是 Tier 0。
+    cases = [
+        ["C:\\Program Files\\Git\\bin\\git.exe", "status"],
+        ["C:\\tools\\python.exe", "script.py"],
+        ["C:\\Windows\\System32\\notepad.exe", "a.txt"],
+    ]
+    for argv in cases:
+        tier, reason = classify_command(argv)
+        assert tier == 0, (argv, tier, reason)
+
+
+def test_env_case_insensitive(tmp_path):
+    # Windows 文件系统不分大小写：.ENV 就是 .env，大写也要只写不读。
+    # 分类器是纯字符串逻辑，在 Linux 上也能测大写输入；这里测的是
+    # “检查认不认大写”，不是 Linux 上两个文件是不是同一个。
+    root = tmp_path / "ws"
+    root.mkdir()
+    for path in (".ENV", ".Env", ".eNv", ".ENV.LOCAL", ".Env.Production", ".ENVRC"):
+        allowed, _ = classify_path(root, path, "read")
+        assert not allowed, path
+    # 写/改/删还是允许的（只写不读的意思就是能写不能读）。
+    allowed, _ = classify_path(root, ".ENV", "write")
+    assert allowed
+
+
+def test_secret_case_insensitive(tmp_path):
+    root = tmp_path / "ws"
+    root.mkdir()
+    for path in (
+        ".GIT/config",
+        ".Git/config",
+        "x/.GIT/y",
+        ".SSH/known_hosts",
+        ".Ssh/id_rsa",
+        "KEY.PEM",
+        "Cert.KEY",
+        "ID_RSA",
+    ):
+        for action in ("read", "write", "delete"):
+            allowed, reason = classify_path(root, path, action)
+            assert not allowed, (path, action, reason)
+
+
+def test_audit_backups_case_insensitive(tmp_path):
+    root = tmp_path / "ws"
+    root.mkdir()
+    # .AUDIT 写/改/删一样不让（审计日志不能用文件工具直接改）。
+    for action in ("write", "edit", "delete"):
+        allowed, _ = classify_path(root, ".AUDIT/audit.log", action)
+        assert not allowed, action
+    # .BACKUPS 下的备份按原文件判断：.ENV 的备份大写目录也一样读不了。
+    allowed, _ = classify_path(
+        root, ".BACKUPS/.env_20260101T000000000000.bak", "read"
+    )
+    assert not allowed
+    allowed, _ = classify_path(
+        root, ".Backups/.ENV_20260101T000000000000.bak", "read"
+    )
+    assert not allowed

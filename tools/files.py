@@ -315,7 +315,7 @@ class Workspace:
         path = resolve_in_workspace(self.root, rel_path)
         if path == self.root:
             raise ToolError("不能删工作区根目录本身")
-        if path.parent == self.root and path.name in (".backups", ".trash", ".audit"):
+        if path.parent == self.root and path.name.lower() in (".backups", ".trash", ".audit"):
             raise ToolError(f"不能删 {path.name} 目录本身")
         if not path.exists():
             raise ToolError(f"文件不存在：{rel_path}")

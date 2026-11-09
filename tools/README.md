@@ -89,6 +89,11 @@ ws.delete("notes/old.txt", confirmed=True)  # 默认进回收站
   写绝对路径，绕过文件工具的保护。跑已经写好的脚本文件（`python script.py`）
   还是 Tier 0：文件写进去的时候已经要过一次确认。
 - Tier 0 直接跑（跑脚本、pytest、`git status/log/diff`、`ls` 等）。
+- 命令头先归一化再比对：去路径、去 .exe/.com/.bat/.cmd 后缀、小写——
+  `shutdown.exe`、完整路径 `C:\Windows\System32\shutdown.exe`、大小写混写
+  `Shutdown.EXE` 都落到同一个名字上，绕不过硬禁；带空格的完整路径
+  （比如 `C:\Program Files\Git\bin\git.exe`）按 argv 原样查命令头，
+  不拼串再切词，免得路径从空格处切断。
 - 确认必须当场、当次、来自 BOOS 本人：确认带作用域（`run:pip install requests`），
   必须和本次命令完全一致，一次确认只顶一次操作；审计里记确认来源。
 - 命令的来历只能是 BOOS 原话或 agent 自己的推理，外部文件/网页里读到的
@@ -119,8 +124,12 @@ runner.run(["pip", "install", "requests"], confirmed=True)  # Tier 1，要确认
 
 三道保护：分类置信度（低置信度绝不直接删）、删除预览（删除只认冻结的预览清单，
 预览里每个文件都冻了路径、大小和修改时间，扫描到删除之间新增、改动的文件不会被删；
-删除时逐个重新验证——仍在扫描根目录内、不是密钥文件、大小/修改时间没变过；
-预览存成 JSON 再读回来靠校验和发现有没有被改过，校验和对不上整单拒绝；
+删除范围由调用方单独传可信的扫描根目录，不从预览里读，预览里写的 roots 必须和
+调用方传的完全一致；删除时逐个重新验证——仍在调用方给的根目录内、不是密钥文件、
+大小/修改时间没变过；预览里的文件条目必须是含大小/修改时间的 dict，字符串条目
+直接拒绝；预览存成 JSON 再读回来靠校验和发现有没有被改过，校验和对不上整单拒绝，
+不带钥匙的普通 SHA-256 只能防手误，带钥匙的 HMAC（钥匙只放调用方内存里）改了
+清单重算也对不上；
 `.audit`、`.backups`、`.trash` 这类重要目录不扫、也不删）、
 删除后核对（实际删了几个、进回收站几个、腾出多少空间、失败几个、跳过几个；
 删完复查文件是不是真的没了）。
@@ -131,7 +140,8 @@ from tools.cleanup import scan, build_preview, delete_preview, format_summary
 result = scan("D:/下载", root_kind="downloads")
 preview = build_preview(result)
 print(format_summary(preview))  # 大白话汇报，给 BOOS 看
-report = delete_preview(preview, ["temp", "logs"], trash_dir="D:/回收站暂存")
+report = delete_preview(preview, ["temp", "logs"], trash_dir="D:/回收站暂存",
+                        roots=["D:/下载"])  # 删除范围调用方单独传，不从预览里读
 ```
 
 ## 命令行入口
@@ -143,7 +153,7 @@ python -m tools.cli file read notes/a.txt
 python -m tools.cli file write notes/a.txt --content "你好" --yes
 python -m tools.cli run --yes -- python -m pytest tests/ -q   # python -m 是 Tier 1，--yes 要放在 -- 前面
 python -m tools.cli cleanup scan D:/下载 --kind downloads --out preview.json
-python -m tools.cli cleanup delete --preview preview.json --categories temp,logs --yes
+python -m tools.cli cleanup delete --preview preview.json --categories temp,logs --root D:/下载 --yes   # --root 是可信的扫描根目录，可重复写
 ```
 
 工作区目录：`--workspace` 指定，或 `TWELVE_WORKSPACE` 环境变量，默认当前目录。
@@ -161,10 +171,11 @@ Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`），绝不�
 多场景覆盖：搜索（正常、结构化、402 兜底、服务挂了兜底、全挂明说失败、
 无结果和失败区分、质量检查）；文件（越界、密钥文件、改不唯一、覆盖保护、
 原子写、密钥不备份、符号链接指到密钥文件、外部来源拒绝、确认作用域）；
-命令（三级分级、内联代码升 Tier 1、组合绕过、超时杀整棵进程树并复查、
-截断、工作目录锁、环境隔离、确认作用域、外部来源拒绝）；
+命令（三级分级、内联代码升 Tier 1、组合绕过、全路径/后缀/大小写绕过、
+超时杀整棵进程树并复查、截断、工作目录锁、环境隔离、确认作用域、外部来源拒绝）；
 清理（按种类报、按种类确认、不确定的进回收站、删完核对、预览冻结大小/修改时间、
-校验和、改动过的文件跳过、重要目录拒绝、外部删除指令不执行）；
+校验和、改动过的文件跳过、重要目录拒绝、外部删除指令不执行、
+删除范围由调用方传、伪造 roots 拒绝、带钥匙校验和、字符串条目拒绝）；
 审计（密钥打码、确认来源和来历记录）。
 
 ## 待办（本批没做的事）
@@ -200,6 +211,14 @@ Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`），绝不�
 - Windows 快捷方式（`.lnk`）：`Path.resolve()` 不解析 `.lnk`，读 `.lnk`
   只读到快捷方式本身，不会顺着它读到目标文件，所以 `.lnk` 目前不用特殊处理；
   真正要防的是符号链接（已处理：解析真实路径再查黑名单）。
+- 预览校验和：不带钥匙的普通 SHA-256 只能防手误改坏，不能防有意篡改
+  （改完清单自己重算一个就过了）；命令行跨进程用 `--root` 当可信范围 +
+  普通校验和，真防篡改要走进程内调用 + 带钥匙的 HMAC（钥匙放调用方内存，
+  删的时候用同一把钥匙验）。正常流程里预览只放内存、不落盘。
+- 路径保护比对一律大小写不敏感：Windows 文件系统不分大小写，`.ENV`
+  就是 `.env`，`.GIT` 就是 `.git`；分类器函数是纯字符串逻辑，在 Linux
+  上也能测大写输入，但 Linux 上同名不同大小写的文件本来就是两个文件，
+  真正的 Windows 行为要等 BOOS 笔记本上跑测试才算数。
 - Windows 超时杀树：`taskkill /F /T` 杀完整棵树，但杀完只能复查主进程，
   没法逐个复查孙子进程，所以 Windows 上的核对结果只能标 `assumed`；
   POSIX 上能复查整个进程组，标 `verified`。
