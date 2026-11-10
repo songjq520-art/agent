@@ -547,9 +547,17 @@ def _memory_order_key(metadata):
 
     没时间戳的按最早算：缺时间戳的都是时间戳功能上线之前存的，
     一定比新写的旧——这是时间线本身，不是猜；序号缺失按 -1 算。
+    后补的时间戳也按没时间算：backfill 补时间时是按库里随手排的
+    顺序给的“现在时间”，根本不知道历史上谁先谁后——那个先后是
+    假的，不能拿来判新旧。两条后补的排出来键一样，_resolve_conflict
+    就会走“分不出先后、问 BOOS”那条；后补的对新写的，新写的赢，
+    因为后补的本来就是功能上线前的老记忆，本来就比新写的旧。
+    迁移沿用的旧日期（migrated）是旧数据里的真日期，照常用。
     raw 和规整过的都能传。
     """
     meta = _normalize_metadata(metadata)
+    if meta.get("created_at_source") == "backfilled":
+        return (datetime.min.replace(tzinfo=timezone.utc), -1)
     when = _parse_created_at(meta.get("created_at"))
     if when is None:
         when = datetime.min.replace(tzinfo=timezone.utc)
@@ -565,7 +573,8 @@ def _resolve_conflict(old_metadata, new_metadata):
     判法：
     - 两条都没有时间戳、或时间戳 + 序号全撞：真分不出先后，问 BOOS。
       （只有一边缺时间戳不问：缺的那条一定是时间戳功能上线之前存的，
-      一定比新写的旧——这是时间线本身，不是猜。）
+      一定比新写的旧——这是时间线本身，不是猜。后补的时间戳在排序
+      时按没时间算（见 _memory_order_key），所以两条后补的也走问 BOOS。）
     - 新的可信度比旧的低：旧的赢，新记忆挂起来“待确认”（pending_new），
       不覆盖——时间戳再新也没用，新旧管不了覆盖资格。
     - 新的可信度比旧的高：新的胜出，旧的标“被取代”（supersede_old）。
@@ -2009,7 +2018,9 @@ class Mem0Store:
         再过一道覆盖守卫（_apply_coverage_guard）：刚提取出的推断记忆
         别把 BOOS 确认过的事实顶掉——守卫要拿提取前的库快照找邻居，
         所以快照在调 mem0.add 之前拍（快照里没有本次新存的，就不会
-        把新记忆和自己/同一批的兄弟认成邻居）。
+        把新记忆和自己/同一批的兄弟认成邻居）；快照还有第二个用处：
+        万一 add 在里面动了旧记忆，守卫按快照原样恢复（见
+        _restore_snapshot_memories）。
         失败时返回 {}，绝不抛异常——存记忆失败不能把聊天回答搞崩。
         """
         try:
@@ -2604,6 +2615,88 @@ class Mem0Store:
     # 共享“预算”）的，不拦——那点重合说明不了是同一件事。
     _COVERAGE_GUARD_MIN_WEIGHT = 4
 
+    def _restore_snapshot_memories(self, before_items):
+        """按提取前的快照，把被改动过的旧记忆恢复原样（守卫的第二道）。
+
+        背景：守卫本来只给新记忆打“待确认”标记——这够用的前提，是
+        mem0.add 只插新记忆、不动旧记忆。实际装着的 mem0 2.2.1 读
+        代码确实是只插不改，但说明书上写着 add 会决定增改删，升级
+        就可能变；万一哪天 add 在里面把旧记忆改了、删了，事后只打
+        标记就救不回来了。所以这里加一道事后核对：add 完拿快照跟
+        现在的库比对，快照里有、现在文本被改了或者没了的旧记忆，
+        都按快照原样恢复（文本 + metadata 全套，包括时间戳、时间
+        来源、序号、来源和确认状态）。恢复的对象是快照里所有的旧
+        记忆，不只核心记忆——提取这条路只会存推断事实，纠正走
+        correct_memory 不走这里，所以恢复全部被改的旧记忆是安全、
+        对的。恢复的办法：还在库里的，原地 update 回去（保住原 id）；
+        已经没了的，重新存一条（mem0 的 id 是它自己生成的，恢复
+        不回来旧 id；文本和 metadata 原样带上，一样不少）。
+        读库失败时不猜：分不清“全被删了”还是“读失败了”，宁可本次
+        不恢复（记一条警告），也别把没删的东西重复存一遍。
+        恢复只记日志、不抛异常——守卫坏了不能把聊天回答搞崩。
+        返回恢复了几条（-1 表示连库都读不出来，本次没核对）。
+        """
+        if not before_items:
+            return 0
+        try:
+            raw = self._memory.get_all(filters={"user_id": self.user_id})
+        except Exception:
+            logger.warning("覆盖守卫：核对快照时读库失败，本次不恢复。", exc_info=True)
+            return -1
+        current = {}
+        for item in (raw or {}).get("results", []):
+            mem_id = (item or {}).get("id")
+            text = (item or {}).get("memory") or ""
+            if not mem_id or not text:
+                continue
+            current[mem_id] = {
+                "text": text,
+                "metadata": _normalize_metadata((item or {}).get("metadata")),
+            }
+        restored = 0
+        for old in before_items:
+            mem_id = (old or {}).get("id")
+            old_text = (old or {}).get("text") or ""
+            if not mem_id or not old_text:
+                continue
+            old_meta = _normalize_metadata((old or {}).get("metadata"))
+            now = current.get(mem_id)
+            if now is None:
+                # 没了：重新存一条，文本和 metadata 原样带上。
+                try:
+                    self._mem0_add(
+                        [{"role": "user", "content": old_text}],
+                        self.user_id,
+                        False,
+                        dict(old_meta),
+                    )
+                except Exception:
+                    logger.warning("覆盖守卫：恢复被删的旧记忆失败。", exc_info=True)
+                    continue
+                restored += 1
+                continue
+            if now["text"] == old_text and now["metadata"] == old_meta:
+                continue
+            # 文本被改了、或者 metadata 被动了：原地恢复，保住原 id。
+            try:
+                try:
+                    self._memory.update(
+                        memory_id=mem_id, text=old_text, metadata=dict(old_meta)
+                    )
+                except TypeError:
+                    logger.warning(
+                        "覆盖守卫：底层 update 不支持 metadata 参数，"
+                        "只恢复了文本、没恢复 metadata。"
+                    )
+                    self._memory.update(memory_id=mem_id, text=old_text)
+            except Exception:
+                logger.warning("覆盖守卫：恢复被改的旧记忆失败。", exc_info=True)
+                continue
+            restored += 1
+        if restored:
+            logger.info("提取后守卫：按快照恢复了 %d 条被改动的旧记忆。", restored)
+        return restored
+
     def _apply_coverage_guard(self, results, before_items, new_metadata):
         """提取后覆盖守卫：刚提取出的推断记忆，别把 BOOS 确认过的事实顶掉。
 
@@ -2629,9 +2722,15 @@ class Mem0Store:
         拦下/失败只记日志（不记内容），绝不抛异常——守卫坏了不能把
         聊天回答搞崩。标记打不上（底层 update 不支持 metadata）时，
         记忆本身还在，只丢了标记，记一条警告。
+        打标记之前先按快照核对恢复（见 _restore_snapshot_memories）：
+        万一 add 在里面动了旧记忆，先恢复原样，再谈新记忆待确认——
+        旧事实丢了，打再多标记也没用。
         """
+        if not before_items:
+            return results
+        self._restore_snapshot_memories(before_items)
         items = (results or {}).get("results") or []
-        if not items or not before_items:
+        if not items:
             return results
         base_meta = dict(new_metadata or {})
         held = []

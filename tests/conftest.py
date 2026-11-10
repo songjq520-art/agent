@@ -274,17 +274,20 @@ class FakeMemory:
             return [item["memory"] for item in self._items]
 
 
-def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4):
+def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4, memory=None):
     """造一个注了 FakeMemory 的 Mem0Store（离线测试用）。
 
     Mem0Store 注入 memory 时跳过版本校验和真实构建，所以 tmp_path
     随便给也行；没传时用系统临时目录。返回的 store 和真实 Mem0Store
     同一个类，只是底下的 memory 是假的，行为（阈值过滤、关键词补充、
     写锁、迁移、删除两道关）走的都是真实代码。
+    memory 不传时用 FakeMemory；想换个行为的假对象（比如
+    test_memory_timestamp.py 里会改旧记忆的 MutatingFakeMemory）
+    就传进来。
     """
     base = Path(tmp_path) if tmp_path is not None else Path(tempfile.mkdtemp())
     return Mem0Store(
-        memory=FakeMemory(),
+        memory=memory if memory is not None else FakeMemory(),
         chroma_path=base / "mem0_chroma",
         history_db_path=base / "history.db",
         version_path=base / "mem0_versions.json",
@@ -318,3 +321,8 @@ def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4):
 # 8. update / metadata 是假的“够测流程”的近似：真实 mem0 的 update
 #    会重新算向量、写 UPDATE 审计行，metadata 是随记忆一起存进 Chroma
 #    的；假对象只改内存里的文本和 metadata 字典，不算向量。
+# 9. add 从不改、删旧记忆：真实 mem0 2.2.1 读代码也是只插不改，但
+#    说明书写着 add 会决定增改删——守卫按快照恢复旧记忆的那条路，
+#    光用这个假对象测不到。所以 tests/test_memory_timestamp.py 里
+#    另有一个会捣乱的 MutatingFakeMemory（add 里改、删旧记忆），
+#    专门用来证明“万一 add 里动了旧记忆，守卫也能恢复回来”。
