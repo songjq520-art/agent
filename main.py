@@ -22,6 +22,10 @@ from config import (
     get_model_status,
 )
 from memory import mem0_store
+from memory.conversation_summary import (
+    ConversationSummaryStore,
+    make_deepseek_summarizer,
+)
 from providers.deepseek import DeepSeekProvider
 from providers.muse import MuseProvider
 from router import route
@@ -160,6 +164,11 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
         "【提取所得】的只能当背景参考，回答时说明是之前提到过、未经确认，"
         "不能说成已确认的事实；【来源未确认】的不能当作事实——"
         "如果没有可确认的记忆回答这个问题，就说不知道。",
+        "回答方式：先说最重要的结论，简短说，别把所有细节和免责都倒出来；"
+        "记忆的来源和确认状态不用每次都展开解释——【用户确认】的直接当事实说，"
+        "【提取所得】的简单提一句“之前提到过”就行；不知道就直接说不知道，别绕圈子。"
+        "还没联网核实过的信息（比如店名、价格、排名、哪家店怎么样）都是凭脑子里"
+        "原有的知识说的，要顺带说明一句是凭已有知识说的、没现查核实，别让人以为是查过的。",
     ]
     for item in kept:
         metadata = (item or {}).get("metadata") or {}
@@ -245,7 +254,7 @@ def _print_correction_result(saved):
     return correction
 
 
-def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None):
+def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None):
     """跑一次普通问答任务（最简单的运行示例）.
 
     参数 prompt：用户的问题；task_type：任务类型，默认 "question"。
@@ -261,6 +270,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     什么都不拼、原样提问（不知道一定要说不知道，不注入近似记忆）；
     回答成功后，把本轮及最近的消息（含刚追加的新问答）存进长期记忆
     （add_turn，mem0 自己提取，不用确认）。
+    参数 summary_store：对话摘要库（ConversationSummaryStore），不传时
+    不带摘要；传了且有摘要时，提问前把“之前对话的摘要”拼进发给模型
+    的问题里（历史里仍记原话，摘要只当上下文）；摘要是对话记录、
+    不是事实，绝不喂给 mem0 提取（add_turn 只拿 messages 和原话）。
     返回：字典，含 mode（模式）、route（路由结果）、result（模型结果或 None）、message（提示）。
     模式：
       - "demo"（演示模式）：无 Key，只演示配置 + 路由，不调用模型；
@@ -323,6 +336,16 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         block = _memory_block(memories)
         if block:
             model_prompt = block + "\n\n" + prompt
+    # 对话摘要：有摘要时拼在最前面当上下文（新对话读回上一段对话的摘要，
+    # 靠的就是这一块）；摘要只进发给模型的问题，不进历史、不进 mem0。
+    if summary_store is not None:
+        try:
+            summary_text = summary_store.prompt_block()
+        except Exception:
+            logger.warning("读对话摘要失败，本次不带摘要继续。", exc_info=True)
+            summary_text = ""
+        if summary_text:
+            model_prompt = summary_text + "\n\n" + model_prompt
     # 按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型），
     # 并把路由算出的模型名传给 Provider——路由说用哪个模型就用哪个，
     # 不能丢了 routing["model"]、让 Provider 又按默认模型自己猜。
@@ -373,6 +396,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         )[-6:]
         saved = mem0_store.add_turn(recent)
         correction = _print_correction_result(saved)
+        # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
+        # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
+        if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
+            print("刚说的那句已经撤回，不记了。")
     return {
         "mode": "real",
         "route": routing,
@@ -393,7 +420,7 @@ def is_exit_command(text):
     return str(text or "").strip().lower() in EXIT_COMMANDS
 
 
-def chat_loop(budget_tracker=None, mem0_store=None):
+def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
     """连续对话循环：持续与模型对话，直到输入退出命令。
 
     整个会话共用一个 BudgetTracker 和一个 messages 历史（user 和 assistant
@@ -407,6 +434,10 @@ def chat_loop(budget_tracker=None, mem0_store=None):
     传了时，每轮提问前先搜相关记忆带给模型，回答成功后把本轮对话存进
     长期记忆；输入“记住：内容”可直接存一条记忆原文（懒加载记忆库，
     不用确认）。不传记忆库时启动会打印一行提示：本次对话不会被记住。
+    参数 summary_store：对话摘要库（ConversationSummaryStore），不传时
+    不记摘要；传了时，每轮后历史超 32,000 token 就总结压缩一次、
+    记一笔最近对话，退出时把剩下的历史总结保存（摘要存在硬盘上，
+    下次新对话读回来当上下文）。
     返回 0 表示正常结束。
     """
     tracker = budget_tracker or BudgetTracker()
@@ -438,7 +469,7 @@ def chat_loop(budget_tracker=None, mem0_store=None):
             handle_remember(tracker, prompt)
             continue
         try:
-            outcome = run_question(prompt, budget_tracker=tracker, messages=messages, mem0_store=mem0_store)
+            outcome = run_question(prompt, budget_tracker=tracker, messages=messages, mem0_store=mem0_store, summary_store=summary_store)
         except RuntimeError as exc:
             # 调用失败：历史不动，继续等下一句，不伪造回答。
             print(f"调用失败：{exc}")
@@ -453,11 +484,50 @@ def chat_loop(budget_tracker=None, mem0_store=None):
         # 这里不再重复调——重复调等于每轮多付一次提取费用。
         messages.append({"role": "user", "content": prompt})
         messages.append({"role": "assistant", "content": result["text"]})
+        # 对话摘要：历史超上限就总结压缩一次，再把本轮记进最近对话列表；
+        # 失败只记日志、不拦聊天。
+        if summary_store is not None:
+            try:
+                summary_store.maybe_compact(messages)
+                summary_store.sync(messages)
+            except Exception:
+                logger.warning("对话摘要更新失败。", exc_info=True)
         print(f"\n--- {result['model']} 的回答 ---")
         print(result["text"])
         print(f"\nToken 使用量：{result.get('usage')}")
         print(f"本次成本：{result.get('cost_usd')} 美元（None 表示模型未返回 usage，成本未知）")
+    # Plan C：退出时把待定区里最后一轮提交——会话结束了，不会再有
+    # 下一轮、也不会再有撤回；不提交，最后一轮就永远丢了。
+    # “不不不”撤回过的那轮在撤回时已经丢掉，这里不会把它捞回来。
+    if mem0_store is not None:
+        try:
+            mem0_store.flush_pending()
+        except Exception:
+            logger.warning("退出时提交待定记忆失败。", exc_info=True)
+    # 对话摘要：退出时把剩下的历史总结保存（不只到上限才总结），
+    # 不然短对话永远触发不到；失败只记日志。
+    if summary_store is not None:
+        try:
+            summary_store.flush(messages)
+        except Exception:
+            logger.warning("退出时总结对话失败。", exc_info=True)
     return 0
+
+
+def _default_summary_store(budget_tracker=None):
+    """建一个对话摘要库（生产环境默认）：摘要存在 memory/ 下的 JSON 里，
+    总结用 DeepSeek flash，费用走传进来的预算跟踪器。
+
+    建失败时返回 None（比如目录写不了），聊天照常、只是不记摘要；
+    没配 Key 时总结函数会跳过（不调用、不花钱），存取照常。
+    """
+    try:
+        return ConversationSummaryStore(
+            summarizer=make_deepseek_summarizer(budget_tracker=budget_tracker)
+        )
+    except Exception:
+        logger.warning("对话摘要未启用：建摘要库失败。", exc_info=True)
+        return None
 
 
 def main(argv=None, mem0_store=None):
@@ -472,11 +542,19 @@ def main(argv=None, mem0_store=None):
     单次问答不付这个代价），记忆只在网页服务里启用，或用户说
     “记住……”时才懒加载一次。调用方（比如测试）可以显式传一个
     记忆库进来，单次问答和连续对话都会用它。
+    对话摘要：这里建一个摘要库传下去——连续对话退出时总结保存，
+    单次问答提问前读回上一段对话的摘要当上下文。
     """
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         # 不带参数：连续对话循环（不传记忆库时不自动加载 mem0）。
-        return chat_loop(mem0_store=mem0_store)
+        # 摘要库和预算跟踪器共用一个 tracker，总结的费用也记进预算。
+        tracker = BudgetTracker()
+        return chat_loop(
+            budget_tracker=tracker,
+            mem0_store=mem0_store,
+            summary_store=_default_summary_store(budget_tracker=tracker),
+        )
 
     prompt = args[0]
     if not prompt.strip():
@@ -489,7 +567,11 @@ def main(argv=None, mem0_store=None):
 
     # 单次问答：不传记忆库时不自动加载 mem0。
     try:
-        outcome = run_question(prompt, mem0_store=mem0_store)
+        outcome = run_question(
+            prompt,
+            mem0_store=mem0_store,
+            summary_store=_default_summary_store(),
+        )
     except RuntimeError as exc:
         print(f"调用失败：{exc}")
         return 1
@@ -503,6 +585,13 @@ def main(argv=None, mem0_store=None):
         print(result["text"])
         print(f"\nToken 使用量：{result.get('usage')}")
         print(f"本次成本：{result.get('cost_usd')} 美元（None 表示模型未返回 usage，成本未知）")
+    # Plan C：单次问答没有下一轮，进程退出前把待定区提交，
+    # 否则本轮对话永远丢了（和 chat_loop 退出时一样）。
+    if mem0_store is not None:
+        try:
+            mem0_store.flush_pending()
+        except Exception:
+            logger.warning("退出时提交待定记忆失败。", exc_info=True)
     return 0
 
 

@@ -230,16 +230,21 @@ def test_search_both_steps_fail_returns_empty(tmp_path):
 
 
 def test_add_turn_calls_mem0_add_with_infer(tmp_path):
-    """add_turn 调一次 mem0.add（infer=True，自动提取），本轮对话存进记忆。"""
+    """add_turn 调一次 mem0.add（infer=True，自动提取），本轮对话存进记忆。
+
+    Plan C：本轮先待定，flush 时才提交——这里用 flush_pending()
+    主动提交，再断言提取调了一次、infer=True。"""
     store = make_fake_store(tmp_path)
     result = store.add_turn(
         [
-            {"role": "user", "content": "我叫小宋。"},
-            {"role": "assistant", "content": "你好，小宋。"},
+            {"role": "user", "content": "我喜欢喝咖啡。"},
+            {"role": "assistant", "content": "好的，记下了。"},
         ]
     )
-    assert result.get("results")
-    assert "我叫小宋" in store._memory.all_texts()
+    assert result.get("pending") is True
+    assert store._memory.add_calls == []
+    store.flush_pending()
+    assert "我喜欢喝咖啡" in store._memory.all_texts()
     # 只记了一次 add 调用。
     assert len(store._memory.add_calls) == 1
     _messages, _user_id, infer = store._memory.add_calls[0]
@@ -267,7 +272,9 @@ def test_add_turn_empty_messages_does_nothing(tmp_path):
 
 
 def test_add_turn_failure_returns_empty_dict(tmp_path):
-    """add 失败时返回 {} 不抛异常：存记忆失败不能把已经拿到的聊天回答搞崩。"""
+    """add 失败时返回 {} 不抛异常：存记忆失败不能把已经拿到的聊天回答搞崩。
+
+    Plan C：失败发生在提交时（本轮先待定），所以 flush_pending() 返回 {}。"""
     memory = FakeMemory()
 
     def _boom(messages, user_id=None, infer=True):
@@ -280,14 +287,17 @@ def test_add_turn_failure_returns_empty_dict(tmp_path):
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
     )
-    assert store.add_turn([{"role": "user", "content": "我叫小宋。"}]) == {}
+    result = store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
+    assert result.get("pending") is True
+    assert store.flush_pending() == {}
 
 
 def test_add_turn_concurrent_writes_do_not_crash(tmp_path):
     """写锁存在：两个线程同时 add_turn，最终不崩、库还能正常读。
 
-    只断言“不崩”：FakeMemory 的去重是假的（见 conftest 说明），
-    不强求两条写合并成一条——去重是真实 mem0 提取时做的事。
+    Plan C：两轮说的是同一句话，第二轮提交第一轮的待定内容（1 次 add），
+    再把自己待定；flush 时按指纹去重、不再重复提——同一句话最终只存 1 条。
+    只断言“不崩”+ 最终库里有这条：去重是提取那侧 + 待定区指纹做的事。
     """
     store = make_fake_store(tmp_path)
     messages = [{"role": "user", "content": "我叫小宋。"}]
@@ -305,7 +315,9 @@ def test_add_turn_concurrent_writes_do_not_crash(tmp_path):
     for thread in threads:
         thread.join(timeout=10)
     assert errors == []
-    assert len(store._memory.add_calls) == 2
+    assert len(store._memory.add_calls) == 1
+    store.flush_pending()
+    assert len(store._memory.add_calls) == 1
     assert store.get_all()  # 库还能正常读
 
 

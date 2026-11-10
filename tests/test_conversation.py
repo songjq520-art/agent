@@ -376,6 +376,8 @@ def test_main_with_arg_is_single_question(monkeypatch, tmp_path):
     所以这里不传 store，只验证单次问答的分发。
     """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    # 摘要文件指到临时目录：单次问答提问前会读摘要，别让它读到真实文件。
+    monkeypatch.setenv("AGENT_SUMMARY_FILE", str(tmp_path / "conversation_summary.json"))
     with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
         assert main(["你好"]) == 0
         mock_post.assert_called_once()
@@ -390,12 +392,24 @@ def test_main_without_arg_enters_chat_loop(monkeypatch, tmp_path):
     同上：命令行入口不带记忆库，这里不传 store，只验证进入循环的分发。
     """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    # 摘要文件指到临时目录：退出时总结会调一次模型、写一次文件，
+    # 别让它碰真实的 memory/conversation_summary.json。
+    monkeypatch.setenv("AGENT_SUMMARY_FILE", str(tmp_path / "conversation_summary.json"))
     with (
         patch("builtins.input", side_effect=["你好", "exit"]),
         patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post,
     ):
         assert main([]) == 0
-        mock_post.assert_called_once()
+        # 两次调用：一次是“你好”的问答，一次是退出时总结对话。
+        assert mock_post.call_count == 2
+        first_sent = mock_post.call_args_list[0].kwargs["json"]["messages"]
+        assert first_sent == [{"role": "user", "content": "你好"}]
+        second_sent = mock_post.call_args_list[1].kwargs["json"]["messages"]
+        assert "对话记录员" in second_sent[0]["content"]
+    # 退出时总结的那段对话记进了最近列表（标题取第一句用户话）。
+    saved = json.loads((tmp_path / "conversation_summary.json").read_text(encoding="utf-8"))
+    assert len(saved["conversations"]) == 1
+    assert saved["conversations"][0]["title"] == "你好"
 
 
 # ---------- 第二阶段补充验收：会话隔离 ----------

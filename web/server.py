@@ -21,7 +21,14 @@
 #                        "mode": "real" 或 "demo", "cost_usd": 成本,
 #                        "usage": Token 用量}；
 #                        出错时返回 {"error": 原因}。
-#   POST /api/reset   → 清空本轮对话历史，返回 {"ok": true}。
+#   POST /api/reset   → 开新对话：先把当前对话总结保存，再清空历史，
+#                        返回 {"ok": true}。
+#   GET  /api/conversations → 最近对话列表（JSON {"conversations": [...]}，
+#                        每条只有 id、标题、开始/更新时间，不带正文）。
+#   POST /api/conversations/open → 回到一段旧对话，请求 JSON {"id": 对话 id}，
+#                        返回 {"id", "title", "summary", "messages"}：
+#                        messages 是恢复的最近几轮（原样），页面按它重画
+#                        聊天区，接着聊；找不到时回 404。
 #   GET  /api/memories → 已存记忆列表（JSON {"memories": [...], "mem0_enabled": bool}，
 #                        每条含 id、text、metadata：source/created_at/confidence/
 #                        user_confirmed/confirmed；记忆未启用时列表为空）。
@@ -39,8 +46,10 @@
 #                        由页面让 BOOS 选一条再提交，不猜。
 #
 # 注意（给以后看代码的人）：
-#   - 对话历史只保存在内存里（ChatState.messages），重启服务后清空；
-#     本阶段不做持久化，README 里也写明了。
+#   - 对话历史存在内存里（ChatState.messages），重启服务后清空；
+#     但每段对话结束时都会总结保存（摘要 + 最近几轮存在硬盘上，
+#     memory/conversation_summary.json），重启后左边“最近”列表里能找回，
+#     点一条就能接着聊；新对话开始时读回最新摘要当上下文。
 #   - 服务用 ThreadingHTTPServer，每个请求一个线程；ChatState 里有一把锁，
 #     问、清空、读状态都走这把锁，一次只处理一个请求，历史和预算不会乱。
 #   - 长期记忆走 mem0（见 memory/mem0_store.py）：服务启动时建一个
@@ -70,6 +79,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import MONTHLY_BUDGET_USD, BudgetTracker, get_model_status  # noqa: E402
 from main import _memory_block, run_question  # noqa: E402
+from memory.conversation_summary import (  # noqa: E402
+    ConversationSummaryStore,
+    make_deepseek_summarizer,
+)
 from memory.mem0_store import create_mem0_store  # noqa: E402
 
 logger = logging.getLogger("agent")
@@ -119,17 +132,23 @@ class ChatState:
     BudgetTracker 和一个 messages 历史（user 和 assistant 消息按时间顺序）。
     成功拿到回答后，才把本轮 user 问题和 assistant 回答追加进历史；
     演示模式或调用失败时，历史不动。
-    对话历史只保存在内存里，重启服务后清空；本阶段不做持久化。
+    对话历史只保存在内存里，重启服务后清空；但每段对话结束（开新对话、
+    回到旧对话、停服务）时都会总结保存——摘要 + 最近几轮存在硬盘上
+    （memory/conversation_summary.json），重启后左边“最近”列表里能找回。
     长期记忆：mem0_store 不传时不带记忆；传了时，每轮提问前先语义检索
     相关记忆拼进发给模型的问题里（历史里仍记原话），回答成功后把本轮
     及最近的消息存进长期记忆（mem0 自动提取，不用确认）。
+    对话摘要：summary_store 不传时不记摘要；传了时，每轮后历史超
+    32,000 token 就总结压缩一次、记一笔最近对话，新对话开始时读回
+    最新摘要当上下文。
     记忆数据只保存在本地（memory/mem0_chroma/ + memory/history.db），不上传。
     """
 
-    def __init__(self, budget_tracker=None, mem0_store=None):
+    def __init__(self, budget_tracker=None, mem0_store=None, summary_store=None):
         self.tracker = budget_tracker or BudgetTracker()
         self.messages = []
         self.mem0_store = mem0_store
+        self.summary_store = summary_store
         # _lock（并发锁）：服务用 ThreadingHTTPServer，每个请求一个线程。
         # 没有这把锁，两个 /api/chat 同时跑会互相污染历史（你问你的、他答他的，
         # 追加顺序乱掉），还可能同时通过预算检查、多记一笔费用。
@@ -139,9 +158,85 @@ class ChatState:
         self._lock = threading.Lock()
 
     def reset(self):
-        """清空本轮对话历史（预算不动，只清聊天记录）。"""
+        """开新对话：先把当前对话总结保存，再清空历史、换一条空记录。
+
+        预算不动，只清聊天记录。摘要没启用时就是原来的清空。
+        """
         with self._lock:
+            self._flush_summary_locked()
+            if self.summary_store is not None:
+                try:
+                    self.summary_store.begin_conversation()
+                except Exception:
+                    logger.warning("开新对话失败。", exc_info=True)
             self.messages = []
+
+    def _flush_summary_locked(self):
+        """把当前对话收尾总结（调用方已拿着锁）：失败只记日志，不拦聊天。"""
+        if self.summary_store is None:
+            return
+        try:
+            self.summary_store.flush(self.messages)
+        except Exception:
+            logger.warning("总结当前对话失败。", exc_info=True)
+
+    def flush_summary(self):
+        """服务停止时把当前对话收尾总结（带锁的公开版，供 main() 调）。"""
+        with self._lock:
+            self._flush_summary_locked()
+
+    def list_conversations(self):
+        """最近对话列表（给网页左边用）：摘要没启用时返回空列表。"""
+        with self._lock:
+            if self.summary_store is None:
+                return []
+            try:
+                return self.summary_store.list_conversations()
+            except Exception:
+                logger.warning("读最近对话列表失败。", exc_info=True)
+                return []
+
+    def open_conversation(self, conv_id):
+        """回到一段旧对话：先把当前对话收尾（总结保存），再恢复那段的摘要 + 最近几轮。
+
+        返回 {"id", "title", "summary", "messages"}（messages 是恢复的
+        最近几轮，页面按它重画聊天区，接着聊）；找不到时返回 None。
+        摘要没启用时也返回 None（没有可回的对话）。
+        """
+        with self._lock:
+            if self.summary_store is None:
+                return None
+            self._flush_summary_locked()
+            try:
+                record = self.summary_store.open_conversation(conv_id)
+            except Exception:
+                logger.warning("回到旧对话失败：id=%s。", conv_id, exc_info=True)
+                return None
+            if record is None:
+                return None
+            self.messages = [dict(m) for m in record.get("recent") or []]
+            return {
+                "id": record["id"],
+                "title": record.get("title") or "新对话",
+                "summary": record.get("summary") or "",
+                "messages": [dict(m) for m in self.messages],
+            }
+
+    def current_summary(self):
+        """新对话提问时用的摘要（给页面顶部的摘要卡片用，和发给模型的是同一份）。
+
+        reset() 之后正在聊的是空记录，这里会回落到列表最新那条——
+        也就是刚结束的“上一段对话”的摘要；没有摘要时返回空串，
+        页面不显示卡片。摘要没启用时也返回空串。
+        """
+        with self._lock:
+            if self.summary_store is None:
+                return ""
+            try:
+                return self.summary_store.current_summary() or ""
+            except Exception:
+                logger.warning("读当前摘要失败。", exc_info=True)
+                return ""
 
     def status(self):
         """给页面状态栏用的：模型状态 + 本月预算使用情况 + 记忆是否启用。"""
@@ -198,6 +293,7 @@ class ChatState:
                 model_prompt,
                 budget_tracker=self.tracker,
                 messages=self.messages,
+                summary_store=self.summary_store,
             )
             if outcome["mode"] == "demo":
                 return {
@@ -210,6 +306,14 @@ class ChatState:
             result = outcome["result"]
             self.messages.append({"role": "user", "content": prompt})
             self.messages.append({"role": "assistant", "content": result["text"]})
+            # 对话摘要：历史超上限就总结压缩一次，再把本轮记进最近对话列表；
+            # 失败只记日志、不拦聊天。
+            if self.summary_store is not None:
+                try:
+                    self.summary_store.maybe_compact(self.messages)
+                    self.summary_store.sync(self.messages)
+                except Exception:
+                    logger.warning("对话摘要更新失败。", exc_info=True)
             # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
             # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
             # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
@@ -432,6 +536,9 @@ def make_handler(state, authenticator=None):
                 self._send_html()
             elif path == "/api/status":
                 self._send_json(state.status())
+            elif path == "/api/conversations":
+                # 最近对话列表：摘要没启用时列表为空，页面显示“暂无对话”。
+                self._send_json({"conversations": state.list_conversations()})
             elif path == "/api/memories":
                 # 记忆列表：记忆未启用时 mem0_enabled 为 False、列表为空，
                 # 页面据此显示“记忆未启用”，不报错。
@@ -470,7 +577,29 @@ def make_handler(state, authenticator=None):
             path = self.path.split("?", 1)[0]
             if path == "/api/reset":
                 state.reset()
-                self._send_json({"ok": True})
+                # 新对话读回的摘要（上一段对话的）一起带上，页面在顶部
+                # 显示摘要卡片；没有摘要时是空串，页面不显示卡片。
+                self._send_json({"ok": True, "summary": state.current_summary()})
+                return
+            if path == "/api/conversations/open":
+                # 回到一段旧对话：请求 {"id": 对话 id}。
+                # 先把当前对话总结保存（state.open_conversation 里做），
+                # 再恢复那段的最近几轮；找不到回 404。
+                payload, error, status = self._read_json_body()
+                if error is not None:
+                    self._send_json({"error": error}, status=status)
+                    return
+                conv_id = str(payload.get("id") or "").strip()
+                if not conv_id:
+                    self._send_json({"error": "请先选一段对话。"}, status=400)
+                    return
+                result = state.open_conversation(conv_id)
+                if result is None:
+                    self._send_json(
+                        {"error": "找不到这段对话，可能已经被删了。"}, status=404
+                    )
+                    return
+                self._send_json(result)
                 return
             if path.startswith("/api/memories/") and path.endswith("/forget"):
                 # 忘一条记忆：POST /api/memories/<id>/forget，请求 {"confirmed": true}。
@@ -595,13 +724,16 @@ def _is_loopback_host(host):
         return False
 
 
-def create_server(config=None, budget_tracker=None, authenticator=None, mem0_store=None):
+def create_server(config=None, budget_tracker=None, authenticator=None, mem0_store=None, summary_store=None):
     """建一个网页服务（不启动），方便测试用临时端口和临时预算文件。
 
     config 是 ServerConfig；不传时用环境变量/默认值（ServerConfig.from_env()）。
     authenticator 是身份验证钩子（见 make_handler），默认不校验。
     mem0_store 是 mem0 长期记忆库（Mem0Store），不传时不带记忆；传了时，
     每轮提问前先语义检索相关记忆带给模型，回答成功后自动存本轮对话。
+    summary_store 是对话摘要库（ConversationSummaryStore），不传时不记摘要；
+    传了时，每轮后历史超上限就总结压缩、记一笔最近对话，开新对话时
+    总结保存，新对话开始时读回最新摘要当上下文。
     测试时可传一个假 store（有 search/add_turn/get_all 方法即可），不碰真实 mem0。
 
     安全保护：监听地址不是本机回环地址（比如 0.0.0.0 或局域网地址），
@@ -620,6 +752,7 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
     state = ChatState(
         budget_tracker=budget_tracker,
         mem0_store=mem0_store,
+        summary_store=summary_store,
     )
     handler = make_handler(state, authenticator=authenticator)
     return ThreadingHTTPServer((config.host, config.port), handler), state
@@ -657,11 +790,36 @@ def main(argv=None):
     mem0_store = create_mem0_store(tracker)
     if mem0_store is None:
         print("⚠️ mem0 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
+    else:
+        # Plan C：把十二的名字和 SOUL.md 以“已确认”种进长期记忆
+        # （只加没有的，不覆盖已有的；失败只记日志、不拦启动）。
+        try:
+            seeded = mem0_store.ensure_identity_memories()
+            added = [
+                key
+                for key, outcome in (seeded or {}).items()
+                if (outcome or {}).get("status") == "added"
+            ]
+            if added:
+                print(f"长期记忆已确认：{', '.join(added)}。", flush=True)
+        except Exception:
+            logger.warning("种身份记忆失败：本次不带名字/SOUL 记忆启动。", exc_info=True)
+    # 对话摘要：常驻服务启动时建一个 ConversationSummaryStore（只建一次），
+    # 每轮后历史超上限就总结压缩、记一笔最近对话，开新对话/停服务时总结保存。
+    # 建不好时不带摘要运行，服务照常启动。
+    summary_store = None
+    try:
+        summary_store = ConversationSummaryStore(
+            summarizer=make_deepseek_summarizer(budget_tracker=tracker)
+        )
+    except Exception:
+        logger.warning("对话摘要未启用：建摘要库失败。", exc_info=True)
     try:
         server, _state = create_server(
             config=config,
             budget_tracker=tracker,
             mem0_store=mem0_store,
+            summary_store=summary_store,
         )
     except ValueError as exc:
         # 非回环地址又没配身份验证时，create_server 会拒绝启动；
@@ -674,6 +832,18 @@ def main(argv=None):
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n服务已停止。")
+    # Plan C：服务停之前把待定区里最后一轮提交——否则最后一轮
+    # 永远待在内存里。撤回过的那轮在撤回时已经丢掉，不会捞回来。
+    if mem0_store is not None:
+        try:
+            mem0_store.flush_pending()
+        except Exception:
+            logger.warning("停服务时提交待定记忆失败。", exc_info=True)
+    # 对话摘要：服务停之前把当前对话总结保存，不然这段对话的尾巴就丢了。
+    try:
+        _state.flush_summary()
+    except Exception:
+        logger.warning("停服务时总结对话失败。", exc_info=True)
     return 0
 
 

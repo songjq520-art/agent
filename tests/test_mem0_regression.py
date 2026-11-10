@@ -44,9 +44,12 @@ TEST2_DIALOGUE = [
 
 
 def test_extraction_rule_a_present_job_is_stored(tmp_path):
-    """A. “我目前在圆通工作，做快递员。”→ 应存：用户明确说的现在时事实。"""
+    """A. “我目前在圆通工作，做快递员。”→ 应存：用户明确说的现在时事实。
+
+    Plan C：本轮先待定，flush 后才提交。"""
     store = make_fake_store(tmp_path)
     store.add_turn([{"role": "user", "content": "我目前在圆通工作，做快递员。"}])
+    store.flush_pending()
     texts = store._memory.all_texts()
     assert len(texts) == 1
     assert "圆通" in texts[0] and "快递员" in texts[0]
@@ -78,7 +81,9 @@ def test_extraction_rule_d_hypothetical_is_not_stored(tmp_path):
 
 
 def test_extraction_rules_all_four_together(tmp_path):
-    """A–D 一起跑：A 存 1 条，B/C/D 一条也不存。"""
+    """A–D 一起跑：A 存 1 条，B/C/D 一条也不存。
+
+    Plan C：前三轮在第四轮调 add_turn 时提交，第四轮在 flush 时提交。"""
     store = make_fake_store(tmp_path)
     for text in [
         "我目前在圆通工作，做快递员。",
@@ -87,6 +92,7 @@ def test_extraction_rules_all_four_together(tmp_path):
         "假设我以后学 Rust，会不会有帮助？",
     ]:
         store.add_turn([{"role": "user", "content": text}])
+    store.flush_pending()
     texts = store._memory.all_texts()
     assert len(texts) == 1
     assert "圆通" in texts[0]
@@ -108,10 +114,14 @@ def test_custom_instructions_keep_never_store_inference():
 
 def test_test2_five_turns_all_core_facts_stored(tmp_path):
     """Test 2 五句对话回归：五句话（试跑原文）各调一次 add，
-    每句的核心事实都要存下来。"""
+    每句的核心事实都要存下来。
+
+    Plan C：前四句在下一轮调 add_turn 时提交，第五句在 flush 时提交；
+    第 1 句“我叫小宋”走身份槽位（upsert），其余四句走提取。"""
     store = make_fake_store(tmp_path)
     for sentence in TEST2_DIALOGUE:
         store.add_turn([{"role": "user", "content": sentence}])
+    store.flush_pending()
     texts = store._memory.all_texts()
     assert len(texts) == 5
     joined = "\n".join(texts)
@@ -180,6 +190,23 @@ def test_memory_block_with_memories_lists_texts():
     block = _memory_block([{"id": "fake-1", "text": "我叫小宋。", "score": 0.9, "source": "semantic"}])
     assert "我叫小宋" in block
     assert "仅供参考" in block
+
+
+def test_memory_block_tells_model_to_answer_important_first():
+    """回答方式：提示块里要教模型先说最重要的、简短说，别把来源和免责
+    都展开倒出来（BOOS 2026-11-10：十二回答太长太绕，要像十一一样挑重要的说）。"""
+    block = _memory_block([{"id": "fake-1", "text": "我叫小宋。", "score": 0.9, "source": "semantic"}])
+    assert "先说最重要的结论" in block
+    assert "不用每次都展开解释" in block
+
+
+def test_memory_block_says_unverified_info_is_from_prior_knowledge():
+    """回答方式：没联网核实过的信息（店名、价格、排名）要说明是凭已有
+    知识说的、没现查核实，别让人以为是查过的（BOOS 2026-11-10：十二
+    没联网却报了火锅店名和价格）。"""
+    block = _memory_block([{"id": "fake-1", "text": "我叫小宋。", "score": 0.9, "source": "semantic"}])
+    assert "没现查核实" in block
+    assert "凭已有知识说的" in block
 
 
 # ---------- 真实 API 回归测试（默认跳过） ----------
@@ -252,6 +279,8 @@ def test_real_mem0_extraction_rules_abcd(tmp_path):
     ]
     for text in cases:
         store.add_turn([{"role": "user", "content": text}])
+    # Plan C：前三句在下一轮调 add_turn 时提交，最后一句在 flush 时提交。
+    store.flush_pending()
     texts = [item["text"] for item in store.get_all()]
     joined = "\n".join(texts)
     assert "圆通" in joined, f"A 没存下来，库里只有：{texts}"
