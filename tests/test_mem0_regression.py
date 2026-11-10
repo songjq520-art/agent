@@ -200,6 +200,15 @@ def test_memory_block_tells_model_to_answer_important_first():
     assert "不用每次都展开解释" in block
 
 
+def test_memory_block_says_unverified_info_is_from_prior_knowledge():
+    """回答方式：没联网核实过的信息（店名、价格、排名）要说明是凭已有
+    知识说的、没现查核实，别让人以为是查过的（BOOS 2026-11-10：十二
+    没联网却报了火锅店名和价格）。"""
+    block = _memory_block([{"id": "fake-1", "text": "我叫小宋。", "score": 0.9, "source": "semantic"}])
+    assert "没现查核实" in block
+    assert "凭已有知识说的" in block
+
+
 # ---------- 真实 API 回归测试（默认跳过） ----------
 
 

@@ -222,6 +222,22 @@ class ChatState:
                 "messages": [dict(m) for m in self.messages],
             }
 
+    def current_summary(self):
+        """新对话提问时用的摘要（给页面顶部的摘要卡片用，和发给模型的是同一份）。
+
+        reset() 之后正在聊的是空记录，这里会回落到列表最新那条——
+        也就是刚结束的“上一段对话”的摘要；没有摘要时返回空串，
+        页面不显示卡片。摘要没启用时也返回空串。
+        """
+        with self._lock:
+            if self.summary_store is None:
+                return ""
+            try:
+                return self.summary_store.current_summary() or ""
+            except Exception:
+                logger.warning("读当前摘要失败。", exc_info=True)
+                return ""
+
     def status(self):
         """给页面状态栏用的：模型状态 + 本月预算使用情况 + 记忆是否启用。"""
         with self._lock:
@@ -561,7 +577,9 @@ def make_handler(state, authenticator=None):
             path = self.path.split("?", 1)[0]
             if path == "/api/reset":
                 state.reset()
-                self._send_json({"ok": True})
+                # 新对话读回的摘要（上一段对话的）一起带上，页面在顶部
+                # 显示摘要卡片；没有摘要时是空串，页面不显示卡片。
+                self._send_json({"ok": True, "summary": state.current_summary()})
                 return
             if path == "/api/conversations/open":
                 # 回到一段旧对话：请求 {"id": 对话 id}。

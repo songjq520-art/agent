@@ -550,3 +550,101 @@ def test_http_conversations_open_bad_requests(monkeypatch, tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------- 摘要卡片：点开旧对话 / 开新对话时顶部看得见 ----------
+
+def test_chat_state_current_summary_after_reset(tmp_path):
+    """开新对话后，current_summary() 是刚结束那段的摘要（和存下来的一致）。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    store = _store(tmp_path, summarizer=StubSummarizer())
+    state = ChatState(budget_tracker=tracker, summary_store=store)
+    assert state.current_summary() == ""
+    state.messages = _messages(2, topic="广州天气")
+    state.reset()
+    assert state.messages == []
+    # 刚结束的那段对话的摘要：和存下来的那份一字不差。
+    assert state.current_summary() == store.current_summary()
+    assert "广州天气" in state.current_summary()
+
+
+def test_chat_state_current_summary_without_store_is_empty(tmp_path):
+    """没启用摘要库时，current_summary() 是空串（页面不显示卡片）。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    state = ChatState(budget_tracker=tracker, summary_store=None)
+    assert state.current_summary() == ""
+
+
+def test_chat_state_open_without_summary_returns_empty(tmp_path):
+    """没摘要的对话点开时 summary 是空串（页面不显示卡片）。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    store = _store(tmp_path, summarizer=None)  # 没配摘要器：flush 不产生摘要。
+    state = ChatState(budget_tracker=tracker, summary_store=store)
+    state.messages = _messages(1, topic="改名十三")
+    store.sync(state.messages)
+    conv_id = state.list_conversations()[0]["id"]
+    result = state.open_conversation(conv_id)
+    assert result is not None
+    assert result["summary"] == ""
+    assert [m["content"] for m in result["messages"]] == ["改名十三第1句", "好的，第1个回答"]
+
+
+def test_http_reset_returns_previous_summary(monkeypatch, tmp_path):
+    """HTTP：开新对话时 reset 回包里带上上一段的摘要（卡片就显示这份）。"""
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    server, port, state, store = _start_summary_server(tmp_path)
+    try:
+        # 还没聊过就开新对话：没有摘要，回空串。
+        status, data = _request(port, "POST", "/api/reset")
+        assert status == 200
+        assert data["ok"] is True
+        assert data["summary"] == ""
+        # 聊一句、再开新对话：回包里是上一段的摘要，和存下来的一致。
+        status, _ = _request(port, "POST", "/api/chat", {"message": "你好"})
+        assert status == 200
+        status, data = _request(port, "POST", "/api/reset")
+        assert status == 200
+        assert data["summary"] == store.current_summary()
+        assert "你好" in data["summary"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_open_returns_stored_summary_exact(monkeypatch, tmp_path):
+    """HTTP：点开旧对话时 open 回包里的摘要和存下来的一字不差。"""
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    server, port, state, store = _start_summary_server(tmp_path)
+    try:
+        status, _ = _request(port, "POST", "/api/chat", {"message": "你好"})
+        assert status == 200
+        status, _ = _request(port, "POST", "/api/reset")
+        assert status == 200
+        status, data = _request(port, "GET", "/api/conversations")
+        first_id = data["conversations"][0]["id"]
+        stored = store.get_conversation(first_id)["summary"]
+        assert stored  # 存下来的摘要不是空的。
+        status, data = _request(port, "POST", "/api/conversations/open", {"id": first_id})
+        assert status == 200
+        assert data["summary"] == stored
+        assert "你好" in data["summary"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_served_html_contains_summary_card(monkeypatch, tmp_path):
+    """下发的页面里有摘要卡片的样式和逻辑：点开/开新对话时用 data.summary 显示。"""
+    monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
+    server, port, state, store = _start_summary_server(tmp_path)
+    try:
+        status, html = _request(port, "GET", "/")
+        assert status == 200
+        assert "summary-card" in html
+        assert "之前聊过" in html
+        assert "renderSummaryCard" in html
+        # 两处都用回包里的 summary：点开旧对话、开新对话。
+        assert html.count("data.summary") >= 2
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -1297,3 +1297,74 @@ def test_page_script_syntax_is_valid(tmp_path):
         timeout=30,
     )
     assert result.returncode == 0, f"页面 JS 语法错误：{result.stderr}"
+
+
+def _extract_js_function(script, name):
+    """从页面 <script> 里按花括号配对抠出一个 function 的完整源码。"""
+    start = script.index("function " + name + "(")
+    i = script.index("{", start)
+    depth = 0
+    for j in range(i, len(script)):
+        if script[j] == "{":
+            depth += 1
+        elif script[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return script[start : j + 1]
+    raise AssertionError("没找到函数 " + name)
+
+
+def test_page_markdown_renders_bold_italic_list_and_escapes_html(tmp_path):
+    """页面渲染 Markdown：**加粗**、*斜体*、- 列表出来，HTML 先转义。
+
+    做法和语法检查一样：把 renderMarkdown 相关函数从页面里抠出来，
+    用 node 真跑一遍断言。没装 node 的机器上跳过（不拦测试）。
+    """
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("没装 node，跳过页面 Markdown 渲染检查。")
+    html = (Path(__file__).resolve().parent.parent / "web" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"<script>(.*?)</script>", html, re.S)
+    assert match is not None, "页面里没找到 <script> 块"
+    script = match.group(1)
+    funcs = _extract_js_function(script, "inlineMarkdown") + "\n" + _extract_js_function(
+        script, "renderMarkdown"
+    )
+    checks = """
+const assert = require('assert');
+assert.strictEqual(renderMarkdown('**加粗**'), '<strong>加粗</strong>');
+assert.strictEqual(renderMarkdown('*斜体*'), '<em>斜体</em>');
+assert.strictEqual(renderMarkdown('**加粗**和*斜体*'), '<strong>加粗</strong>和<em>斜体</em>');
+assert.strictEqual(renderMarkdown('第一行\\n第二行'), '第一行<br>第二行');
+assert.strictEqual(renderMarkdown('- 苹果\\n- 香蕉'), '<ul><li>苹果</li><li>香蕉</li></ul>');
+assert.strictEqual(renderMarkdown('- **加粗**苹果'), '<ul><li><strong>加粗</strong>苹果</li></ul>');
+assert.strictEqual(renderMarkdown('<script>alert(1)</script>'), '&lt;script&gt;alert(1)&lt;/script&gt;');
+assert.strictEqual(renderMarkdown('**<b>hi</b>**'), '<strong>&lt;b&gt;hi&lt;/b&gt;</strong>');
+assert.strictEqual(renderMarkdown('5*3=15'), '5*3=15');
+assert.strictEqual(renderMarkdown(''), '');
+console.log('markdown ok');
+"""
+    js_path = tmp_path / "md.js"
+    js_path.write_text(funcs + "\n" + checks, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(js_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"页面 Markdown 渲染不对：{result.stderr}"
+
+
+def test_page_chat_bubble_uses_markdown_renderer():
+    """聊天区气泡用 renderMarkdown 渲染（** 加粗不再原样显示 * 号）。"""
+    html = (Path(__file__).resolve().parent.parent / "web" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert "bubble.innerHTML = renderMarkdown(text)" in html
+    assert "function renderMarkdown" in html
