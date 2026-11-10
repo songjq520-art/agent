@@ -13,6 +13,14 @@
 #       里提取的）、created_at（形成时间）、confidence（可信度）、
 #       user_confirmed（BOOS 是否逐条确认过）。没有 metadata 的旧记忆，
 #       取回时一律按“未确认”处理，绝不默认当成已确认的事实（安全降级）。
+#       时间戳（第一步，2026-11-10）：created_at 是微秒级、严格单调递增
+#       的 UTC ISO 时间串（带 Z），同一批写进去的几条各拿一个 write_seq
+#       序号分先后；created_at_source 说明这个时间是哪来的
+#       （written：这次写进去的；backfilled：老记忆后补的；
+#       migrated：迁移时沿用的旧日期）。覆盖规则：时间戳决定新旧，
+#       来源可信度决定有没有资格覆盖——低可信度的新记忆不能直接覆盖
+#       高可信度的旧事实，改标 pending_confirmation（待确认）挂起来，
+#       只有真用上时才问 BOOS（见 _resolve_conflict、_apply_coverage_guard）。
 #       只有 user_confirmed=True 的记忆才能在回答里直接当作事实；
 #       inferred 的只能当背景参考；未确认的不能当作事实（见 main.py
 #       的 _memory_block，那里按来源给每条记忆打标签、分层）。
@@ -90,7 +98,7 @@ import sqlite3
 import threading
 import unicodedata
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger("agent")
@@ -287,7 +295,13 @@ def _today():
 #   source：记忆从哪来。"user"——BOOS 亲口说的/让记住的/亲口纠正的；
 #           "inferred"——DeepSeek 从对话里提取的（用户明确说过的话，
 #           但 BOOS 没逐条确认过那个写法）。
-#   created_at：记忆形成的时间（UTC 的 ISO 时间串，精确到秒）。
+#   created_at：记忆形成的时间（UTC 的 ISO 时间串，微秒级、严格单调递增，
+#           固定 6 位小数、带 Z——见 _now_iso）。
+#   write_seq：同一批写进去的序号（进程内严格递增，和 created_at 一起
+#           排新旧，见 _memory_order_key）。
+#   created_at_source：这个时间是哪来的——"written"（这次写进去的）、
+#           "backfilled"（老记忆后补的，见 backfill_timestamps）、
+#           "migrated"（迁移时沿用的旧日期，见 migrate_from_v1）。
 #   confidence：可信度 0–1。BOOS 亲口说的记 1.0；提取的记 0.7——
 #           不是因为提取得不准，而是因为“模型提的”本身就比“用户
 #           亲口确认的”低一档；模型用它来判断这条记忆有多可信。
@@ -304,13 +318,70 @@ SOURCE_UNCONFIRMED = "unconfirmed"
 CONFIDENCE_USER = 1.0
 CONFIDENCE_INFERRED = 0.7
 
+# 可信度分级（覆盖规则用，见 _resolve_conflict）：
+#   3 = BOOS 亲口确认的（source=user 且 user_confirmed=True）；
+#   2 = 来源是 user、但没逐条确认（旧数据损坏/写坏了才有，正常写不到）；
+#   1 = 模型从对话里提取的（inferred）；
+#   0 = 没来源信息的旧记忆（unconfirmed）。
+# 时间戳决定新旧，可信度决定有没有资格覆盖：级别低的新记忆不能
+# 直接覆盖级别高的旧事实。
+CREDIBILITY_CONFIRMED = 3
+CREDIBILITY_USER = 2
+CREDIBILITY_INFERRED = 1
+CREDIBILITY_UNCONFIRMED = 0
+
+# created_at 的合法来源（见 _provenance 的 created_at_source 参数）。
+CREATED_AT_SOURCES = ("written", "backfilled", "migrated")
+
+# _NOW_LOCK / _NOW_LAST：保证 _now_iso() 发出的时间戳严格递增。
+# 秒级精度时，两轮对话同一秒写进去，created_at 一撞就分不出新旧——
+# 和 conversation_summary 的 _now_iso 修过的是同一类问题（PR #13，
+# BOOS 笔记本上跑全套时撞上过一次）。这里不能直接 import 那边
+# （conversation_summary 反过来 import 本模块的 _redact_sensitive，
+# 循环了），所以同一套算法、各自一份状态，各管各的域。
+# 每次发值时如果新值 <= 上一次发的值，就在上一次的值上加 1 微秒再发。
+# 时钟往回调也不会乱：每次只比上一次大 1 微秒，墙上时间追上来就恢复正常。
+# 写记忆是多线程的（网页服务），读-改-写上锁，别让两个线程同时拿到同一个值。
+_NOW_LOCK = threading.Lock()
+_NOW_LAST = None
+
 
 def _now_iso():
-    """现在的时间，UTC 的 ISO 时间串（精确到秒），供 metadata 用。"""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    """现在的时间，UTC 的 ISO 时间串（固定 6 位微秒，带 Z），供 metadata 用。
+
+    小数部分固定 6 位：isoformat() 默认会省略微秒为 0 时的小数点，
+    '...T03:00:00Z' 按字符串排会比 '...T03:00:00.000001Z' 大——
+    字符串顺序就和时间顺序反了。固定 6 位后，字符串顺序就是时间顺序。
+    """
+    global _NOW_LAST
+    now = datetime.now(timezone.utc)
+    with _NOW_LOCK:
+        if _NOW_LAST is not None and now <= _NOW_LAST:
+            now = _NOW_LAST + timedelta(microseconds=1)
+        _NOW_LAST = now
+    return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _provenance(source, confidence, user_confirmed, created_at=None, slot=None):
+# _WRITE_SEQ_LOCK / _WRITE_SEQ：同一批写进去的序号（进程内严格递增）。
+# 同一批写进去的几条记忆，时间戳也可能撞在同一微秒——单调 +1 微秒能
+# 分开绝大多数，但序号是更稳的第二道：同一批里每条各拿一个号，先后
+# 一目了然。序号只管同一进程里的先后，跨进程重启从 0 再来——新旧判断
+# 先看 created_at，序号只是平局时的决胜（见 _memory_order_key）。
+# 真正的写操作本来就串在 _WRITE_LOCK 里，这里这把锁只是兜底。
+_WRITE_SEQ_LOCK = threading.Lock()
+_WRITE_SEQ = 0
+
+
+def _next_write_seq():
+    """下一条写入序号（进程内严格递增）。"""
+    global _WRITE_SEQ
+    with _WRITE_SEQ_LOCK:
+        _WRITE_SEQ += 1
+        return _WRITE_SEQ
+
+
+def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
+                created_at_source="written"):
     """拼一份来源元数据（存记忆时传给 mem0.add 的 metadata 参数）。
 
     source 不是 "user" 时一律按 "inferred" 存（调用方传错也不让它
@@ -318,11 +389,20 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None):
     slot（Plan C）：身份/称呼类记忆的槽位名（agent_name/user_name/
     soul），只认 KNOWN_SLOTS 里的，其他值不进库——同槽位只留一条，
     新值盖旧值时靠它找旧记忆。
+    created_at 不传时取新鲜的单调时间（_now_iso）；传了就用传的
+    （迁移沿用旧日期、纠错回滚恢复旧时间时用）。created_at_source
+    说明这个时间是哪来的，只认 CREATED_AT_SOURCES 里的三个值，
+    传错了按 "written" 算——时间来源不能靠猜，必须是明确的。
+    每次调都新拿一个 write_seq（同一批里的先后靠它分）。
     """
     source = SOURCE_USER if source == SOURCE_USER else SOURCE_INFERRED
+    if created_at_source not in CREATED_AT_SOURCES:
+        created_at_source = "written"
     metadata = {
         "source": source,
         "created_at": created_at or _now_iso(),
+        "created_at_source": created_at_source,
+        "write_seq": _next_write_seq(),
         "confidence": confidence,
         "user_confirmed": bool(user_confirmed) and source == SOURCE_USER,
     }
@@ -342,17 +422,24 @@ def _normalize_metadata(raw):
       "yes"/1 这类非布尔值不算——确认必须是明确的，不能靠猜；
     - confidence 不是 0–1 之间的数字时记成 None（不知道就是不知道）；
     - created_at 不是字符串时记成 None；
+    - write_seq 不是整数时记成 None；created_at_source 不是三个合法值
+      时记成 None；pending_confirmation 只有明确是 True（布尔值）
+      才算待确认——这三样也一样，不能靠猜；
     - slot 不是 KNOWN_SLOTS 里的已知槽位时记成 None（旧记忆、新旧
       版本混用、损坏数据都走这条路——槽位只认这三个，别的都不认）。
-    返回：{"source", "created_at", "confidence", "user_confirmed",
-           "confirmed", "slot"}，其中 confirmed 就是 user_confirmed
+    返回：{"source", "created_at", "created_at_source", "write_seq",
+           "confidence", "user_confirmed", "confirmed", "slot",
+           "pending_confirmation"}，其中 confirmed 就是 user_confirmed
     （取了个短名字，方便调用方判断“能不能当作事实用”）。
     """
     source = SOURCE_UNCONFIRMED
     created_at = None
+    created_at_source = None
+    write_seq = None
     confidence = None
     user_confirmed = False
     slot = None
+    pending_confirmation = False
     if isinstance(raw, dict):
         raw_source = raw.get("source")
         if raw_source in (SOURCE_USER, SOURCE_INFERRED):
@@ -360,6 +447,12 @@ def _normalize_metadata(raw):
         raw_created = raw.get("created_at")
         if isinstance(raw_created, str) and raw_created:
             created_at = raw_created
+        raw_created_source = raw.get("created_at_source")
+        if raw_created_source in CREATED_AT_SOURCES:
+            created_at_source = raw_created_source
+        raw_seq = raw.get("write_seq")
+        if isinstance(raw_seq, int) and not isinstance(raw_seq, bool):
+            write_seq = raw_seq
         raw_conf = raw.get("confidence")
         if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool):
             if 0 <= raw_conf <= 1:
@@ -368,14 +461,185 @@ def _normalize_metadata(raw):
         raw_slot = raw.get("slot")
         if raw_slot in KNOWN_SLOTS:
             slot = raw_slot
+        pending_confirmation = raw.get("pending_confirmation") is True
     return {
         "source": source,
         "created_at": created_at,
+        "created_at_source": created_at_source,
+        "write_seq": write_seq,
         "confidence": confidence,
         "user_confirmed": user_confirmed,
         "confirmed": user_confirmed,
         "slot": slot,
+        "pending_confirmation": pending_confirmation,
     }
+
+
+# ---------- 时间戳 + 覆盖规则（第一步，2026-11-10） ----------
+# 规则（BOOS 定的）：时间戳决定新旧，来源可信度决定有没有资格覆盖。
+# 同级里新的胜出，旧的标“被取代”但原话留着；低可信度的新记忆不能
+# 直接覆盖高可信度的旧事实——新记忆挂起来“待确认”，只有真用上时
+# 才问 BOOS；时间戳相同或缺失、真分不出先后的，问 BOOS；核心记忆
+# 钉住不动，模型推断一律不能顶掉。
+# 这几个函数都是纯函数（只“判”，不动库），调用方见 _resolve_conflict
+# 的注释——它不管两条记忆是不是同一件事，“是不是同一件事”由调用方
+# 按各自的证据定（槽位相同、BOOS 亲口指的、提取后守卫的关键词邻居）。
+
+
+def _credibility_rank(metadata):
+    """一条记忆的可信度级别（覆盖规则用，见 _resolve_conflict）。
+
+    只看规整过的 metadata：confirmed（user 且逐条确认）最高；
+    source=user 但没确认次之；inferred 再次；没来源信息的最低。
+    raw 和规整过的都能传——里面先过一遍 _normalize_metadata，
+    所以两种形状结果一样。
+    """
+    meta = _normalize_metadata(metadata)
+    if meta["confirmed"]:
+        return CREDIBILITY_CONFIRMED
+    if meta["source"] == SOURCE_USER:
+        return CREDIBILITY_USER
+    if meta["source"] == SOURCE_INFERRED:
+        return CREDIBILITY_INFERRED
+    return CREDIBILITY_UNCONFIRMED
+
+
+def _is_core_memory(metadata):
+    """是不是核心记忆（第一步的口径）。
+
+    核心记忆 = 原四类（名字、SOUL、你的决定、钱的规矩）+ 安全权限 +
+    项目基础决策。第一步里先按“用户已确认”来认：名字/SOUL 有槽位
+    标记，其余几类都是 BOOS 亲口确认过的记忆（记住/纠正/迁移都记
+    source=user、user_confirmed=True）；对话里随口说的决定是提取的
+    （inferred），要等 BOOS 逐条确认才算核心——这是 Plan C 已有的
+    区分，第一步不改它。以后做衰减/删除时，这里换成正式的
+    “类别/重要性”字段（见下面“以后留的位置”）。
+    raw 和规整过的都能传。
+    """
+    meta = _normalize_metadata(metadata)
+    return bool(meta["confirmed"]) or meta["slot"] in KNOWN_SLOTS
+
+
+def _parse_created_at(value):
+    """把 created_at 字符串解析成带时区的 datetime，解析不出返回 None。
+
+    认三种写法：新版微秒 + Z（"2026-11-10T12:00:00.000001Z"）、
+    旧版秒级 +00:00（"2026-11-09T10:00:00+00:00"）、迁移带来的
+    纯日期（"2026-11-07"，算当天 0 点）。没时区的当 UTC。
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if len(text) == 10:
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+            return parsed.replace(tzinfo=timezone.utc)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _memory_order_key(metadata):
+    """一条记忆的新旧排序键：(形成时间, 写入序号)。
+
+    没时间戳的按最早算：缺时间戳的都是时间戳功能上线之前存的，
+    一定比新写的旧——这是时间线本身，不是猜；序号缺失按 -1 算。
+    raw 和规整过的都能传。
+    """
+    meta = _normalize_metadata(metadata)
+    when = _parse_created_at(meta.get("created_at"))
+    if when is None:
+        when = datetime.min.replace(tzinfo=timezone.utc)
+    seq = meta.get("write_seq")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        seq = -1
+    return (when, seq)
+
+
+def _resolve_conflict(old_metadata, new_metadata):
+    """新旧两条记忆打架时，时间戳 + 可信度怎么判（纯函数，不动库）。
+
+    判法：
+    - 两条都没有时间戳、或时间戳 + 序号全撞：真分不出先后，问 BOOS。
+      （只有一边缺时间戳不问：缺的那条一定是时间戳功能上线之前存的，
+      一定比新写的旧——这是时间线本身，不是猜。）
+    - 新的可信度比旧的低：旧的赢，新记忆挂起来“待确认”（pending_new），
+      不覆盖——时间戳再新也没用，新旧管不了覆盖资格。
+    - 新的可信度比旧的高：新的胜出，旧的标“被取代”（supersede_old）。
+    - 同级：新的胜出，旧的标“被取代”；但新记忆比旧的还早（迟到的
+      旧写入）时不覆盖，旧的留着（keep_old）。
+    - 核心记忆钉住不动：核心记忆都是用户已确认的（见 _is_core_memory），
+      可信度最高，模型推断（最低档）永远判成 pending_new——上面
+      “新低旧高”那条已经盖住了，这里不用再单列。
+    返回 {"winner": "old" | "new" | "ask",
+           "action": "supersede_old" | "pending_new" | "keep_old" | "ask",
+           "reason": 给人看的一句话}。
+    注意：这个函数只“判”，不“认”——它不管两条记忆是不是同一件事。
+    “是不是同一件事”由调用方按各自的证据定：同槽位就是同一件事
+    （_upsert_slot_memory）；纠正是 BOOS 亲口指的（correct_memory）；
+    提取后守卫只凭关键词重合找“同一话题”的邻居（_apply_coverage_guard），
+    所以同级的新胜出在那里不自动标被取代——关键词重合分不出
+    “同一条事实的新版本”还是“同一话题的不同事实”（“喜欢喝咖啡”
+    和“喜欢喝拿铁”能同时是真的），宁可不标，不标错。等以后有模型判
+    “同一事实”时，再把 supersede_old 接到提取后守卫上。
+    """
+    old = _normalize_metadata(old_metadata)
+    new = _normalize_metadata(new_metadata)
+    old_rank = _credibility_rank(old)
+    new_rank = _credibility_rank(new)
+    old_key = _memory_order_key(old)
+    new_key = _memory_order_key(new)
+    if old.get("created_at") is None and new.get("created_at") is None:
+        return {
+            "winner": "ask",
+            "action": "ask",
+            "reason": "两条记忆都没有时间戳，分不出先后，请 BOOS 定。",
+        }
+    if old_key == new_key:
+        return {
+            "winner": "ask",
+            "action": "ask",
+            "reason": "两条记忆时间戳和序号都一样，分不出先后，请 BOOS 定。",
+        }
+    if new_rank < old_rank:
+        return {
+            "winner": "old",
+            "action": "pending_new",
+            "reason": "新记忆可信度比旧的低，不能直接覆盖，挂起来待确认。",
+        }
+    if new_rank > old_rank:
+        return {
+            "winner": "new",
+            "action": "supersede_old",
+            "reason": "新记忆可信度比旧的高，新的胜出，旧的标被取代。",
+        }
+    if new_key > old_key:
+        return {
+            "winner": "new",
+            "action": "supersede_old",
+            "reason": "同一级别，新的胜出，旧的标被取代。",
+        }
+    return {
+        "winner": "old",
+        "action": "keep_old",
+        "reason": "同一级别，但新记忆比旧的还早，不覆盖。",
+    }
+
+
+# 以后留的位置（第二步衰减 / 删除时再用，第一步不实现，只把名字占住，
+# 免得以后各写各的、又要迁移一次）：
+#   - "importance"（重要性，high/normal/low）：和用得多不多分开算——
+#     低频不等于低价值（原则②）；衰减速度看 importance，不看调用次数。
+#     钉住的核心记忆 importance=high、衰减是零。
+#   - "superseded"（被取代标记，bool）：同级新胜出时旧记忆标上，原话保留；
+#     第一步里只有 _resolve_conflict 会判，真正标上去要等模型能判断
+#     “同一条事实”时再接（见 _resolve_conflict 注释）。
+#   - 真删前检查（原则③）：删之前查三样——是不是核心记忆、是不是
+#     BOOS 明确让记的、有没有别的记忆连着它；有一条不满足就继续
+#     归档、不删。delete_memory() 现在不改。
 
 
 # ---------- 关键词补充信号（从 v1 main.py 搬过来，只做补充用） ----------
@@ -1742,19 +2006,30 @@ class Mem0Store:
 
         调 mem0.add 提取本轮对话、去重、存入；提取出的记忆里万一
         还带着敏感信息，_drop_sensitive_results 会再删掉。
+        再过一道覆盖守卫（_apply_coverage_guard）：刚提取出的推断记忆
+        别把 BOOS 确认过的事实顶掉——守卫要拿提取前的库快照找邻居，
+        所以快照在调 mem0.add 之前拍（快照里没有本次新存的，就不会
+        把新记忆和自己/同一批的兄弟认成邻居）。
         失败时返回 {}，绝不抛异常——存记忆失败不能把聊天回答搞崩。
         """
+        try:
+            before = self.get_all(include_sensitive=True)
+        except Exception:
+            logger.warning("提取前快照失败：本次不做覆盖守卫。", exc_info=True)
+            before = []
+        metadata = _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
         try:
             result = self._mem0_add(
                 safe_messages,
                 self.user_id,
                 True,
-                _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False),
+                metadata,
             )
         except Exception:
             logger.warning("mem0 自动存记忆失败：本轮对话未存入长期记忆。", exc_info=True)
             return {}
-        return self._drop_sensitive_results(result or {})
+        result = self._drop_sensitive_results(result or {})
+        return self._apply_coverage_guard(result, before, metadata)
 
     # ---------- Plan C：待定区提交 + 同槽位 UPDATE + 身份种子 ----------
 
@@ -2320,6 +2595,94 @@ class Mem0Store:
         filtered["results"] = kept
         return filtered
 
+    # 提取后守卫用的关键词门槛：和检索补充信号（KEYWORD_MIN_WEIGHT=2）
+    # 不是同一把尺子——守卫一旦拦下就要挂起来、以后真用上时问 BOOS，
+    # 多拦的代价是以后多问一句，所以宁严不宽：新记忆和旧记忆至少
+    # 共享两个两字词（或一个更长的共有词）才算“同一话题”。
+    # 例子：新记忆“数据库改成 PostgreSQL”和旧记忆“数据库用 SQLite”
+    # 共享“数据”“据库”，权重 2+2=4，刚好够；只共享一个词（比如只
+    # 共享“预算”）的，不拦——那点重合说明不了是同一件事。
+    _COVERAGE_GUARD_MIN_WEIGHT = 4
+
+    def _apply_coverage_guard(self, results, before_items, new_metadata):
+        """提取后覆盖守卫：刚提取出的推断记忆，别把 BOOS 确认过的事实顶掉。
+
+        只处理一种情况：新记忆是推断的（inferred），而库里已经有一条
+        同一话题（关键词重合 ≥ _COVERAGE_GUARD_MIN_WEIGHT，和检索
+        补充信号同一类尺子、但更严）的用户已确认记忆——这时新记忆
+        不能直接当成事实，改标“待确认”挂起来（metadata 里
+        pending_confirmation=True，时间戳和序号原样保留），旧记忆
+        原封不动；只有真用上时才问 BOOS（问的那一步以后再接，
+        先挂起来——挂起来本身就有用：面板上看得到，主流程里它
+        本来就是 inferred、不会被当成确认过的事实）。
+        同级冲突在这里不自动标“被取代”：关键词重合分不出“同一条事实
+        的新版本”还是“同一话题的不同事实”，宁可不标，不标错（见
+        _resolve_conflict 注释）。用户亲口说的（记住/纠正/槽位）不走
+        这里——那是 BOOS 本人的话，可信度最高，不该被守卫拦。
+        before_items：提取前库里的记忆快照（get_all 的结果），用来找邻居、
+        也防止新记忆和自己/同一批的兄弟互相认成邻居。
+        new_metadata：本次提取传给 mem0.add 的那份 metadata（兄弟们共用
+        的同一份），打待确认标记时在它的基础上加 pending_confirmation，
+        时间戳和序号原样保留。
+        返回：标注过的结果字典（没拦下任何东西时原样返回；结果里被拦下
+        的那条多一个 "pending_confirmation": True，调用方不用再查库）。
+        拦下/失败只记日志（不记内容），绝不抛异常——守卫坏了不能把
+        聊天回答搞崩。标记打不上（底层 update 不支持 metadata）时，
+        记忆本身还在，只丢了标记，记一条警告。
+        """
+        items = (results or {}).get("results") or []
+        if not items or not before_items:
+            return results
+        base_meta = dict(new_metadata or {})
+        held = []
+        for item in items:
+            new_text = (item or {}).get("memory") or ""
+            mem_id = (item or {}).get("id")
+            if not new_text or not mem_id:
+                continue
+            keywords = _extract_keywords(new_text)
+            if not keywords:
+                continue
+            for old in before_items:
+                old_meta = (old or {}).get("metadata") or {}
+                if not _is_core_memory(old_meta):
+                    continue
+                old_text = (old or {}).get("text") or ""
+                weight, _matched = _keyword_weight(old_text, keywords)
+                if weight < self._COVERAGE_GUARD_MIN_WEIGHT:
+                    continue
+                resolution = _resolve_conflict(old_meta, base_meta)
+                if resolution.get("action") != "pending_new":
+                    continue
+                try:
+                    try:
+                        self._memory.update(
+                            memory_id=mem_id,
+                            text=new_text,
+                            metadata={
+                                **base_meta,
+                                "pending_confirmation": True,
+                            },
+                        )
+                    except TypeError:
+                        logger.warning(
+                            "覆盖守卫：底层 update 不支持 metadata 参数，"
+                            "待确认标记没打上。"
+                        )
+                        self._memory.update(memory_id=mem_id, text=new_text)
+                except Exception:
+                    logger.warning("覆盖守卫：打待确认标记失败。", exc_info=True)
+                    continue
+                item["pending_confirmation"] = True
+                held.append(mem_id)
+                break
+        if held:
+            logger.info(
+                "提取后守卫：%d 条推断记忆撞上 BOOS 确认过的事实，已标待确认。",
+                len(held),
+            )
+        return results
+
     def _add_text_with_metadata(self, text, metadata):
         """原文存一条记忆（infer=False），带上来源元数据。
 
@@ -2454,7 +2817,13 @@ class Mem0Store:
             created_at = item.get("date") if isinstance(item.get("date"), str) else None
             result = self._add_text_with_metadata(
                 text,
-                _provenance(SOURCE_USER, CONFIDENCE_USER, True, created_at=created_at),
+                _provenance(
+                    SOURCE_USER,
+                    CONFIDENCE_USER,
+                    True,
+                    created_at=created_at,
+                    created_at_source="migrated",
+                ),
             )
             if result and not result.get("duplicate"):
                 added += 1
@@ -2496,6 +2865,69 @@ class Mem0Store:
         if added:
             logger.info("已记录 %d 条初始记忆。", added)
         return added
+
+    def backfill_timestamps(self):
+        """给没有时间戳的老记忆补时间戳（第一步的一次性迁移）。
+
+        只补缺的：created_at 不是非空字符串的才补；补的时候时间戳用
+        新鲜的单调时间（_now_iso），created_at_source 记 "backfilled"——
+        诚实标明这是后补的，不是原来就有的；其他 metadata（来源、
+        置信度、是否确认、槽位）原样保留，绝不因为补时间就把可信度
+        抬上去（后补的时间戳不能让一条没确认的记忆变成已确认）。
+        幂等：补过的不会再补，重复调也没事。失败只记日志、不抛异常，
+        返回补了几条（-1 表示连库都读不出来）。
+        网页服务启动时调一次（web/server.py）；命令行“记住”不调——
+        后补是一次性的事，服务启动时补完就够了，平时不用反复跑。
+        """
+        with _WRITE_LOCK:
+            try:
+                raw = self._memory.get_all(filters={"user_id": self.user_id})
+            except Exception:
+                logger.warning("补时间戳：读记忆库失败，本次不补。", exc_info=True)
+                return -1
+            items = (raw or {}).get("results") or []
+            backfilled = 0
+            for item in items:
+                mem_id = (item or {}).get("id")
+                text = (item or {}).get("memory") or ""
+                if not mem_id or not text:
+                    continue
+                raw_meta = (item or {}).get("metadata")
+                if (
+                    isinstance(raw_meta, dict)
+                    and isinstance(raw_meta.get("created_at"), str)
+                    and raw_meta.get("created_at")
+                ):
+                    continue
+                new_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+                new_meta["created_at"] = _now_iso()
+                new_meta["created_at_source"] = "backfilled"
+                new_meta["write_seq"] = _next_write_seq()
+                try:
+                    try:
+                        self._memory.update(
+                            memory_id=mem_id, text=text, metadata=new_meta
+                        )
+                    except TypeError:
+                        # 老版本 update 不支持 metadata 参数：退一步只传
+                        # text（文本不变），再记一条警告——时间戳没补上，
+                        # 下次启动还会再试，不丢记忆。
+                        logger.warning(
+                            "补时间戳：底层 update 不支持 metadata 参数，"
+                            "时间戳没补上。"
+                        )
+                        self._memory.update(memory_id=mem_id, text=text)
+                        continue
+                except Exception:
+                    logger.warning("补时间戳：更新记忆失败，已跳过。", exc_info=True)
+                    continue
+                backfilled += 1
+            if backfilled:
+                logger.info(
+                    "补时间戳：给 %d 条老记忆补了时间戳（标记为后补）。",
+                    backfilled,
+                )
+            return backfilled
 
     # ---------- 纠错（改）与深度删除（忘） ----------
     # 改和忘是两件不同的事，别搞混：
@@ -3004,6 +3436,8 @@ class Mem0Store:
                             else CONFIDENCE_INFERRED,
                             bool(old_metadata.get("user_confirmed")),
                             created_at=old_metadata.get("created_at"),
+                            created_at_source=old_metadata.get("created_at_source")
+                            or "written",
                             slot=old_metadata.get("slot"),
                         )
                     )

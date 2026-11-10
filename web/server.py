@@ -804,6 +804,15 @@ def main(argv=None):
                 print(f"长期记忆已确认：{', '.join(added)}。", flush=True)
         except Exception:
             logger.warning("种身份记忆失败：本次不带名字/SOUL 记忆启动。", exc_info=True)
+        # 第一步（2026-11-10）：给时间戳功能上线之前存的老记忆补时间戳
+        # （只补缺的，标记为后补，来源/可信度原样不动；失败只记日志、
+        # 不拦启动；补过的下次不再补）。
+        try:
+            backfilled = mem0_store.backfill_timestamps()
+            if backfilled and backfilled > 0:
+                print(f"长期记忆：给 {backfilled} 条老记忆补了时间戳。", flush=True)
+        except Exception:
+            logger.warning("补记忆时间戳失败：本次不补。", exc_info=True)
     # 对话摘要：常驻服务启动时建一个 ConversationSummaryStore（只建一次），
     # 每轮后历史超上限就总结压缩、记一笔最近对话，开新对话/停服务时总结保存。
     # 建不好时不带摘要运行，服务照常启动。
