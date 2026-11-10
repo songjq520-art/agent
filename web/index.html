@@ -297,6 +297,21 @@
   .approval-actions { display: flex; gap: 8px; margin-top: 10px; }
   .approval-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
 
+  /* ---------- 等你点头的横幅 ---------- */
+  /* 有没点的确认卡时，聊天区顶部显示这一句，点一下滚到那张卡。
+     平时藏起来（hidden），有卡时才显示；卡点完了、过期了就再藏起来。
+     样式和确认卡保持一致（白底、细边框、左边一条竖线）。 */
+  .approval-banner {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn, #d97706);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    font-size: 14px; font-weight: 700; line-height: 1.7;
+    cursor: pointer;
+  }
+
   /* ---------- 聊天顶部的摘要卡片 ---------- */
   /* 点开一段旧对话 / 开新对话时，顶部显示这段对话之前聊过什么：
      灰底小卡片，样式和 .mem-box 保持一致（白字不用，灰底 + 细边框）。
@@ -355,6 +370,9 @@
         <div class="topbar-sub" id="topStatus">正在连接…</div>
       </div>
     </div>
+
+    <!-- 有没点的确认卡时显示，点一下滚到那张卡；平时藏起来。 -->
+    <div class="approval-banner" id="approvalBanner" hidden>有一条等你点头</div>
 
     <div class="chat" id="chat">
       <div class="welcome">
@@ -592,6 +610,20 @@
   // 卡片只按 approval_id 显示一次；刷新页面后没点的卡会从
   // /api/approvals/pending 里再找回来（refreshPendingApprovals）。
   const shownApprovals = new Set();
+  const approvalBanner = document.getElementById('approvalBanner');
+
+  // 横幅：有没点的卡就显示“有一条等你点头”，没卡就藏起来。
+  function setApprovalBannerVisible(visible) {
+    approvalBanner.hidden = !visible;
+  }
+
+  // 点横幅：回到聊天区，先把没点的卡找回来，再滚到第一张卡跟前。
+  approvalBanner.addEventListener('click', async () => {
+    if (chatEl.hidden) showChatPanel();
+    await refreshPendingApprovals();
+    const firstCard = document.querySelector('.approval');
+    if (firstCard) firstCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
 
   function renderApproval(needs) {
     const approvalId = (needs || {}).approval_id || '';
@@ -623,6 +655,8 @@
     wrap.appendChild(box);
     chatEl.appendChild(wrap);
     chatEl.scrollTop = chatEl.scrollHeight;
+    // 新卡画出来了，横幅也亮起来。
+    setApprovalBannerVisible(true);
   }
 
   async function decideApproval(needs, decision, box) {
@@ -655,13 +689,18 @@
     }
     refreshStatus();
     refreshRecent();
+    // 点完一张卡：再拉一次没点的卡，有下一张就亮着横幅、没了就藏起来。
+    refreshPendingApprovals();
   }
 
   async function refreshPendingApprovals() {
     try {
       const res = await fetch('/api/approvals/pending');
       const data = await res.json();
-      (data.approvals || []).forEach((item) => {
+      const approvals = data.approvals || [];
+      // 有没点的卡就亮横幅，没卡（都点了或都过期了）就藏起来。
+      setApprovalBannerVisible(approvals.length > 0);
+      approvals.forEach((item) => {
         if (item.approval) renderApproval({ ...item.approval, task_id: item.task_id });
       });
     } catch (e) {

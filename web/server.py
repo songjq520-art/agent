@@ -36,7 +36,8 @@
 #                        不会执行第二次。
 #   GET  /api/approvals/pending → 所有等确认的任务（JSON
 #                        {"approvals": [{task_id, goal, approval}]}），
-#                        刷新页面后还能找回没点的卡。
+#                        刷新页面后还能找回没点的卡；已经过期的卡不列
+#                        （10 分钟没点，点了也没用）。
 #   POST /api/reset   → 开新对话：先把当前对话总结保存，再清空历史，
 #                        返回 {"ok": true}。
 #   GET  /api/conversations → 最近对话列表（JSON {"conversations": [...]}，
@@ -440,7 +441,13 @@ class ChatState:
     def list_pending_approvals(self):
         """所有等确认的任务（给页面刷新时用）：每条带 task_id、原话 goal
         和确认记录（approval_id、工具名、参数、风险、过期时间）。
+        已经过期的卡不列出来：10 分钟没点的卡点了也没用（网关的
+        resolve_approval 里过期检查会拦），列出来只会让人再点一次、
+        再看一次“已过期”。过期判断和网关用同一个 approval_expired，
+        不各写一套。
         读失败时返回空列表，页面显示“没有等确认的”，不拦聊天。"""
+        from tasks.task_store import approval_expired  # noqa: E402
+
         with self._lock:
             try:
                 tasks = self.task_store.list_waiting()
@@ -450,6 +457,14 @@ class ChatState:
             waiting = []
             for task in tasks:
                 approval = task.get("approval") or {}
+                try:
+                    expired = approval_expired(approval)
+                except (KeyError, TypeError, ValueError):
+                    # 确认记录里没有能用的过期时间：宁可列出来让人看到、
+                    # 点了再由网关判，也不在列表里悄悄藏掉一张卡。
+                    expired = False
+                if expired:
+                    continue
                 waiting.append(
                     {
                         "task_id": task.get("task_id"),

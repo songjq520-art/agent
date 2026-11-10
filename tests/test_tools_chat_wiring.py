@@ -828,3 +828,64 @@ def test_chat_state_resolve_cancel_tells_model_declined(monkeypatch, tmp_path, s
     assert seen["user_declined"] is True
     assert seen["pending_tool_result"] is None
     assert _CONFIRM_CALLS == []
+
+
+# ---------- （复查补修）过期卡不列出、横幅 ----------
+
+def test_pending_list_hides_expired_approval(store, gateway):
+    """（复查补修 1）列表不列过期的卡：10 分钟没点的卡刷新页面也不
+    显示，只列还没过期的；点了过期的卡还是网关那道过期检查在拦。"""
+    from web.server import ChatState
+
+    # 一张过期的卡（过期时间改到过去，模拟 10 分钟没人点）。
+    expired = make_task(goal="写个旧文件", model="deepseek-flash")
+    expired_approval = make_approval(
+        "test_confirm_tool", {"path": "old.txt"}, "call_old", "medium"
+    )
+    expired_approval["expires_at"] = "2000-01-01T00:00:00+00:00"
+    expired["approval"] = expired_approval
+    expired["status"] = "WAITING_APPROVAL"
+    store.save(expired)
+    # 一张没过期的卡。
+    fresh = make_task(goal="写个新文件", model="deepseek-flash")
+    outcome = gateway.execute(
+        "test_confirm_tool", {"path": "new.txt"},
+        task_id=fresh["task_id"], trace_id=fresh["trace_id"],
+        tool_call_id="call_new",
+    )
+    assert outcome["decision"] == "needs_approval"
+    fresh["approval"] = outcome["approval"]
+    fresh["status"] = "WAITING_APPROVAL"
+    store.save(fresh)
+
+    state = ChatState(task_store=store, tool_gateway=gateway)
+    listed = state.list_pending_approvals()
+    listed_ids = [item["approval"]["approval_id"] for item in listed]
+    assert len(listed) == 1
+    assert outcome["approval"]["approval_id"] in listed_ids
+    assert expired_approval["approval_id"] not in listed_ids
+
+
+def test_pending_banner_text_and_wiring():
+    """（复查补修 2）横幅：页面上有“有一条等你点头”这句，点一下滚到
+    第一张卡；没点的卡列表一变，横幅跟着亮/藏；卡上“10 分钟内没点
+    就按取消处理”那句还在。只做页面静态检查（真正的点按由 BOOS
+    在浏览器里验，和仓库里其他页面测试一个做法）。"""
+    from pathlib import Path
+
+    html = (Path(__file__).resolve().parent.parent / "web" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        '<div class="approval-banner" id="approvalBanner" hidden>有一条等你点头</div>'
+        in html
+    )
+    # 点横幅：先把没点的卡找回来，再滚到第一张卡跟前。
+    assert "approvalBanner.addEventListener('click'" in html
+    assert "document.querySelector('.approval')" in html
+    # 列表里有卡就亮横幅，没卡（都点了或都过期了）就藏起来。
+    assert "const approvals = data.approvals || [];" in html
+    assert "setApprovalBannerVisible(approvals.length > 0)" in html
+    # 新卡画出来时也亮横幅；点完一张卡后也再拉一次列表重算。
+    assert "setApprovalBannerVisible(true)" in html
+    assert "10 分钟内没点就按取消处理" in html
