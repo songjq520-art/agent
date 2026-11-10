@@ -43,6 +43,15 @@ memory/delete-journal.json
 memory/mem0_versions.json
 memory/memories-backup-*.json
 
+# 工具循环的任务状态（进行中的任务、等确认的卡，只保存在本地，不上传）
+# 注意：只忽略 tasks.json 数据文件和原子写入的临时文件，
+#       任务存储的代码（task_store.py、__init__.py）要上传。
+tasks/tasks.json
+tasks/tasks.json.tmp
+
+# 工具审计日志（只保存在本地，不上传）
+.audit/
+
 # 临时文件
 *.tmp
 *.log

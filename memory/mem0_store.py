@@ -1481,7 +1481,7 @@ class Mem0Store:
                         prompt_tokens / 1_000_000 * price_in
                         + completion_tokens / 1_000_000 * price_out
                     )
-                    tracker.add_cost(cost, model=LLM_MODEL)
+                    tracker.add_cost(cost, model=LLM_MODEL, ledger="chat")
                 except Exception:
                     logger.warning("mem0 用量记录失败：本次提取调用未记账。", exc_info=True)
                 return resp

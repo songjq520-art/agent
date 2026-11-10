@@ -20,7 +20,23 @@
 #                        返回 JSON {"reply": 回答, "model": 模型名,
 #                        "mode": "real" 或 "demo", "cost_usd": 成本,
 #                        "usage": Token 用量}；
+#                        工具循环停在确认卡上时返回
+#                        {"mode": "waiting_approval",
+#                         "needs_approval": {task_id, approval_id, tool,
+#                         args, risk_level, expires_at}}，本轮不写历史、
+#                         不存记忆，等确认结果回来再恢复；
 #                        出错时返回 {"error": 原因}。
+#   POST /api/chat/confirm → 处理一张确认卡，请求 JSON
+#                        {"task_id": 任务 id, "approval_id": 确认编号,
+#                         "decision": "confirm"（确认执行）或 "cancel"（取消）}，
+#                        确认了就执行存着的参数、把停住的那轮跑完，
+#                        返回和 /api/chat 成功时一样的字典；
+#                        取消了也跑完（模型按“用户没同意”继续答）。
+#                        已经处理过、超时、参数被改过时回 409 + 原因，
+#                        不会执行第二次。
+#   GET  /api/approvals/pending → 所有等确认的任务（JSON
+#                        {"approvals": [{task_id, goal, approval}]}），
+#                        刷新页面后还能找回没点的卡。
 #   POST /api/reset   → 开新对话：先把当前对话总结保存，再清空历史，
 #                        返回 {"ok": true}。
 #   GET  /api/conversations → 最近对话列表（JSON {"conversations": [...]}，
@@ -144,11 +160,18 @@ class ChatState:
     记忆数据只保存在本地（memory/mem0_chroma/ + memory/history.db），不上传。
     """
 
-    def __init__(self, budget_tracker=None, mem0_store=None, summary_store=None):
+    def __init__(self, budget_tracker=None, mem0_store=None, summary_store=None,
+                 tool_gateway=None, task_store=None, search_service=None):
         self.tracker = budget_tracker or BudgetTracker()
         self.messages = []
         self.mem0_store = mem0_store
         self.summary_store = summary_store
+        # 工具循环用的网关、任务存储、搜索服务：不传时第一次用才建
+        # （懒加载——服务启动时不建任务文件、不碰搜索服务的 Key）；
+        # 测试时传假的进来。
+        self._tool_gateway = tool_gateway
+        self._task_store = task_store
+        self._search_service = search_service
         # _lock（并发锁）：服务用 ThreadingHTTPServer，每个请求一个线程。
         # 没有这把锁，两个 /api/chat 同时跑会互相污染历史（你问你的、他答他的，
         # 追加顺序乱掉），还可能同时通过预算检查、多记一笔费用。
@@ -156,6 +179,30 @@ class ChatState:
         # 等一会儿没关系，顺序和预算不会错。调用模型时会一直拿着锁，
         # 期间别的请求（包括看状态、清空）会等一等，这是为了保证一致性。
         self._lock = threading.Lock()
+
+    @property
+    def tool_gateway(self):
+        """工具网关（懒加载）：第一次用时才建，测试可注入假的。"""
+        if self._tool_gateway is None:
+            from tools.tool_gateway import ToolGateway
+
+            self._tool_gateway = ToolGateway()
+        return self._tool_gateway
+
+    @property
+    def task_store(self):
+        """任务存储（懒加载）：第一次用时才建，测试可注入假的。"""
+        if self._task_store is None:
+            from tasks.task_store import TaskStore
+
+            self._task_store = TaskStore()
+        return self._task_store
+
+    @property
+    def search_service(self):
+        """搜索服务：不传时为 None，循环自己建一个带翻译器的；
+        测试时传假服务进来。"""
+        return self._search_service
 
     def reset(self):
         """开新对话：先把当前对话总结保存，再清空历史、换一条空记录。
@@ -239,13 +286,27 @@ class ChatState:
                 return ""
 
     def status(self):
-        """给页面状态栏用的：模型状态 + 本月预算使用情况 + 记忆是否启用。"""
+        """给页面状态栏用的：模型状态 + 本月预算使用情况 + 记忆是否启用。
+
+        预算分两账本显示（BOOS 2026-11-11 定）：工具账本（tool_cost_usd，
+        上限 $5）和聊天账本（chat_cost_usd，不设限），同时给人民币换算
+        （汇率见 config.USD_CNY_RATE）。老键 monthly_budget_usd /
+        total_cost_usd / remaining_usd 保留兼容：remaining_usd 现在是
+        工具账本剩下的预算（$5 减工具账本），不是总数剩下的。
+        """
         with self._lock:
+            summary = self.tracker.budget_summary_cny()
             return {
                 "model_status": get_model_status(),
                 "monthly_budget_usd": MONTHLY_BUDGET_USD,
                 "total_cost_usd": round(self.tracker.total_cost_usd, 6),
                 "remaining_usd": round(self.tracker.remaining_usd(), 6),
+                "tool_cost_usd": round(self.tracker.tool_cost_usd, 6),
+                "chat_cost_usd": round(self.tracker.chat_cost_usd, 6),
+                "tool_cost_cny": summary["tool_cost_cny"],
+                "chat_cost_cny": summary["chat_cost_cny"],
+                "tool_budget_cap_cny": summary["tool_budget_cap_cny"],
+                "usd_cny_rate": summary["usd_cny_rate"],
                 "budget_corrupted": bool(getattr(self.tracker, "corrupted", False)),
                 "unknown_cost": bool(self.tracker.unknown_cost),
                 "mem0_enabled": self.mem0_store is not None,
@@ -294,6 +355,10 @@ class ChatState:
                 budget_tracker=self.tracker,
                 messages=self.messages,
                 summary_store=self.summary_store,
+                tool_gateway=self.tool_gateway,
+                task_store=self.task_store,
+                search_service=self.search_service,
+                original_prompt=prompt,
             )
             if outcome["mode"] == "demo":
                 return {
@@ -303,38 +368,192 @@ class ChatState:
                     "cost_usd": None,
                     "usage": None,
                 }
+            if outcome["mode"] == "waiting_approval":
+                # 工具循环停在确认卡上：本轮还没答完，历史、摘要、记忆
+                # 都不动；任务已经存盘了，页面按 needs_approval 显示确认卡，
+                # BOOS 点了之后走 /api/chat/confirm 恢复。
+                approval = outcome["approval"] or {}
+                return {
+                    "reply": "",
+                    "model": None,
+                    "mode": "waiting_approval",
+                    "cost_usd": outcome.get("cost_usd"),
+                    "usage": None,
+                    "needs_approval": {
+                        "task_id": (outcome["task"] or {}).get("task_id"),
+                        "approval_id": approval.get("approval_id"),
+                        "tool": approval.get("tool"),
+                        "args": approval.get("args"),
+                        "risk_level": approval.get("risk_level"),
+                        "expires_at": approval.get("expires_at"),
+                    },
+                }
             result = outcome["result"]
-            self.messages.append({"role": "user", "content": prompt})
-            self.messages.append({"role": "assistant", "content": result["text"]})
-            # 对话摘要：历史超上限就总结压缩一次，再把本轮记进最近对话列表；
-            # 失败只记日志、不拦聊天。
-            if self.summary_store is not None:
-                try:
-                    self.summary_store.maybe_compact(self.messages)
-                    self.summary_store.sync(self.messages)
-                except Exception:
-                    logger.warning("对话摘要更新失败。", exc_info=True)
-            # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
-            # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
-            # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
-            # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
-            # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
-            # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
-            # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
-            correction = None
-            if self.mem0_store is not None:
-                saved = self.mem0_store.add_turn(self.messages[-_MEMORY_SAVE_HISTORY_MAX:])
-                if isinstance(saved, dict):
-                    correction = saved.get("correction")
-            response = {
-                "reply": result["text"],
-                "model": result["model"],
-                "mode": "real",
-                "cost_usd": result.get("cost_usd"),
-                "usage": result.get("usage"),
-            }
-            if correction is not None:
-                response["correction"] = correction
+            return self._finish_turn_locked(
+                prompt,
+                result["text"],
+                result["model"],
+                result.get("cost_usd"),
+                result.get("usage"),
+            )
+
+    def _finish_turn_locked(self, prompt, reply_text, model_name, cost_usd, usage):
+        """一轮问答答完了的收尾（调用方已拿着锁）：把本轮问答追加进历史、
+        更新对话摘要、存进长期记忆。返回给页面展示的字典。
+        ask() 和 resolve_approval() 共用这一段，保证确认恢复后的那轮
+        和普通那轮收尾一模一样：只存 BOOS 的原话 + 最后的回答，
+        工具中间结果不进历史、不进记忆。
+        """
+        self.messages.append({"role": "user", "content": prompt})
+        self.messages.append({"role": "assistant", "content": reply_text})
+        # 对话摘要：历史超上限就总结压缩一次，再把本轮记进最近对话列表；
+        # 失败只记日志、不拦聊天。
+        if self.summary_store is not None:
+            try:
+                self.summary_store.maybe_compact(self.messages)
+                self.summary_store.sync(self.messages)
+            except Exception:
+                logger.warning("对话摘要更新失败。", exc_info=True)
+        # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
+        # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
+        # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
+        # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
+        # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
+        # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
+        # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
+        correction = None
+        if self.mem0_store is not None:
+            saved = self.mem0_store.add_turn(self.messages[-_MEMORY_SAVE_HISTORY_MAX:])
+            if isinstance(saved, dict):
+                correction = saved.get("correction")
+        response = {
+            "reply": reply_text,
+            "model": model_name,
+            "mode": "real",
+            "cost_usd": cost_usd,
+            "usage": usage,
+        }
+        if correction is not None:
+            response["correction"] = correction
+        return response
+
+    def list_pending_approvals(self):
+        """所有等确认的任务（给页面刷新时用）：每条带 task_id、原话 goal
+        和确认记录（approval_id、工具名、参数、风险、过期时间）。
+        读失败时返回空列表，页面显示“没有等确认的”，不拦聊天。"""
+        with self._lock:
+            try:
+                tasks = self.task_store.list_waiting()
+            except Exception:
+                logger.warning("读等确认的任务失败。", exc_info=True)
+                return []
+            waiting = []
+            for task in tasks:
+                approval = task.get("approval") or {}
+                waiting.append(
+                    {
+                        "task_id": task.get("task_id"),
+                        "goal": task.get("goal") or "",
+                        "approval": {
+                            "approval_id": approval.get("approval_id"),
+                            "tool": approval.get("tool"),
+                            "args": approval.get("args"),
+                            "risk_level": approval.get("risk_level"),
+                            "expires_at": approval.get("expires_at"),
+                        },
+                    }
+                )
+            return waiting
+
+    def resolve_approval(self, task_id, approval_id, decision):
+        """处理 BOOS 对一张确认卡的决定（确认执行 / 取消），再把停住的那轮跑完。
+
+        参数 decision："confirm"（确认执行）或 "cancel"（取消）。
+        先让网关处理确认（原子抢占 + 只执行存着的参数，见
+        tools/tool_gateway.py 的 resolve_approval），再调 run_question
+        恢复循环跑完：确认了就把工具结果喂回去接着跑，取消了就告诉模型
+        “用户没同意”再接着跑。跑完后的收尾和 ask() 一模一样
+        （写历史、更新摘要、存记忆，只存原话 + 最后回答）。
+        返回：跑完了时和 ask() 成功时一样的字典（多一个 "ok": True）；
+        确认被拒绝时（已经处理过、超时、参数被改过）返回
+        {"ok": False, "reason": 原因}，调用方按 409 回给页面；
+        恢复后又停在下一张确认卡上时返回 waiting_approval 字典
+        （多一个 "ok": True），页面再显示下一张卡。
+        调用失败时（模型调用报错）直接抛 RuntimeError，调用方转成错误返回。
+        已知限制（第一版不修）：BOOS 在一张卡等确认时又发了新消息，
+        之后再点确认，恢复的那轮会追加在新消息后面——顺序上旧轮在后，
+        不影响回答本身，页面上看起来是旧回答晚到了。
+        """
+        with self._lock:
+            task = self.task_store.load(task_id)
+            if task is None:
+                # task_id 对不上时再按 approval_id 找一次（页面可能拿的是旧卡）。
+                task = self.task_store.find_by_approval(approval_id)
+                if task is None:
+                    return {"ok": False, "reason": f"找不到任务：{task_id}。"}
+                task_id = task["task_id"]
+            resolved = self.tool_gateway.resolve_approval(
+                self.task_store, task_id, approval_id, decision
+            )
+            if resolved["decision"] == "rejected":
+                return {"ok": False, "reason": resolved["reason"]}
+            goal = (resolved.get("task") or {}).get("goal") or task.get("goal") or ""
+            if resolved["decision"] == "cancelled":
+                outcome = run_question(
+                    goal,
+                    budget_tracker=self.tracker,
+                    messages=self.messages,
+                    summary_store=self.summary_store,
+                    tool_gateway=self.tool_gateway,
+                    task_store=self.task_store,
+                    search_service=self.search_service,
+                    resume_task=resolved["task"],
+                    user_declined=True,
+                    original_prompt=goal,
+                )
+            else:  # 确认执行了
+                outcome = run_question(
+                    goal,
+                    budget_tracker=self.tracker,
+                    messages=self.messages,
+                    summary_store=self.summary_store,
+                    tool_gateway=self.tool_gateway,
+                    task_store=self.task_store,
+                    search_service=self.search_service,
+                    resume_task=resolved["task"],
+                    pending_tool_result=resolved["result"],
+                    original_prompt=goal,
+                )
+            if outcome["mode"] == "waiting_approval":
+                # 恢复后又停在下一张确认卡上：同样不写历史，等下一张卡。
+                approval = outcome["approval"] or {}
+                return {
+                    "ok": True,
+                    "reply": "",
+                    "model": None,
+                    "mode": "waiting_approval",
+                    "cost_usd": outcome.get("cost_usd"),
+                    "usage": None,
+                    "needs_approval": {
+                        "task_id": (outcome["task"] or {}).get("task_id"),
+                        "approval_id": approval.get("approval_id"),
+                        "tool": approval.get("tool"),
+                        "args": approval.get("args"),
+                        "risk_level": approval.get("risk_level"),
+                        "expires_at": approval.get("expires_at"),
+                    },
+                }
+            if outcome["mode"] == "demo":
+                return {"ok": False, "reason": "恢复任务时没有可用的模型 Key。"}
+            result = outcome["result"]
+            response = self._finish_turn_locked(
+                goal,
+                result["text"],
+                result["model"],
+                result.get("cost_usd"),
+                result.get("usage"),
+            )
+            response["ok"] = True
             return response
 
     # ---------- 长期记忆管理（“长期记忆”页面用） ----------
@@ -536,6 +755,9 @@ def make_handler(state, authenticator=None):
                 self._send_html()
             elif path == "/api/status":
                 self._send_json(state.status())
+            elif path == "/api/approvals/pending":
+                # 等确认的任务：刷新页面后还能找回没点的卡。
+                self._send_json({"approvals": state.list_pending_approvals()})
             elif path == "/api/conversations":
                 # 最近对话列表：摘要没启用时列表为空，页面显示“暂无对话”。
                 self._send_json({"conversations": state.list_conversations()})
@@ -580,6 +802,47 @@ def make_handler(state, authenticator=None):
                 # 新对话读回的摘要（上一段对话的）一起带上，页面在顶部
                 # 显示摘要卡片；没有摘要时是空串，页面不显示卡片。
                 self._send_json({"ok": True, "summary": state.current_summary()})
+                return
+            if path == "/api/chat/confirm":
+                # 处理一张确认卡：请求 {"task_id", "approval_id",
+                # "decision": "confirm" 或 "cancel"}。
+                # 确认了就执行存着的参数、把停住的那轮跑完；取消了也跑完
+                # （模型按“用户没同意”继续答）。已经处理过、超时、
+                # 参数被改过时回 409 + 原因，不会执行第二次。
+                payload, error, status = self._read_json_body()
+                if error is not None:
+                    self._send_json({"error": error}, status=status)
+                    return
+                task_id = str(payload.get("task_id") or "").strip()
+                approval_id = str(payload.get("approval_id") or "").strip()
+                decision = str(payload.get("decision") or "").strip()
+                if not task_id or not approval_id:
+                    self._send_json(
+                        {"error": "确认卡信息不完整（缺 task_id 或 approval_id）。"},
+                        status=400,
+                    )
+                    return
+                if decision not in ("confirm", "cancel"):
+                    self._send_json(
+                        {"error": "确认决定只认 confirm（确认执行）或 cancel（取消）。"},
+                        status=400,
+                    )
+                    return
+                try:
+                    result = state.resolve_approval(task_id, approval_id, decision)
+                except RuntimeError as exc:
+                    # 服务端日志保留完整异常，方便排查；前端只回通用提示，
+                    # 不把原始异常暴露出去。状态码仍是 502。
+                    traceback.print_exc()
+                    self._send_json({"error": "调用失败，请稍后再试。"}, status=502)
+                    return
+                if not result.get("ok", True):
+                    self._send_json(
+                        {"error": result.get("reason") or "这张确认卡已经处理过了。"},
+                        status=409,
+                    )
+                    return
+                self._send_json(result)
                 return
             if path == "/api/conversations/open":
                 # 回到一段旧对话：请求 {"id": 对话 id}。
@@ -724,7 +987,7 @@ def _is_loopback_host(host):
         return False
 
 
-def create_server(config=None, budget_tracker=None, authenticator=None, mem0_store=None, summary_store=None):
+def create_server(config=None, budget_tracker=None, authenticator=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None):
     """建一个网页服务（不启动），方便测试用临时端口和临时预算文件。
 
     config 是 ServerConfig；不传时用环境变量/默认值（ServerConfig.from_env()）。
@@ -734,6 +997,8 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
     summary_store 是对话摘要库（ConversationSummaryStore），不传时不记摘要；
     传了时，每轮后历史超上限就总结压缩、记一笔最近对话，开新对话时
     总结保存，新对话开始时读回最新摘要当上下文。
+    tool_gateway / task_store / search_service 是工具循环用的网关、
+    任务存储、搜索服务，不传时第一次用才建；测试时可传假的进来。
     测试时可传一个假 store（有 search/add_turn/get_all 方法即可），不碰真实 mem0。
 
     安全保护：监听地址不是本机回环地址（比如 0.0.0.0 或局域网地址），
@@ -753,6 +1018,9 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
         budget_tracker=budget_tracker,
         mem0_store=mem0_store,
         summary_store=summary_store,
+        tool_gateway=tool_gateway,
+        task_store=task_store,
+        search_service=search_service,
     )
     handler = make_handler(state, authenticator=authenticator)
     return ThreadingHTTPServer((config.host, config.port), handler), state

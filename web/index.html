@@ -271,6 +271,32 @@
   .correction-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .btn-small:disabled { opacity: 0.55; cursor: default; }
 
+  /* ---------- 工具确认卡 ---------- */
+  /* 后端 /api/chat 返回 waiting_approval 时在这里展示：样式和纠错提示
+     保持一致（白底、细边框），左边一条醒目的竖线，标明这是“等你确认
+     才执行”的工具调用。参数用等宽字体原样显示，不渲染 Markdown。 */
+  .approval {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn, #d97706);
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 14px; line-height: 1.7;
+    word-break: break-word;
+  }
+  .approval.err { border-left-color: var(--danger); }
+  .approval pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word;
+    margin: 8px 0;
+  }
+  .approval-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .approval-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
   /* ---------- 聊天顶部的摘要卡片 ---------- */
   /* 点开一段旧对话 / 开新对话时，顶部显示这段对话之前聊过什么：
      灰底小卡片，样式和 .mem-box 保持一致（白字不用，灰底 + 细边框）。
@@ -357,7 +383,7 @@
         <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
         <button id="send">发送</button>
       </div>
-      <div class="hint">按 Enter 发送 · 本月预算 $5，到 5 美元提醒一次，永不自动停</div>
+      <div class="hint">按 Enter 发送 · 工具预算 ¥33.35（$5），到 5 美元提醒一次，永不自动停；聊天只记账、不设限</div>
     </div>
   </div>
 
@@ -430,15 +456,19 @@
         .map(([name, v]) => name + '（' + (v.model || '') + (v.has_api_key ? '，已接通' : '，未接 Key') + '）')
         .join('、');
       let text = '模型：' + (models || '无') +
-        '\n本月成本：$' + s.total_cost_usd.toFixed(4) + ' / $' + s.monthly_budget_usd.toFixed(2) +
-        '，剩余 $' + s.remaining_usd.toFixed(4) +
+        // 预算分两账本显示（BOOS 2026-11-11 定）：工具账本上限 ¥33.35（$5），
+        // 聊天账本只记账、不设限；单位用人民币，老字段留着兼容。
+        '\n本月成本：工具 ¥' + (s.tool_cost_cny !== undefined ? s.tool_cost_cny.toFixed(2) : '?') +
+        ' / ¥' + (s.tool_budget_cap_cny !== undefined ? s.tool_budget_cap_cny.toFixed(2) : '33.35') +
+        '，聊天 ¥' + (s.chat_cost_cny !== undefined ? s.chat_cost_cny.toFixed(2) : '?') +
         '\n记忆：' + (s.mem0_enabled ? '已启用' : '未启用');
       if (s.budget_corrupted) text += '\n⚠️ 预算记录异常，已暂停付费调用';
       else if (s.unknown_cost) text += '\n⚠️ 有未核对的未知成本，已暂停付费调用';
       statusEl.textContent = text;
       topStatusEl.textContent = s.budget_corrupted || s.unknown_cost
         ? '已暂停付费调用，请先检查预算'
-        : '本月已用 $' + s.total_cost_usd.toFixed(4) + '，剩余 $' + s.remaining_usd.toFixed(4);
+        : '工具 ¥' + (s.tool_cost_cny !== undefined ? s.tool_cost_cny.toFixed(2) : '?') +
+          ' / ¥' + (s.tool_budget_cap_cny !== undefined ? s.tool_budget_cap_cny.toFixed(2) : '33.35');
     } catch (e) {
       statusEl.textContent = '状态加载失败：服务没连上？';
       topStatusEl.textContent = '未连接';
@@ -473,6 +503,10 @@
         addMsg('ai', '出错了：' + (data.error || ('HTTP ' + res.status)));
       } else if (data.mode === 'demo') {
         addMsg('ai', data.reply, '演示模式 · 未调用模型 · 未产生费用');
+      } else if (data.mode === 'waiting_approval' && data.needs_approval) {
+        // 工具循环停在确认卡上：本轮还没答完，页面只显示确认卡，
+        // 不追加回答、不记历史；点了确认/取消后那轮才跑完。
+        renderApproval(data.needs_approval);
       } else {
         const cost = data.cost_usd === null || data.cost_usd === undefined
           ? '成本未知'
@@ -492,6 +526,7 @@
     inputEl.focus();
     refreshStatus();
     refreshRecent();  // 发完一轮，最近列表里出现/更新这段对话（标题取第一句）。
+    refreshPendingApprovals();  // 顺便把没点的确认卡找回来（刷新页面后也一样）。
   }
 
   // ---------- 聊天里的纠错提示 ----------
@@ -547,6 +582,91 @@
     wrap.appendChild(box);
     chatEl.appendChild(wrap);
     chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  // ---------- 工具确认卡 ----------
+  // 后端 /api/chat 返回 waiting_approval 时，needs_approval 里是
+  // {task_id, approval_id, tool, args, risk_level, expires_at}；
+  // 点“确认执行”或“取消”调 /api/chat/confirm，确认了就执行存着的
+  // 参数、把停住的那轮跑完，取消了也跑完（模型按“用户没同意”继续答）。
+  // 卡片只按 approval_id 显示一次；刷新页面后没点的卡会从
+  // /api/approvals/pending 里再找回来（refreshPendingApprovals）。
+  const shownApprovals = new Set();
+
+  function renderApproval(needs) {
+    const approvalId = (needs || {}).approval_id || '';
+    if (!approvalId || shownApprovals.has(approvalId)) return;
+    shownApprovals.add(approvalId);
+    const wrap = el('div', 'msg ai');
+    const box = el('div', 'approval');
+    box.appendChild(el('div', '', 'Agent 想用工具，需要你确认一下：'));
+    box.appendChild(el('div', '', '工具：' + (needs.tool || '')));
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(needs.args || {}, null, 2);
+    box.appendChild(pre);
+    box.appendChild(el('div', '', '风险：' + (needs.risk_level || '')));
+    if (needs.expires_at) {
+      box.appendChild(el('div', 'approval-hint', '10 分钟内没点就按取消处理（到 ' + needs.expires_at + ' 过期）。'));
+    }
+    const actions = el('div', 'approval-actions');
+    actions.appendChild(smallBtn('确认执行', 'primary', () => {
+      // 点了就定下来：先把这块卡片里的按钮都锁住，免得重复点；
+      // 再调确认接口，等后端跑完那轮后回的回答显示出来。
+      box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      decideApproval(needs, 'confirm', box);
+    }));
+    actions.appendChild(smallBtn('取消', '', () => {
+      box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      decideApproval(needs, 'cancel', box);
+    }));
+    box.appendChild(actions);
+    wrap.appendChild(box);
+    chatEl.appendChild(wrap);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  async function decideApproval(needs, decision, box) {
+    try {
+      const res = await fetch('/api/chat/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_id: needs.task_id, approval_id: needs.approval_id, decision }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        box.classList.add('err');
+        box.appendChild(el('div', '', '没处理成：' + (data.error || ('HTTP ' + res.status))));
+        return;
+      }
+      if (data.mode === 'waiting_approval' && data.needs_approval) {
+        box.appendChild(el('div', 'approval-hint', '已处理，又停在下一张确认卡上了。'));
+        renderApproval(data.needs_approval);
+        return;
+      }
+      box.appendChild(el('div', 'approval-hint', decision === 'confirm' ? '已确认执行，继续回答。' : '已取消，继续回答。'));
+      const cost = data.cost_usd === null || data.cost_usd === undefined
+        ? '成本未知'
+        : ('本次 $' + Number(data.cost_usd).toFixed(6));
+      addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+      if (data.correction) renderCorrection(data.correction);
+    } catch (e) {
+      box.classList.add('err');
+      box.appendChild(el('div', '', '出错了：连不上服务，请确认服务还在运行。'));
+    }
+    refreshStatus();
+    refreshRecent();
+  }
+
+  async function refreshPendingApprovals() {
+    try {
+      const res = await fetch('/api/approvals/pending');
+      const data = await res.json();
+      (data.approvals || []).forEach((item) => {
+        if (item.approval) renderApproval({ ...item.approval, task_id: item.task_id });
+      });
+    } catch (e) {
+      // 读不到等确认的卡也不拦聊天，下次发消息时再试。
+    }
   }
 
   sendBtn.addEventListener('click', send);
@@ -927,6 +1047,7 @@
 
   refreshStatus();
   refreshRecent();
+  refreshPendingApprovals();  // 打开页面时把没点的确认卡找回来。
   inputEl.focus();
 </script>
 </body>

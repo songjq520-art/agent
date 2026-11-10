@@ -189,10 +189,11 @@ def test_deepseek_provider_unknown_model_raises():
 
 
 def test_deepseek_budget_no_block_after_reaching_budget(tmp_path):
-    """到 $5 不停：累计到 $5 后，chat() 不应抛错，应正常发请求、拿到回答。
+    """到 $5 不停：工具账本累计到 $5 后，chat() 不应抛错，应正常发请求、拿到回答。
 
     新规矩（BOOS 2026-11-08 定）：到 5 美元（100%）只提醒一次，永不自动停。
-    提醒由 add_cost() 在刚跨过 $5 时打印，这里只验证调用本身不被拦住。"""
+    提醒只看工具账本（BOOS 2026-11-11 定：$5 只算工具的钱）。
+    提醒由 add_cost() 在工具账本刚跨过 $5 时打印，这里只验证调用本身不被拦住。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好"}}],
@@ -200,7 +201,7 @@ def test_deepseek_budget_no_block_after_reaching_budget(tmp_path):
     }
     fake_response.raise_for_status.return_value = None
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    tracker.add_cost(5.0)
+    tracker.add_cost(5.0, ledger="tool")
     assert tracker.is_over_budget() is True
     assert tracker.can_call() is True  # 到 $5 也不拦
     provider = DeepSeekProvider(api_key="fake-key-for-test", budget_tracker=tracker)
@@ -236,7 +237,9 @@ def test_deepseek_estimated_cost_no_block_before_api_request(tmp_path):
 
 # ---------- 模拟测试：按模型记账 ----------
 def test_budget_per_model_breakdown(tmp_path):
-    """按模型记账：不同模型的费用分别记小计，总数是两者之和，且总数仍是唯一封顶依据。"""
+    """按模型记账：不同模型的费用分别记小计，总数是两者之和；
+    提醒只看工具账本（BOOS 2026-11-11 定：$5 只算工具的钱，
+    聊天账本不设限）——聊天账本单独到 $5 也不触发提醒。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     tracker.add_cost(0.1, model="deepseek-flash")
     tracker.add_cost(0.2, model="muse-spark-1.3")
@@ -248,12 +251,24 @@ def test_budget_per_model_breakdown(tmp_path):
         "deepseek-flash": pytest.approx(0.1),
         "muse-spark-1.3": pytest.approx(0.2),
     }
-    # 封顶只看总数：总数 0.3，没到 $5 提醒线。
+    # 提醒只看工具账本：这两笔默认记聊天账本，工具账本还是 0，不提醒。
     assert tracker.is_over_warn() is False
     assert tracker.can_call() is True
-    # 总数到 $5 也不拦截，只提醒一次（提醒由 add_cost 在刚跨过 $5 时打印）。
-    tracker.add_cost(4.7, model="deepseek-flash")
+    # 聊天账本单独到 $5 也不触发提醒（聊天不设限），总数到了也不算。
+    tracker.add_cost(4.7, model="deepseek-flash", ledger="chat")
     assert tracker.total_cost_usd == pytest.approx(5.0)
+    assert tracker.chat_cost_usd == pytest.approx(5.0)
+    assert tracker.tool_cost_usd == pytest.approx(0.0)
+    assert tracker.is_over_budget() is False
+    assert tracker.is_over_warn() is False
+    # 工具账本到 $5 才提醒，提醒了也不拦截，只提醒一次
+    # （提醒由 add_cost 在工具账本刚跨过 $5 时打印）。
+    tracker.add_cost(5.0, model="deepseek-flash", ledger="tool")
+    assert tracker.tool_cost_usd == pytest.approx(5.0)
+    assert tracker.ledger_breakdown() == {
+        "tool": pytest.approx(5.0),
+        "chat": pytest.approx(5.0),
+    }
     assert tracker.is_over_budget() is True
     assert tracker.can_call() is True
 

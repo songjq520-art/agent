@@ -122,8 +122,13 @@ DEFAULT_MODEL = "deepseek"
 CONTROLLER = "deepseek"  # 第一任主控
 
 # ---------- 预算配置 ----------
-MONTHLY_BUDGET_USD = 5.0  # 每月预算：5 美元（初期参考值）
+MONTHLY_BUDGET_USD = 5.0  # 每月工具账本预算：5 美元（BOOS 2026-11-11 定：只算工具的钱）
 BUDGET_WARN_RATIO = 1.0  # 到预算 100%（$5）时才提醒，永不自动停（BOOS 2026-11-08 定）
+# USD_CNY_RATE（美元兑人民币汇率）：显示和汇报一律用人民币（BOOS 2026-11-11 定）。
+# 2026-11-11 实查约 1 美元 = 6.67 人民币，$5 工具预算显示为约 ¥33.35。
+# 汇率会动，这里只是一个显示用的换算数，不参与美元记账；汇率明显变了就改这里。
+USD_CNY_RATE = 6.67
+# TOOL_BUDGET_CAP_CNY：$5 工具预算按上面汇率换算的人民币数（显示用）。
 # MAX_OUTPUT_TOKENS（输出上限，单位 Token）：一次回答最多输出 2048 Token。
 # 这个值既是调用前费用预估用的输出量，也是请求里实际传给 API 的
 # max_tokens 上限；输出成本上限 = 2048/1e6*4.25 美元。
@@ -170,29 +175,47 @@ def get_model_status():
 class BudgetTracker:
     """预算跟踪器（简单版，不要过度设计）。
 
-    作用：记录本月累计成本，到 5 美元（100%）提醒一次，永不自动停；
-    只有预算文件损坏时才拦住付费调用（BOOS 2026-11-08 定的新规矩）。
+    作用：分两个账本记本月成本——工具账本（tool）和聊天账本（chat）；
+    工具账本到 5 美元（100%）提醒一次，永不自动停；聊天账本只记数、
+    不设限、不提醒（BOOS 2026-11-11 定）。只有预算文件损坏时才拦住
+    付费调用（BOOS 2026-11-08 定的新规矩）。
+    按轮次算账（BOOS 2026-11-11 定）：一轮对话里调了工具，从第一次
+    发工具请求到最后回答，整轮的输入和输出都算工具账本；没调工具的
+    整轮算聊天账本；记忆提取算聊天账本。调用方在记账时传 ledger 参数
+    打标签（"tool" 或 "chat"，默认 "chat"）。
     原理：累计成本存在本地文件 logs/budget_usage.json（JSON 格式），
           这个文件会被 .gitignore 忽略，不上传到 GitHub。
-          文件里还有 month（月份，YYYY-MM）、unknown_cost（成本未知标记）
-          和 cost_by_model（按模型小计，例如 {"deepseek-flash": 0.01}）字段，
-          跨月时累计和小计一起自动重置为 0，但 unknown_cost 不会因跨月自动清除——
-          只有人工核对过官方后台后才能清除（见 clear_unknown_cost）。
-          提醒只看总数 total_cost_usd，小计只是分模型的明细，方便看钱花在哪个模型上。
+          文件里还有 month（月份，YYYY-MM）、unknown_cost（成本未知标记）、
+          cost_by_model（按模型小计，例如 {"deepseek-flash": 0.01}）、
+          tool_cost_usd / chat_cost_usd（两账本小计）和 records
+          （每笔记录：时间、模型、账本、task_id、trace_id、Token 数、
+          成本，最新 500 笔）字段，跨月时累计和小计一起自动重置为 0，
+          但 unknown_cost 不会因跨月自动清除——只有人工核对过官方后台
+          后才能清除（见 clear_unknown_cost）。
+          提醒只看工具账本 tool_cost_usd，小计只是明细。
+          旧文件（2026-11-11 分账之前混着记的）没有两账本字段时不算损坏，
+          两账本从 0 开始，旧的总数 total_cost_usd 原样保留、不追溯拆分。
     注意：cost 为 None（模型没返回 usage，成本未知）时，不计入累计，不编造，
           但会把 unknown_cost 标记为 True 并提醒，不拦后续调用，等人工核对。
+          推理 Token 已含在 completion_tokens 里，按输出价算一次就行，
+          不要重复加（见 providers/deepseek.py）。
     安全规则：预算文件损坏、无法解析或关键字段缺失时，不会自动初始化为
           正常可调用状态，而是进入安全暂停状态（corrupted=True），
           原损坏文件会被保留、不被覆盖，只能人工检查修复后才能恢复。
     限制：本地预算只能记账和提醒，不能保证单次请求绝对不超支，
           实际费用以各模型官方后台为准
           （Muse 看 Meta 后台，DeepSeek 看 DeepSeek 后台）。
+    人民币显示：记账一律用美元（服务商收美元），显示时按 USD_CNY_RATE
+          换算成人民币（见 to_cny / budget_summary_cny）。
     """
 
     def __init__(self, file_path=None):
         # 默认存在项目根目录下的 logs/budget_usage.json
         self.file_path = Path(file_path) if file_path else Path(__file__).parent / "logs" / "budget_usage.json"
         self.total_cost_usd = 0.0
+        self.tool_cost_usd = 0.0  # 工具账本：工具循环 + 工具相关翻译
+        self.chat_cost_usd = 0.0  # 聊天账本：平时聊天 + 记忆提取（不设限）
+        self.records = []  # 每笔记录（最新 500 笔），见 add_cost
         self.month = self.current_month()
         self.unknown_cost = False  # 是否有一次调用的成本未知（没返回 usage）
         self.cost_by_model = {}  # 按模型小计：{"deepseek-flash": 0.01}，只作明细，封顶只看总数
@@ -220,7 +243,10 @@ class BudgetTracker:
             return
         if self.month != self.current_month():
             self.total_cost_usd = 0.0
+            self.tool_cost_usd = 0.0
+            self.chat_cost_usd = 0.0
             self.cost_by_model = {}
+            self.records = []
             # 注意：这里故意不碰 self.unknown_cost，保留未核对的未知成本标记。
             self.month = self.current_month()
             self._save()
@@ -308,6 +334,29 @@ class BudgetTracker:
                     break
             else:
                 breakdown = {name: float(value) for name, value in raw_breakdown.items()}
+        # 两账本小计是可选字段（分账是 2026-11-11 新加的，旧文件没有）：
+        # 没有时默认 0；写了但格式不对也算损坏。
+        ledger_values = {}
+        for key in ("tool_cost_usd", "chat_cost_usd"):
+            raw_value = data.get(key, 0.0)
+            if not (
+                isinstance(raw_value, (int, float))
+                and not isinstance(raw_value, bool)
+                and math.isfinite(raw_value)
+                and raw_value >= 0
+            ):
+                problems.append(f"{key} 非法（必须是大于或等于 0 的有限数字）")
+            else:
+                ledger_values[key] = float(raw_value)
+        # 每笔记录是可选字段：没有时默认空列表；不是列表、或里面有非字典项也算损坏。
+        raw_records = data.get("records", [])
+        records = []
+        if not isinstance(raw_records, list):
+            problems.append("records 不是 JSON 数组")
+        elif any(not isinstance(item, dict) for item in raw_records):
+            problems.append("records 里有非对象项")
+        else:
+            records = raw_records[-500:]
         if problems:
             self._enter_corrupted(
                 "预算文件" + "、".join(problems) + "或字段类型不对",
@@ -319,6 +368,9 @@ class BudgetTracker:
         self.unknown_cost = bool(data["unknown_cost"])
         self.month = raw_month
         self.cost_by_model = breakdown
+        self.tool_cost_usd = ledger_values.get("tool_cost_usd", 0.0)
+        self.chat_cost_usd = ledger_values.get("chat_cost_usd", 0.0)
+        self.records = records
         self._check_month_rollover()
 
     def _save(self):
@@ -334,10 +386,13 @@ class BudgetTracker:
                 {
                     "month": self.month,
                     "total_cost_usd": round(self.total_cost_usd, 6),
+                    "tool_cost_usd": round(self.tool_cost_usd, 6),
+                    "chat_cost_usd": round(self.chat_cost_usd, 6),
                     "unknown_cost": self.unknown_cost,
                     "cost_by_model": {
                         name: round(value, 6) for name, value in self.cost_by_model.items()
                     },
+                    "records": self.records[-500:],
                 },
                 ensure_ascii=False,
             ),
@@ -371,31 +426,86 @@ class BudgetTracker:
         self.unknown_cost = False
         self._save()
 
-    def add_cost(self, cost_usd, model=None):
+    def add_cost(self, cost_usd, model=None, ledger="chat", task_id=None, trace_id=None, usage=None, estimated=False):
         """记一笔成本。cost 为 None 时不记，返回当前累计。
 
         参数 model：这次调用用的模型名（例如 "deepseek-flash"），
         传了就同时记到该模型的小计里；不传时只记总数（兼容旧调用）。
-        注意：提醒只看总数，小计只是明细；总数和小计之和可能不一致
-        （例如直接调 add_cost 没传模型时），以总数为准。
-        到 5 美元（100%）时打印一次提醒（只在刚跨过 5 美元那次打印，
+        参数 ledger：记到哪个账本，"tool"（工具循环 + 工具相关翻译）
+        或 "chat"（平时聊天 + 记忆提取），默认 "chat"——普通聊天和
+        记忆提取都是聊天账本；工具循环里每一轮都要显式传 ledger="tool"。
+        参数 task_id / trace_id：这次调用属于哪个任务、哪次循环，
+        用来把模型请求、工具请求、授权、执行结果和费用串起来查；
+        没有时记空字符串。参数 usage：模型返回的 usage 字典
+        （prompt_tokens / completion_tokens / cached_tokens），
+        有就记进每笔记录里；没有（成本未知）时不记 Token 数。
+        参数 estimated：True 表示这笔是估算（没有真实 usage），
+        不能伪装成精确金额。
+        注意：提醒只看工具账本 tool_cost_usd，小计只是明细；总数和
+        小计之和可能不一致（例如直接调 add_cost 没传模型时），以总数为准。
+        到 5 美元（100%）时打印一次提醒（只在工具账本刚跨过 5 美元那次打印，
         之后不再重复），不拦后续调用——请你自己决定是否继续。
         预算文件损坏时不记账、不写文件，直接返回当前累计（仅作显示）。
         """
         if self.corrupted:
             return self.total_cost_usd
+        if ledger not in ("tool", "chat"):
+            raise ValueError(f"未知的账本：{ledger}，只认 'tool'（工具）或 'chat'（聊天）。")
         self._check_month_rollover()
         if cost_usd is None:
             return self.total_cost_usd
         amount = float(cost_usd)
-        was_below_budget = self.total_cost_usd < MONTHLY_BUDGET_USD
+        was_below_tool_budget = self.tool_cost_usd < MONTHLY_BUDGET_USD
         self.total_cost_usd += amount
+        if ledger == "tool":
+            self.tool_cost_usd += amount
+        else:
+            self.chat_cost_usd += amount
         if model:
             self.cost_by_model[model] = self.cost_by_model.get(model, 0.0) + amount
+        usage = usage or {}
+        self.records.append(
+            {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "model": model or "",
+                "ledger": ledger,
+                "task_id": task_id or "",
+                "trace_id": trace_id or "",
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "cached_tokens": int(
+                    (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+                ),
+                "cost_usd": round(amount, 6),
+                "estimated": bool(estimated),
+            }
+        )
+        self.records = self.records[-500:]
         self._save()
-        if was_below_budget and self.total_cost_usd >= MONTHLY_BUDGET_USD:
-            print("提醒：本月已花到 5 美元（100%），请你自己决定是否继续。")
+        if (
+            ledger == "tool"
+            and was_below_tool_budget
+            and self.tool_cost_usd >= MONTHLY_BUDGET_USD
+        ):
+            print("提醒：本月工具调用已花到 5 美元（100%），请你自己决定是否继续。")
         return self.total_cost_usd
+
+    def cost_for_ledger(self, ledger):
+        """某账本本月累计成本（美元），"tool" 或 "chat"。"""
+        if ledger not in ("tool", "chat"):
+            raise ValueError(f"未知的账本：{ledger}，只认 'tool'（工具）或 'chat'（聊天）。")
+        self._check_month_rollover()
+        return self.tool_cost_usd if ledger == "tool" else self.chat_cost_usd
+
+    def ledger_breakdown(self):
+        """本月两账本的成本小计，返回一份副本（改它不影响内部记录）。"""
+        self._check_month_rollover()
+        return {"tool": self.tool_cost_usd, "chat": self.chat_cost_usd}
+
+    def recent_records(self, limit=100):
+        """最近 limit 笔费用记录（按时间顺序，最新的在最后），返回副本。"""
+        self._check_month_rollover()
+        return [dict(item) for item in self.records[-limit:]]
 
     def cost_for_model(self, model):
         """某模型本月累计成本（美元），没记过为 0。"""
@@ -408,23 +518,43 @@ class BudgetTracker:
         return dict(self.cost_by_model)
 
     def warn_threshold_usd(self):
-        """提醒线：预算的 100%，即 $5。"""
+        """提醒线：工具账本预算的 100%，即 $5。"""
         return MONTHLY_BUDGET_USD * BUDGET_WARN_RATIO
 
     def is_over_budget(self):
-        """是否已达到或超过预算上限。"""
+        """是否已达到或超过预算上限——只看工具账本（BOOS 2026-11-11 定：
+        $5 只算工具的钱，聊天账本不设限）。超了也只提醒，不拦调用。"""
         self._check_month_rollover()
-        return self.total_cost_usd >= MONTHLY_BUDGET_USD
+        return self.tool_cost_usd >= MONTHLY_BUDGET_USD
 
     def is_over_warn(self):
-        """是否已达到提醒线（100%，即 $5）。"""
+        """是否已达到提醒线（100%，即 $5）——只看工具账本。"""
         self._check_month_rollover()
-        return self.total_cost_usd >= self.warn_threshold_usd()
+        return self.tool_cost_usd >= self.warn_threshold_usd()
 
     def remaining_usd(self):
-        """本月剩余预算（美元），已累计超支时为负数。"""
+        """工具账本本月剩余预算（美元），已超支时为负数。"""
         self._check_month_rollover()
-        return MONTHLY_BUDGET_USD - self.total_cost_usd
+        return MONTHLY_BUDGET_USD - self.tool_cost_usd
+
+    def to_cny(self, usd_amount):
+        """美元换算成人民币（显示用），按 USD_CNY_RATE；结果保留两位小数。"""
+        return round(float(usd_amount) * USD_CNY_RATE, 2)
+
+    def tool_budget_cap_cny(self):
+        """工具预算上限换算成人民币（显示用）：$5 ≈ ¥33.35。"""
+        return round(MONTHLY_BUDGET_USD * USD_CNY_RATE, 2)
+
+    def budget_summary_cny(self):
+        """本月预算摘要（人民币，显示用）：两账本、总数、上限、汇率。"""
+        self._check_month_rollover()
+        return {
+            "tool_cost_cny": self.to_cny(self.tool_cost_usd),
+            "chat_cost_cny": self.to_cny(self.chat_cost_usd),
+            "total_cost_cny": self.to_cny(self.total_cost_usd),
+            "tool_budget_cap_cny": self.tool_budget_cap_cny(),
+            "usd_cny_rate": USD_CNY_RATE,
+        }
 
     def estimate_input_tokens(self, prompt_text):
         """粗略估算输入 Token 数（不是真实分词，只是调用前预估用）。
@@ -495,7 +625,7 @@ class BudgetTracker:
         if self.unknown_cost:
             return f"提醒：有未核对的未知成本，请核对{backend}官方后台后再清除标记。"
         if self.is_over_budget():
-            return "提醒：本月已花到 5 美元（100%），请你自己决定是否继续。"
+            return "提醒：本月工具调用已花到 5 美元（100%），请你自己决定是否继续。"
         return ""
 
     def can_call(self):
