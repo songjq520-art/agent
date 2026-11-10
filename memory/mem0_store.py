@@ -1585,6 +1585,38 @@ def _check_version_file(version_path, chroma_path, embedding_model, embedding_di
         )
 
 
+# 保护失败时结果里附带的列表字段：没恢复回来的旧记忆 id、回滚删不掉
+# 的新记忆 id 和原文。保护信息要经过守卫 → 提交 → add_turn 三层往上传，
+# 以前每层手写一个键一个键地传，加个字段就得改三处，漏一处就半路丢了
+# （回滚残留的原文就是这么丢的：守卫算出来了，只进了保护事件，没进
+# 返回结果）。现在三层都调 _carry_protection_fields，以后再加字段只改
+# 下面这个元组一行。
+_PROTECTION_RESULT_KEYS = (
+    "failed_ids",
+    "rollback_leftover_ids",
+    "rollback_leftover_texts",
+)
+
+
+def _carry_protection_fields(src, dst):
+    """把保护失败的字段从一个结果字典带到另一个。
+
+    只在源字典标了 protection_failed 时才带；没标时什么都不动。
+    失败标记和原因照原样带（原因即使是 None 也带，和以前手写时
+    一样）；三个列表字段只在非空时带，空的就不写进结果——返回的
+    样子不变，同样的顶层键，调用方（web 面板、命令行）不用动。
+    """
+    src = src or {}
+    if not src.get("protection_failed"):
+        return
+    dst["protection_failed"] = True
+    dst["protection_reason"] = src.get("protection_reason")
+    for key in _PROTECTION_RESULT_KEYS:
+        value = src.get(key)
+        if value:
+            dst[key] = value
+
+
 class Mem0Store:
     """mem0 长期记忆的适配器（项目里唯一直接碰 mem0 的类）。
 
@@ -2197,32 +2229,20 @@ class Mem0Store:
                 fresh.append(messages[i + 1])
         results = []
         protection_failed = False
-        protection_reason = None
-        failed_ids = None
-        rollback_leftover_ids = None
         filtered = _filter_extraction_messages(fresh)
         if filtered:
             extracted = self._extract_and_save_turn(filtered)
             results = (extracted or {}).get("results") or []
             # 保护失败的标记要往上传：本轮没写成、或回滚过，调用方
             # （add_turn / 面板）得知道，不能只留在提取那一层。
-            # failed_ids 是没恢复回来的旧记忆 id（只有恢复个别失败时有）。
-            # rollback_leftover_ids 是回滚删不掉、还留在库里的新记忆 id，
-            # 和 failed_ids 同一条路往上传，半路不能丢。
+            # 用共用的 _carry_protection_fields 一次带过去——以前这里
+            # 手写一个键一个键地传，残留原文就是这么漏掉的。
             protection_failed = bool((extracted or {}).get("protection_failed"))
-            protection_reason = (extracted or {}).get("protection_reason")
-            failed_ids = (extracted or {}).get("failed_ids")
-            rollback_leftover_ids = (extracted or {}).get("rollback_leftover_ids")
         if not results and not identity_outcomes and not protection_failed:
             return {}
         out = {"results": results, "identity": identity_outcomes}
         if protection_failed:
-            out["protection_failed"] = True
-            out["protection_reason"] = protection_reason
-            if failed_ids:
-                out["failed_ids"] = failed_ids
-            if rollback_leftover_ids:
-                out["rollback_leftover_ids"] = rollback_leftover_ids
+            _carry_protection_fields(extracted, out)
         return out
 
     def flush_pending(self):
@@ -2705,15 +2725,10 @@ class Mem0Store:
                 "results": (committed or {}).get("results") or [],
                 "identity": [item["slot"] for item in identity_items],
             }
-            if (committed or {}).get("protection_failed"):
-                out["protection_failed"] = True
-                out["protection_reason"] = (committed or {}).get("protection_reason")
-                if (committed or {}).get("failed_ids"):
-                    out["failed_ids"] = (committed or {}).get("failed_ids")
-                if (committed or {}).get("rollback_leftover_ids"):
-                    out["rollback_leftover_ids"] = (committed or {}).get(
-                        "rollback_leftover_ids"
-                    )
+            # 保护失败的字段用共用的 _carry_protection_fields 一次带过去，
+            # 和 _commit_pending_turn 里是同一个函数——以后再加字段只改
+            # 它里面那一行，不会再漏。
+            _carry_protection_fields(committed, out)
             return out
 
     def _drop_sensitive_results(self, result):
@@ -3061,6 +3076,7 @@ class Mem0Store:
             leftover_texts = [(item or {}).get("memory") or "" for item in survivors]
             if leftover_ids or leftover_texts:
                 results["rollback_leftover_ids"] = leftover_ids
+                results["rollback_leftover_texts"] = leftover_texts
                 reason = (
                     "恢复时读库失败，没法核对 %d 条旧记忆有没有被改动，"
                     "本轮新存的 %d 条记忆里删掉了 %d 条，还有 %d 条没删掉"
@@ -3130,9 +3146,10 @@ class Mem0Store:
             leftover_texts = [(item or {}).get("memory") or "" for item in survivors]
             if leftover_ids or leftover_texts:
                 # 回滚不完整：删不掉的那条还留在库里（results 里没有
-                # 它），id 写进结果往上传，原文写进保护事件——调用方
-                # 和面板都得看得见，不能假装删掉了。
+                # 它），id 和原文都写进结果往上传，原文也写进保护事件——
+                # 调用方和面板都得看得见，不能假装删掉了。
                 results["rollback_leftover_ids"] = leftover_ids
+                results["rollback_leftover_texts"] = leftover_texts
                 reason = (
                     "有旧记忆没恢复回来，跟它们同一话题的新记忆里删掉了 %d 条，"
                     "还有 %d 条没删掉（仍在库里）。"

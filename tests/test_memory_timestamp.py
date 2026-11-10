@@ -885,3 +885,164 @@ def test_rollback_delete_noop_leaves_visible_leftover(tmp_path):
     )
     assert "已删掉回滚" not in events[0]["reason"]
     assert "没删掉" in events[0]["reason"]
+
+
+# ---------- 保护字段往上传：共用小帮手 + 残留原文 + 命令行提醒 ----------
+
+
+def test_carry_protection_fields_copies_all_keys():
+    """共用小帮手：五个保护字段一次带过去，没标失败时什么都不动。
+
+    以前每层手写一个键一个键地传，残留原文就是这么漏掉的。现在
+    守卫 → 提交 → add_turn 都调这一个函数，以后再加字段只改它
+    里面那一行。
+    """
+    from memory.mem0_store import _carry_protection_fields
+
+    src = {
+        "protection_failed": True,
+        "protection_reason": "restore_partial",
+        "failed_ids": ["old-1"],
+        "rollback_leftover_ids": ["new-1"],
+        "rollback_leftover_texts": ["我现在把数据库改成 PostgreSQL 了"],
+        "results": [{"id": "new-1"}],
+    }
+    dst = {}
+    _carry_protection_fields(src, dst)
+    assert dst == {
+        "protection_failed": True,
+        "protection_reason": "restore_partial",
+        "failed_ids": ["old-1"],
+        "rollback_leftover_ids": ["new-1"],
+        "rollback_leftover_texts": ["我现在把数据库改成 PostgreSQL 了"],
+    }
+    # 没标保护失败：什么都不带，哪怕源里有残留也不带。
+    dst2 = {}
+    _carry_protection_fields({"rollback_leftover_ids": ["new-1"]}, dst2)
+    assert dst2 == {}
+    # 空列表不带：结果里不出现空的残留字段，和以前手写时一样。
+    dst3 = {}
+    _carry_protection_fields(
+        {
+            "protection_failed": True,
+            "protection_reason": "restore_unverified",
+            "rollback_leftover_ids": [],
+            "rollback_leftover_texts": [],
+        },
+        dst3,
+    )
+    assert dst3 == {
+        "protection_failed": True,
+        "protection_reason": "restore_unverified",
+    }
+
+
+def test_rollback_leftover_texts_reach_add_turn_unverified(tmp_path):
+    """残留原文一路传到 add_turn：restore_unverified 那支。
+
+    端到端（和 test_rollback_delete_failure_leaves_visible_leftover
+    同一个局）：恢复没法核对，delete 抛错、新记忆还在库里。
+    以前 add_turn 返回里只有残留的 id，原文在半路丢了；现在
+    id 和原文都要在，调用方光看返回就知道是哪条记忆没删掉。
+    """
+    store = make_fake_store(tmp_path, memory=FailDeleteMutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 第一次读（快照）正常，第二次读（恢复前核对）读不出来。
+    store._memory.get_all_failures = [None, RuntimeError("库读不出来。")]
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "restore_unverified"
+    leftover_ids = out.get("rollback_leftover_ids") or []
+    leftover_texts = out.get("rollback_leftover_texts") or []
+    assert len(leftover_ids) == 1
+    assert leftover_ids[0] != old_id
+    assert leftover_texts == ["我现在把数据库改成 PostgreSQL 了"]
+
+
+def test_rollback_leftover_texts_reach_add_turn_partial(tmp_path):
+    """残留原文一路传到 add_turn：restore_partial 那支。
+
+    端到端（和 test_rollback_delete_noop_leaves_visible_leftover
+    同一个局）：恢复个别失败，delete 不报错、记录还躺在库里。
+    add_turn 返回里 id 和原文都要在，拿铁那条照常留下。
+    """
+    store = make_fake_store(tmp_path, memory=NoopDeleteMutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 恢复时写不进去：守卫原地 update 旧的 SQLite 那条就抛错。
+    store._memory.fail_update_ids = {old_id}
+    store.add_turn(
+        [{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。我喜欢喝拿铁。"}]
+    )
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "restore_partial"
+    assert out.get("failed_ids") == [old_id]
+    leftover_ids = out.get("rollback_leftover_ids") or []
+    leftover_texts = out.get("rollback_leftover_texts") or []
+    assert len(leftover_ids) == 1
+    assert leftover_texts == ["我现在把数据库改成 PostgreSQL 了"]
+    items = {item["id"]: item for item in store.get_all()}
+    assert leftover_ids[0] in items
+    assert items[leftover_ids[0]]["text"] == "我现在把数据库改成 PostgreSQL 了"
+
+
+def test_print_protection_result_shows_leftover(capsys):
+    """命令行提醒：有残留时明说还剩几条、去面板看，不能写“已删掉回滚”。
+
+    两支（restore_unverified、restore_partial）都要测。
+    """
+    from main import _print_protection_result
+
+    _print_protection_result(
+        {
+            "protection_failed": True,
+            "protection_reason": "restore_unverified",
+            "rollback_leftover_ids": ["new-1"],
+        }
+    )
+    out = capsys.readouterr().out
+    assert "1 条没删掉" in out
+    assert "已删掉回滚" not in out
+    assert "保护记录" in out
+    _print_protection_result(
+        {
+            "protection_failed": True,
+            "protection_reason": "restore_partial",
+            "rollback_leftover_ids": ["new-1", "new-2"],
+        }
+    )
+    out = capsys.readouterr().out
+    assert "2 条没删掉" in out
+    assert "已删掉回滚" not in out
+    assert "保护记录" in out
+
+
+def test_print_protection_result_clean_rollback(capsys):
+    """命令行提醒：没残留时照旧写“已删掉回滚”，快照失败那支不动。"""
+    from main import _print_protection_result
+
+    _print_protection_result(
+        {"protection_failed": True, "protection_reason": "restore_unverified"}
+    )
+    out = capsys.readouterr().out
+    assert "已删掉回滚" in out
+    assert "没删掉" not in out
+    _print_protection_result(
+        {"protection_failed": True, "protection_reason": "restore_partial"}
+    )
+    out = capsys.readouterr().out
+    assert "已删掉回滚" in out
+    assert "没删掉" not in out
+    _print_protection_result(
+        {"protection_failed": True, "protection_reason": "snapshot_failed"}
+    )
+    out = capsys.readouterr().out
+    assert "这次记忆没存上" in out
+    # 没保护失败时什么都不打印。
+    _print_protection_result({})
+    assert capsys.readouterr().out == ""

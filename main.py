@@ -265,12 +265,25 @@ def _print_protection_result(saved):
     if not (saved or {}).get("protection_failed"):
         return
     reason = (saved or {}).get("protection_reason") or ""
+    leftovers = (saved or {}).get("rollback_leftover_ids") or []
     if reason == "snapshot_failed":
         print("提醒：这次记忆没存上（提取前快照读不出来），面板“保护记录”里有账。")
     elif reason == "restore_unverified":
-        print("提醒：这次没法核对旧记忆有没有被改动，新存的记忆已删掉回滚，面板“保护记录”里有账。")
+        if leftovers:
+            print(
+                "提醒：这次没法核对旧记忆有没有被改动，新存的记忆里还有 %d 条没删掉"
+                "（仍在库里），面板“保护记录”里有账，去看一眼。" % len(leftovers)
+            )
+        else:
+            print("提醒：这次没法核对旧记忆有没有被改动，新存的记忆已删掉回滚，面板“保护记录”里有账。")
     elif reason == "restore_partial":
-        print("提醒：这次有旧记忆没恢复回来，相关的记忆已删掉回滚，面板“保护记录”里有账。")
+        if leftovers:
+            print(
+                "提醒：这次有旧记忆没恢复回来，相关的记忆里还有 %d 条没删掉"
+                "（仍在库里），面板“保护记录”里有账，去看一眼。" % len(leftovers)
+            )
+        else:
+            print("提醒：这次有旧记忆没恢复回来，相关的记忆已删掉回滚，面板“保护记录”里有账。")
     else:
         print("提醒：这次记忆保护失败了，面板“保护记录”里有账。")
 
