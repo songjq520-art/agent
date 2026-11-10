@@ -120,6 +120,44 @@ def test_build_summary_prompt_includes_turns_and_previous_summary():
     assert "不要编造" in prompt
 
 
+def test_build_summary_prompt_redacts_secrets_in_turns():
+    """隐私：轮次里的密码/密钥不进提示（只留占位符），和 mem0 提取同一套脱敏。"""
+    turns = [
+        {"role": "user", "content": "我的密码是 hunter2ABCdef12345678，帮我记一下"},
+        {"role": "assistant", "content": "好的"},
+        {"role": "user", "content": "我的 API 密钥是 sk-testkey1234567890abcdefgh"},
+        {"role": "user", "content": "令牌 Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z 也别外传"},
+    ]
+    prompt = build_summary_prompt(turns)
+    assert "hunter2ABCdef12345678" not in prompt
+    assert "sk-testkey1234567890abcdefgh" not in prompt
+    assert "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z" not in prompt
+    assert "【已隐藏敏感信息】" in prompt
+
+
+def test_build_summary_prompt_redacts_previous_summary():
+    """隐私：旧摘要里带的秘密也要脱敏——修复前生成的旧摘要可能已经带了秘密，
+    下次合并时还会再发出去，不能只脱敏新轮次。"""
+    prompt = build_summary_prompt(
+        _messages(1),
+        previous_summary="之前聊过广州出差，我的密码是 hunter2ABCdef12345678",
+    )
+    assert "hunter2ABCdef12345678" not in prompt
+    assert "【已隐藏敏感信息】" in prompt
+    assert "广州出差" in prompt
+
+
+def test_build_summary_prompt_keeps_normal_content():
+    """脱敏不伤正常内容：话题、决定、人名/地名原样留在提示里。"""
+    turns = [
+        {"role": "user", "content": "我喜欢喝咖啡，明天去广州出差，决定坐高铁"},
+        {"role": "assistant", "content": "好的，广州出差坐高铁"},
+    ]
+    prompt = build_summary_prompt(turns)
+    assert "我喜欢喝咖啡，明天去广州出差，决定坐高铁" in prompt
+    assert "广州出差坐高铁" in prompt
+
+
 # ---------- 存取：重启后还在 ----------
 
 def test_store_save_load_round_trip_restart(tmp_path):

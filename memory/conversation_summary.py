@@ -18,6 +18,10 @@
 #   - 摘要用 DeepSeek flash 走现有 provider 接口生成，简短、省钱；
 #     摘要本身是对话记录、单独存放，绝不喂给 mem0 当事实提取
 #     （摘要只拼进发给模型的问题里，不进 add_turn 的消息）。
+#   - 摘要发给模型之前先脱敏：对话记录和旧摘要都过
+#     memory.mem0_store._redact_sensitive（和 mem0 提取同一套，
+#     密码/密钥/令牌换成占位符），秘密不发到外部 API；本地存的
+#     最近几轮和标题是本地存储，不上传，不在这次脱敏范围里。
 #   - 摘要失败（没 Key、网络断、模型返回空）时不丢历史：不裁剪、不覆盖，
 #     下一轮再试；聊天本身不受影响。
 #   - 一个对话一条记录：标题（第一句用户话，没有时取摘要头一句）、
@@ -40,6 +44,8 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from memory.mem0_store import _redact_sensitive
 
 logger = logging.getLogger("agent")
 
@@ -119,11 +125,27 @@ def format_turns(turns):
     return "\n".join(lines)
 
 
+def _redacted_turns(turns):
+    """发给模型前脱敏：每轮消息内容过一遍 _redact_sensitive（和 mem0
+    提取同一套，密码/密钥/令牌换成占位符），秘密不出本机。
+    只改要发出去的副本，原消息不动；本地存的最近几轮和标题不受影响。"""
+    return [
+        {
+            "role": (msg or {}).get("role"),
+            "content": _redact_sensitive((msg or {}).get("content") or ""),
+        }
+        for msg in (turns or [])
+    ]
+
+
 def build_summary_prompt(turns, previous_summary=None):
     """给 DeepSeek 的总结提示：把一段对话压成简短摘要。
 
     要求模型只写对话里有的内容、不编造；留关键信息（话题、重要的事、
     决定、人名/地名/数字/待办）。有旧摘要时让模型合并进去，仍保持简短。
+    发给模型之前先脱敏：对话记录和旧摘要都过 _redact_sensitive，
+    密码/密钥等秘密只留占位符，不发到外部 API（mem0 提取也是同一套，
+    两边一致；修复前生成的旧摘要里可能已经带了秘密，合并时也要脱敏）。
     """
     parts = [
         "你是十二的对话记录员。把下面这段对话压缩成一段简短摘要。",
@@ -137,9 +159,9 @@ def build_summary_prompt(turns, previous_summary=None):
     if previous_summary:
         parts.append(
             "下面是这段对话之前的摘要，请把新内容合并进去，仍保持在 500 字以内：\n"
-            f"{previous_summary}"
+            f"{_redact_sensitive(previous_summary)}"
         )
-    parts.append("对话记录：\n" + format_turns(turns))
+    parts.append("对话记录：\n" + format_turns(_redacted_turns(turns)))
     return "\n".join(parts)
 
 
