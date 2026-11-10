@@ -849,7 +849,10 @@ _CONDITIONAL_LEADS = ("如果", "假设", "假如", "要是", "万一")
 _IDENTITY_USER_TRIGGERS = ("我的名字是", "我的名字叫", "你叫我", "叫我", "我叫")
 _IDENTITY_AGENT_TRIGGERS = ("以后你叫", "现在你叫", "你的名字是", "你的名字叫", "你叫")
 _IDENTITY_VALUE_MAX_LEN = 12  # 名字值最多 12 字
-_IDENTITY_TRAILING_PARTICLES = "了啊呀呢"  # 名字末尾的语气词，去掉
+_IDENTITY_TRAILING_PARTICLES = "了啊呀呢吧哦嘛呗啦喽哈"  # 名字末尾的语气词，去掉
+# 问句尾巴：值以这些结尾时整句是问句（“你叫十三好不好”是在问，
+# 不是在起名），不当身份陈述认。
+_IDENTITY_QUESTION_SUFFIXES = ("好不好", "行不行", "可以吗", "好吗")
 
 
 def _is_bare_retraction(text):
@@ -874,7 +877,8 @@ def _detect_identity_statement(sentence):
       离线关键词召回问“你叫什么”时也能找着）；
     - user_name（BOOS 的称呼）：“我叫小宋”→ 原句存（去句末标点）；
       “叫我小宋”/“你叫我小宋”→ "我叫小宋，请称呼我小宋"。
-    名字值最多 12 字，末尾的“了/啊/呀/呢”语气词去掉。
+    名字值最多 12 字，末尾的语气词（了/啊/呀/呢/吧/哦/嘛/呗/啦/喽/哈）去掉；
+    值以“好不好/行不行/可以吗/好吗”结尾时整句是问句，返回 None。
     认不到返回 None。
     """
     if not isinstance(sentence, str):
@@ -896,6 +900,9 @@ def _detect_identity_statement(sentence):
             # 值到第一个标点为止。
             value = re.split(r"[，。！？、；;,\s]", rest, maxsplit=1)[0].strip()
             value = value.rstrip(_IDENTITY_TRAILING_PARTICLES)
+            # 问句尾巴：整句是在问“这样叫好不好”，不是在起名。
+            if any(value.endswith(suffix) for suffix in _IDENTITY_QUESTION_SUFFIXES):
+                return None
             if not value or len(value) > _IDENTITY_VALUE_MAX_LEN:
                 continue
             if slot == SLOT_USER_NAME:

@@ -27,6 +27,19 @@ def test_detect_identity_agent_name_forms():
     assert _detect_identity_statement("你的名字是什么？") is None
 
 
+def test_detect_identity_trailing_particles_stripped():
+    """身份识别：句末语气词不进名字（“你叫十三吧”存“十三”，不是“十三吧”）。"""
+    assert _detect_identity_statement("你叫十三吧")["value"] == "十三"
+    assert _detect_identity_statement("你叫十二哦")["value"] == "十二"
+    assert _detect_identity_statement("你叫十三啦")["value"] == "十三"
+
+
+def test_detect_identity_question_suffix_not_stored():
+    """身份识别：问句尾巴不当名字存（“你叫十三好不好”是在问，不是在起名）。"""
+    assert _detect_identity_statement("你叫十三好不好") is None
+    assert _detect_identity_statement("你叫十三行不行") is None
+
+
 def test_detect_identity_user_name_forms():
     """身份识别：BOOS 称呼的几种说法都认；“你叫我小宋”是叫“我”，
     不是给 Agent 起名（先认 user、后认 agent）。"""
