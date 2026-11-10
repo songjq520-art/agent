@@ -10,8 +10,24 @@ import sys
 import pytest
 
 from tools.audit import AuditLog
-from tools.commands import CommandRunner
+from tools.commands import CommandRunner, _pid_alive_windows
 from tools.errors import NeedsConfirmation, PermissionDenied
+
+
+def _assert_child_dead(child_pid):
+    """跨平台查子进程死了没。
+    Linux 上 os.kill(pid, 0) 对已死进程报 ProcessLookupError，就是死了；
+    Windows 上 os.kill(pid, 0) 对已死进程报 WinError 11，不能用，改走
+    tasklist 查：找不到就是死了；查不出来（返回 None）按失败处理，
+    不静默跳过。"""
+    if os.name == "nt":
+        alive = _pid_alive_windows(child_pid)
+        assert alive is False, (
+            f"子进程 {child_pid} 没死，或 tasklist 查不出来（alive={alive!r}）"
+        )
+    else:
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
 
 
 @pytest.fixture
@@ -169,7 +185,9 @@ def test_external_origin_command_refused(runner):
 
 def test_timeout_kills_whole_process_tree(runner, tmp_path):
     # 真实进程树：父进程起一个子进程（sleep 30），父进程也睡；
-    # 超时 1 秒后，父子都必须死了，且结果里标 verified。
+    # 超时 1 秒后，父子都必须死了。结果里的 verified 分系统：POSIX 上
+    # killpg 后复查了进程组，标 verified；Windows 上 taskkill 成功只能
+    # 标 assumed（没法逐个复查孙子进程），这是设计，不是降级。
     child_pid_file = tmp_path / "child.pid"
     script = tmp_path / "spawner.py"
     script.write_text(
@@ -184,10 +202,10 @@ def test_timeout_kills_whole_process_tree(runner, tmp_path):
         timeout=1,
     )
     assert out["timed_out"] is True
-    assert out["tree_kill"]["verified"] == "verified"
+    expected = "verified" if os.name == "posix" else "assumed"
+    assert out["tree_kill"]["verified"] == expected
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    _assert_child_dead(child_pid)
 
 
 def test_windows_tree_kill_builds_taskkill_command(monkeypatch):
@@ -226,8 +244,7 @@ def test_windows_taskkill_kills_tree(runner, tmp_path):
     assert out["timed_out"] is True
     assert out["tree_kill"]["method"] == "taskkill /F /T"
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    _assert_child_dead(child_pid)
 
 
 # ---------- GPT 三次审查新增（2026-11-10）：taskkill 失败时标 failed ----------

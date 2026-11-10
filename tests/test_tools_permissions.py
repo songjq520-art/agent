@@ -45,13 +45,24 @@ def test_resolve_absolute_outside_rejected(tmp_path):
         resolve_in_workspace(root, str(tmp_path / "outside.txt"))
 
 
+def _symlink_dir_or_skip(link, target):
+    """建指到目录的符号链接；建不起来就跳过，不算失败。
+    Windows 普通用户没开开发者模式时，建符号链接报 WinError 1314
+    （客户端没有所需的特权）——是这台机器缺权限，不是代码坏了。
+    安全断言本身不动，能建链接的机器上照常测。"""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"建符号链接要管理员权限或开发者模式：{exc}")
+
+
 def test_resolve_symlink_escape_rejected(tmp_path):
     root = tmp_path / "ws"
     root.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.txt").write_text("secret", encoding="utf-8")
-    os.symlink(outside, root / "link")
+    _symlink_dir_or_skip(root / "link", outside)
     with pytest.raises(PermissionDenied):
         resolve_in_workspace(root, "link/secret.txt")
 

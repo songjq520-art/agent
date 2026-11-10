@@ -20,6 +20,17 @@ def ws(tmp_path):
     return Workspace(root, audit_log=AuditLog(root / ".audit" / "audit.log"))
 
 
+def _symlink_or_skip(link, target):
+    """建符号链接；建不起来就跳过，不算失败。
+    Windows 普通用户没开开发者模式时，建符号链接报 WinError 1314
+    （客户端没有所需的特权）——是这台机器缺权限，不是代码坏了。
+    安全断言本身不动，能建链接的机器上照常测。"""
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"建符号链接要管理员权限或开发者模式：{exc}")
+
+
 def test_write_read_round_trip(ws):
     out = ws.write_text("notes/a.txt", "你好\n世界\n", confirmed=True)
     assert out["sha256"]
@@ -197,7 +208,7 @@ def test_symlink_to_env_cannot_be_read(ws):
     target = ws.root / ".env"
     target.write_text("TAVILY_API_KEY=tvly-fake-secret\n", encoding="utf-8")
     link = ws.root / "link_to_env"
-    link.symlink_to(target)
+    _symlink_or_skip(link, target)
     with pytest.raises(PermissionDenied):
         ws.read_text("link_to_env")
 
@@ -206,7 +217,7 @@ def test_symlink_to_secret_inside_workspace_cannot_be_read(ws):
     target = ws.root / "real_key.pem"
     target.write_text("FAKE-PEM-CONTENT\n", encoding="utf-8")
     link = ws.root / "innocent_name.txt"
-    link.symlink_to(target)
+    _symlink_or_skip(link, target)
     with pytest.raises(PermissionDenied):
         ws.read_text("innocent_name.txt")
 
