@@ -84,6 +84,28 @@
     font-weight: 600;
   }
   .btn-primary:hover { filter: brightness(1.08); background: var(--accent); }
+
+  /* ---------- 左侧“最近”对话列表 ---------- */
+  /* 样式和侧边栏按钮保持一致：白底、细边框、圆角；当前那条用主色描边。 */
+  .recent { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .recent-title { font-size: 12px; color: var(--muted); font-weight: 700; margin-bottom: 6px; }
+  .recent-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .recent-item {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 8px 10px;
+    cursor: pointer; text-align: left;
+    width: 100%;
+  }
+  .recent-item:hover { background: var(--bg); }
+  .recent-item.active { border-color: var(--accent); background: var(--accent-soft); }
+  .recent-item-title {
+    font-size: 13px; color: var(--text); line-height: 1.5;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .recent-item-time { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .recent-empty { font-size: 12px; color: var(--muted); line-height: 1.6; }
   .status {
     font-size: 12px; color: var(--muted);
     border-top: 1px solid var(--border);
@@ -267,10 +289,14 @@
     </div>
     <button class="btn btn-primary" id="newChat">＋ 新对话</button>
     <button class="btn" id="memoriesBtn">🧠 长期记忆</button>
+    <div class="recent">
+      <div class="recent-title">最近</div>
+      <div class="recent-list" id="recentList"></div>
+    </div>
     <div class="status" id="status">正在加载状态…</div>
     <div class="sidebar-foot">
       只在你自己的电脑上运行（<span id="origin">本机</span>），不上云，别人打不开。<br>
-      对话历史只保存在内存里，重启服务后清空。<br>
+      对话结束时会总结保存，左边“最近”里能找回。<br>
       想改颜色、名字、头像：改本文件最上面 &lt;style&gt; 里 :root 的颜色，和标着“可改”的地方。
     </div>
   </aside>
@@ -412,6 +438,7 @@
     sendBtn.disabled = false;
     inputEl.focus();
     refreshStatus();
+    refreshRecent();  // 发完一轮，最近列表里出现/更新这段对话（标题取第一句）。
   }
 
   // ---------- 聊天里的纠错提示 ----------
@@ -728,19 +755,96 @@
   document.getElementById('memoriesBtn').addEventListener('click', showMemoriesPanel);
   document.getElementById('backToChat').addEventListener('click', showChatPanel);
 
+  // ---------- 左侧“最近”对话列表 ----------
+  // 每条只有标题和时间（正文在服务端），点一条就回到那段对话：
+  // 服务端先把当前对话总结保存，再恢复那段的最近几轮，页面按返回的
+  // 消息重画聊天区，接着聊。新对话第一轮后自动出现在列表顶部。
+  const recentListEl = document.getElementById('recentList');
+  let currentConvId = null;
+
+  function formatRecentTime(iso) {
+    if (!iso) return '';
+    try {
+      return new Date(iso).toLocaleString('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+      });
+    } catch (e) {
+      return String(iso);
+    }
+  }
+
+  async function refreshRecent() {
+    try {
+      const res = await fetch('/api/conversations');
+      const data = await res.json();
+      const list = (data && data.conversations) || [];
+      recentListEl.textContent = '';
+      if (!list.length) {
+        recentListEl.appendChild(el('div', 'recent-empty', '还没有对话。聊几句、开新对话后，这里会出现最近的对话，点一条就能回去接着聊。'));
+        return;
+      }
+      list.forEach((conv) => {
+        const item = el('button', 'recent-item' + (conv.id === currentConvId ? ' active' : ''));
+        item.appendChild(el('div', 'recent-item-title', conv.title || '新对话'));
+        item.appendChild(el('div', 'recent-item-time', formatRecentTime(conv.updated_at || conv.started_at)));
+        item.addEventListener('click', () => openConversation(conv.id));
+        recentListEl.appendChild(item);
+      });
+    } catch (e) {
+      recentListEl.textContent = '';
+      recentListEl.appendChild(el('div', 'recent-empty', '最近列表加载失败：连不上服务。'));
+    }
+  }
+
+  async function openConversation(convId) {
+    if (busy) return;
+    busy = true;
+    sendBtn.disabled = true;
+    try {
+      const res = await fetch('/api/conversations/open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: convId }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        addMsg('ai', '回不去了：' + (data.error || ('HTTP ' + res.status)));
+        return;
+      }
+      currentConvId = data.id || convId;
+      showChatPanel();
+      chatEl.querySelectorAll('.msg').forEach((node) => node.remove());
+      (data.messages || []).forEach((m) => {
+        addMsg(m.role === 'user' ? 'user' : 'ai', m.content || '');
+      });
+      addMsg('ai', '已回到之前的对话《' + (data.title || '新对话') + '》，摘要和最近几轮已恢复，接着聊吧。');
+      refreshRecent();
+    } catch (e) {
+      addMsg('ai', '回不去了：连不上服务，请确认服务还在运行。');
+    }
+    busy = false;
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+
   // ---------- 原来的聊天逻辑 ----------
   document.getElementById('newChat').addEventListener('click', async () => {
     if (busy) return;
     showChatPanel();  // 正在看记忆时点了新对话：先回到聊天，再清空。
     await fetch('/api/reset', { method: 'POST' });
     chatEl.querySelectorAll('.msg').forEach((el) => el.remove());
-    addMsg('ai', '已开始新对话，之前的记录清空了。');
+    currentConvId = null;
+    addMsg('ai', '已开始新对话，之前的对话已总结保存了，左边“最近”里能找回。');
+    refreshRecent();
   });
 
   // 侧边栏显示当前实际地址（端口改了也能对上，不用在 HTML 里写死地址）。
   document.getElementById('origin').textContent = window.location.origin;
 
   refreshStatus();
+  refreshRecent();
   inputEl.focus();
 </script>
 </body>
