@@ -46,6 +46,36 @@ def _timestamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
 
+# 重要目录名：递归删目录时，树里出现这些就按受保护内容处理。
+_PROTECTED_DIR_NAMES = (".backups", ".trash", ".audit")
+
+
+def _find_protected_in_tree(root, path):
+    """递归删目录之前，先扫一遍树里有没有秘密/受保护内容。
+
+    按 classify_path 同一套规则：.env 类、.git/、.ssh/、*.pem、*.key、
+    id_rsa*、.backups/、.trash/、.audit/。只看条目在工作区里的相对路径，
+    不解析符号链接的目标——rmtree 只删链接本身、不跟过去，所以树里
+    指到 .env 的链接（名字不是 .env）不算，目标不会被删掉。
+    返回工作区相对路径的列表（按发现顺序）。"""
+    root = Path(root)
+    protected = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            entry = Path(dirpath) / name
+            try:
+                rel = entry.relative_to(root)
+            except ValueError:
+                continue
+            if (
+                _is_secret_blocked(rel)
+                or _is_env_file(rel)
+                or any(part.lower() in _PROTECTED_DIR_NAMES for part in rel.parts)
+            ):
+                protected.append(str(rel))
+    return protected
+
+
 class Workspace:
     """固定工作区里的文件工具。root 之外的路径一律拒绝。"""
 
@@ -317,28 +347,61 @@ class Workspace:
         """删文件：默认进回收站（.trash/，能找回来）；彻底删要显式说。
         删目录默认拒绝，要删必须显式说递归。工作区根目录和 .backups/、
         .trash/、.audit/ 本身不让删。origin 见 _confirm——删用的路径只能
-        来自 BOOS 原话或 agent 自己的推理，外部文件里读到的路径不直接拿来删。"""
+        来自 BOOS 原话或 agent 自己的推理，外部文件里读到的路径不直接拿来删。
+        符号链接只删链接本身，永远不碰目标（resolve 会把链接解析成目标，
+        再删就删错了东西）。递归彻底删目录之前先扫一遍树里有没有秘密/
+        受保护内容，有就拒绝；进回收站那路可恢复，允许继续，但结果和
+        审计里注明里面含受保护内容。"""
         self._check(rel_path, "delete")
         path = resolve_in_workspace(self.root, rel_path)
         if path == self.root:
             raise ToolError("不能删工作区根目录本身")
         if path.parent == self.root and path.name.lower() in (".backups", ".trash", ".audit"):
             raise ToolError(f"不能删 {path.name} 目录本身")
-        if not path.exists():
-            raise ToolError(f"文件不存在：{rel_path}")
-        if path.is_dir() and not recursive:
-            raise ToolError(f"删目录必须显式说递归：{rel_path}")
+        # 5 号：先看没解析过的原始路径是不是符号链接——resolve 会把链接
+        # 解析成目标路径，再 unlink/rmtree 删的就是目标（实测：链接还在，
+        # 目标文件没了）。是链接就只删链接本身，不动目标；指着目录的链接
+        # 也一样，不用 recursive。_check 已经拦住了解析后在工作区外的目标。
+        raw = Path(os.path.normpath(Path(rel_path) if Path(rel_path).is_absolute() else (self.root / rel_path)))
+        is_link = raw.is_symlink()
+        if is_link:
+            # 链接本身就是一条目录项（哪怕目标已经没了、链接悬空），不用再查 exists()。
+            pass
+        else:
+            if not path.exists():
+                raise ToolError(f"文件不存在：{rel_path}")
+            if path.is_dir() and not recursive:
+                raise ToolError(f"删目录必须显式说递归：{rel_path}")
+        # 3 号：递归删目录之前，先扫一遍树里有没有秘密/受保护内容。
+        # 顶层确认只写了“删目录 data”，里面的 .env、密钥文件不会出现在
+        # 确认理由里，彻底删就一声不吭没了。链接本身不扫树（只删链接）。
+        protected_inside = []
+        if path.is_dir() and not is_link:
+            protected_inside = _find_protected_in_tree(self.root, path)
+            if permanent and protected_inside:
+                shown = protected_inside[:10]
+                more = f"等共 {len(protected_inside)} 个" if len(protected_inside) > 10 else ""
+                raise ToolError(
+                    "目录里有受保护内容，彻底删除拒绝："
+                    + "、".join(shown)
+                    + (f"（{more}）" if more else "")
+                    + "——请先把这些文件单独处理，或进回收站。"
+                )
         confirm_source = self._confirm(
             "delete",
             rel_path,
-            f"删{'目录' if path.is_dir() else '文件'} {rel_path}（{'彻底删除' if permanent else '进回收站'}）",
+            f"删{'符号链接' if is_link else ('目录' if path.is_dir() else '文件')} {rel_path}"
+            + ("（只删链接本身，不动它指着的东西）" if is_link else "")
+            + f"（{'彻底删除' if permanent else '进回收站'}）",
             confirmed,
             actor,
             origin,
         )
-        before_sha = sha256_file(path) if path.is_file() else None
+        before_sha = sha256_file(path) if (path.is_file() and not is_link) else None
         if permanent:
-            if path.is_dir():
+            if is_link:
+                raw.unlink()
+            elif path.is_dir():
                 shutil.rmtree(path)
             else:
                 path.unlink()
@@ -346,8 +409,11 @@ class Workspace:
         else:
             trash_dir = self.root / ".trash"
             trash_dir.mkdir(parents=True, exist_ok=True)
-            destination = trash_dir / f"{path.name}_{_timestamp()}"
-            shutil.move(str(path), str(destination))
+            # 链接进回收站时，回收站里的名字用链接自己的名字（raw），
+            # 不用解析后目标的名字，不然找回来的时候认不出来是哪条链接。
+            trash_name = raw.name if is_link else path.name
+            destination = trash_dir / f"{trash_name}_{_timestamp()}"
+            shutil.move(str(raw if is_link else path), str(destination))
         self.audit_log.record(
             tool="files",
             action="delete",
@@ -357,7 +423,12 @@ class Workspace:
             success=True,
             before_sha256=before_sha,
             after_sha256=None,
-            extra={"permanent": permanent, "destination": str(destination) if destination else None},
+            extra={
+                "permanent": permanent,
+                "destination": str(destination) if destination else None,
+                "is_symlink": is_link,
+                "protected_inside": protected_inside,
+            },
             confirmation_source=confirm_source,
             origin=origin,
         )
@@ -365,4 +436,6 @@ class Workspace:
             "path": str(rel_path),
             "permanent": permanent,
             "destination": str(destination) if destination else None,
+            "is_symlink": is_link,
+            "protected_inside": protected_inside,
         }

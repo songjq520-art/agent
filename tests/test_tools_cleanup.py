@@ -150,7 +150,41 @@ def test_format_summary_reports_listed_count_when_capped(tmp_path):
     assert "一共 2 个文件" in summary
 
 
-# ---------- 多场景补充（BOOS 2026-11-10 要求：不只测正常路） ----------
+def _symlink_or_skip(link, target):
+    """建符号链接；建不起来就跳过，不算失败。
+    Windows 普通用户没开开发者模式时报 WinError 1314——是这台机器
+    缺权限，不是代码坏了。"""
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"建符号链接要管理员权限或开发者模式：{exc}")
+
+
+def test_delete_preview_symlink_deletes_link_only(tmp_path):
+    # 5 号复核：清理预览里含符号链接时，只删链接本身，不删目标；
+    # 腾出的空间按链接自己算，不按目标算。
+    root = tmp_path / "tree"
+    root.mkdir(parents=True)
+    victim = root / "victim.txt"
+    victim.write_bytes(b"v" * 500)
+    link = root / "link.tmp"
+    _symlink_or_skip(link, victim)
+    link_lstat_size = os.lstat(link).st_size
+    preview = build_preview(scan(root, root_kind="temp", large_threshold_mb=10))
+    # 预览里只有链接那一条（目标文件本身是另一条，单独删它才是另一回事）；
+    # 改完重新盖校验和，这样测的是删除本身，而不是校验和那一关。
+    bucket = preview["categories"]["temp"]
+    bucket["files"] = [f for f in bucket["files"] if f["path"] == str(link)]
+    bucket["file_count"] = 1
+    assert len(bucket["files"]) == 1
+    preview["checksum"] = preview_checksum(preview)
+    report = delete_preview(preview, ["temp"], trash_dir=tmp_path / "trash", roots=[str(root)])
+    assert report["deleted"] == 1
+    assert not link.exists() and not link.is_symlink()
+    assert victim.exists()  # 目标文件完好
+    assert victim.read_bytes() == b"v" * 500
+    assert report["freed_bytes"] == link_lstat_size
+    assert report["freed_bytes"] < 500  # 不是目标的 500 字节
 
 
 def test_per_category_confirmation_only_confirmed_deleted(tmp_path):

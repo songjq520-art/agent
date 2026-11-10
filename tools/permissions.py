@@ -365,6 +365,49 @@ def _decode_powershell_encoded(text):
     return None
 
 
+def _find_shell_code_flag(normalized):
+    """在 shell 的 argv 里找 -c / -EncodedCommand 标志的位置。
+
+    返回 (index, kind)，kind 是 "code"（-c/-command//c//k）或
+    "encoded"（-EncodedCommand/-enc）；找不到返回 None。
+    只认第一个标志：它后面的一个参数就是内含命令，再往后的 -c
+    是内含命令自己的事，不归这里管。
+
+    -c 不一定紧跟在 shell 后面——以前只看 normalized[1]，所以
+    bash -lc、bash -l -c、bash --login -c、cmd /d /c、powershell
+    -NoProfile -EncodedCommand 全都漏查，里面的硬禁命令只剩 Tier 1。
+    找法：从 argv[1] 起按顺序扫选项类 token，第一个非选项 token
+    （脚本名/命令名）出现就停——它后面的 -c 是脚本自己的参数，
+    不是 shell 的（比如 bash script.sh -c ... 不查）。
+    sh/bash/zsh 的选项以 - 开头（-lc 这种合并短标志簇里带 c 的也算，
+    和 getopt 的拼法一致）；cmd/powershell 的 - 和 / 都算选项前缀。
+    """
+    prog = _program_name(normalized[0])
+    for i in range(1, len(normalized)):
+        token = normalized[i]
+        lower = token.lower()
+        if lower in ("-c", "-command", "/c", "/k"):
+            return i, "code"
+        if lower in ("-encodedcommand", "-enc"):
+            return i, "encoded"
+        if token in ("-", "--", "/"):
+            return None
+        if prog in ("sh", "bash", "zsh"):
+            if not token.startswith("-"):
+                return None
+            if token.startswith("--"):
+                continue
+            if len(token) > 2 and "c" in token[1:].lower():
+                return i, "code"
+            continue
+        # cmd / powershell：- 和 / 都可能是标志前缀。
+        if not (token.startswith("-") or token.startswith("/")):
+            return None
+        if token.startswith("-") and not token.startswith("--") and len(token) > 2 and "c" in token[1:].lower():
+            return i, "code"
+    return None
+
+
 def classify_command(argv):
     """给一条结构化命令分级：返回 (tier, reason)。
 
@@ -400,46 +443,45 @@ def classify_command(argv):
                 return 2, reason
     # sh/bash/cmd/powershell -c "..."：把引号里的内容也当命令查。
     # 命令头同样先归一化（全路径的 cmd.exe 也认），-Command 大小写不敏感。
-    if (
-        _program_name(normalized[0]) in _SHELLS
-        and len(normalized) > 2
-        and normalized[1].lower() in ("-c", "-command", "/c")
-    ):
-        inner = normalized[2]
-        for segment in _split_segments(inner):
-            tier, reason = _check_segment(segment)
-            if tier == 2:
-                return 2, reason
-            if tier > worst_tier:
-                worst_tier, worst_reason = tier, reason
-    # powershell -EncodedCommand/-enc：base64 包起来的命令也要拆开查。
-    # 解出来的内容按同一套规则查（比如编进去一个 shutdown 也进 Tier 2）；
-    # 解出来的原命令（截断到 200 字）写进确认理由里，让 BOOS 点头时
-    # 看得懂里面是什么，而不是对着一串 base64 点头。解不开就明确标注
-    #“解不出来”，内容未检查。
-    if (
-        _program_name(normalized[0]) in _SHELLS
-        and len(normalized) > 2
-        and normalized[1].lower() in ("-encodedcommand", "-enc")
-    ):
-        decoded = _decode_powershell_encoded(normalized[2])
-        if decoded is None:
-            # shell 本身已经是 Tier 1，这里只换理由：让 BOOS 知道这串
-            # base64 解不出来、内容没检查过，不能让他对着看不懂的东西点头。
-            worst_tier, worst_reason = (
-                1,
-                "内含编码命令（-EncodedCommand），解不出来，内容未检查，需要确认",
-            )
-        else:
-            for segment in _split_segments(decoded):
-                tier, reason = _check_segment(segment)
-                if tier == 2:
-                    return 2, reason
-                if tier > worst_tier:
-                    worst_tier, worst_reason = tier, reason
-            shown = decoded if len(decoded) <= 200 else decoded[:200] + "……"
-            if worst_tier <= 1:
-                worst_tier, worst_reason = 1, f"跑 shell 编码命令，需要确认：{shown}"
+    # -c 标志的位置用 _find_shell_code_flag 找：-lc、-l -c、--login -c、
+    # cmd /d /c、cmd /k（执行命令后留住窗口，和 /c 同类）里的命令也要查；
+    # powershell 的 -EncodedCommand 在 -NoProfile 这类标志后面时也要找到。
+    if _program_name(normalized[0]) in _SHELLS:
+        found = _find_shell_code_flag(normalized)
+        if found is not None and found[0] + 1 < len(normalized):
+            idx, kind = found
+            if kind == "code":
+                inner = normalized[idx + 1]
+                for segment in _split_segments(inner):
+                    tier, reason = _check_segment(segment)
+                    if tier == 2:
+                        return 2, reason
+                    if tier > worst_tier:
+                        worst_tier, worst_reason = tier, reason
+            else:
+                # powershell -EncodedCommand/-enc：base64 包起来的命令也要拆开查。
+                # 解出来的内容按同一套规则查（比如编进去一个 shutdown 也进 Tier 2）；
+                # 解出来的原命令（截断到 200 字）写进确认理由里，让 BOOS 点头时
+                # 看得懂里面是什么，而不是对着一串 base64 点头。解不开就明确标注
+                #“解不出来”，内容未检查。
+                decoded = _decode_powershell_encoded(normalized[idx + 1])
+                if decoded is None:
+                    # shell 本身已经是 Tier 1，这里只换理由：让 BOOS 知道这串
+                    # base64 解不出来、内容没检查过，不能让他对着看不懂的东西点头。
+                    worst_tier, worst_reason = (
+                        1,
+                        "内含编码命令（-EncodedCommand），解不出来，内容未检查，需要确认",
+                    )
+                else:
+                    for segment in _split_segments(decoded):
+                        tier, reason = _check_segment(segment)
+                        if tier == 2:
+                            return 2, reason
+                        if tier > worst_tier:
+                            worst_tier, worst_reason = tier, reason
+                    shown = decoded if len(decoded) <= 200 else decoded[:200] + "……"
+                    if worst_tier <= 1:
+                        worst_tier, worst_reason = 1, f"跑 shell 编码命令，需要确认：{shown}"
     if worst_tier == 1:
         return 1, worst_reason
     return 0, ""

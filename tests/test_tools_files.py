@@ -272,3 +272,104 @@ def test_delete_protected_dirs_case_insensitive(ws):
         with pytest.raises(ToolError):
             ws.delete(name, recursive=True, confirmed=True)
         assert (ws.root / name).exists()
+
+
+def test_recursive_permanent_delete_refuses_protected_inside(ws):
+    # 3 号：递归彻底删目录，树里有 .env、id_rsa 时拒绝，报错里列出来是什么，
+    # 目录和里面的文件一个都不少。
+    (ws.root / "data" / "sub").mkdir(parents=True)
+    ws.write_text("data/notes.txt", "hello", confirmed=True)
+    (ws.root / "data" / ".env").write_text("K=v\n", encoding="utf-8")
+    (ws.root / "data" / "sub" / "id_rsa").write_text("PRIVATE\n", encoding="utf-8")
+    with pytest.raises(ToolError, match=".env"):
+        ws.delete("data", permanent=True, recursive=True, confirmed=True)
+    assert (ws.root / "data" / ".env").exists()
+    assert (ws.root / "data" / "sub" / "id_rsa").exists()
+    assert (ws.root / "data" / "notes.txt").exists()
+
+
+def test_recursive_permanent_delete_clean_dir_ok(ws):
+    # 3 号对照：树里没有秘密/受保护内容，递归彻底删正常走。
+    (ws.root / "data" / "sub").mkdir(parents=True)
+    ws.write_text("data/notes.txt", "hello", confirmed=True)
+    ws.write_text("data/sub/more.txt", "more", confirmed=True)
+    out = ws.delete("data", permanent=True, recursive=True, confirmed=True)
+    assert out["protected_inside"] == []
+    assert not (ws.root / "data").exists()
+
+
+def test_recursive_delete_to_trash_notes_protected(ws):
+    # 3 号：进回收站那路可恢复，允许继续，但结果和审计里注明含受保护内容。
+    (ws.root / "data").mkdir(parents=True)
+    ws.write_text("data/notes.txt", "hello", confirmed=True)
+    (ws.root / "data" / ".env").write_text("K=v\n", encoding="utf-8")
+    out = ws.delete("data", recursive=True, confirmed=True)
+    assert not (ws.root / "data").exists()
+    assert any(".env" in p for p in out["protected_inside"])
+    trashed = list((ws.root / ".trash").glob("data_*"))
+    assert len(trashed) == 1
+    assert (trashed[0] / ".env").exists()  # 进了回收站，还能找回来
+    events = ws.audit_log.read()
+    assert any(".env" in str(e.get("extra", {}).get("protected_inside", [])) for e in events)
+
+
+def test_delete_symlink_to_file_deletes_link_only(ws):
+    # 5 号：删指着重要文件的链接，只删链接本身，目标文件完好。
+    target = ws.root / "victim.txt"
+    target.write_text("important\n", encoding="utf-8")
+    link = ws.root / "link.txt"
+    _symlink_or_skip(link, target)
+    out = ws.delete("link.txt", permanent=True, confirmed=True)
+    assert out["is_symlink"] is True
+    assert not link.exists() and not link.is_symlink()
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "important\n"
+
+
+def test_delete_symlink_to_dir_deletes_link_only(ws):
+    # 5 号：递归删指着目录的链接，只删链接，目标目录和里面的文件完好，
+    # 不管 recursive 是不是 True。
+    realdir = ws.root / "realdir"
+    realdir.mkdir()
+    (realdir / "keep.txt").write_text("keep me\n", encoding="utf-8")
+    link = ws.root / "linkdir"
+    _symlink_or_skip(link, realdir)
+    out = ws.delete("linkdir", permanent=True, recursive=True, confirmed=True)
+    assert out["is_symlink"] is True
+    assert not link.exists() and not link.is_symlink()
+    assert realdir.exists()
+    assert (realdir / "keep.txt").exists()
+
+
+def test_delete_symlink_to_file_goes_to_trash(ws):
+    # 5 号：进回收站那路也只移动链接本身，不移动目标。
+    target = ws.root / "victim.txt"
+    target.write_text("important\n", encoding="utf-8")
+    link = ws.root / "link.txt"
+    _symlink_or_skip(link, target)
+    out = ws.delete("link.txt", confirmed=True)
+    assert not link.exists() and not link.is_symlink()
+    assert target.exists()
+    trashed = list((ws.root / ".trash").glob("link.txt_*"))
+    assert len(trashed) == 1
+    assert trashed[0].is_symlink()  # 回收站里的是链接本身
+
+
+def test_delete_symlink_to_outside_refused(ws, tmp_path):
+    # 5 号：删指着工作区外文件的链接，拒绝，目标完好。
+    outside = tmp_path / "outside.txt"
+    outside.write_text("别动我\n", encoding="utf-8")
+    link = ws.root / "link.txt"
+    _symlink_or_skip(link, outside)
+    with pytest.raises(PermissionDenied):
+        ws.delete("link.txt", permanent=True, confirmed=True)
+    assert outside.exists()
+    assert outside.read_text(encoding="utf-8") == "别动我\n"
+
+
+def test_delete_dangling_symlink(ws):
+    # 5 号：目标已经没了的悬空链接，照样能删（不用先报“文件不存在”）。
+    link = ws.root / "dangling.txt"
+    _symlink_or_skip(link, ws.root / "gone.txt")
+    ws.delete("dangling.txt", permanent=True, confirmed=True)
+    assert not link.exists() and not link.is_symlink()

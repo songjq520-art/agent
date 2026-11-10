@@ -235,6 +235,38 @@ def test_powershell_encoded_command_undecodable_flagged():
     assert "解不出来" in reason
 
 
+def test_shell_code_flag_combined_forms_checked():
+    # 4 号：-c 不一定紧跟在 shell 后面，-lc、-l -c、--login -c、
+    # cmd /d /c、cmd /k 里的硬禁命令也要进 Tier 2，不能只剩 Tier 1。
+    tier2_cases = [
+        ["bash", "-lc", "shutdown /s"],
+        ["sh", "-lc", "shutdown /s"],
+        ["bash", "-l", "-c", "shutdown /s"],
+        ["bash", "--login", "-c", "shutdown /s"],
+        ["zsh", "-lc", "format C:"],
+        ["bash", "-cl", "shutdown /s"],
+        ["bash", "-ic", "shutdown /s"],
+        ["cmd", "/k", "shutdown /s"],
+        ["cmd", "/d", "/c", "shutdown /s"],
+        ["powershell", "-NoProfile", "-Command", "shutdown /s"],
+        ["powershell", "-NoProfile", "-EncodedCommand", _b64_utf16le("shutdown /s")],
+    ]
+    for argv in tier2_cases:
+        tier, reason = classify_command(argv)
+        assert tier == 2, (argv, tier, reason)
+    # 正常命令还是 Tier 1：组合标志 + 无害内容不升级。
+    tier, _ = classify_command(["bash", "-lc", "echo hi"])
+    assert tier == 1
+    tier, _ = classify_command(["bash", "-c", "echo hi"])
+    assert tier == 1
+    # 不带 c 的组合标志（光 -l）：没有内含命令，不报错、不升级。
+    tier, _ = classify_command(["bash", "-l", "echo hi"])
+    assert tier == 1
+    # 脚本自己的 -c 不是 shell 的：bash script.sh -c ... 里面的命令不查。
+    tier, _ = classify_command(["bash", "script.sh", "-c", "shutdown /s"])
+    assert tier == 1
+
+
 def test_command_must_be_list():
     with pytest.raises(ToolError):
         classify_command("rm -rf /")

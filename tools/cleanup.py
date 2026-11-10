@@ -486,7 +486,11 @@ def delete_preview(preview, confirmed_categories, trash_dir, *, roots, key=None,
                 counts["skipped"] += 1
                 report["skipped"].append(path_text)
                 continue
-            size = stat.st_size if path.is_file() else 0
+            # 符号链接只删链接本身（unlink/move 都不对解析后的目标动手，
+            # 上面 _is_inside 那几道检查也看的是链接自己的路径），
+            # 所以腾出的空间按链接自己算（lstat），不按它指着的目标算——
+            # 目标还留着，报目标的大小就是虚报。
+            size = os.lstat(path).st_size if path.is_symlink() else (stat.st_size if path.is_file() else 0)
             try:
                 if bucket["confidence"] == "low":
                     destination = trash_dir / f"{path.name}_{uuid.uuid4().hex[:8]}"
