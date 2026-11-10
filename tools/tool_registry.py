@@ -25,6 +25,16 @@
 #     调用时，True 的允许再执行一次，False 的直接拒绝、不执行；
 #     恢复/续跑时一律喂存下来的结果，不重执行——这条规则是真的关口，
 #     不是只登记不用的摆设（见 tools/agent_loop.py 的 _execute_one）。
+#   side_effect_free：这工具会不会改东西（True = 纯只读，什么都不改；
+#     False = 会改东西，或者不确定）。和 replay_safe 是两个意思，
+#     不能互相代替：只读操作重跑一次结果可能变了（比如实时搜索），
+#     所以 replay_safe 未必是 True；反过来幂等的写操作重跑没事，
+#     replay_safe 可以是 True，但它照样会改东西。网关拿这个字段
+#     决定超时的跑法（见 tools/tool_gateway.py 的 execute）：
+#     True 的走线程超时（超时了后台还在跑也没关系，反正什么都不改），
+#     False 的同步跑（线程杀不掉，超时后后台接着改等于改两次）。
+#     默认 False：没声明无副作用时，一律按会改东西处理，宁可慢，
+#     不可错。replay_safe 的默认值还是 True，别动它。
 #   timeout：执行超时秒数（默认 60 秒，见 tools/commands.py）；
 #   func：真正干活的函数，签名 func(args: dict) -> dict，
 #     返回 {"ok": True/False, "data": ..., "error": ...}。
@@ -37,7 +47,7 @@ _REGISTRY = {}
 
 def register_tool(name, description, parameters, output, risk_level,
                   needs_confirmation, tier2=False, replay_safe=True,
-                  timeout=60):
+                  side_effect_free=False, timeout=60):
     """登记一个工具。返回一个装饰器，装饰真正干活的函数。
 
     参数说明见文件头。risk_level 只认 "low" / "medium" / "high"，
@@ -63,6 +73,7 @@ def register_tool(name, description, parameters, output, risk_level,
             "needs_confirmation": bool(needs_confirmation),
             "tier2": bool(tier2),
             "replay_safe": bool(replay_safe),
+            "side_effect_free": bool(side_effect_free),
             "timeout": timeout,
             "func": func,
         }

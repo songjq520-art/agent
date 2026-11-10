@@ -151,5 +151,6 @@ def register_search_tool():
         needs_confirmation=False,
         tier2=False,
         replay_safe=True,
+        side_effect_free=True,
         timeout=60,
     )(_run_search)

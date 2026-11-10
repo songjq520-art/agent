@@ -1242,6 +1242,7 @@ if get_tool("test_slow_tool") is None:
         needs_confirmation=False,
         tier2=False,
         replay_safe=True,
+        side_effect_free=True,
         timeout=1,
     )(_slow_tool_fn)
 
@@ -1512,6 +1513,7 @@ if get_tool("test_slow_tool_2s") is None:
         needs_confirmation=False,
         tier2=False,
         replay_safe=True,
+        side_effect_free=True,
         timeout=1,
     )(_slow_tool_2s_fn)
 
@@ -1527,6 +1529,51 @@ if get_tool("test_slow_no_replay_tool") is None:
         replay_safe=False,
         timeout=1,
     )(_slow_no_replay_tool_fn)
+
+
+def _slow_replayable_side_effecting_fn(args):
+    """睡 2 秒、能重跑、但会改东西的工具（两个字段分开用）：
+    replay_safe=True，但 side_effect_free=False，网关不该用
+    线程超时掐它，得同步跑完。"""
+    time.sleep(2)
+    return {"ok": True, "data": {"done": True}, "error": None}
+
+
+def _slow_pure_no_replay_fn(args):
+    """睡 2 秒、不改东西、但不许重跑的工具（两个字段分开用）：
+    replay_safe=False，但 side_effect_free=True，网关该用
+    线程超时掐它。"""
+    time.sleep(2)
+    return {"ok": True, "data": {"done": True}, "error": None}
+
+
+if get_tool("test_replayable_but_side_effecting") is None:
+    register_tool(
+        name="test_replayable_but_side_effecting",
+        description="测试用的能重跑、但会改东西的工具（语义对照用）。",
+        parameters={"type": "object", "properties": {}},
+        output="正常时 data 是 {done: true}，但它会睡 2 秒。",
+        risk_level="low",
+        needs_confirmation=False,
+        tier2=False,
+        replay_safe=True,
+        side_effect_free=False,
+        timeout=1,
+    )(_slow_replayable_side_effecting_fn)
+
+if get_tool("test_pure_but_no_replay") is None:
+    register_tool(
+        name="test_pure_but_no_replay",
+        description="测试用的不改东西、但不许重跑的工具（语义对照用）。",
+        parameters={"type": "object", "properties": {}},
+        output="正常时 data 是 {done: true}，但它会睡 2 秒。",
+        risk_level="low",
+        needs_confirmation=False,
+        tier2=False,
+        replay_safe=False,
+        side_effect_free=True,
+        timeout=1,
+    )(_slow_pure_no_replay_fn)
 
 
 def test_timeout_marked_unknown_and_tool_keeps_running(gateway):
@@ -1784,3 +1831,137 @@ def test_invalid_json_call_leaves_record_and_counts_match(store, gateway):
     reopened = TaskStore(file_path=store.file_path)
     reloaded = reopened.load(outcome["task"]["task_id"])
     assert len(reloaded["tool_calls"]) == outcome["tool_calls"] == 1
+
+
+def test_confirm_crash_after_execute_does_not_reexecute(store, gateway, monkeypatch):
+    """（第三轮 1）确认执行完、结果还没存盘就崩了：工具只执行一次；
+    盘上留着 executing 记录（带幂等键）；恢复时模型再发同一条调用
+    也绝不重执行，喂给模型的是“执行过了、结果丢了，不要重复调用”。
+    标记是在 execute() 之前写盘的——这里把 _persist 改成抛错，
+    模拟“执行完、存盘前崩了”，盘上照样有 executing，证明标记
+    不是靠 _persist 写上去的。"""
+    _CONFIRM_CALLS.clear()
+    task, approval = _make_waiting_task(store, gateway)
+    monkeypatch.setattr(
+        gateway, "_persist_confirmed_execution",
+        Mock(side_effect=RuntimeError("模拟崩溃：存盘前进程死了")),
+    )
+    with pytest.raises(RuntimeError, match="模拟崩溃"):
+        gateway.resolve_approval(
+            store, task["task_id"], approval["approval_id"], "confirm"
+        )
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]  # 工具已经执行了一次
+    # 从磁盘重读：记录是 executing，带幂等键；任务卡在 RUNNING。
+    reopened = TaskStore(file_path=store.file_path)
+    saved = reopened.load(task["task_id"])
+    assert saved["status"] == "RUNNING"
+    record = [r for r in saved["tool_calls"] if r["tool_call_id"] == "call_1"][0]
+    assert record["status"] == "executing"
+    assert record["idempotency_key"] == approval["approval_id"]
+    assert saved.get("pending_tool_result") is None
+    # 恢复：模型又发同一条调用，绝不重执行。
+    resumer = ScriptedProvider(
+        script=[
+            _tool_response(
+                tool_calls=[_tool_call("call_1", "test_confirm_tool", {"path": "a.txt"})]
+            ),
+        ]
+    )
+    loop2 = AgentLoop(resumer, gateway=gateway, task_store=reopened,
+                      search_service=FakeSearchService())
+    resumed = loop2.run("帮我写个文件", resume_task=saved, pending_tool_result=None)
+    assert resumed["mode"] == "done"
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]  # 还是只执行了一次
+    # 恢复那轮喂给模型的 tool 消息写明了“执行过了、结果丢了，不要重复调用”。
+    resumed_messages = resumer.tool_calls_log[0]["messages"]
+    tool_msgs = [m for m in resumed_messages if m.get("role") == "tool"]
+    assert tool_msgs and "已经执行过了" in tool_msgs[0]["content"]
+    assert "不要重复调用" in tool_msgs[0]["content"]
+    # 盘上的记录还是 executing，没被偷偷改回去。
+    again = reopened.load(task["task_id"])
+    assert [r for r in again["tool_calls"] if r["tool_call_id"] == "call_1"][0]["status"] == "executing"
+
+
+def test_confirm_persist_cas_retry_keeps_concurrent_update(store, gateway, monkeypatch):
+    """（第三轮 2）_persist 的 CAS 第一次抢不到、同时有人改了别的字段：
+    兜底对新读出来的状态重试 CAS，不许用无条件全量保存把别人的
+    改动覆盖掉；最后记录是 ok、结果存着，别人的字段也还在。
+    并发改动发生在 _persist 读出任务、还没写回去之间：旧的
+    load + 无条件 save 兜底读的是改动前的那份，存回去就把别人
+    的改动覆盖了；重试 CAS 是重新读、再改、再比状态写，改动
+    不会丢。"""
+    _CONFIRM_CALLS.clear()
+    task, approval = _make_waiting_task(store, gateway)
+    real_cas = store.cas
+    real_load = store.load
+    armed = {"done": False}
+
+    def flaky_cas(task_id, expected_status, mutate):
+        # 只搅 _persist 那次 CAS（期望 RUNNING）：第一次返回抢不到，
+        # 同时把“并发改动”武装好——下一次 load 返回后由别人写进去。
+        if expected_status == "RUNNING" and not armed["done"]:
+            armed["done"] = True
+            return False, None
+        return real_cas(task_id, expected_status, mutate)
+
+    def loaded_with_race(task_id):
+        loaded = real_load(task_id)
+        if armed["done"] and not armed.get("raced"):
+            armed["raced"] = True
+            # 别人同时改了别的字段、存盘了：发生在 _persist 读出来、
+            # 还没写回去之间（调用方手里还是改动前的那份）。
+            other = TaskStore(file_path=store.file_path)
+            concurrent = other.load(task_id)
+            concurrent["goal"] = "别人同时改的"
+            other.save(concurrent)
+        return loaded
+
+    monkeypatch.setattr(store, "cas", flaky_cas)
+    monkeypatch.setattr(store, "load", loaded_with_race)
+    resolved = gateway.resolve_approval(
+        store, task["task_id"], approval["approval_id"], "confirm"
+    )
+    assert resolved["decision"] == "ok"
+    assert armed["done"] is True  # 兜底确实被触发过
+    assert armed.get("raced") is True  # 并发改动确实发生过
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]
+    saved = real_load(task["task_id"])
+    # 别人的改动还在（没被兜底覆盖），记录和结果也存好了。
+    assert saved["goal"] == "别人同时改的"
+    record = [r for r in saved["tool_calls"] if r["tool_call_id"] == "call_1"][0]
+    assert record["status"] == "ok"
+    assert record["result"]["ok"] is True
+    assert saved["pending_tool_result"]["ok"] is True
+
+
+def test_side_effect_free_independent_from_replay_safe(gateway):
+    """（第三轮 3）side_effect_free 和 replay_safe 是两个意思：
+    能重跑、但会改东西的工具走同步执行（不进线程超时）；
+    不许重跑、但不改东西的工具走线程超时；can_replay 还是
+    只看 replay_safe；搜索声明了 side_effect_free=True。"""
+    # 超时判断看 side_effect_free，不看 replay_safe。
+    assert get_tool("test_replayable_but_side_effecting")["replay_safe"] is True
+    assert get_tool("test_replayable_but_side_effecting")["side_effect_free"] is False
+    started = time.monotonic()
+    outcome = gateway.execute("test_replayable_but_side_effecting", {})
+    elapsed = time.monotonic() - started
+    assert outcome["decision"] == "ok"
+    assert outcome["result"]["ok"] is True
+    assert outcome["result"].get("timeout") is None
+    assert elapsed >= 1.8  # 同步跑完 2 秒才返回，没被超时掐断
+
+    assert get_tool("test_pure_but_no_replay")["replay_safe"] is False
+    assert get_tool("test_pure_but_no_replay")["side_effect_free"] is True
+    started = time.monotonic()
+    outcome = gateway.execute("test_pure_but_no_replay", {})
+    elapsed = time.monotonic() - started
+    assert outcome["decision"] == "ok"
+    assert outcome["result"].get("timeout") is True
+    assert elapsed < 1.5  # 线程超时，1 秒多就返回了
+
+    # can_replay 还是只看 replay_safe，不动。
+    assert gateway.can_replay("test_replayable_but_side_effecting") is True
+    assert gateway.can_replay("test_pure_but_no_replay") is False
+    # 搜索：无副作用，行为不变。
+    assert get_tool("search")["side_effect_free"] is True
+    assert gateway.can_replay("search") is True

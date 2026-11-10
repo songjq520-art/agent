@@ -268,7 +268,24 @@ class AgentLoop:
         elif pending_tool_result is not None:
             content = self._tool_result_text(pending_tool_result)
         else:
-            content = "确认已通过，但没有拿到工具结果，请根据已有信息直接回答。"
+            # 没拿到结果：先看这条调用是不是已经“执行中”了——
+            # 执行完、存盘前崩了就会在盘上留一条 executing 记录：
+            # 工具可能已经改过东西了，结果丢了，绝不能再调一次。
+            # 没留 executing 记录时，才是老任务那种“确认过了、但
+            # 没拿到结果”，按原话告诉模型。
+            executing = any(
+                rec.get("tool_call_id") == tool_call_id
+                and rec.get("status") == "executing"
+                for rec in (task.get("tool_calls") or [])
+            )
+            if executing:
+                content = (
+                    "这次工具调用已经执行过了，但结果没保存下来（执行完、"
+                    "存盘前出了问题），结果未知——不要重复调用这个工具，"
+                    "请根据已有信息直接回答。"
+                )
+            else:
+                content = "确认已通过，但没有拿到工具结果，请根据已有信息直接回答。"
         if tool_call_id:
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "content": content}
@@ -412,7 +429,10 @@ class AgentLoop:
         False 直接拦下、不执行（恢复/续跑时也一样，绝不悄悄重跑
         一次写操作）；被拦的那次不计数、不占 5 次上限。
         超时（timeout）也算执行过：工具可能仍在后台跑，再发一次
-        可能重复改东西。"""
+        可能重复改东西。
+        执行中（executing）更要拦，而且不问 can_replay：这条调用
+        可能已经改过东西了，只是结果没存下来——不管登记成什么，
+        一律不重执行。"""
         function = (call or {}).get("function") or {}
         tool_name = function.get("name", "")
         arguments_text = function.get("arguments", "") or ""
@@ -451,7 +471,27 @@ class AgentLoop:
         # 但结果未知，工具可能仍在后台跑，再发一次可能重复改东西，
         # 也按执行过处理；rejected / invalid_args 是没执行就被拦下的，
         # 再发也不算重复执行。）
+        # 执行中（executing）单独先拦：确认执行完了、结果还没存盘就断了，
+        # 盘上会留这条记录——工具可能已经改过东西了，结果未知，
+        # 不管 replay_safe 登记成什么，一律不重执行。
         if tool_call_id:
+            executing_ids = {
+                rec.get("tool_call_id")
+                for rec in (task.get("tool_calls") or [])
+                if rec.get("status") == "executing"
+            }
+            if tool_call_id in executing_ids:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": (
+                            "这条工具调用已经执行过了，但结果没保存下来，"
+                            "不要重复调用。"
+                        ),
+                    }
+                )
+                return "skipped"
             executed_ids = {
                 rec.get("tool_call_id")
                 for rec in (task.get("tool_calls") or [])
