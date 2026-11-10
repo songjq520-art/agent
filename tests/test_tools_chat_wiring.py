@@ -889,3 +889,324 @@ def test_pending_banner_text_and_wiring():
     # 新卡画出来时也亮横幅；点完一张卡后也再拉一次列表重算。
     assert "setApprovalBannerVisible(true)" in html
     assert "10 分钟内没点就按取消处理" in html
+
+# ---------- （补修）确认记录带 task_id/run_id、恢复插回原位 ----------
+
+def test_approval_carries_task_and_run_id(store, gateway):
+    """（补修 1）确认记录带上所属任务的 task_id 和 run_id：
+    网关创建时从任务里带上，直接建也一样；列表里也认这两个字段。"""
+    from web.server import ChatState
+
+    task = make_task(goal="写个文件", model="deepseek-flash")
+    outcome = gateway.execute(
+        "test_confirm_tool", {"path": "a.txt"},
+        task_id=task["task_id"], trace_id=task["trace_id"],
+        tool_call_id="call_1", run_id=task["run_id"],
+    )
+    assert outcome["decision"] == "needs_approval"
+    approval = outcome["approval"]
+    assert approval["task_id"] == task["task_id"]
+    assert approval["run_id"] == task["run_id"]
+    direct = make_approval(
+        "test_confirm_tool", {"path": "b.txt"}, "call_2", "medium",
+        task_id="task_x", run_id="run_y",
+    )
+    assert direct["task_id"] == "task_x"
+    assert direct["run_id"] == "run_y"
+
+    task["approval"] = approval
+    task["status"] = "WAITING_APPROVAL"
+    store.save(task)
+    state = ChatState(task_store=store, tool_gateway=gateway)
+    listed = state.list_pending_approvals()
+    assert len(listed) == 1
+    assert listed[0]["approval"]["task_id"] == task["task_id"]
+    assert listed[0]["approval"]["run_id"] == task["run_id"]
+
+
+def test_approval_without_ids_still_resolves_and_mismatch_rejected(store, gateway):
+    """（补修 1）旧记录没有 task_id/run_id 时照旧能确认执行；
+    记录写着别的任务、或不是本次运行时拒绝执行。"""
+    _CONFIRM_CALLS.clear()
+    task = make_task(goal="写个旧文件", model="deepseek-flash")
+    old = make_approval("test_confirm_tool", {"path": "a.txt"}, "call_1", "medium")
+    assert old["task_id"] is None and old["run_id"] is None
+    task["approval"] = old
+    task["status"] = "WAITING_APPROVAL"
+    store.save(task)
+    resolved = gateway.resolve_approval(
+        store, task["task_id"], old["approval_id"], "confirm"
+    )
+    assert resolved["decision"] == "ok"
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]
+
+    _CONFIRM_CALLS.clear()
+    other = make_task(goal="写个别的文件", model="deepseek-flash")
+    wrong_task = make_approval(
+        "test_confirm_tool", {"path": "b.txt"}, "call_2", "medium",
+        task_id="task_not_this_one", run_id=other["run_id"],
+    )
+    other["approval"] = wrong_task
+    other["status"] = "WAITING_APPROVAL"
+    store.save(other)
+    resolved = gateway.resolve_approval(
+        store, other["task_id"], wrong_task["approval_id"], "confirm"
+    )
+    assert resolved["decision"] == "rejected"
+    assert "不属于这条任务" in resolved["reason"]
+    assert _CONFIRM_CALLS == []
+
+    wrong_run = make_approval(
+        "test_confirm_tool", {"path": "c.txt"}, "call_3", "medium",
+        task_id=other["task_id"], run_id="run_not_this_one",
+    )
+    other["approval"] = wrong_run
+    other["status"] = "WAITING_APPROVAL"
+    store.save(other)
+    resolved = gateway.resolve_approval(
+        store, other["task_id"], wrong_run["approval_id"], "confirm"
+    )
+    assert resolved["decision"] == "rejected"
+    assert "不是本次运行" in resolved["reason"]
+    assert _CONFIRM_CALLS == []
+
+
+def _make_waiting_task(store, gateway, goal="帮我写个文件", path="a.txt",
+                      call_id="call_1"):
+    """建一条停在确认卡上的任务（网关真执行一次要确认的工具），返回 (task, approval)。"""
+    task = make_task(goal=goal, model="deepseek-flash")
+    outcome = gateway.execute(
+        "test_confirm_tool", {"path": path},
+        task_id=task["task_id"], trace_id=task["trace_id"],
+        tool_call_id=call_id, run_id=task["run_id"],
+    )
+    assert outcome["decision"] == "needs_approval"
+    task["approval"] = outcome["approval"]
+    task["status"] = "WAITING_APPROVAL"
+    store.save(task)
+    return task, outcome["approval"]
+
+
+def _fake_waiting_outcome(task, approval):
+    """假的 run_question：停在确认卡上（网页层测试用）。"""
+    return {
+        "mode": "waiting_approval",
+        "route": {"provider": "deepseek", "model": "deepseek-flash"},
+        "result": None,
+        "message": "等 BOOS 确认工具调用。",
+        "model_status": {},
+        "task": task,
+        "approval": approval,
+        "cost_usd": 0.001,
+    }
+
+
+def _fake_done_outcome(text):
+    """假的 run_question：直接答完了（网页层测试用）。"""
+    return {
+        "mode": "real",
+        "route": {"provider": "deepseek", "model": "deepseek-flash"},
+        "result": {
+            "text": text,
+            "usage": None,
+            "cost_usd": 0.001,
+            "model": "deepseek-flash",
+        },
+        "message": "真实调用完成。",
+        "model_status": {},
+    }
+
+
+def test_chat_state_resolve_approval_inserts_before_newer_message(monkeypatch, store, gateway):
+    """（补修 2）等确认时新发了一条消息并答完了，再点确认，恢复的那轮
+    插回它原来那轮的位置，不追加在新消息后面；新消息不动。"""
+    from web.server import ChatState
+
+    _CONFIRM_CALLS.clear()
+    task, approval = _make_waiting_task(store, gateway)
+    state = ChatState(task_store=store, tool_gateway=gateway)
+    state.messages.append({"role": "user", "content": "之前的问题"})
+    state.messages.append({"role": "assistant", "content": "之前的回答"})
+    # Q1 问完停在确认卡上：历史不动，但任务记下位置 2。
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_waiting_outcome(task, approval),
+    )
+    reply = state.ask("帮我写个文件")
+    assert reply["mode"] == "waiting_approval"
+    assert reply["needs_approval"]["run_id"] == task["run_id"]
+    assert store.load(task["task_id"])["history_index"] == 2
+    assert state.messages == [
+        {"role": "user", "content": "之前的问题"},
+        {"role": "assistant", "content": "之前的回答"},
+    ]
+    # Q2 新消息：正常问完，追加到末尾。
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_done_outcome("新消息答完了。"),
+    )
+    reply = state.ask("新消息")
+    assert reply["mode"] == "real"
+    assert state.messages == [
+        {"role": "user", "content": "之前的问题"},
+        {"role": "assistant", "content": "之前的回答"},
+        {"role": "user", "content": "新消息"},
+        {"role": "assistant", "content": "新消息答完了。"},
+    ]
+    # 再点 Q1 的确认卡：恢复的那轮插回位置 2，Q2 那轮不动。
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_done_outcome("写好了。"),
+    )
+    reply = state.resolve_approval(task["task_id"], approval["approval_id"], "confirm")
+    assert reply["mode"] == "real"
+    assert reply["reply"] == "写好了。"
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]
+    assert state.messages == [
+        {"role": "user", "content": "之前的问题"},
+        {"role": "assistant", "content": "之前的回答"},
+        {"role": "user", "content": "帮我写个文件"},
+        {"role": "assistant", "content": "写好了。"},
+        {"role": "user", "content": "新消息"},
+        {"role": "assistant", "content": "新消息答完了。"},
+    ]
+
+
+def test_chat_state_resumed_turn_still_saved_to_memory(monkeypatch, store, gateway):
+    """（补修 2）恢复的那轮被后面 3 轮挤出最近 6 条时，存记忆的窗口
+    仍带上它，不丢记忆。"""
+    from unittest.mock import Mock
+
+    from web.server import ChatState
+
+    _CONFIRM_CALLS.clear()
+    task, approval = _make_waiting_task(store, gateway)
+    mem0 = Mock()
+    mem0.search = Mock(return_value=[])
+    mem0.note_context = Mock()
+    mem0.add_turn = Mock(return_value={})
+    state = ChatState(task_store=store, tool_gateway=gateway, mem0_store=mem0)
+    state.messages.append({"role": "user", "content": "之前的问题"})
+    state.messages.append({"role": "assistant", "content": "之前的回答"})
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_waiting_outcome(task, approval),
+    )
+    assert state.ask("帮我写个文件")["mode"] == "waiting_approval"
+    # 后面又问了 3 轮，都答完了。
+    for i, text in enumerate(["答2。", "答3。", "答4。"], start=2):
+        monkeypatch.setattr(
+            "web.server.run_question",
+            lambda *args, text=text, **kwargs: _fake_done_outcome(text),
+        )
+        assert state.ask(f"新消息{i}")["mode"] == "real"
+    assert len(state.messages) == 8
+    # 再点 Q1 的确认卡：恢复的那轮插回位置 2。
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_done_outcome("写好了。"),
+    )
+    reply = state.resolve_approval(task["task_id"], approval["approval_id"], "confirm")
+    assert reply["mode"] == "real"
+    assert state.messages[2:4] == [
+        {"role": "user", "content": "帮我写个文件"},
+        {"role": "assistant", "content": "写好了。"},
+    ]
+    # 存记忆的最后一次窗口里有恢复的那轮（最近 6 条已挤不下它）。
+    window = mem0.add_turn.call_args_list[-1].args[0]
+    assert {"role": "user", "content": "帮我写个文件"} in window
+    assert {"role": "assistant", "content": "写好了。"} in window
+    assert len(window) == 6
+
+
+def test_waiting_history_index_shifts_after_compact(store, gateway):
+    """（补修 2）摘要压缩从前面裁掉消息后，等确认任务记着的位置跟着挪。"""
+    from web.server import ChatState
+
+    class FakeSummary:
+        def maybe_compact(self, messages):
+            del messages[:4]
+            return True
+
+        def sync(self, messages):
+            return True
+
+    task = make_task(goal="等确认的问题", model="deepseek-flash")
+    task["history_index"] = 6
+    task["status"] = "WAITING_APPROVAL"
+    store.save(task)
+    state = ChatState(
+        task_store=store, tool_gateway=gateway, summary_store=FakeSummary()
+    )
+    state.messages = [
+        {"role": "user", "content": f"消息{i}"} for i in range(8)
+    ]
+    state._finish_turn_locked("新问题", "新回答", "deepseek-flash", 0.001, None)
+    # 新问答追加后 10 条，压缩裁掉前 4 条剩 6 条；位置 6-4=2。
+    assert len(state.messages) == 6
+    assert store.load(task["task_id"])["history_index"] == 2
+
+
+def test_chat_state_chained_approval_keeps_original_position(monkeypatch, store, gateway):
+    """（补修 2）恢复后又停在第二张卡上，位置还是原来那轮的；
+    第二张卡点了之后，回答仍插回原位，不追加在新消息后面。"""
+    from web.server import ChatState
+
+    _CONFIRM_CALLS.clear()
+    task, approval = _make_waiting_task(store, gateway)
+    state = ChatState(task_store=store, tool_gateway=gateway)
+    state.messages.append({"role": "user", "content": "之前的问题"})
+    state.messages.append({"role": "assistant", "content": "之前的回答"})
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_waiting_outcome(task, approval),
+    )
+    assert state.ask("帮我写个文件")["mode"] == "waiting_approval"
+    assert store.load(task["task_id"])["history_index"] == 2
+    # Q2 新消息问完。
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_done_outcome("新消息答完了。"),
+    )
+    assert state.ask("新消息")["mode"] == "real"
+    # 点第一张卡：恢复后又停在第二张卡上（循环模拟：把第二张确认存进任务）。
+    approval2 = make_approval(
+        "test_confirm_tool", {"path": "b.txt"}, "call_2", "medium",
+        task_id=task["task_id"], run_id=task["run_id"],
+    )
+
+    def fake_waiting_again(prompt, **kwargs):
+        resumed = kwargs.get("resume_task") or {}
+        resumed["approval"] = approval2
+        resumed["status"] = "WAITING_APPROVAL"
+        store.save(resumed)
+        return _fake_waiting_outcome(resumed, approval2)
+
+    monkeypatch.setattr("web.server.run_question", fake_waiting_again)
+    reply = state.resolve_approval(task["task_id"], approval["approval_id"], "confirm")
+    assert reply["mode"] == "waiting_approval"
+    assert reply["needs_approval"]["approval_id"] == approval2["approval_id"]
+    # 位置还是原来那轮的 2，没被改成现在历史的长度 4。
+    assert store.load(task["task_id"])["history_index"] == 2
+    assert state.messages == [
+        {"role": "user", "content": "之前的问题"},
+        {"role": "assistant", "content": "之前的回答"},
+        {"role": "user", "content": "新消息"},
+        {"role": "assistant", "content": "新消息答完了。"},
+    ]
+    # 点第二张卡：回答插回位置 2。
+    monkeypatch.setattr(
+        "web.server.run_question",
+        lambda *args, **kwargs: _fake_done_outcome("写好了。"),
+    )
+    reply = state.resolve_approval(task["task_id"], approval2["approval_id"], "confirm")
+    assert reply["mode"] == "real"
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}, {"path": "b.txt"}]
+    assert state.messages == [
+        {"role": "user", "content": "之前的问题"},
+        {"role": "assistant", "content": "之前的回答"},
+        {"role": "user", "content": "帮我写个文件"},
+        {"role": "assistant", "content": "写好了。"},
+        {"role": "user", "content": "新消息"},
+        {"role": "assistant", "content": "新消息答完了。"},
+    ]

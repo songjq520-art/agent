@@ -373,6 +373,7 @@ class AgentLoop:
             trace_id=task.get("trace_id"),
             tool_call_id=tool_call_id,
             confirmed=False,
+            run_id=task.get("run_id"),
         )
         if outcome["decision"] == "needs_approval":
             # 在等确认：先把确认记录存进任务（调用方 _wait_approval 会存盘），

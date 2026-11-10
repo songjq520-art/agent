@@ -373,7 +373,17 @@ class ChatState:
                 # 工具循环停在确认卡上：本轮还没答完，历史、摘要、记忆
                 # 都不动；任务已经存盘了，页面按 needs_approval 显示确认卡，
                 # BOOS 点了之后走 /api/chat/confirm 恢复。
+                # 记下这轮在历史里的位置：恢复时回答插回这里，不追加在
+                # 后来新消息的后面。本轮还没写进历史，位置就是现在历史
+                # 的长度。记失败也不拦卡（恢复时按旧做法追加到末尾）。
                 approval = outcome["approval"] or {}
+                waiting_task = outcome["task"] or {}
+                if waiting_task.get("task_id"):
+                    try:
+                        waiting_task["history_index"] = len(self.messages)
+                        self.task_store.save(waiting_task)
+                    except Exception:
+                        logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
                 return {
                     "reply": "",
                     "model": None,
@@ -381,7 +391,8 @@ class ChatState:
                     "cost_usd": outcome.get("cost_usd"),
                     "usage": None,
                     "needs_approval": {
-                        "task_id": (outcome["task"] or {}).get("task_id"),
+                        "task_id": waiting_task.get("task_id"),
+                        "run_id": waiting_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
                         "args": approval.get("args"),
@@ -398,23 +409,41 @@ class ChatState:
                 result.get("usage"),
             )
 
-    def _finish_turn_locked(self, prompt, reply_text, model_name, cost_usd, usage):
-        """一轮问答答完了的收尾（调用方已拿着锁）：把本轮问答追加进历史、
+    def _finish_turn_locked(self, prompt, reply_text, model_name, cost_usd, usage,
+                            insert_at=None):
+        """一轮问答答完了的收尾（调用方已拿着锁）：把本轮问答写进历史、
         更新对话摘要、存进长期记忆。返回给页面展示的字典。
         ask() 和 resolve_approval() 共用这一段，保证确认恢复后的那轮
         和普通那轮收尾一模一样：只存 BOOS 的原话 + 最后的回答，
         工具中间结果不进历史、不进记忆。
+        参数 insert_at：恢复的那轮在历史里的插入位置（ask() 等确认时
+        记下的 history_index）。不传时追加在末尾；传了时插回这个位置，
+        不追加在后来新消息的后面——等确认时新发的消息不受影响、顺序不乱。
+        位置不是数时按追加处理；位置超过当前长度时钳制到末尾。
         """
-        self.messages.append({"role": "user", "content": prompt})
-        self.messages.append({"role": "assistant", "content": reply_text})
+        user_msg = {"role": "user", "content": prompt}
+        assistant_msg = {"role": "assistant", "content": reply_text}
+        if isinstance(insert_at, bool) or not isinstance(insert_at, int):
+            insert_at = None
+        if insert_at is None:
+            self.messages.append(user_msg)
+            self.messages.append(assistant_msg)
+        else:
+            insert_pos = max(0, min(insert_at, len(self.messages)))
+            self.messages[insert_pos:insert_pos] = [user_msg, assistant_msg]
         # 对话摘要：历史超上限就总结压缩一次，再把本轮记进最近对话列表；
-        # 失败只记日志、不拦聊天。
+        # 失败只记日志、不拦聊天。压缩从前面裁掉消息后，等确认的任务记着
+        # 的插入位置也要跟着往前挪，不然恢复时插错地方。
         if self.summary_store is not None:
+            before_len = len(self.messages)
             try:
                 self.summary_store.maybe_compact(self.messages)
                 self.summary_store.sync(self.messages)
             except Exception:
                 logger.warning("对话摘要更新失败。", exc_info=True)
+            removed = before_len - len(self.messages)
+            if removed > 0:
+                self._shift_waiting_history_index(removed)
         # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
         # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
         # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
@@ -424,7 +453,17 @@ class ChatState:
         # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
         correction = None
         if self.mem0_store is not None:
-            saved = self.mem0_store.add_turn(self.messages[-_MEMORY_SAVE_HISTORY_MAX:])
+            recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
+            if insert_at is not None and not any(
+                msg is user_msg for msg in recent
+            ):
+                # 恢复的那轮插在中间、又被后面的轮次挤出最近 6 条时，
+                # 把它放进要存记忆的窗口最前面（它比窗口里的消息更早，
+                # 顺序仍是时间顺序），别让它丢了记忆。
+                recent = [user_msg, assistant_msg] + self.messages[
+                    -(_MEMORY_SAVE_HISTORY_MAX - 2):
+                ]
+            saved = self.mem0_store.add_turn(recent)
             if isinstance(saved, dict):
                 correction = saved.get("correction")
         response = {
@@ -437,6 +476,22 @@ class ChatState:
         if correction is not None:
             response["correction"] = correction
         return response
+
+    def _shift_waiting_history_index(self, removed):
+        """摘要压缩从历史前面裁掉 removed 条消息后，等确认的任务记着的
+        插入位置（history_index）跟着往前挪同样条数，不然恢复时插错地方。
+        失败只记日志、不拦聊天——挪不成就按旧位置钳制到末尾，最多是
+        以前那个“追加在新消息后面”的样子，不会丢消息、不会崩。"""
+        if removed <= 0:
+            return
+        try:
+            for task in self.task_store.list_waiting():
+                index = task.get("history_index")
+                if isinstance(index, int) and not isinstance(index, bool):
+                    task["history_index"] = max(0, index - removed)
+                    self.task_store.save(task)
+        except Exception:
+            logger.warning("等确认任务的插入位置没挪成。", exc_info=True)
 
     def list_pending_approvals(self):
         """所有等确认的任务（给页面刷新时用）：每条带 task_id、原话 goal
@@ -475,6 +530,8 @@ class ChatState:
                             "args": approval.get("args"),
                             "risk_level": approval.get("risk_level"),
                             "expires_at": approval.get("expires_at"),
+                            "task_id": approval.get("task_id") or task.get("task_id"),
+                            "run_id": approval.get("run_id") or task.get("run_id"),
                         },
                     }
                 )
@@ -495,9 +552,9 @@ class ChatState:
         恢复后又停在下一张确认卡上时返回 waiting_approval 字典
         （多一个 "ok": True），页面再显示下一张卡。
         调用失败时（模型调用报错）直接抛 RuntimeError，调用方转成错误返回。
-        已知限制（第一版不修）：BOOS 在一张卡等确认时又发了新消息，
-        之后再点确认，恢复的那轮会追加在新消息后面——顺序上旧轮在后，
-        不影响回答本身，页面上看起来是旧回答晚到了。
+        恢复的那轮插回它原来那轮的位置（任务里记的 history_index），
+        不追加在等确认时新发的消息后面；新消息本身不受影响、顺序不乱。
+        任务里没记位置时（老任务、命令行恢复）按旧做法追加到末尾。
         """
         with self._lock:
             task = self.task_store.load(task_id)
@@ -541,7 +598,16 @@ class ChatState:
                 )
             if outcome["mode"] == "waiting_approval":
                 # 恢复后又停在下一张确认卡上：同样不写历史，等下一张卡。
+                # 位置沿用原来那轮记下的（还是同一轮，没写进历史，位置不变）；
+                # 只有老任务没记位置时，才按现在历史的长度记一个。
                 approval = outcome["approval"] or {}
+                next_task = outcome["task"] or {}
+                if next_task.get("task_id") and next_task.get("history_index") is None:
+                    try:
+                        next_task["history_index"] = len(self.messages)
+                        self.task_store.save(next_task)
+                    except Exception:
+                        logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
                 return {
                     "ok": True,
                     "reply": "",
@@ -550,7 +616,8 @@ class ChatState:
                     "cost_usd": outcome.get("cost_usd"),
                     "usage": None,
                     "needs_approval": {
-                        "task_id": (outcome["task"] or {}).get("task_id"),
+                        "task_id": next_task.get("task_id"),
+                        "run_id": next_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
                         "args": approval.get("args"),
@@ -567,6 +634,7 @@ class ChatState:
                 result["model"],
                 result.get("cost_usd"),
                 result.get("usage"),
+                insert_at=task.get("history_index"),
             )
             response["ok"] = True
             return response

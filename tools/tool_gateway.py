@@ -123,7 +123,7 @@ class ToolGateway:
     # ---------- 执行入口 ----------
 
     def execute(self, tool_name, args, task_id=None, trace_id=None,
-                tool_call_id=None, confirmed=False):
+                tool_call_id=None, confirmed=False, run_id=None):
         """执行一次工具调用，返回决定字典：
         {"decision": "ok" / "rejected" / "needs_approval",
          "result": 工具返回（ok 时才有）,
@@ -133,6 +133,8 @@ class ToolGateway:
         参数 confirmed：True 表示这次是 BOOS 点了确认后执行的
         （resolve_approval 调进来），跳过“要确认”的检查，但参数校验、
         禁令、风险等级照样过一遍——确认不能绕过这些。
+        参数 run_id：所属任务的本次运行编号，和 task_id 一起写进确认记录，
+        执行校验时核对归属用；不传时确认记录里记 None。
         """
         extra = {"task_id": task_id or "", "trace_id": trace_id or ""}
 
@@ -165,7 +167,8 @@ class ToolGateway:
         # 第 4 关：确认检查——要确认的工具，没确认就不执行，只返回确认记录。
         if tool["needs_confirmation"] and not confirmed:
             approval = make_approval(
-                tool_name, args, tool_call_id or "", tool["risk_level"]
+                tool_name, args, tool_call_id or "", tool["risk_level"],
+                task_id=task_id, run_id=run_id,
             )
             self._audit(
                 tool_name, "needs_approval", False,
@@ -243,6 +246,24 @@ class ToolGateway:
                 "task": task,
             }
 
+        # 归属核对：确认记录里写着 task_id/run_id 时，必须和这条任务对上，
+        # 不然就是拿错了卡，不能执行。旧记录没有这两个字段时跳过核对
+        # （按没有处理，不崩、不拦）。
+        if approval.get("task_id") and approval["task_id"] != task_id:
+            return {
+                "decision": "rejected",
+                "result": None,
+                "reason": "这张确认卡不属于这条任务，不能执行。",
+                "task": task,
+            }
+        if approval.get("run_id") and approval["run_id"] != task.get("run_id"):
+            return {
+                "decision": "rejected",
+                "result": None,
+                "reason": "这张确认卡不是本次运行的，不能执行。",
+                "task": task,
+            }
+
         # 超时：10 分钟没点就当取消，之后再点也不执行。
         # 确认记录留在任务上（恢复循环时还要靠它找 tool_call_id，
         # 告诉模型那次调用超时取消了；列表只看状态，不会再显示这张卡）。
@@ -315,6 +336,7 @@ class ToolGateway:
             trace_id=task.get("trace_id"),
             tool_call_id=approval.get("tool_call_id", ""),
             confirmed=True,
+            run_id=task.get("run_id"),
         )
         if outcome["decision"] == "needs_approval":
             # 不应该发生：confirmed=True 时不会再要确认。万一发生了，

@@ -19,7 +19,8 @@
 #   和 tool_calls，JSON 能直接存）、tool_calls（调过的工具记录）、
 #   failures（同一工具同一参数失败次数）、approval（等确认的信息：
 #   approval_id、工具名、完整参数 + 参数 sha256、tool_call_id、
-#   风险等级、创建时间、过期时间 10 分钟）、result（最终回答）。
+#   风险等级、创建时间、过期时间 10 分钟，所属任务的 task_id 和 run_id）、
+#   result（最终回答）。
 # 安全：确认时只执行这里存着的参数，不执行页面新传来的参数
 #       （见 web/server.py）；过期、重复确认都由 cas 拦住。
 
@@ -88,9 +89,12 @@ def approval_sha256(args):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def make_approval(tool, args, tool_call_id, risk_level):
+def make_approval(tool, args, tool_call_id, risk_level, task_id=None, run_id=None):
     """拼一条等确认的信息：确认编号、工具名、完整参数 + 参数 sha256、
-    tool_call_id、风险等级、创建时间和过期时间（10 分钟后）。"""
+    tool_call_id、风险等级、创建时间和过期时间（10 分钟后），以及
+    它所属任务的 task_id 和 run_id（执行校验时核对归属用）。
+    task_id/run_id 不传时记 None——老代码和旧记录没有这两个字段，
+    读的时候按没有处理，不崩。"""
     now = datetime.now(timezone.utc)
     return {
         "approval_id": new_approval_id(),
@@ -99,6 +103,8 @@ def make_approval(tool, args, tool_call_id, risk_level):
         "args_sha256": approval_sha256(args),
         "tool_call_id": tool_call_id,
         "risk_level": risk_level,
+        "task_id": task_id,
+        "run_id": run_id,
         "created_at": now.isoformat(timespec="seconds"),
         "expires_at": (now + APPROVAL_TIMEOUT).isoformat(timespec="seconds"),
     }
