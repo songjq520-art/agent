@@ -20,6 +20,7 @@
 # 文件工具的写保护）。真正的隔离靠 OS 层（Box 上先测 gVisor），
 # 第一批先做到“误操作伤不到电脑”。
 
+import base64
 import re
 import unicodedata
 from pathlib import Path
@@ -56,8 +57,24 @@ def _is_env_file(path):
     return False
 
 
-# 备份文件名：<原路径（/ 换成 __）>_<时间戳>.bak，时间戳是 %Y%m%dT%H%M%S%f。
+# 备份文件名：<原路径编码后>_<时间戳>.bak，时间戳是 %Y%m%dT%H%M%S%f。
+# 路径分隔符用 %2F 式转义（% → %25，/ → %2F，\ → %5C）：以前
+# 是把 / 换成 __，a/b.txt 和字面就叫 a__b.txt 的文件会撞同一个
+# 备份名；% 编码是一一对应的，撞不上。_original_from_backup_name
+# 解码时认新编码；没有 %2F/%5C/%25 的旧备份按老办法（__ → /）解，
+# 老备份不至于一下子认不出来。
 _BACKUP_NAME_RE = re.compile(r"^(.*)_(\d{8}T\d{12})\.bak$")
+
+
+def _encode_backup_name(rel_path):
+    """把工作区里的相对路径编成备份文件名里的一段：/ 和 \ 用 %2F/%5C
+    转义，% 先转成 %25（不先转 %，字面带 %2F 的文件名解码时会串）。"""
+    return (
+        str(rel_path)
+        .replace("%", "%25")
+        .replace("/", "%2F")
+        .replace("\\", "%5C")
+    )
 
 
 def _original_from_backup_name(filename):
@@ -66,7 +83,14 @@ def _original_from_backup_name(filename):
     match = _BACKUP_NAME_RE.match(filename)
     if not match:
         return None
-    return match.group(1).replace("__", "/")
+    encoded = match.group(1)
+    if "%2F" in encoded or "%5C" in encoded or "%25" in encoded:
+        return (
+            encoded.replace("%2F", "/")
+            .replace("%5C", "\\")
+            .replace("%25", "%")
+        )
+    return encoded.replace("__", "/")
 
 
 def resolve_in_workspace(workspace_root, rel_path):
@@ -325,6 +349,22 @@ def _check_segment(segment):
     return _check_tokens(_tokens(segment))
 
 
+def _decode_powershell_encoded(text):
+    """解 powershell -EncodedCommand 的 base64：PowerShell 默认用
+    UTF-16LE 编码命令，解不开就按 UTF-8 试；都解不开返回 None
+    （调用方明确标注“解不出来”，不静默放行）。"""
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except ValueError:
+        return None
+    for encoding in ("utf-16-le", "utf-8"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
 def classify_command(argv):
     """给一条结构化命令分级：返回 (tier, reason)。
 
@@ -372,6 +412,34 @@ def classify_command(argv):
                 return 2, reason
             if tier > worst_tier:
                 worst_tier, worst_reason = tier, reason
+    # powershell -EncodedCommand/-enc：base64 包起来的命令也要拆开查。
+    # 解出来的内容按同一套规则查（比如编进去一个 shutdown 也进 Tier 2）；
+    # 解出来的原命令（截断到 200 字）写进确认理由里，让 BOOS 点头时
+    # 看得懂里面是什么，而不是对着一串 base64 点头。解不开就明确标注
+    #“解不出来”，内容未检查。
+    if (
+        _program_name(normalized[0]) in _SHELLS
+        and len(normalized) > 2
+        and normalized[1].lower() in ("-encodedcommand", "-enc")
+    ):
+        decoded = _decode_powershell_encoded(normalized[2])
+        if decoded is None:
+            # shell 本身已经是 Tier 1，这里只换理由：让 BOOS 知道这串
+            # base64 解不出来、内容没检查过，不能让他对着看不懂的东西点头。
+            worst_tier, worst_reason = (
+                1,
+                "内含编码命令（-EncodedCommand），解不出来，内容未检查，需要确认",
+            )
+        else:
+            for segment in _split_segments(decoded):
+                tier, reason = _check_segment(segment)
+                if tier == 2:
+                    return 2, reason
+                if tier > worst_tier:
+                    worst_tier, worst_reason = tier, reason
+            shown = decoded if len(decoded) <= 200 else decoded[:200] + "……"
+            if worst_tier <= 1:
+                worst_tier, worst_reason = 1, f"跑 shell 编码命令，需要确认：{shown}"
     if worst_tier == 1:
         return 1, worst_reason
     return 0, ""

@@ -64,6 +64,27 @@ def test_overwrite_backups_old_content(ws):
     assert backups[0].read_text(encoding="utf-8") == "one"
 
 
+def test_backup_names_do_not_collide(ws):
+    # 16 号回归：a/b.txt 和字面就叫 a__b.txt 的文件，以前备份名
+    # 都拼成 a__b.txt_<时间戳>.bak，会撞在一起互相覆盖。
+    ws.write_text("a/b.txt", "斜杠那个", confirmed=True)
+    ws.write_text("a__b.txt", "下划线那个", confirmed=True)
+    ws.write_text("a/b.txt", "斜杠那个 v2", overwrite=True, confirmed=True)
+    ws.write_text("a__b.txt", "下划线那个 v2", overwrite=True, confirmed=True)
+    backups = sorted((ws.root / ".backups").glob("*.bak"))
+    assert len(backups) == 2
+    contents = {b.read_text(encoding="utf-8") for b in backups}
+    assert contents == {"斜杠那个", "下划线那个"}
+
+
+def test_edit_refuses_oversize_file(ws, monkeypatch):
+    # 10 号：改文件和读文件一样的 10MB 上限，别一次读爆内存。
+    monkeypatch.setattr("tools.files._MAX_FILE_BYTES", 100)
+    ws.write_text("big.txt", "x" * 200, confirmed=True)
+    with pytest.raises(ToolError, match="文件太大"):
+        ws.edit_text("big.txt", "x", "y", confirmed=True)
+
+
 def test_edit_requires_unique_old_string(ws):
     ws.write_text("a.txt", "foo bar foo", confirmed=True)
     with pytest.raises(ToolError):

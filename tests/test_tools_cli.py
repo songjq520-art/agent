@@ -1,7 +1,7 @@
 # tests/test_tools_cli.py（第一批工具：命令行入口测试）
 # 作用：验证 tools/cli.py 的 cleanup 流程走真实的 CLI 函数和真实文件——
-# 扫描必须带钥匙生成 HMAC 预览，删除必须用同一把钥匙验；篡改清单后
-# 重算普通 SHA-256 也必须被拒绝，原文件保留。
+# 扫描必须带钥匙生成 HMAC 预览（环境变量优先，其次钥匙文件，没有就自动生成），
+# 删除必须用同一把钥匙验；篡改清单后重算普通 SHA-256 也必须被拒绝，原文件保留。
 # 全部离线，只碰临时目录，不产生费用。
 
 import hashlib
@@ -11,6 +11,29 @@ from pathlib import Path
 import pytest
 
 from tools.cli import main
+from tools.errors import ToolError
+
+
+class _FakeOutcome:
+    """cmd_search 测试用的假搜索结果：不联网。"""
+
+    status = "ok"
+
+    def to_dict(self):
+        return {"status": "ok", "results": []}
+
+
+class _FakeSearchService:
+    """cmd_search 测试用的假调度器：记下传进来的 translator，不联网。"""
+
+    last = None
+
+    def __init__(self, translator=None):
+        self.translator = translator
+        _FakeSearchService.last = self
+
+    def search(self, *args, **kwargs):
+        return _FakeOutcome()
 
 
 @pytest.fixture
@@ -21,6 +44,8 @@ def cli_env(tmp_path, monkeypatch):
     (root / "temp" / "a.tmp").write_bytes(b"x" * 100)
     monkeypatch.setenv("TWELVE_WORKSPACE", str(tmp_path / "ws"))
     monkeypatch.setenv("TWELVE_CLEANUP_KEY", "test-cleanup-key")
+    # 钥匙文件指到临时目录：测试绝不碰项目根目录下真的 .cleanup/cleanup_key。
+    monkeypatch.setenv("TWELVE_CLEANUP_KEY_FILE", str(tmp_path / "cleanup_key"))
     return {"root": root, "tmp": tmp_path}
 
 
@@ -41,17 +66,35 @@ def _delete(cli_env, preview_path):
     ])
 
 
-def test_cli_scan_requires_key(tmp_path, monkeypatch):
-    # 没设 TWELVE_CLEANUP_KEY：扫描拒绝生成可删除的预览（与其让 BOOS
-    # 白走一趟确认流程再被拒，不如扫描这一步就明确拒绝）。
+def test_cli_scan_generates_key_file_when_no_env_key(tmp_path, monkeypatch):
+    # 11 号：没设 TWELVE_CLEANUP_KEY 时，第一次扫描自动生成一把钥匙
+    # 存进钥匙文件，以后扫描和删除一直用它；预览是带钥匙的 HMAC。
     root = tmp_path / "tree"
     (root / "temp").mkdir(parents=True)
     (root / "temp" / "a.tmp").write_bytes(b"x" * 100)
+    key_file = tmp_path / "cleanup_key"
     monkeypatch.delenv("TWELVE_CLEANUP_KEY", raising=False)
-    with pytest.raises(SystemExit):
-        main(["cleanup", "scan", str(root), "--kind", "temp",
-              "--out", str(tmp_path / "preview.json")])
-    assert not (tmp_path / "preview.json").exists()
+    monkeypatch.setenv("TWELVE_CLEANUP_KEY_FILE", str(key_file))
+    monkeypatch.setenv("TWELVE_WORKSPACE", str(tmp_path / "ws"))
+    main(["cleanup", "scan", str(root), "--kind", "temp",
+          "--out", str(tmp_path / "preview.json")])
+    assert key_file.is_file()
+    assert key_file.read_text(encoding="utf-8").strip()
+    preview = json.loads((tmp_path / "preview.json").read_text(encoding="utf-8"))
+    assert preview["checksum_algo"] == "hmac-sha256"
+    # 同一把钥匙删得掉：删除时也没设环境变量，走钥匙文件验。
+    main(["cleanup", "delete", "--preview", str(tmp_path / "preview.json"),
+          "--categories", "temp", "--root", str(root),
+          "--trash", str(tmp_path / "trash"), "--yes"])
+    assert not (root / "temp" / "a.tmp").exists()
+
+
+def test_cli_scan_with_env_key_does_not_create_key_file(cli_env):
+    # 11 号：设了环境变量钥匙，就用环境变量那把，不生成钥匙文件。
+    preview_path = _scan(cli_env)
+    assert not (cli_env["tmp"] / "cleanup_key").exists()
+    preview = json.loads(preview_path.read_text(encoding="utf-8"))
+    assert preview["checksum_algo"] == "hmac-sha256"
 
 
 def test_cli_scan_produces_keyed_preview(cli_env):
@@ -119,7 +162,8 @@ def test_cli_downgraded_algo_preview_refused_and_files_kept(cli_env):
 
 
 def test_cli_delete_requires_key(cli_env, monkeypatch):
-    # 删除时没钥匙：拒绝删除，原文件保留。
+    # 删除时没钥匙（环境变量没设，钥匙文件也没有）：拒绝删除，原文件保留。
+    # 注意：删除这一步不现生成钥匙——现生成的和扫描时那把对不上，验不过。
     preview_path = _scan(cli_env)
     monkeypatch.delenv("TWELVE_CLEANUP_KEY", raising=False)
     with pytest.raises(SystemExit):
@@ -138,3 +182,73 @@ def test_cli_delete_refuses_plain_sha256_preview(cli_env):
     with pytest.raises(SystemExit):
         _delete(cli_env, preview_path)
     assert (cli_env["root"] / "temp" / "a.tmp").exists()
+
+
+# ---------- 7 号：CLI 接 DeepSeek 翻译器 ----------
+
+
+def test_deepseek_translate_calls_api(monkeypatch):
+    # CLI 的 DeepSeek 翻译走 chat completions，deepseek-flash。
+    from tools.cli import _deepseek_translate
+
+    calls = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "Guangzhou weather"}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["url"] = url
+        calls["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr("tools.cli.requests.post", fake_post)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-fake")
+    assert _deepseek_translate("广州天气", "en") == "Guangzhou weather"
+    assert calls["url"] == "https://api.deepseek.com/chat/completions"
+    assert calls["json"]["model"] == "deepseek-flash"
+    assert "广州天气" in calls["json"]["messages"][1]["content"]
+
+
+def test_deepseek_translate_raises_on_http_error(monkeypatch):
+    # 翻译调用失败要抛错，调用方（SearchService）会回落原文，不影响搜索本身。
+    from tools.cli import _deepseek_translate
+
+    class FakeResponse:
+        status_code = 401
+
+    monkeypatch.setattr("tools.cli.requests.post", lambda *a, **k: FakeResponse())
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-fake")
+    with pytest.raises(ToolError):
+        _deepseek_translate("广州天气", "en")
+
+
+def test_cli_search_uses_deepseek_translator_when_key_set(monkeypatch):
+    # 设了 DEEPSEEK_API_KEY，CLI 搜索接上翻译器。
+    from tools.cli import _deepseek_translate
+
+    monkeypatch.setattr("tools.cli.SearchService", _FakeSearchService)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-fake")
+    main(["search", "广州天气"])
+    assert _FakeSearchService.last.translator is _deepseek_translate
+
+
+def test_cli_search_hints_when_no_key_and_chinese_query(monkeypatch, capsys):
+    # 没设 DEEPSEEK_API_KEY，中文查询打印一句提示（stderr，stdout 只留 JSON）。
+    monkeypatch.setattr("tools.cli.SearchService", _FakeSearchService)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    main(["search", "广州天气"])
+    out = capsys.readouterr()
+    assert "提示" in out.err
+    assert "AnySearch 中文结果可能不准" in out.err
+    assert json.loads(out.out)["status"] == "ok"
+
+
+def test_cli_search_no_hint_for_english_query_without_key(monkeypatch, capsys):
+    # 英文查询不用翻译，没 Key 也不用提示。
+    monkeypatch.setattr("tools.cli.SearchService", _FakeSearchService)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    main(["search", "Guangzhou weather"])
+    assert capsys.readouterr().err == ""

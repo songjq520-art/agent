@@ -28,6 +28,7 @@ from pathlib import Path
 from tools.audit import AuditLog, sha256_bytes, sha256_file
 from tools.errors import NeedsConfirmation, PermissionDenied, ToolError
 from tools.permissions import (
+    _encode_backup_name,
     _is_env_file,
     _is_secret_blocked,
     classify_path,
@@ -107,7 +108,9 @@ class Workspace:
             return None, True
         backup_dir = self.root / ".backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = str(rel_path).replace("/", "__").replace("\\", "__")
+        # 备份名里的路径用 %2F 式转义（_encode_backup_name）：以前是把 /
+        # 换成 __，a/b.txt 和字面就叫 a__b.txt 的文件会撞同一个备份名。
+        safe_name = _encode_backup_name(rel_path)
         backup_path = backup_dir / f"{safe_name}_{_timestamp()}.bak"
         shutil.copy2(path, backup_path)
         # 只留最近 5 份旧备份。
@@ -277,6 +280,10 @@ class Workspace:
         path = resolve_in_workspace(self.root, rel_path)
         if not path.is_file():
             raise ToolError(f"文件不存在：{rel_path}")
+        # 和读文件一样的 10MB 上限：改文件也要先把整文件读进内存，
+        # 没上限会被一个大文件直接读爆。
+        if path.stat().st_size > _MAX_FILE_BYTES:
+            raise ToolError(f"文件太大（>{_MAX_FILE_BYTES // (1024 * 1024)}MB），先拒绝：{rel_path}")
         try:
             text = path.read_bytes().decode("utf-8")
         except UnicodeDecodeError as exc:

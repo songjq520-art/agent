@@ -133,6 +133,23 @@ def test_format_summary_plain_language(tmp_path):
     assert "key.pem" not in summary
 
 
+def test_format_summary_reports_listed_count_when_capped(tmp_path):
+    # 9 号回归：某类超过 200 个文件时（这里用 max_files_per_category=2
+    # 模拟），汇报不能按全类总数报“3 个”实际只删 2 个，要按实际列出的
+    # 数报，再写清“只列出前 2 个，共 3 个”。
+    root = tmp_path / "tree" / "temp"
+    root.mkdir(parents=True)
+    for name in ("a.tmp", "b.tmp", "c.tmp"):
+        (root / name).write_bytes(b"x" * 100)
+    preview = build_preview(
+        scan(root, root_kind="temp", max_files_per_category=2)
+    )
+    assert preview["categories"]["temp"]["capped"] is True
+    summary = format_summary(preview)
+    assert "只列出前 2 个，共 3 个" in summary
+    assert "一共 2 个文件" in summary
+
+
 # ---------- 多场景补充（BOOS 2026-11-10 要求：不只测正常路） ----------
 
 

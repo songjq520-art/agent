@@ -10,19 +10,27 @@
 #   python -m tools.cli run -- python -m pytest tests/ -q
 #   python -m tools.cli cleanup scan D:/下载 --kind downloads --out preview.json
 #   python -m tools.cli cleanup delete --preview preview.json --categories temp,logs --yes
-#   （清理流程必须用带钥匙的 HMAC 预览：扫描和删除用同一把 TWELVE_CLEANUP_KEY，
-#   只从环境变量读；缺钥匙时扫描就拒绝，普通 SHA-256 预览删除时也拒绝。）
+#   （清理流程必须用带钥匙的 HMAC 预览：扫描和删除用同一把钥匙，
+#   环境变量 TWELVE_CLEANUP_KEY 优先，其次读项目根目录 .cleanup/cleanup_key，
+#   都没有时第一次扫描自动生成一把存进去；普通 SHA-256 预览删除时也拒绝。）
+#   （搜中文时：设了 DEEPSEEK_API_KEY 就先把查询翻成英文再搜
+#   ——AnySearch 中文不准；没设就打印一句提示。）
 #
 # 工作区目录：--workspace 指定，或 TWELVE_WORKSPACE 环境变量，默认当前目录。
-# Key 只从环境变量读（ANYSEARCH_API_KEY、TAVILY_API_KEY、TWELVE_CLEANUP_KEY），绝不在命令行传 Key
-# （会进 shell 历史记录）；Parallel 不用 Key。
+# 搜索的 Key 只从环境变量读（ANYSEARCH_API_KEY、TAVILY_API_KEY、DEEPSEEK_API_KEY），
+# 清理钥匙优先读 TWELVE_CLEANUP_KEY 环境变量，其次读项目根目录
+# .cleanup/cleanup_key 文件（第一次扫描自动生成，已加进 .gitignore）；
+# 绝不在命令行传 Key（会进 shell 历史记录）；Parallel 不用 Key。
 # 写/改/删和 Tier 1 命令默认要确认，--yes 表示“我确认过了”。
 
 import argparse
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
+
+import requests
 
 from tools.audit import AuditLog
 from tools.cleanup import build_preview, delete_preview, format_summary, scan
@@ -30,7 +38,7 @@ from tools.commands import CommandRunner
 from tools.errors import NeedsConfirmation, PermissionDenied, ToolError
 from tools.files import Workspace
 from tools.permissions import confirmation_scope_for_command, confirmation_scope_for_file
-from tools.search import SearchService
+from tools.search import SearchService, _contains_cjk
 
 
 def _confirmation(action, path_or_argv, yes):
@@ -60,8 +68,62 @@ def _fail(message, code=1):
     raise SystemExit(code)
 
 
+def _deepseek_translate(text, target):
+    """CLI 用的 DeepSeek 翻译：只翻查询/标题/摘要。Key 从 DEEPSEEK_API_KEY
+    环境变量读；翻失败抛错，调用方（SearchService）会回落原文，不影响搜索本身。
+    成本：一次搜索约多花 $0.0002，一个月最坏约 $0.5–1。"""
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise ToolError("没有 DEEPSEEK_API_KEY，无法翻译")
+    direction = "英文" if target == "en" else "中文"
+    try:
+        response = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek-flash",
+                "messages": [
+                    {"role": "system", "content": "你是一个翻译工具。只返回译文，不要解释，不要加引号。"},
+                    {"role": "user", "content": f"把下面的文字翻译成{direction}：\n{text}"},
+                ],
+                "temperature": 0,
+                "max_tokens": 1024,
+            },
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise ToolError(f"翻译调用失败：{exc}") from exc
+    if response.status_code != 200:
+        raise ToolError(f"翻译调用失败：HTTP {response.status_code}")
+    try:
+        translated = response.json()["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, AttributeError) as exc:
+        raise ToolError("翻译返回解析失败") from exc
+    if not translated:
+        raise ToolError("翻译返回为空")
+    return translated
+
+
 def cmd_search(args):
-    service = SearchService()
+    # 设了 DEEPSEEK_API_KEY 就接上翻译器：中文查询先翻成英文再搜
+    #（AnySearch 中文不准，直接搜中文会返回不相干的法院文书），标题和
+    # 摘要前 200 字再翻回中文；没设 Key 就不翻译，但中文查询要先提醒
+    # 一句，别让 BOOS 以为搜出来的就是对的。提示打 stderr，stdout
+    # 只留 JSON，别把 JSON 打坏。
+    translator = None
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        translator = _deepseek_translate
+    elif _contains_cjk(args.query):
+        print(
+            "提示：没设 DEEPSEEK_API_KEY，中文查询不走翻译，"
+            "AnySearch 中文结果可能不准（会返回不相干的法院文书）；"
+            "设了 Key 就会先翻成英文再搜。",
+            file=sys.stderr,
+        )
+    service = SearchService(translator=translator)
     try:
         outcome = service.search(
             args.query,
@@ -159,18 +221,63 @@ def cmd_run(args):
         raise SystemExit(result["returncode"])
 
 
+def _cleanup_key_file_path():
+    """清理钥匙文件的长期住处：项目根目录下的 .cleanup/cleanup_key
+    （按 cli.py 所在位置算，不按当前工作目录算，换个目录跑也找得到）。
+    测试时可用 TWELVE_CLEANUP_KEY_FILE 指到别处，别碰真的钥匙文件。"""
+    override = os.environ.get("TWELVE_CLEANUP_KEY_FILE")
+    if override:
+        return Path(override)
+    project_root = Path(__file__).resolve().parent.parent
+    return project_root / ".cleanup" / "cleanup_key"
+
+
+def _load_cleanup_key():
+    """读清理钥匙（不生成）：环境变量优先，其次钥匙文件；都没有返回 None。
+    返回 (key, 来源)，来源是 "env" 或 "file"。"""
+    env_key = os.environ.get("TWELVE_CLEANUP_KEY")
+    if env_key:
+        return env_key, "env"
+    key_file = _cleanup_key_file_path()
+    try:
+        file_key = key_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not file_key:
+        return None
+    return file_key, "file"
+
+
+def _cleanup_key():
+    """拿一把清理钥匙：环境变量优先，其次钥匙文件；都没有就现生成一把
+    随机钥匙存进钥匙文件里，以后扫描和删除一直用它。
+    返回 (key, 来源)，来源是 "env" / "file" / "generated"。"""
+    loaded = _load_cleanup_key()
+    if loaded is not None:
+        return loaded
+    key = secrets.token_hex(16)
+    key_file = _cleanup_key_file_path()
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.write_text(key, encoding="utf-8")
+    try:
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass
+    return key, "generated"
+
+
 def cmd_cleanup_scan(args):
     # 扫描要生成可删除的预览，必须有钥匙：没钥匙生成的只是普通 SHA-256 预览，
-    # 改了清单重算一个就能过，删的时候会被拒绝——与其让 BOOS 白走一趟确认流程，
-    # 不如扫描这一步就明确拒绝。钥匙只从 TWELVE_CLEANUP_KEY 环境变量读，
-    # 绝不在命令行传（会进 shell 历史记录）。
-    # 生成一把钥匙：python -c "import secrets; print(secrets.token_hex(16))"
-    key = os.environ.get("TWELVE_CLEANUP_KEY")
-    if not key:
-        _fail(
-            "扫描要生成可删除的预览，必须先设 TWELVE_CLEANUP_KEY 环境变量"
-            "（扫描和删除用同一把钥匙）。没有钥匙时，生成的预览只是普通"
-            " SHA-256，防不了篡改，删的时候会被拒绝。"
+    # 改了清单重算一个就能过，删的时候会被拒绝。钥匙的找法（按顺序）：
+    # TWELVE_CLEANUP_KEY 环境变量 → 项目根目录 .cleanup/cleanup_key 文件 →
+    # 都没有就现生成一把随机钥匙存进那个文件，以后扫描和删除一直用它。
+    # 钥匙绝不在命令行传（会进 shell 历史记录）；钥匙文件已加进 .gitignore，
+    # 绝不进仓库。钥匙文件要是丢了，旧预览就验不过，只能重新扫描。
+    key, source = _cleanup_key()
+    if source == "generated":
+        print(
+            f"钥匙已自动生成并存到 {_cleanup_key_file_path()}，"
+            "扫描和删除都用这把；别删这个文件，删了旧预览就验不过，只能重扫。"
         )
     try:
         result = scan(args.root, root_kind=args.kind, large_threshold_mb=args.large_mb)
@@ -196,13 +303,13 @@ def cmd_cleanup_delete(args):
     audit_log = AuditLog(Path(os.environ.get("TWELVE_WORKSPACE", os.getcwd())) / ".audit" / "audit.log")
     if not args.root:
         _fail("删文件必须加 --root 指明可信的扫描根目录（当初扫的那几个目录，可重复写），删除范围不从预览文件里读")
-    # 删除必须用扫描时那把钥匙验证：钥匙放 TWELVE_CLEANUP_KEY 环境变量里，
-    # 别写进命令行（命令行会被 shell 历史记下来）。缺钥匙拒绝删除；
-    # 普通 SHA-256 的预览（没钥匙生成的，防不了篡改）也明确拒绝，
-    # 请用带钥匙的 cleanup scan 重新扫一份。
-    key = os.environ.get("TWELVE_CLEANUP_KEY")
-    if not key:
-        _fail("删除必须用扫描时那把钥匙验证：请先设 TWELVE_CLEANUP_KEY 环境变量（和扫描时同一把），缺钥匙拒绝删除。")
+    # 删除必须用扫描时那把钥匙验证：环境变量优先，其次钥匙文件；都没
+    # 有就拒绝——删除这一步不现生成钥匙（现生成的和扫描时那把对不上，
+    # 验不过），请设成扫描时那把钥匙，或重新扫描。
+    loaded = _load_cleanup_key()
+    if loaded is None:
+        _fail("删除必须用扫描时那把钥匙验证：既没设 TWELVE_CLEANUP_KEY，也没有 .cleanup/cleanup_key 文件；请设成扫描时那把钥匙，或重新扫描。")
+    key, _source = loaded
     if preview.get("checksum_algo", "sha256") != "hmac-sha256":
         _fail("这份预览是普通 SHA-256 校验和，防不了篡改，拒绝删除；请用带钥匙的 cleanup scan 重新扫一份。")
     try:

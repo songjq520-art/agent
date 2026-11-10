@@ -4,6 +4,7 @@
 # Tier 0 自动放行）。这些测试先于实现写（TDD）：越界和危险输入必须被拒绝。
 # 全部离线，不联网、不产生费用。
 
+import base64
 import os
 from pathlib import Path
 
@@ -192,6 +193,46 @@ def test_tier0_auto_allowed():
     for argv in cases:
         tier, reason = classify_command(argv)
         assert tier == 0, (argv, tier, reason)
+
+
+def _b64_utf16le(text):
+    # PowerShell -EncodedCommand 默认就是 UTF-16LE 的 base64。
+    return base64.b64encode(text.encode("utf-16-le")).decode()
+
+
+def _b64_utf8(text):
+    return base64.b64encode(text.encode("utf-8")).decode()
+
+
+def test_powershell_encoded_command_decoded_and_checked():
+    # 14 号：-EncodedCommand 的 base64 要拆开查，编进去的硬禁命令也要进 Tier 2。
+    tier, _ = classify_command(
+        ["powershell", "-EncodedCommand", _b64_utf16le("shutdown /s")]
+    )
+    assert tier == 2
+    tier, _ = classify_command(["powershell", "-enc", _b64_utf8("shutdown /s")])
+    assert tier == 2
+    # 编进去的是普通命令：Tier 1，但确认理由里要写出解出来的原命令，
+    # BOOS 点头时看得懂里面是什么，而不是对着一串 base64 点头。
+    tier, reason = classify_command(
+        ["powershell", "-EncodedCommand", _b64_utf16le("Get-ChildItem")]
+    )
+    assert tier == 1
+    assert "Get-ChildItem" in reason
+    tier, reason = classify_command(
+        ["powershell", "-enc", _b64_utf8("Get-ChildItem")]
+    )
+    assert tier == 1
+    assert "Get-ChildItem" in reason
+
+
+def test_powershell_encoded_command_undecodable_flagged():
+    # 解不出来的编码命令：明确标注“解不出来”，内容未检查。
+    tier, reason = classify_command(
+        ["powershell", "-EncodedCommand", "!!!not-base64!!!"]
+    )
+    assert tier == 1
+    assert "解不出来" in reason
 
 
 def test_command_must_be_list():

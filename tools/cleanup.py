@@ -26,8 +26,9 @@
 #     普通 SHA-256 只能防手误（改完重算一个就过了）；带钥匙的 HMAC
 #     （钥匙只放调用方内存里）改了清单重算也对不上。正常流程里预览
 #     只放内存、不落盘；要存成 JSON 跨进程用，必须传一把钥匙——
-#     命令行流程（tools/cli.py）缺钥匙时扫描就拒绝，普通 SHA-256 预览
-#     删除时也明确拒绝。
+#     命令行流程（tools/cli.py）扫描和删除用同一把钥匙验（环境变量优先，
+#     其次项目根目录 .cleanup/cleanup_key 文件，第一次扫描自动生成），
+#     普通 SHA-256 预览删除时明确拒绝。
 #     预览里的文件条目必须是含大小/修改时间的 dict，字符串条目直接拒绝。
 #     校验和或范围那关不过、拒绝删除时，也记一笔审计（成功=False），
 #     不然事后查不到“有人改过清单”。
@@ -312,19 +313,32 @@ def build_preview(scan_result, *, key=None):
 
 def format_summary(preview):
     """把预览写成大白话汇报（给 BOOS 看的）：每类是什么、有多大、
-    删了有什么影响。不列原始文件名。"""
+    删了有什么影响。不列原始文件名。
+    报的是这次实际会删的数：扫描每类最多只列 200 个文件，超过 200
+    个时 file_count/total_bytes 是全类的总数，照那个数报会说“500 个”
+    实际只删 200 个——所以超了就按列出的文件数和大小报，再补一句
+    “只列出前 200 个，共 500 个”。"""
     lines = []
     total_files = 0
     total_bytes = 0
     for category_id, bucket in preview["categories"].items():
         if bucket["file_count"] == 0:
             continue
-        total_files += bucket["file_count"]
-        total_bytes += bucket["total_bytes"]
+        listed = bucket.get("files") or []
+        if bucket.get("capped"):
+            count = len(listed)
+            size = sum(f["size"] for f in listed)
+            capped_note = f"（只列出前 {count} 个，共 {bucket['file_count']} 个）"
+        else:
+            count = bucket["file_count"]
+            size = bucket["total_bytes"]
+            capped_note = ""
+        total_files += count
+        total_bytes += size
         confidence_note = "（拿不准，先问你）" if bucket["confidence"] == "low" else ""
         lines.append(
-            f"{bucket['name']} {human_size(bucket['total_bytes'])}，"
-            f"{bucket['file_count']} 个文件，{bucket['description']}，"
+            f"{bucket['name']} {human_size(size)}，"
+            f"{count} 个文件{capped_note}，{bucket['description']}，"
             f"{bucket['impact']}{confidence_note}"
         )
     lines.append(f"一共 {total_files} 个文件，{human_size(total_bytes)}")

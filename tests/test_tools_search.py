@@ -315,24 +315,40 @@ def ok_outcome(query, provider, urls):
 
 
 def test_scheduler_falls_back_on_402():
-    anysearch = FakeProvider(
-        "anysearch", [QuotaExhausted("anysearch", 402, "当日额度用完")]
+    # 链路第一家 Tavily 额度用完（402），切备选 Parallel，AnySearch 不用试。
+    tavily = FakeProvider(
+        "tavily", [QuotaExhausted("tavily", 402, "月额度用完")]
     )
     parallel = FakeProvider(
         "parallel", [ok_outcome("q", "parallel", ["https://p.com/1"])]
     )
-    tavily = FakeProvider("tavily", [])
+    anysearch = FakeProvider("anysearch", [])
     service = SearchService(anysearch=anysearch, tavily=tavily, parallel=parallel)
     outcome = service.search("q")
     assert outcome.status == "ok"
     assert outcome.provider == "parallel"
     assert len(outcome.results) == 1
     assert len(outcome.attempts) == 2
-    assert outcome.attempts[0]["provider"] == "anysearch"
+    assert outcome.attempts[0]["provider"] == "tavily"
     assert outcome.attempts[0]["status"] == "failed"
     assert outcome.attempts[1]["provider"] == "parallel"
     assert outcome.attempts[1]["status"] == "ok"
-    assert tavily.calls == []  # 备选成功了就不再往下试
+    assert anysearch.calls == []  # 备选成功了就不再往下试
+
+
+def test_scheduler_force_provider_failure_names_only_tried_provider():
+    # 6 号回归：--provider 只指定一个服务时，报错不能写“三个服务都试过了”。
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=FakeProvider("tavily", []),
+        parallel=FakeProvider("parallel", [ToolError("parallel 挂了")]),
+    )
+    outcome = service.search("q", force_provider="parallel")
+    assert outcome.status == "failed"
+    assert "三个" not in outcome.error
+    assert "parallel" in outcome.error
+    assert "anysearch" not in outcome.error
+    assert "tavily" not in outcome.error
 
 
 def test_scheduler_all_fail_is_honest():
@@ -423,6 +439,21 @@ def test_scheduler_quality_notes_present():
 # ---------- 多场景补充（BOOS 2026-11-10 要求：不只测正常路） ----------
 
 
+def test_scheduler_normal_routes_to_tavily_first():
+    # 9 号：普通查询也先走 Tavily（不用翻译的放前面），Tavily 行了就
+    # 不再试别的——AnySearch（要翻译的）放最后，前面额度用完才轮到它。
+    tavily = FakeProvider(
+        "tavily", [ok_outcome("q", "tavily", ["https://t.com/1"])]
+    )
+    anysearch = FakeProvider("anysearch", [])
+    parallel = FakeProvider("parallel", [])
+    service = SearchService(anysearch=anysearch, tavily=tavily, parallel=parallel)
+    outcome = service.search("q", kind="normal")
+    assert outcome.status == "ok"
+    assert outcome.provider == "tavily"
+    assert anysearch.calls == [] and parallel.calls == []
+
+
 def test_scheduler_structured_routes_to_tavily_first():
     # 结构化查询先走 Tavily，Tavily 行了就不再试别的。
     tavily = FakeProvider(
@@ -438,14 +469,14 @@ def test_scheduler_structured_routes_to_tavily_first():
 
 
 def test_scheduler_provider_down_falls_back():
-    # 主力挂了（不是 402，是直接报错），也要切备选，不能直接认栽。
-    anysearch = FakeProvider("anysearch", [ToolError("anysearch 连不上")])
+    # 链路第一家 Tavily 挂了（不是 402，是直接报错），也要切备选，不能直接认栽。
+    tavily = FakeProvider("tavily", [ToolError("tavily 连不上")])
     parallel = FakeProvider(
         "parallel", [ok_outcome("q", "parallel", ["https://p.com/1"])]
     )
     service = SearchService(
-        anysearch=anysearch,
-        tavily=FakeProvider("tavily", []),
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
         parallel=parallel,
     )
     outcome = service.search("q")
@@ -736,7 +767,10 @@ def test_translator_translates_chinese_query_for_anysearch_only():
     assert outcome.provider == "anysearch"
     assert anysearch.calls == ["Guangzhou weather"]
     assert ("广州天气", "en") in translator.calls
-    assert outcome.attempts[0]["translated_query"] == "Guangzhou weather"
+    # AnySearch 是链路最后一家才赢的，翻过的查询记在赢的那条 attempt 上，
+    # 不在 attempts[0]（前面是 Tavily、Parallel 的空 attempt）。
+    ok_attempt = [a for a in outcome.attempts if a["status"] == "ok"][0]
+    assert ok_attempt["translated_query"] == "Guangzhou weather"
     assert outcome.query == "广州天气"
     assert outcome.quality["translated_back"] is True
 
@@ -830,13 +864,13 @@ def test_translator_failure_falls_back_to_original_query():
 
 def test_translator_cross_check_partner_gets_original_query():
     # 交叉验证的搭档拿原查询（中文），不拿翻过的英文。
+    # AnySearch 赢主链路（Tavily、Parallel 没结果才轮到它），搭档 Tavily
+    # 拿中文原文去印证。
     translator = FakeTranslator({("广州天气", "en"): "Guangzhou weather"})
     anysearch = FakeProvider(
         "anysearch", [ok_outcome("Guangzhou weather", "anysearch", ["https://a.com/1"])]
     )
-    tavily = FakeProvider(
-        "tavily", [ok_outcome("广州天气", "tavily", ["https://a.com/1"])]
-    )
+    tavily = FakeProvider("tavily", [])
     service = SearchService(
         anysearch=anysearch,
         tavily=tavily,
@@ -844,7 +878,9 @@ def test_translator_cross_check_partner_gets_original_query():
         translator=translator,
     )
     outcome = service.search("广州天气", cross_check=True)
-    assert tavily.calls == ["广州天气"]
+    # Tavily 被调了两次：主链路第一次（没结果），交叉验证搭档第二次；
+    # 两次拿的都是中文原文，没拿翻过的英文。
+    assert tavily.calls == ["广州天气", "广州天气"]
     assert len(outcome.results) == 1
 
 

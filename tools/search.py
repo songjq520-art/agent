@@ -8,8 +8,9 @@
 #   - Parallel MCP：零门槛入口兼兜底，不用注册、不用 Key、不用绑卡；
 #     走托管 MCP（https://mcp.parallel.ai/mcp，没有末尾斜杠），调 web_search。
 #     默认 fast 模式（中文查询用 fast，Turbo 只支持英文和日文）。
-#   - SearchService：统一调度器——普通查询 → AnySearch；结构化 → Tavily；
-#     主力失败/额度用完/没结果 → 顺着链路切备选；cross_check 时两个服务
+#   - SearchService：统一调度器——先试不用翻译的（Tavily → Parallel），
+#     前面免费额度用完或失败了，才走 AnySearch（中文要翻译）；
+#     失败/额度用完/没结果 → 顺着链路切备选；cross_check 时两个服务
 #     的结果互相印证（多源印证）；失败和无结果区分开；保留来源 URL 和时间；
 #     所有服务都失败/都没结果时老实说失败，绝不编结果。
 #
@@ -73,14 +74,6 @@ def _repair_mojibake(text):
         return run
 
     return _MOJIBAKE_RUN_RE.sub(_fix_run, text)
-
-ANYSEARCH_API_URL = "https://api.anysearch.com/v1/search"
-ANYSEARCH_GENERAL_TAG = "general.general"
-TAVILY_API_URL = "https://api.tavily.com/search"
-PARALLEL_MCP_URL = "https://mcp.parallel.ai/mcp"
-
-_DEFAULT_TIMEOUT = 30
-_SNIPPET_MAX_CHARS = 1000
 
 
 @dataclass
@@ -534,11 +527,15 @@ class ParallelProvider:
 # ---------- 统一调度器 ----------
 
 # 路由表（按任务类型，不是一股脑全试）：
-#   普通查询 → AnySearch → Parallel → Tavily
-#   结构化信息 → Tavily → AnySearch → Parallel
+#   普通查询和结构化信息都先走不用翻译的：Tavily → Parallel → AnySearch。
+#   Tavily（中文直接搜，一个月 1000 次免费额度）先用，Parallel
+#   （不用注册、不用 Key）兜底，前面两个额度用完或失败了，才走
+#   AnySearch（每天 1000 次免费，但中文要翻译，多花翻译钱）。
+#   失败回落按链路顺序走（402 超额、429、报错都算失败、自动下一个），
+#   不用另加额度计数逻辑。
 _CHAINS = {
-    "normal": ["anysearch", "parallel", "tavily"],
-    "structured": ["tavily", "anysearch", "parallel"],
+    "normal": ["tavily", "parallel", "anysearch"],
+    "structured": ["tavily", "parallel", "anysearch"],
 }
 # 交叉验证的搭档：主服务是谁，就用另一个服务的结果互相印证。
 _CROSS_CHECK_PARTNER = {"anysearch": "tavily", "tavily": "anysearch", "parallel": "anysearch"}
@@ -741,14 +738,24 @@ class SearchService:
             break
         if outcome is None:
             failed = [a for a in attempts if a["status"] == "failed"]
+            # 报错只说实际试过的服务：--provider 只指定一个时，别写成
+            #“三个服务都试过了”（以前写死了这句，只试一个也这么说）。
+            attempted = [a for a in attempts if a["status"] in ("failed", "empty")]
+            tried = "、".join(a["provider"] for a in attempted)
             if failed:
-                error = "三个搜索服务都试过了，都失败了： " + "；".join(
+                error = f"试过的服务都失败了（{tried}）： " + "；".join(
                     f"{a['provider']}（{a['reason']}）" for a in failed
                 )
                 status = "failed"
-            else:
-                error = "三个搜索服务都试过了，都没找到结果"
+            elif attempted:
+                error = f"试过的服务都没找到结果（{tried}）"
                 status = "no_results"
+            else:
+                skipped = "；".join(
+                    f"{a['provider']}（{a['reason']}）" for a in attempts
+                )
+                error = f"三个服务都没法用：{skipped}" if skipped else "没有可用的搜索服务"
+                status = "failed"
             return SearchOutcome(
                 query=query,
                 provider=force_provider or "",

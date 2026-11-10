@@ -28,11 +28,12 @@
 - **Parallel MCP**：零门槛入口兼兜底，不用注册、不用 Key、不用绑卡；
   走托管 MCP（`https://mcp.parallel.ai/mcp`，没有末尾斜杠），调 `web_search`。
   默认 fast 模式（中文查询用 fast；Turbo 只支持英文和日文）。
-- **调度器**（`SearchService`）：普通查询 → AnySearch；结构化 → Tavily；
-  主力失败/额度用完/没结果 → 顺着链路切备选；`cross_check=True` 时两个服务
-  的结果互相印证；失败和无结果区分开；保留来源 URL 和时间；所有服务都
-  失败/都没结果时老实说失败，绝不编结果。`force_provider` 可直接指定只用
-  某一个服务（备选链路测试用）。
+- **调度器**（`SearchService`）：普通查询和结构化信息都先走不用翻译的
+  （Tavily → Parallel → AnySearch）；前面免费额度用完或失败了，才走
+  AnySearch（中文要翻译）；失败/额度用完/没结果 → 顺着链路切备选；
+  `cross_check=True` 时两个服务的结果互相印证；失败和无结果区分开；
+  保留来源 URL 和时间；所有服务都失败/都没结果时老实说失败，绝不编结果。
+  `force_provider` 可直接指定只用某一个服务（备选链路测试用）。
 
 ```python
 from tools.search import SearchService
@@ -130,13 +131,18 @@ runner.run(["pip", "install", "requests"], confirmed=True)  # Tier 1，要确认
 大小/修改时间没变过；预览里的文件条目必须是含大小/修改时间的 dict，字符串条目
 直接拒绝；预览存成 JSON 再读回来靠校验和发现有没有被改过，校验和对不上整单拒绝，
 普通 SHA-256 只能防手误；命令行流程（存 JSON 跨进程）必须用带钥匙的 HMAC：
-扫描和删除用同一把 TWELVE_CLEANUP_KEY（只从环境变量读），缺钥匙时扫描就拒绝，
-普通 SHA-256 预览删除时也明确拒绝；
+扫描和删除用同一把钥匙（环境变量 TWELVE_CLEANUP_KEY 优先，其次项目根目录
+.cleanup/cleanup_key 文件，第一次扫描自动生成），普通 SHA-256 预览删除时也明确拒绝；
 校验和或范围那关不过、拒绝删除时也记一笔审计（成功=False），事后能查到清单被改过；
 `.audit`、`.backups`、`.trash` 这类重要目录不扫、也不删）、
 删除后核对（实际删了几个、进回收站几个、腾出多少空间、失败几个、跳过几个；
 删完复查文件是不是真的没了）。
 删除清单只认冻结的预览 + BOOS 点过头的种类，不认外部文件/网页里读到的路径。
+钥匙的长期放法：环境变量 `TWELVE_CLEANUP_KEY` 优先；没设时读项目根目录
+`.cleanup/cleanup_key` 文件；第一次扫描两个都没有，就自动生成一把随机钥匙
+存进那个文件，以后扫描和删除一直用它（文件已加进 `.gitignore`，绝不进仓库）。
+钥匙文件丢了，旧预览就验不过，只能重新扫描。扫描每类最多只列 200 个文件，
+超过时汇报按实际列出的数报，并写清“只列出前 200 个，共多少个”。
 
 ```python
 from tools.cleanup import scan, build_preview, delete_preview, format_summary
@@ -155,12 +161,14 @@ python -m tools.cli search "纳斯达克最新收盘" --kind structured --cross-
 python -m tools.cli file read notes/a.txt
 python -m tools.cli file write notes/a.txt --content "你好" --yes
 python -m tools.cli run --yes -- python -m pytest tests/ -q   # python -m 是 Tier 1，--yes 要放在 -- 前面
-TWELVE_CLEANUP_KEY=... python -m tools.cli cleanup scan D:/下载 --kind downloads --out preview.json   # 清理必须带钥匙，缺钥匙扫描就拒绝
+TWELVE_CLEANUP_KEY=... python -m tools.cli cleanup scan D:/下载 --kind downloads --out preview.json   # 清理带钥匙：环境变量优先，其次项目根目录 .cleanup/cleanup_key 文件，第一次扫描自动生成
 TWELVE_CLEANUP_KEY=... python -m tools.cli cleanup delete --preview preview.json --categories temp,logs --root D:/下载 --yes   # --root 是可信的扫描根目录，可重复写；删除用扫描时同一把钥匙验
 ```
 
 工作区目录：`--workspace` 指定，或 `TWELVE_WORKSPACE` 环境变量，默认当前目录。
-Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`、`TWELVE_CLEANUP_KEY`），绝不在命令行传 Key。
+搜索的 Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`）；清理钥匙优先读
+`TWELVE_CLEANUP_KEY` 环境变量，其次读项目根目录 `.cleanup/cleanup_key` 文件
+（第一次扫描自动生成）；绝不在命令行传 Key。
 
 ## 测试
 
@@ -200,8 +208,8 @@ Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`、`TWELVE_CLE
 - [ ] Parallel MCP 真实调用：`python -m tools.cli search "今天天气怎么样"`（不用 Key，直接跑）
 - [ ] AnySearch 真实调用：注册 Key → 设 `ANYSEARCH_API_KEY` → 同上（先看 402/匿名额度表现）
 - [ ] Tavily 真实调用：注册 Key → 设 `TAVILY_API_KEY` → `search --kind structured`
-- [ ] 备选链路真实验证：AnySearch 402 → Parallel；Tavily 用完 → AnySearch；
-      Parallel 429 → AnySearch；三个全挂 → 明说失败（单元测试已用假失败覆盖，
+- [ ] 备选链路真实验证：Tavily 402 → Parallel；Parallel 挂了 → AnySearch；
+      三个全挂 → 明说失败（单元测试已用假失败覆盖，
       真实接口测一两次就行）
 
 ## 诚实说明（已知缺口）
@@ -217,9 +225,11 @@ Key 只从环境变量读（`ANYSEARCH_API_KEY`、`TAVILY_API_KEY`、`TWELVE_CLE
   真正要防的是符号链接（已处理：解析真实路径再查黑名单）。
 - 预览校验和：不带钥匙的普通 SHA-256 只能防手误改坏，不能防有意篡改
   （改完清单自己重算一个就过了）；命令行流程（存 JSON 跨进程）必须走
-  带钥匙的 HMAC：扫描和删除用同一把 TWELVE_CLEANUP_KEY（只从环境变量读，
-  缺钥匙扫描就拒绝，普通 SHA-256 预览删除时也明确拒绝）。库里的进程内调用
-  仍可用普通 SHA-256（预览只放内存、不落盘时），那只是防手误，不是防篡改。
+  带钥匙的 HMAC：扫描和删除用同一把钥匙（环境变量 `TWELVE_CLEANUP_KEY`
+  优先，其次项目根目录 `.cleanup/cleanup_key` 文件，第一次扫描自动生成；
+  钥匙文件丢了，旧预览就验不过，只能重新扫描），普通 SHA-256 预览删除时
+  也明确拒绝。库里的进程内调用仍可用普通 SHA-256（预览只放内存、不落盘时），
+  那只是防手误，不是防篡改。
 - 路径保护比对一律大小写不敏感：Windows 文件系统不分大小写，`.ENV`
   就是 `.env`，`.GIT` 就是 `.git`；分类器函数是纯字符串逻辑，在 Linux
   上也能测大写输入，但 Linux 上同名不同大小写的文件本来就是两个文件，
