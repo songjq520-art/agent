@@ -478,3 +478,146 @@ def test_backfilled_memories_have_no_order(tmp_path):
     )
     keys = [_memory_order_key(item["metadata"]) for item in items]
     assert keys[0] == keys[1]
+
+# ---------- 失败关闭：快照失败不写、恢复失败回滚 ----------
+
+
+def test_snapshot_retry_succeeds_on_second_try(tmp_path):
+    """快照第一次读不出来、重试成功：照常写，不留保护记录。
+
+    很多时候库只是抖一下，重试一次就好了。这条证明重试那一下
+    真的发生了、写也没少：新推断存下来了、标了待确认、没留账。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    store._memory.get_all_failures = [RuntimeError("库抖了一下。")]
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert "protection_failed" not in out
+    items = {item["text"]: item for item in store.get_all()}
+    assert "数据库用 SQLite。" in items
+    assert "我现在把数据库改成 PostgreSQL 了" in items
+    assert items["我现在把数据库改成 PostgreSQL 了"]["metadata"]["pending_confirmation"] is True
+    assert store.list_protection_events() == []
+
+
+def test_snapshot_both_attempts_fail_skips_write(tmp_path):
+    """快照两次都读不出来：本轮不写，mem0.add 没被调，跳过有账可查。
+
+    快照是守卫的眼睛：读不出来就不知道旧记忆长什么样，写了也
+    没法保护，干脆不写。断言三点：add 没被调（add_calls 里没有
+    infer=True 那条）、新说法没进库、保护事件记下来了。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    store._memory.get_all_failures = [
+        RuntimeError("库读不出来。"),
+        RuntimeError("库还是读不出来。"),
+    ]
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "snapshot_failed"
+    # add 没被调：add_calls 里只有种子那条 infer=False，没有写新记忆那条。
+    assert all(infer is not True for (_, _, infer) in store._memory.add_calls)
+    items = {item["text"]: item for item in store.get_all()}
+    assert "我现在把数据库改成 PostgreSQL 了" not in items
+    assert "数据库用 SQLite。" in items
+    events = store.list_protection_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "snapshot_failed"
+
+
+def test_restore_unverified_rolls_back_new_memories(tmp_path):
+    """恢复没法核对（库读不出来）：新存的几条全删掉回滚。
+
+    假 mem0 在 add 里把旧的 SQLite 改成了 PostgreSQL，守卫想按
+    快照恢复，可库读不出来、根本没法核对——保护状态未知，不能
+    当成成功。本轮新存的几条全删掉，库回到写之前那个样子。
+    旧的 SQLite 文本没恢复回来（恢复没法核对），这点如实记在
+    账里、不是假装恢复了。
+    """
+    store = make_fake_store(tmp_path, memory=MutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 第一次读（快照）正常，第二次读（恢复时核对）读不出来。
+    store._memory.get_all_failures = [None, RuntimeError("库读不出来。")]
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "restore_unverified"
+    items = store.get_all()
+    # 新存的那条被删掉了：库里只有一条 PostgreSQL 意思的记忆，
+    # 就是被假 mem0 改过的那条旧的（id 还是旧的）。
+    pg_items = [item for item in items if item["text"] == "我现在把数据库改成 PostgreSQL 了"]
+    assert len(pg_items) == 1
+    assert pg_items[0]["id"] == old_id
+    # 旧的 SQLite 文本没恢复回来（恢复没法核对，如实保留现状）。
+    assert all(item["text"] != "数据库用 SQLite。" for item in items)
+    events = store.list_protection_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "restore_unverified"
+    assert "数据库用 SQLite。" in events[0]["failed_texts"]
+
+
+def test_restore_partial_rolls_back_only_same_topic(tmp_path):
+    """恢复个别失败：只回滚跟没恢复回来的旧记忆同一话题的新记忆。
+
+    同一轮里两条新记忆：PostgreSQL（跟旧的 SQLite 同一话题）
+    和拿铁（不同话题）。假 mem0 把旧的 SQLite 改了，守卫恢复时
+    写不进去——PostgreSQL 那条新记忆删掉回滚，拿铁照常留下、
+    不标待确认；结果和账里都写明是哪条旧记忆没恢复回来。
+    """
+    store = make_fake_store(tmp_path, memory=MutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 恢复时写不进去：守卫原地 update 旧的 SQLite 那条就抛错。
+    store._memory.fail_update_ids = {old_id}
+    store.add_turn(
+        [{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。我喜欢喝拿铁。"}]
+    )
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "restore_partial"
+    assert out.get("failed_ids") == [old_id]
+    items = store.get_all()
+    # PostgreSQL 那条新存的被删掉了：只剩被假 mem0 改过的旧的那条。
+    pg_items = [item for item in items if item["text"] == "我现在把数据库改成 PostgreSQL 了"]
+    assert len(pg_items) == 1
+    assert pg_items[0]["id"] == old_id
+    # 拿铁照常留下，不标待确认。
+    latte_items = [item for item in items if item["text"] == "我喜欢喝拿铁"]
+    assert len(latte_items) == 1
+    assert latte_items[0]["metadata"]["pending_confirmation"] is False
+    # 旧的 SQLite 文本没恢复回来（恢复写不进去，如实保留现状）。
+    assert all(item["text"] != "数据库用 SQLite。" for item in items)
+    events = store.list_protection_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "restore_partial"
+    assert events[0]["failed_ids"] == [old_id]
+    assert "数据库用 SQLite。" in events[0]["failed_texts"]
+
+
+def test_restore_result_tells_verified_and_failed(tmp_path):
+    """_restore_snapshot_memories 的返回值要说清楚三种情况。
+
+    没什么要恢复时：verified=True、restored=0、failed_ids 为空；
+    读库失败时：verified=False（不是 -1、不是个数，调用方分得
+    出“没核对上”和“核对上了但没什么可恢复”）。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = store.get_all()
+    assert store._restore_snapshot_memories(before) == {
+        "verified": True,
+        "restored": 0,
+        "failed_ids": [],
+    }
+    store._memory.get_all_failures = [RuntimeError("库读不出来。")]
+    assert store._restore_snapshot_memories(before) == {
+        "verified": False,
+        "restored": 0,
+        "failed_ids": [],
+    }

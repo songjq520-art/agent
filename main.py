@@ -254,6 +254,27 @@ def _print_correction_result(saved):
     return correction
 
 
+def _print_protection_result(saved):
+    """把 add_turn 的保护失败结果用人话打印一行（只在保护失败时打印）。
+
+    参数 saved：add_turn 的返回字典；没保护失败时里面没有
+    "protection_failed" 键。保护失败就是快照读不出来、或旧记忆
+    没恢复回来——本轮要么没写记忆、要么回滚过，面板“保护记录”
+    里有详细账，这里只提醒 BOOS 一声。
+    """
+    if not (saved or {}).get("protection_failed"):
+        return
+    reason = (saved or {}).get("protection_reason") or ""
+    if reason == "snapshot_failed":
+        print("提醒：这次记忆没存上（提取前快照读不出来），面板“保护记录”里有账。")
+    elif reason == "restore_unverified":
+        print("提醒：这次没法核对旧记忆有没有被改动，新存的记忆已删掉回滚，面板“保护记录”里有账。")
+    elif reason == "restore_partial":
+        print("提醒：这次有旧记忆没恢复回来，相关的记忆已删掉回滚，面板“保护记录”里有账。")
+    else:
+        print("提醒：这次记忆保护失败了，面板“保护记录”里有账。")
+
+
 def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None):
     """跑一次普通问答任务（最简单的运行示例）.
 
@@ -396,6 +417,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         )[-6:]
         saved = mem0_store.add_turn(recent)
         correction = _print_correction_result(saved)
+        _print_protection_result(saved)
         # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
         # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
         if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:

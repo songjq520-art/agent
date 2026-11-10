@@ -819,6 +819,33 @@ def test_memories_list_without_store_returns_empty_and_disabled(running_server):
     assert data["memories"] == []
 
 
+def test_protection_events_returns_recorded_events(running_server_with_real_mem0):
+    """GET /api/protection-events：返回记下来的保护事件（新的在前）。
+
+    保护事件是失败关闭的可见留痕：快照失败、恢复失败时记一条，
+    面板上“保护记录”那块读这个接口展示。"""
+    port, _state, store = running_server_with_real_mem0
+    store._record_protection_event(
+        "snapshot_failed", "提取前快照两次都失败，本轮没有存记忆。"
+    )
+    status, _ct, data = _request(port, "GET", "/api/protection-events")
+    assert status == 200
+    assert data["mem0_enabled"] is True
+    assert len(data["events"]) == 1
+    assert data["events"][0]["kind"] == "snapshot_failed"
+    assert data["events"][0]["reason"]
+
+
+def test_protection_events_without_store_returns_empty_and_disabled(running_server):
+    """没带记忆库启动时：GET /api/protection-events 返回 mem0_enabled
+    False、列表为空，不报错，页面据此显示“暂无保护记录”。"""
+    port, _state = running_server
+    status, _ct, data = _request(port, "GET", "/api/protection-events")
+    assert status == 200
+    assert data["mem0_enabled"] is False
+    assert data["events"] == []
+
+
 def test_memory_scope_returns_deletion_scope(running_server_with_real_mem0):
     """GET /api/memories/<id>/scope：返回删除范围——找得到这条记忆、
     有 1 条 history 审计行、删的范围和不删的范围都列出来了。"""

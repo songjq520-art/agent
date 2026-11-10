@@ -361,6 +361,22 @@ class ChatState:
                 logger.warning("读记忆列表失败。", exc_info=True)
                 return []
 
+    def list_protection_events(self):
+        """返回最近的保护事件（供页面“保护记录”那块展示用）。
+
+        记忆未启用时返回空列表；读失败时也返回空列表（页面显示
+        “暂无保护记录”，不拦聊天）。事件本身在 Mem0Store 里读
+        （memory/protection-events.jsonl），这里只做传话。
+        """
+        with self._lock:
+            if self.mem0_store is None:
+                return []
+            try:
+                return self.mem0_store.list_protection_events()
+            except Exception:
+                logger.warning("读保护事件失败。", exc_info=True)
+                return []
+
     def memory_scope(self, memory_id):
         """返回一条记忆的删除范围（deletion_scope 的原样返回）。
 
@@ -546,6 +562,15 @@ def make_handler(state, authenticator=None):
                     {
                         "mem0_enabled": state.mem0_store is not None,
                         "memories": state.list_memories(),
+                    }
+                )
+            elif path == "/api/protection-events":
+                # 保护记录：快照失败、恢复失败这些事的可见留痕，新的在前。
+                # 记忆未启用时列表为空，页面显示“暂无保护记录”。
+                self._send_json(
+                    {
+                        "mem0_enabled": state.mem0_store is not None,
+                        "events": state.list_protection_events(),
                     }
                 )
             elif path.startswith("/api/memories/") and path.endswith("/scope"):

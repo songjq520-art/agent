@@ -350,6 +350,8 @@
       </div>
       <div class="memories-msg" id="memoriesMsg"></div>
       <div id="memoriesList"></div>
+      <div class="memories-sub" style="margin-top:16px">保护记录：记忆写入时如果保护失败了（比如快照读不出来、旧记忆没恢复回来），会记在这里，不会悄悄跳过。没有记录就是没出过事。</div>
+      <div id="protectionEventsList"></div>
     </div>
 
     <div class="composer" id="composer">
@@ -619,6 +621,7 @@
   }
 
   async function refreshMemories() {
+    refreshProtectionEvents();
     setMemoriesMsg('正在加载记忆…');
     memoriesListEl.textContent = '';
     try {
@@ -642,6 +645,42 @@
     } catch (e) {
       setMemoriesMsg('加载失败：连不上服务，请确认服务还在运行。', true);
     }
+  }
+
+  // ---------- 保护记录 ----------
+  // 记忆写入时保护失败了（快照读不出来、旧记忆没恢复回来），事件
+  // 记在服务端的 memory/protection-events.jsonl 里，这里只负责读出来
+  // 展示。读不出来不拦记忆列表，只是不显示。
+  async function refreshProtectionEvents() {
+    const listEl = document.getElementById('protectionEventsList');
+    if (!listEl) return;
+    listEl.textContent = '';
+    try {
+      const res = await fetch('/api/protection-events');
+      const data = await res.json();
+      if (!res.ok || !data.mem0_enabled) return;
+      (data.events || []).forEach((ev) => listEl.appendChild(renderProtectionEvent(ev)));
+    } catch (e) {
+      // 保护记录读不出来不拦记忆列表，只是不显示。
+    }
+  }
+
+  function renderProtectionEvent(ev) {
+    const kindText = {
+      snapshot_failed: '有一次没存记忆',
+      restore_unverified: '有一次没法核对旧记忆',
+      restore_partial: '有旧记忆没恢复回来',
+    }[(ev && ev.kind) || ''] || '保护失败';
+    const item = el('div', 'mem-item');
+    item.appendChild(el('div', 'mem-text', kindText + '：' + ((ev && ev.reason) || '')));
+    const metaLine = el('div', 'mem-meta');
+    metaLine.appendChild(document.createTextNode(formatCreatedAt(ev && ev.time)));
+    const failed = (ev && ev.failed_texts) || [];
+    if (failed.length) {
+      metaLine.appendChild(document.createTextNode('　没恢复回来的记忆：' + failed.join('；')));
+    }
+    item.appendChild(metaLine);
+    return item;
   }
 
   function renderMemoryItem(mem) {

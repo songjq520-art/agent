@@ -1607,6 +1607,7 @@ class Mem0Store:
         chroma_path=None,
         history_db_path=None,
         version_path=None,
+        protection_events_path=None,
         user_id=DEFAULT_USER_ID,
         budget_tracker=None,
         threshold=RETRIEVAL_THRESHOLD,
@@ -1623,6 +1624,14 @@ class Mem0Store:
         )
         self.version_path = (
             Path(version_path) if version_path else project_root / "memory" / "mem0_versions.json"
+        )
+        # 保护事件记录（失败关闭的可见留痕）：快照失败、恢复失败这些事
+        # 不能只写日志——记到本地 JSONL 里（memory/protection-events.jsonl，
+        # gitignore 覆盖，不进仓库），面板上有接口能读到，BOOS 看得见。
+        self.protection_events_path = (
+            Path(protection_events_path)
+            if protection_events_path
+            else project_root / "memory" / "protection-events.jsonl"
         )
         self.user_id = user_id
         self.budget_tracker = budget_tracker
@@ -1890,6 +1899,30 @@ class Mem0Store:
         except Exception:
             logger.warning("记对话上下文失败：本次上下文未记录。", exc_info=True)
 
+    def _snapshot_all(self):
+        """拍一张库快照（提取前、恢复核对时用）。
+
+        内容口径和 get_all(include_sensitive=True) 一样：全部记忆，
+        空文本跳过，metadata 规整过。区别只有一点：读库失败时抛
+        异常、不吞掉——调用方要分得出“库是空的”还是“库读不出来”，
+        分不出来就没法失败关闭（快照读不出来还往里写，就是没保护
+        硬写，见 _extract_and_save_turn）。
+        """
+        raw = self._memory.get_all(filters={"user_id": self.user_id})
+        out = []
+        for item in (raw or {}).get("results", []):
+            text = item.get("memory") or ""
+            if not text:
+                continue
+            out.append(
+                {
+                    "id": item.get("id"),
+                    "text": text,
+                    "metadata": _normalize_metadata(item.get("metadata")),
+                }
+            )
+        return out
+
     def get_all(self, include_sensitive=False):
         """返回当前用户的所有记忆（列表，每项 {"id", "text", "metadata"}，
         metadata 是规整过的来源信息，见 _normalize_metadata）。
@@ -1902,24 +1935,74 @@ class Mem0Store:
         出问题时返回空列表，不抛异常。
         """
         try:
-            raw = self._memory.get_all(filters={"user_id": self.user_id})
-            out = []
-            for item in (raw or {}).get("results", []):
-                text = item.get("memory") or ""
-                if not text:
-                    continue
-                if not include_sensitive and _contains_sensitive(text):
-                    continue
-                out.append(
-                    {
-                        "id": item.get("id"),
-                        "text": text,
-                        "metadata": _normalize_metadata(item.get("metadata")),
-                    }
-                )
-            return out
+            out = self._snapshot_all()
         except Exception:
             logger.warning("mem0 取全部记忆失败。", exc_info=True)
+            return []
+        if not include_sensitive:
+            out = [
+                item
+                for item in out
+                if not _contains_sensitive(item.get("text") or "")
+            ]
+        return out
+
+    def _record_protection_event(self, kind, reason, failed_ids=None, failed_texts=None):
+        """记一条保护事件（失败关闭的可见留痕）。
+
+        快照失败、恢复失败这些事不能只写日志——日志 BOOS 看不到，
+        悄悄跳过一轮他也不知道。记到本地 JSONL 里
+        （memory/protection-events.jsonl，gitignore 覆盖，不进仓库），
+        面板上有接口能读到（GET /api/protection-events）。
+        kind：snapshot_failed（快照两次都失败，本轮没写）、
+        restore_unverified（恢复前读库失败，没法核对，本轮新存的已回滚）、
+        restore_partial（个别旧记忆没恢复回来，跟它们同一话题的新记忆已回滚）。
+        failed_ids 是旧记忆的 id，failed_texts 是它们的原文——面板上
+        BOOS 要看得出是哪条记忆，光给 id 他认不出来。文件只在本地，
+        和 history.db 一个待遇（里面本来就有全文），不上传、不导出；
+        logger 里的警告照旧不带内容。
+        记不下来时只记日志、不抛异常——留痕本身坏了不能把聊天搞崩。
+        """
+        try:
+            event = {
+                "time": _now_iso(),
+                "kind": kind,
+                "reason": reason,
+                "failed_ids": list(failed_ids or []),
+                "failed_texts": list(failed_texts or []),
+            }
+            self.protection_events_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.protection_events_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.warning("保护事件没记下来。", exc_info=True)
+
+    def list_protection_events(self, limit=50):
+        """返回最近的保护事件（给面板看，新的在前，最多 limit 条）。
+
+        文件没有、读不出来、某一行写坏了，都跳过不报错——面板上
+        显示“暂无保护记录”，不拦聊天。
+        """
+        try:
+            path = self.protection_events_path
+            if not path.exists():
+                return []
+            events = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(event, dict) and event.get("kind"):
+                        events.append(event)
+            events.reverse()
+            return events[:limit]
+        except Exception:
+            logger.warning("读保护事件失败。", exc_info=True)
             return []
 
     # ---------- 写入（回答后自动存 / 手动存） ----------
@@ -2021,13 +2104,33 @@ class Mem0Store:
         把新记忆和自己/同一批的兄弟认成邻居）；快照还有第二个用处：
         万一 add 在里面动了旧记忆，守卫按快照原样恢复（见
         _restore_snapshot_memories）。
-        失败时返回 {}，绝不抛异常——存记忆失败不能把聊天回答搞崩。
+        失败关闭：快照是保护的前提——快照读不出来，就不知道旧记忆
+        长什么样，写进去就是没保护硬写。所以快照先重试一次（很多
+        时候就是抖一下，重试之间不睡、保持简单），还失败就不调
+        mem0.add，本轮不写，记一条保护事件、结果里带上
+        protection_failed 标记（调用方和面板能读到）。代价只是这轮
+        的事实这次没存进长期记忆，对话摘要里还留着，还能再说——
+        比悄悄顶掉已确认的事实强得多。
+        失败时返回 {} 或带 protection_failed 的字典，绝不抛异常——
+        存记忆失败不能把聊天回答搞崩。
         """
-        try:
-            before = self.get_all(include_sensitive=True)
-        except Exception:
-            logger.warning("提取前快照失败：本次不做覆盖守卫。", exc_info=True)
-            before = []
+        before = None
+        for _attempt in range(2):
+            try:
+                before = self._snapshot_all()
+                break
+            except Exception:
+                before = None
+        if before is None:
+            logger.warning("提取前快照两次都失败：本轮不写记忆。", exc_info=True)
+            self._record_protection_event(
+                "snapshot_failed", "提取前快照两次都失败，本轮没有存记忆。"
+            )
+            return {
+                "protection_failed": True,
+                "protection_reason": "snapshot_failed",
+                "results": [],
+            }
         metadata = _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
         try:
             result = self._mem0_add(
@@ -2085,13 +2188,28 @@ class Mem0Store:
             ) == "assistant":
                 fresh.append(messages[i + 1])
         results = []
+        protection_failed = False
+        protection_reason = None
+        failed_ids = None
         filtered = _filter_extraction_messages(fresh)
         if filtered:
             extracted = self._extract_and_save_turn(filtered)
             results = (extracted or {}).get("results") or []
-        if not results and not identity_outcomes:
+            # 保护失败的标记要往上传：本轮没写成、或回滚过，调用方
+            # （add_turn / 面板）得知道，不能只留在提取那一层。
+            # failed_ids 是没恢复回来的旧记忆 id（只有恢复个别失败时有）。
+            protection_failed = bool((extracted or {}).get("protection_failed"))
+            protection_reason = (extracted or {}).get("protection_reason")
+            failed_ids = (extracted or {}).get("failed_ids")
+        if not results and not identity_outcomes and not protection_failed:
             return {}
-        return {"results": results, "identity": identity_outcomes}
+        out = {"results": results, "identity": identity_outcomes}
+        if protection_failed:
+            out["protection_failed"] = True
+            out["protection_reason"] = protection_reason
+            if failed_ids:
+                out["failed_ids"] = failed_ids
+        return out
 
     def flush_pending(self):
         """立刻提交待定区（Plan C）。
@@ -2568,11 +2686,17 @@ class Mem0Store:
                 "messages": safe_messages,
                 "identity": identity_items,
             }
-            return {
+            out = {
                 "pending": True,
                 "results": (committed or {}).get("results") or [],
                 "identity": [item["slot"] for item in identity_items],
             }
+            if (committed or {}).get("protection_failed"):
+                out["protection_failed"] = True
+                out["protection_reason"] = (committed or {}).get("protection_reason")
+                if (committed or {}).get("failed_ids"):
+                    out["failed_ids"] = (committed or {}).get("failed_ids")
+            return out
 
     def _drop_sensitive_results(self, result):
         """提取后二次过滤：检查本次提取出的记忆，万一哪条还带着敏感信息
@@ -2634,15 +2758,19 @@ class Mem0Store:
         读库失败时不猜：分不清“全被删了”还是“读失败了”，宁可本次
         不恢复（记一条警告），也别把没删的东西重复存一遍。
         恢复只记日志、不抛异常——守卫坏了不能把聊天回答搞崩。
-        返回恢复了几条（-1 表示连库都读不出来，本次没核对）。
+        返回一个小结构（调用方要分得出三种情况，不能只给个数）：
+        {"verified": 本次到底核没核对上（读库失败时是 False）、
+         "restored": 恢复了几条、
+         "failed_ids": 没恢复回来的旧记忆 id（空表示都恢复了、
+         或本来就没什么要恢复的）}。
         """
         if not before_items:
-            return 0
+            return {"verified": True, "restored": 0, "failed_ids": []}
         try:
             raw = self._memory.get_all(filters={"user_id": self.user_id})
         except Exception:
             logger.warning("覆盖守卫：核对快照时读库失败，本次不恢复。", exc_info=True)
-            return -1
+            return {"verified": False, "restored": 0, "failed_ids": []}
         current = {}
         for item in (raw or {}).get("results", []):
             mem_id = (item or {}).get("id")
@@ -2654,6 +2782,7 @@ class Mem0Store:
                 "metadata": _normalize_metadata((item or {}).get("metadata")),
             }
         restored = 0
+        failed_ids = []
         for old in before_items:
             mem_id = (old or {}).get("id")
             old_text = (old or {}).get("text") or ""
@@ -2672,6 +2801,7 @@ class Mem0Store:
                     )
                 except Exception:
                     logger.warning("覆盖守卫：恢复被删的旧记忆失败。", exc_info=True)
+                    failed_ids.append(mem_id)
                     continue
                 restored += 1
                 continue
@@ -2691,11 +2821,34 @@ class Mem0Store:
                     self._memory.update(memory_id=mem_id, text=old_text)
             except Exception:
                 logger.warning("覆盖守卫：恢复被改的旧记忆失败。", exc_info=True)
+                failed_ids.append(mem_id)
                 continue
             restored += 1
         if restored:
             logger.info("提取后守卫：按快照恢复了 %d 条被改动的旧记忆。", restored)
-        return restored
+        return {"verified": True, "restored": restored, "failed_ids": failed_ids}
+
+    def _rollback_new_memories(self, items):
+        """删掉本轮新存的几条记忆（恢复失败时的回滚）。
+
+        删的办法复用 _drop_sensitive_results 里现成的
+        self._memory.delete——刚存进来的记录，删掉就是回到写之前
+        的样子。删失败只记日志、不抛异常：删不掉的那条留在库里、
+        也留在返回的 results 里，如实反映（不能谎称删掉了）。
+        返回删完还留着的条目（删失败的还在里面）。
+        """
+        survivors = []
+        for item in items or []:
+            mem_id = (item or {}).get("id")
+            if not mem_id:
+                survivors.append(item)
+                continue
+            try:
+                self._memory.delete(mem_id)
+            except Exception:
+                logger.warning("回滚新记忆失败：id=%s。", mem_id, exc_info=True)
+                survivors.append(item)
+        return survivors
 
     def _apply_coverage_guard(self, results, before_items, new_metadata):
         """提取后覆盖守卫：刚提取出的推断记忆，别把 BOOS 确认过的事实顶掉。
@@ -2725,11 +2878,81 @@ class Mem0Store:
         打标记之前先按快照核对恢复（见 _restore_snapshot_memories）：
         万一 add 在里面动了旧记忆，先恢复原样，再谈新记忆待确认——
         旧事实丢了，打再多标记也没用。
+        恢复失败时失败关闭，不当成保护成功（恢复的返回值不能丢掉）：
+        (a) 连库都读不出来、根本没法核对——本轮新存的都删掉回滚，
+        结果里标 protection_failed=True、原因 restore_unverified，
+        记一条保护事件，提前返回，不再打标记；
+        (b) 个别旧记忆没恢复回来——只回滚跟它们同一话题的新记忆，
+        其他新记忆照常走打标记的流程，结果里同样标 protection_failed、
+        原因 restore_partial、并写明是哪几条旧记忆（failed_ids），
+        也记一条保护事件。没恢复回来的旧记忆本身还是坏的，这事
+        标出来、记下来，不能当成保护成功。
         """
         if not before_items:
             return results
-        self._restore_snapshot_memories(before_items)
+        results = dict(results or {})
+        restore = self._restore_snapshot_memories(before_items)
         items = (results or {}).get("results") or []
+        if not restore.get("verified", False):
+            # (a) 没法核对：旧记忆到底被动了没有根本不知道。光标个
+            #     失败不够——新记忆已经存进去了，得把本轮新存的都
+            #     删掉回滚，让库回到写之前的样子。
+            survivors = self._rollback_new_memories(items)
+            results["results"] = survivors
+            results["protection_failed"] = True
+            results["protection_reason"] = "restore_unverified"
+            self._record_protection_event(
+                "restore_unverified",
+                "恢复前读库失败，没法核对 %d 条旧记忆有没有被改动，"
+                "本轮新存的记忆已删掉回滚。" % len(before_items),
+                failed_ids=[
+                    (old or {}).get("id")
+                    for old in before_items
+                    if (old or {}).get("id")
+                ],
+                failed_texts=[
+                    (old or {}).get("text") or "" for old in before_items
+                ],
+            )
+            return results
+        failed_ids = restore.get("failed_ids") or []
+        if failed_ids:
+            # (b) 个别旧记忆没恢复回来：只回滚跟它们同一话题的新记忆，
+            #     其他新记忆照常走打标记的流程。
+            failed_set = set(failed_ids)
+            failed_old = [
+                old for old in before_items if (old or {}).get("id") in failed_set
+            ]
+            doomed = []
+            kept = []
+            for item in items:
+                new_text = (item or {}).get("memory") or ""
+                keywords = _extract_keywords(new_text) if new_text else set()
+                same_topic = False
+                for old in failed_old:
+                    old_text = (old or {}).get("text") or ""
+                    weight, _matched = _keyword_weight(old_text, keywords)
+                    if weight >= self._COVERAGE_GUARD_MIN_WEIGHT:
+                        same_topic = True
+                        break
+                if same_topic:
+                    doomed.append(item)
+                else:
+                    kept.append(item)
+            self._rollback_new_memories(doomed)
+            items = kept
+            results["results"] = items
+            results["protection_failed"] = True
+            results["protection_reason"] = "restore_partial"
+            results["failed_ids"] = list(failed_ids)
+            self._record_protection_event(
+                "restore_partial",
+                "有旧记忆没恢复回来，跟它们同一话题的新记忆已删掉回滚。",
+                failed_ids=list(failed_ids),
+                failed_texts=[
+                    (old or {}).get("text") or "" for old in failed_old
+                ],
+            )
         if not items:
             return results
         base_meta = dict(new_metadata or {})
