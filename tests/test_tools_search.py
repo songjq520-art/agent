@@ -351,6 +351,41 @@ def test_scheduler_force_provider_failure_names_only_tried_provider():
     assert "tavily" not in outcome.error
 
 
+def test_scheduler_force_provider_skipped_names_specified_provider():
+    # 2 号回归：--provider 只指定一个服务、且该服务不可用（没 Key）时，
+    # 报错不能写“三个服务都没法用”，实际只试了一个。
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=FakeProvider("tavily", []),
+        parallel=FakeProvider(
+            "parallel", [], available=False, unavailable_reason="没 Key"
+        ),
+    )
+    outcome = service.search("q", force_provider="parallel")
+    assert outcome.status == "failed"
+    assert "三个" not in outcome.error
+    assert "指定的服务没法用" in outcome.error
+    assert "parallel" in outcome.error
+    assert "anysearch" not in outcome.error
+    assert "tavily" not in outcome.error
+
+
+def test_scheduler_failed_and_empty_listed_separately():
+    # 2 号附：failed + empty 混在一起时，括号里只列真的失败了的；
+    # “没找到结果”的那个另起一句，别和失败混在一个“都失败了”后面。
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", [ToolError("anysearch 挂了")]),
+        tavily=FakeProvider("tavily", []),
+        parallel=FakeProvider("parallel", [ToolError("parallel 挂了")]),
+    )
+    outcome = service.search("q")
+    assert outcome.status == "failed"
+    assert "都失败了" in outcome.error
+    assert "（parallel、anysearch）" in outcome.error
+    assert "（tavily" not in outcome.error
+    assert "tavily 没找到结果" in outcome.error
+
+
 def test_scheduler_all_fail_is_honest():
     service = SearchService(
         anysearch=FakeProvider("anysearch", [ToolError("anysearch 挂了")]),

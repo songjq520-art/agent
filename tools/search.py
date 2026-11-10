@@ -740,21 +740,35 @@ class SearchService:
             failed = [a for a in attempts if a["status"] == "failed"]
             # 报错只说实际试过的服务：--provider 只指定一个时，别写成
             #“三个服务都试过了”（以前写死了这句，只试一个也这么说）。
+            # 括号里也只列真的失败了的——“没找到结果”不是失败，别和
+            # 失败混在一个“都失败了”后面。
             attempted = [a for a in attempts if a["status"] in ("failed", "empty")]
-            tried = "、".join(a["provider"] for a in attempted)
             if failed:
-                error = f"试过的服务都失败了（{tried}）： " + "；".join(
+                failed_names = "、".join(a["provider"] for a in failed)
+                error = f"试过的服务都失败了（{failed_names}）： " + "；".join(
                     f"{a['provider']}（{a['reason']}）" for a in failed
                 )
+                empty = [a for a in attempted if a["status"] == "empty"]
+                if empty:
+                    empty_names = "、".join(a["provider"] for a in empty)
+                    error += f"；{empty_names} 没找到结果"
                 status = "failed"
             elif attempted:
+                tried = "、".join(a["provider"] for a in attempted)
                 error = f"试过的服务都没找到结果（{tried}）"
                 status = "no_results"
             else:
                 skipped = "；".join(
                     f"{a['provider']}（{a['reason']}）" for a in attempts
                 )
-                error = f"三个服务都没法用：{skipped}" if skipped else "没有可用的搜索服务"
+                if not skipped:
+                    error = "没有可用的搜索服务"
+                elif len(chain) == 1:
+                    # 链路只有一个服务（--provider 指定的那一个被跳过），
+                    # 别写“三个服务都没法用”，实际只试了一个。
+                    error = f"指定的服务没法用：{skipped}"
+                else:
+                    error = f"三个服务都没法用：{skipped}"
                 status = "failed"
             return SearchOutcome(
                 query=query,

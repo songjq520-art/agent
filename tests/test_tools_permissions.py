@@ -12,6 +12,9 @@ import pytest
 
 from tools.errors import PermissionDenied, ToolError
 from tools.permissions import (
+    _decode_powershell_encoded,
+    _encode_backup_name,
+    _original_from_backup_name,
     classify_command,
     classify_path,
     resolve_in_workspace,
@@ -265,6 +268,67 @@ def test_shell_code_flag_combined_forms_checked():
     # 脚本自己的 -c 不是 shell 的：bash script.sh -c ... 里面的命令不查。
     tier, _ = classify_command(["bash", "script.sh", "-c", "shutdown /s"])
     assert tier == 1
+
+
+def test_powershell_long_value_flags_do_not_hide_command():
+    # 1 号回归：powershell 的长标志里含 c（-ExecutionPolicy 等）不能
+    # 当成 -c 标志簇——它的值（Bypass）不是内含命令，真正的 -Command
+    # 在后面，必须继续找；带值的长标志要跳过值再找。
+    tier2_cases = [
+        ["powershell", "-ExecutionPolicy", "Bypass", "-Command", "shutdown /s"],
+        ["powershell", "-ConfigurationName", "X", "-Command", "shutdown /s"],
+        ["powershell", "-NonInteractive", "-Command", "shutdown /s"],
+        ["powershell", "-WorkingDirectory", "C:\\x", "-Command", "shutdown /s"],
+        ["powershell", "-InputFormat", "xml", "-Command", "shutdown /s"],
+        ["powershell", "-OutputFormat", "text", "-Command", "format C:"],
+    ]
+    for argv in tier2_cases:
+        tier, reason = classify_command(argv)
+        assert tier == 2, (argv, tier, reason)
+    # -File 的值是脚本，值后面的全是脚本参数，不查。
+    tier, _ = classify_command(
+        ["powershell", "-File", "script.ps1", "-Command", "shutdown /s"]
+    )
+    assert tier == 1
+    # 无害命令仍是 Tier 1：长标志 + 无害内容不升级。
+    tier, _ = classify_command(
+        ["powershell", "-ExecutionPolicy", "Bypass", "-Command", "echo hi"]
+    )
+    assert tier == 1
+    # 同类问题：bash -o 后面跟一个值（-o vi），跳过它再找 -c。
+    tier, _ = classify_command(["bash", "-o", "vi", "-c", "shutdown /s"])
+    assert tier == 2
+    tier, _ = classify_command(["bash", "-o", "vi", "echo hi"])
+    assert tier == 1
+
+
+def test_powershell_encoded_command_utf8_decoded_as_text():
+    # 3 号回归：UTF-8 编码的命令不能按 UTF-16LE 解成乱码——确认理由里
+    # 要写 BOOS 看得懂的原文。
+    assert _decode_powershell_encoded(_b64_utf8("echo hello")) == "echo hello"
+    assert _decode_powershell_encoded(_b64_utf8("关机")) == "关机"
+    # 真 UTF-16LE 的不受影响：带 NUL 字节的仍按 UTF-16LE 解。
+    assert _decode_powershell_encoded(_b64_utf16le("shutdown /s")) == "shutdown /s"
+    # UTF-16LE 的纯中文也不能误判成 UTF-8（"你好"按 UTF-8 解是 `O}Y）。
+    assert _decode_powershell_encoded(_b64_utf16le("你好")) == "你好"
+    # 走 classify_command：UTF-8 编的普通命令，理由里写原文。
+    tier, reason = classify_command(
+        ["powershell", "-EncodedCommand", _b64_utf8("echo hello")]
+    )
+    assert tier == 1
+    assert "echo hello" in reason
+
+
+def test_backup_name_roundtrip_with_underscores():
+    # 4 号回归：编解码要一一对应——a__b.txt 编完再解回来还是 a__b.txt，
+    # 不能变回 a/b.txt。
+    for original in ["a__b.txt", "a/b.txt", "100%2F.txt", "a_b/c__d.txt"]:
+        encoded = _encode_backup_name(original)
+        assert _original_from_backup_name(encoded + "_20261110T103000000000.bak") == original
+    # 旧备份（没有 % 标记的）仍按老办法解，不至于认不出来。
+    assert (
+        _original_from_backup_name("a__b.txt_20261110T103000000000.bak") == "a/b.txt"
+    )
 
 
 def test_command_must_be_list():

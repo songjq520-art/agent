@@ -58,22 +58,26 @@ def _is_env_file(path):
 
 
 # 备份文件名：<原路径编码后>_<时间戳>.bak，时间戳是 %Y%m%dT%H%M%S%f。
-# 路径分隔符用 %2F 式转义（% → %25，/ → %2F，\ → %5C）：以前
-# 是把 / 换成 __，a/b.txt 和字面就叫 a__b.txt 的文件会撞同一个
-# 备份名；% 编码是一一对应的，撞不上。_original_from_backup_name
-# 解码时认新编码；没有 %2F/%5C/%25 的旧备份按老办法（__ → /）解，
-# 老备份不至于一下子认不出来。
+# 路径分隔符用 %2F 式转义（% → %25，/ → %2F，\ → %5C，_ → %5F）：
+# 以前是把 / 换成 __，a/b.txt 和字面就叫 a__b.txt 的文件会撞同一个
+# 备份名；_ 不转的话 a__b.txt 编完还是 a__b.txt，解码时分不清它是
+# 字面 __ 还是 / 转过来的。% 编码是一一对应的，撞不上。
+# _original_from_backup_name 解码时认新编码（%2F/%5C/%25/%5F）；
+# 四个标记一个都没有的旧备份按老办法（__ → /）解，老备份不至于
+# 一下子认不出来。
 _BACKUP_NAME_RE = re.compile(r"^(.*)_(\d{8}T\d{12})\.bak$")
 
 
 def _encode_backup_name(rel_path):
-    """把工作区里的相对路径编成备份文件名里的一段：/ 和 \ 用 %2F/%5C
-    转义，% 先转成 %25（不先转 %，字面带 %2F 的文件名解码时会串）。"""
+    r"""把工作区里的相对路径编成备份文件名里的一段：/ 和 \ 用 %2F/%5C
+    转义，% 先转成 %25，_ 转成 %5F（不先转 %，字面带 %2F 的文件名
+    解码时会串；不转 _，字面 a__b.txt 和 a/b.txt 解码时分不清）。"""
     return (
         str(rel_path)
         .replace("%", "%25")
         .replace("/", "%2F")
         .replace("\\", "%5C")
+        .replace("_", "%5F")
     )
 
 
@@ -84,10 +88,11 @@ def _original_from_backup_name(filename):
     if not match:
         return None
     encoded = match.group(1)
-    if "%2F" in encoded or "%5C" in encoded or "%25" in encoded:
+    if "%2F" in encoded or "%5C" in encoded or "%25" in encoded or "%5F" in encoded:
         return (
             encoded.replace("%2F", "/")
             .replace("%5C", "\\")
+            .replace("%5F", "_")
             .replace("%25", "%")
         )
     return encoded.replace("__", "/")
@@ -351,18 +356,79 @@ def _check_segment(segment):
 
 def _decode_powershell_encoded(text):
     """解 powershell -EncodedCommand 的 base64：PowerShell 默认用
-    UTF-16LE 编码命令，解不开就按 UTF-8 试；都解不开返回 None
-    （调用方明确标注“解不出来”，不静默放行）。"""
+    UTF-16LE 编码命令。raw 里有 NUL 字节时一定是 UTF-16LE（UTF-8
+    命令里不会有 NUL）；没有 NUL 时，UTF-16LE 解出来是乱码、UTF-8
+    解出来是干净可打印文本就用 UTF-8 那份——以前 UTF-16LE 先试，
+    偶数长度字节解 UTF-16LE 几乎不失败，UTF-8 回落基本是死代码，
+    echo hello 这类 UTF-8 编码的命令在确认理由里显示成乱码。
+    都解不开返回 None（调用方明确标注“解不出来”，不静默放行）。"""
     try:
         raw = base64.b64decode(text, validate=True)
     except ValueError:
         return None
-    for encoding in ("utf-16-le", "utf-8"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
+    t16 = None
+    try:
+        t16 = raw.decode("utf-16-le")
+    except UnicodeDecodeError:
+        t16 = None
+    if t16 is not None and b"\x00" in raw:
+        return t16
+    t8 = None
+    try:
+        t8 = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        t8 = None
+    if t16 is not None and t8 is not None and _looks_like_plain_text(t8):
+        return t8
+    if t16 is not None:
+        return t16
+    return t8
+
+
+def _looks_like_plain_text(text):
+    """判断一段解出来的文本是不是干净可打印的命令样文本。
+
+    每个字符都得是可打印 ASCII / 空白 / CJK 常用字或标点，且要么含
+    空格、要么整个像个命令词（字母数字及点、下划线、连字符、斜杠、
+    反斜杠、冒号、分号、美元符、@、百分号、加号、等号和 CJK）。
+    用来区分 UTF-8 解出来的真文本和 UTF-16LE 误解出来的乱码——
+    比如 UTF-16LE 的“你好”按 UTF-8 解是 `O}Y，含反引号和花括号，
+    不像命令词，不会误判成 UTF-8。"""
+    if not text:
+        return False
+    for ch in text:
+        o = ord(ch)
+        if 0x20 <= o <= 0x7E or ch in "\n\r\t":
             continue
-    return None
+        if 0x4E00 <= o <= 0x9FFF or 0x3000 <= o <= 0x303F:
+            continue
+        return False
+    if " " in text or "\t" in text or "\n" in text:
+        return True
+    word_chars = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/\\:;$@%+="
+    )
+    return all(
+        ch in word_chars or 0x4E00 <= ord(ch) <= 0x9FFF for ch in text
+    )
+
+
+# PowerShell 里带值的长标志（值是紧跟的下一个 token）：找 -c 时要跳过
+# 值再找，不然 -ExecutionPolicy Bypass 后面的 Bypass 会被当成位置参数、
+# 扫描就停了，真正的 -Command 再也找不到。-file 例外：它的值是脚本，
+# 值后面的全是脚本参数，不再是 powershell 自己的标志，停在那里。
+_POWERSHELL_VALUE_FLAGS = frozenset({
+    "-executionpolicy",
+    "-configurationname",
+    "-workingdirectory",
+    "-inputformat",
+    "-outputformat",
+    "-psconsolefile",
+    "-version",
+    "-windowstyle",
+    "-settingsfile",
+    "-file",
+})
 
 
 def _find_shell_code_flag(normalized):
@@ -380,10 +446,18 @@ def _find_shell_code_flag(normalized):
     （脚本名/命令名）出现就停——它后面的 -c 是脚本自己的参数，
     不是 shell 的（比如 bash script.sh -c ... 不查）。
     sh/bash/zsh 的选项以 - 开头（-lc 这种合并短标志簇里带 c 的也算，
-    和 getopt 的拼法一致）；cmd/powershell 的 - 和 / 都算选项前缀。
+    和 getopt 的拼法一致）；cmd/powershell 的 - 和 / 都算选项前缀，
+    但只认精确匹配——以前 cmd/powershell 分支把任意含 c 的 -xxx 长
+    标志都当成 -c 标志簇，powershell -ExecutionPolicy Bypass
+    -Command "shutdown /s" 里 Bypass 被当成内含命令查了一遍，
+    真正的 -Command 再也没人看，硬禁就这么绕过了。
+    带值的标志要跳过值再找：-o vi、-ExecutionPolicy Bypass 里的 vi、
+    Bypass 都是值，不是位置参数，不能停在那里。
     """
     prog = _program_name(normalized[0])
-    for i in range(1, len(normalized)):
+    is_posix = prog in ("sh", "bash", "zsh")
+    i = 1
+    while i < len(normalized):
         token = normalized[i]
         lower = token.lower()
         if lower in ("-c", "-command", "/c", "/k"):
@@ -392,19 +466,30 @@ def _find_shell_code_flag(normalized):
             return i, "encoded"
         if token in ("-", "--", "/"):
             return None
-        if prog in ("sh", "bash", "zsh"):
+        if is_posix:
             if not token.startswith("-"):
                 return None
             if token.startswith("--"):
+                i += 1
+                continue
+            if lower == "-o":
+                # -o 后面跟一个值（比如 -o vi），跳过它再找。
+                i += 2
                 continue
             if len(token) > 2 and "c" in token[1:].lower():
                 return i, "code"
+            i += 1
             continue
-        # cmd / powershell：- 和 / 都可能是标志前缀。
+        # cmd / powershell：只认精确匹配，其他长标志跳过继续扫。
         if not (token.startswith("-") or token.startswith("/")):
             return None
-        if token.startswith("-") and not token.startswith("--") and len(token) > 2 and "c" in token[1:].lower():
-            return i, "code"
+        if lower in _POWERSHELL_VALUE_FLAGS:
+            if lower == "-file":
+                # -file 的值是脚本，值后面的全是脚本参数，不查。
+                return None
+            i += 2
+            continue
+        i += 1
     return None
 
 
