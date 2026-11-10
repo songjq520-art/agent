@@ -1227,6 +1227,59 @@ def test_topic_check_skipped_when_embedder_unavailable(tmp_path):
     assert correction["audit"]["old_new_similarity"] is None
 
 
+def test_single_candidate_blocked_by_topic_check(tmp_path):
+    """单候选也走安全网：库里只有 Go 写代码一条，旧说法找回来它
+    （单候选、不是原文完全相同），新说法是纪录片，相似度约 0.21、
+    低于 0.56 阈值 → 不换，status="ambiguous"、layer="judge_blocked"、
+    resolution="judge_blocked"，Go 那条原封不动，等 BOOS 挑。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我现在喜欢用 Go 写代码。")
+    go_id = store.get_all()[0]["id"]
+    _install_fake_embedder(
+        store,
+        {
+            "我喜欢看纪录片。": 0.0,
+            "我现在喜欢用 Go 写代码。": 1.36,
+        },
+    )
+    outcome = store.correct_memory("我现在喜欢用 Go 写代码吗", "我喜欢看纪录片。")
+    assert outcome["status"] == "ambiguous"
+    assert outcome["layer"] == "judge_blocked"
+    assert outcome["resolution"] == "judge_blocked"
+    assert outcome["memory_id"] is None
+    assert [item["text"] for item in store.get_all()] == ["我现在喜欢用 Go 写代码。"]
+    assert store._memory.update_calls == []
+    audit = outcome["audit"]
+    assert audit["picked_id"] == go_id
+    assert audit["old_new_similarity"] is not None
+    assert abs(audit["old_new_similarity"] - 0.21) < 0.02
+    assert audit["old_new_similarity"] < 0.56
+
+
+def test_single_candidate_passes_topic_check(tmp_path):
+    """单候选安全网通过：库里只有喝咖啡一条，旧说法找回来它，
+    新说法是喝茶，相似度约 0.90、高于阈值 → 正常换，layer 还是
+    "single"、resolution="updated"，审计里记着相似度。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我喜欢喝咖啡。")
+    _install_fake_embedder(
+        store,
+        {
+            "我喜欢喝茶。": 0.0,
+            "我喜欢喝咖啡。": 0.44,
+        },
+    )
+    outcome = store.correct_memory("我喜欢喝咖啡吗", "我喜欢喝茶。")
+    assert outcome["status"] == "updated"
+    assert outcome["layer"] == "single"
+    assert outcome["resolution"] == "updated"
+    assert [item["text"] for item in store.get_all()] == ["我喜欢喝茶。"]
+    audit = outcome["audit"]
+    assert audit["old_new_similarity"] is not None
+    assert abs(audit["old_new_similarity"] - 0.90) < 0.02
+    assert audit["old_new_similarity"] >= 0.56
+
+
 def test_correction_audit_marking(tmp_path):
     """审计标记：每次纠正的返回里都有 resolution + audit。
     updated 的审计里有挑中的 id、候选分数、当时上下文里的 id；

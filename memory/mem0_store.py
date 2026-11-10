@@ -2750,15 +2750,16 @@ class Mem0Store:
         2. 新文本和旧文本规整后相同：status="unchanged"，不用改。
         3. 脱敏新文本：新文本里带秘密时只存脱敏后的版本；脱敏后
            什么都不剩时 status="failed"（不存一条空记忆）。
-        4. 安全网（只拦模型判挑中的目标）：真正替换之前，用本地
+        4. 安全网（拦模型判和单候选挑中的目标）：真正替换之前，用本地
            bge 向量算旧记忆和新说法的相似度
            （_old_new_similarity）；低于
            CORRECTION_TOPIC_MIN_SIMILARITY 说明新说法和这条旧记忆
-           不是同一话题——模型可能挑错了槽位，不换，改问 BOOS
+           不是同一话题——可能挑错了槽位，不换，改问 BOOS
            （status="ambiguous"、layer="judge_blocked"）。嵌不出来
            时不拦（安全网坏了不该堵死纠正，主防线是模型判本身）。
-           exact / single 不走这道网：原文对上了没歧义、单候选没
-           别的能挑错。
+           exact 不走这道网：原文对上了没歧义。single 也走这道网——
+           单候选也可能是错的（同话题长得像的另一条），直接改会
+           静默改错，和 C3 一个毛病。
         5. 用 mem0.update() 原地替换（同一 id），新记忆来源记 user、
            user_confirmed=True（BOOS 亲口纠正的）、confidence=1.0。
            mem0.update 不支持 metadata 参数的老版本会报 TypeError，
@@ -2919,18 +2920,19 @@ class Mem0Store:
                     "resolution": "failed",
                     "audit": _audit(picked_id=mem_id, judge_reason=judge_reason, cands=candidates),
                 }
-            # 安全网（只拦模型判挑中的目标）：真正替换之前，用本地
+            # 安全网（拦模型判和单候选挑中的目标）：真正替换之前，用本地
             # bge 向量算旧记忆和新说法的相似度。低于
             # CORRECTION_TOPIC_MIN_SIMILARITY 说明新说法和这条旧记忆
-            # 不是同一话题——模型可能挑错了槽位（C3 就是这样：把 Go
+            # 不是同一话题——可能挑错了槽位（C3 就是这样：把 Go
             # 写代码改成纪录片），不换，改问 BOOS。嵌不出来
             # （similarity 是 None）时不拦：安全网坏了不该堵死纠正，
-            # 主防线是模型判本身。exact / single 不走这道网。
-            if layer == "judge":
+            # 主防线是模型判本身。exact 不走这道网（原文对上了没歧义）；
+            # single 也走这道网——单候选也可能是错的。
+            if layer in ("judge", "single"):
                 similarity = self._old_new_similarity(old_stored_text, safe_new)
                 if similarity is not None and similarity < CORRECTION_TOPIC_MIN_SIMILARITY:
                     logger.info(
-                        "纠错安全网：模型挑中的旧记忆和新说法话题不像"
+                        "纠错安全网：挑中的旧记忆和新说法话题不像"
                         "（相似度 %.3f，低于 %.2f），不换，改问 BOOS。",
                         similarity,
                         CORRECTION_TOPIC_MIN_SIMILARITY,
@@ -2942,7 +2944,7 @@ class Mem0Store:
                         "new_text": safe_new,
                         "candidates": candidates,
                         "reason": (
-                            "模型挑中的那条记忆和新说法不是同一话题，"
+                            "挑中的那条记忆和新说法不是同一话题，"
                             "可能是挑错了，请 BOOS 指明改哪条再改。"
                         ),
                         "layer": "judge_blocked",
