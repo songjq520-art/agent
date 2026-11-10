@@ -1602,12 +1602,20 @@ def _carry_protection_fields(src, dst):
     """把保护失败的字段从一个结果字典带到另一个。
 
     只在源字典标了 protection_failed 时才带；没标时什么都不动。
+    只填空、不覆盖：目标字典里已经有 protection_failed 时，目标
+    那份是更新鲜的（比如纠错返回路里，本轮自己的提取也失败了），
+    原样留着、一个键都不盖——上一轮的只在目标没有时才补。不能按
+    键一个一个填：上一轮的 failed_ids、残留 id/原文都是上一轮那次
+    失败的，单拎几个键填进本轮的失败里会串味（比如原因写着快照
+    失败，failed_ids 却是上一轮没恢复回来的旧记忆）。
     失败标记和原因照原样带（原因即使是 None 也带，和以前手写时
     一样）；三个列表字段只在非空时带，空的就不写进结果——返回的
     样子不变，同样的顶层键，调用方（web 面板、命令行）不用动。
     """
     src = src or {}
     if not src.get("protection_failed"):
+        return
+    if dst.get("protection_failed"):
         return
     dst["protection_failed"] = True
     dst["protection_reason"] = src.get("protection_reason")
@@ -2676,6 +2684,10 @@ class Mem0Store:
                     )
                     handled = self._handle_correction_outcome(outcome)
                     if handled is not None:
+                        # 上一轮提交的保护失败不能丢在半路：纠错结果
+                        # 里没有保护字段，上一轮的才补进来；只填空、
+                        # 不覆盖（见 _carry_protection_fields）。
+                        _carry_protection_fields(committed, handled)
                         return handled
                     # not_found：挑中的那条已经不在库里了（被删了），
                     # 新说法还是他确认过的，直接当新记忆存下来。
@@ -2685,6 +2697,7 @@ class Mem0Store:
                     if isinstance(saved, dict):
                         saved = dict(saved)
                         saved["correction"] = _correction_result(outcome)
+                        _carry_protection_fields(committed, saved)
                     return saved
                 # 没挑中（说了别的、或说“都不是”）：当作放弃这次纠错，
                 # 继续按本轮消息正常处理（下面可能又是一次新的纠错）。
@@ -2699,6 +2712,9 @@ class Mem0Store:
                     # 2 号：纠正那一轮里别的句子别丢——去掉纠错句，
                     # 剩下的按正常轮次进待定区，下一轮正常存。
                     self._pend_correction_remainder(safe_messages, latest_user)
+                    # 上一轮提交的保护失败不能丢在半路：纠错结果里
+                    # 没有保护字段，上一轮的才补进来；只填空、不覆盖。
+                    _carry_protection_fields(committed, handled)
                     return handled
                 # not_found：库里没有冲突的旧记忆——新说法当成一条新记忆，
                 # 走正常提取保存（下面），结果里附上这次纠错的尝试记录。
@@ -2706,6 +2722,9 @@ class Mem0Store:
                 if isinstance(normal, dict):
                     normal = dict(normal)
                     normal["correction"] = _correction_result(outcome)
+                    # 上一轮提交的保护失败不能丢在半路：本轮自己的
+                    # 提取也可能带保护失败，留本轮的、只填空不覆盖。
+                    _carry_protection_fields(committed, normal)
                 return normal
             # 3. 正常轮次：不立即存，放进待定区等下一轮。
             #    身份陈述（名字/称呼）只在最新一句里认——旧轮次的

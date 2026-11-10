@@ -1046,3 +1046,226 @@ def test_print_protection_result_clean_rollback(capsys):
     # 没保护失败时什么都不打印。
     _print_protection_result({})
     assert capsys.readouterr().out == ""
+
+
+# ---------- 纠错返回路：上一轮提交的保护失败不能丢在半路 ----------
+
+
+def test_carry_protection_fields_does_not_overwrite_existing():
+    """小帮手只填空、不覆盖：目标已经有保护失败时，原样留着。
+
+    目标那份是更新鲜的（比如本轮自己的提取也失败了），一个键都
+    不盖——上一轮的 failed_ids、残留 id/原文都是上一轮那次失败的，
+    单拎几个键填进本轮的失败里会串味。
+    """
+    from memory.mem0_store import _carry_protection_fields
+
+    dst = {
+        "protection_failed": True,
+        "protection_reason": "snapshot_failed",
+        "results": [],
+    }
+    src = {
+        "protection_failed": True,
+        "protection_reason": "restore_partial",
+        "failed_ids": ["old-1"],
+        "rollback_leftover_ids": ["new-1"],
+        "rollback_leftover_texts": ["我现在把数据库改成 PostgreSQL 了"],
+    }
+    _carry_protection_fields(src, dst)
+    assert dst == {
+        "protection_failed": True,
+        "protection_reason": "snapshot_failed",
+        "results": [],
+    }
+    # 目标连列表字段都没有，也不能从上一轮补——整块是本轮的。
+    dst2 = {
+        "protection_failed": True,
+        "protection_reason": "restore_unverified",
+    }
+    _carry_protection_fields(src, dst2)
+    assert dst2 == {
+        "protection_failed": True,
+        "protection_reason": "restore_unverified",
+    }
+
+
+def test_correction_handled_carries_committed_protection(tmp_path):
+    """本轮纠错改好了（handled）：上一轮提交的保护失败也要带出来。
+
+    上一轮待定提交时快照两次都读不出来（snapshot_failed），本轮
+    是“你记错了”改好了旧记忆——纠错结果里没有保护字段，上一轮
+    的才补进来；correction 键和改好的结果原样不动。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我喜欢用 Python 写代码。")
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    store._memory.get_all_failures = [
+        RuntimeError("库读不出来。"),
+        RuntimeError("库还是读不出来。"),
+    ]
+    result = store.add_turn([
+        {"role": "user", "content": "你记错了，我喜欢用 Go 写代码。"},
+        {"role": "assistant", "content": "明白，你喜欢用 Go 写代码，我记下了。"},
+    ])
+    assert result["correction"]["status"] == "updated"
+    assert result["correction"]["old_text"] == "我喜欢用 Python 写代码。"
+    assert result.get("protection_failed") is True
+    assert result.get("protection_reason") == "snapshot_failed"
+    assert [item["text"] for item in store.get_all()] == ["我喜欢用 Go 写代码。"]
+
+
+def test_correction_handled_carries_committed_leftover_fields(tmp_path):
+    """本轮纠错改好了：上一轮提交是 restore_unverified、回滚有残留，
+    五个保护字段都要一路带到纠错返回里（id 和原文都要在）。"""
+    store = make_fake_store(tmp_path, memory=FailDeleteMutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    store.add_memory_text("我喜欢用 Python 写代码。")
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    # 第一次读（快照）正常，第二次读（恢复前核对）读不出来。
+    store._memory.get_all_failures = [None, RuntimeError("库读不出来。")]
+    result = store.add_turn([
+        {"role": "user", "content": "你记错了，我喜欢用 Go 写代码。"},
+        {"role": "assistant", "content": "明白，你喜欢用 Go 写代码，我记下了。"},
+    ])
+    assert result["correction"]["status"] == "updated"
+    assert result.get("protection_failed") is True
+    assert result.get("protection_reason") == "restore_unverified"
+    leftover_ids = result.get("rollback_leftover_ids") or []
+    leftover_texts = result.get("rollback_leftover_texts") or []
+    assert len(leftover_ids) == 1
+    assert leftover_texts == ["我现在把数据库改成 PostgreSQL 了"]
+
+
+def test_correction_not_found_carries_committed_protection(tmp_path):
+    """本轮纠错没找到旧记忆（not_found）：走正常提取保存，上一轮
+    提交的保护失败也要带到最终返回里。"""
+    store = make_fake_store(tmp_path)
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    store._memory.get_all_failures = [
+        RuntimeError("库读不出来。"),
+        RuntimeError("库还是读不出来。"),
+    ]
+    result = store.add_turn([
+        {"role": "user", "content": "不对，我喜欢喝茶。"},
+        {"role": "assistant", "content": "明白，你喜欢喝茶，我记下了。"},
+    ])
+    assert result["correction"]["status"] == "not_found"
+    assert result.get("protection_failed") is True
+    assert result.get("protection_reason") == "snapshot_failed"
+    assert [item["text"] for item in store.get_all()] == ["我喜欢喝茶"]
+
+
+def test_correction_not_found_keeps_current_round_protection(tmp_path):
+    """本轮自己的提取也失败了：留本轮的保护失败，上一轮的不许盖掉。
+
+    上一轮提交是 restore_partial（failed_ids 有旧的 SQLite），本轮
+    提取是快照失败——最终返回里原因要是本轮的 snapshot_failed，
+    上一轮的 failed_ids 不能出现（那是上一轮那次失败的，单拎过来
+    会串味）。
+    """
+    store = make_fake_store(tmp_path, memory=MutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 恢复时写不进去：守卫原地 update 旧的 SQLite 那条就抛错。
+    store._memory.fail_update_ids = {old_id}
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    # 读库排队：提交时快照、恢复核对、回滚核对各一次正常，纠错找
+    # 候选两次正常（语义检索的关键词补充 + 关键词找候选各一次），
+    # 本轮提取快照两次都读不出来。
+    store._memory.get_all_failures = [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        RuntimeError("库读不出来。"),
+        RuntimeError("库还是读不出来。"),
+    ]
+    result = store.add_turn([
+        {"role": "user", "content": "不对，我喜欢喝茶。"},
+        {"role": "assistant", "content": "明白，你喜欢喝茶，我记下了。"},
+    ])
+    assert result["correction"]["status"] == "not_found"
+    assert result.get("protection_failed") is True
+    assert result.get("protection_reason") == "snapshot_failed"
+    assert "failed_ids" not in result
+    # 本轮提取没存成，喝茶不在库里；旧的 SQLite 被改成 PostgreSQL
+    # 后没恢复回来，新存的那条已回滚删掉。
+    assert [item["text"] for item in store.get_all()] == [
+        "我现在把数据库改成 PostgreSQL 了"
+    ]
+
+
+def test_pending_selection_handled_carries_committed_protection(tmp_path):
+    """上一轮待确认纠错挑中了、改好了：上一轮提交的保护失败也要带出来。
+
+    局：两条科幻记忆 + 一句“不对，我喜欢看纪录片。我喜欢喝拿铁。”
+    → ambiguous，拿铁那句进了待定区；下句“第 1 条”挑中之前，
+    待定区提交时快照两次都读不出来。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我喜欢看科幻电影。")
+    store.add_memory_text("我喜欢看科幻小说。")
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    result = store.add_turn([
+        {"role": "user", "content": "不对，我喜欢看纪录片。我喜欢喝拿铁。"},
+        {"role": "assistant", "content": "明白，你现在喜欢看纪录片，我更新一下。"},
+    ])
+    assert result["correction"]["status"] == "ambiguous"
+    assert store._pending_correction is not None
+    store._memory.get_all_failures = [
+        RuntimeError("库读不出来。"),
+        RuntimeError("库还是读不出来。"),
+    ]
+    resolved = store.add_turn([
+        {"role": "user", "content": "第 1 条"},
+        {"role": "assistant", "content": "好的，改第一条。"},
+    ])
+    assert resolved["correction"]["status"] == "updated"
+    assert resolved["correction"]["old_text"] == "我喜欢看科幻电影。"
+    assert resolved.get("protection_failed") is True
+    assert resolved.get("protection_reason") == "snapshot_failed"
+    # 拿铁那轮提交失败，没存成；纪录片替换了科幻电影，小说不动。
+    assert {item["text"] for item in store.get_all()} == {
+        "我现在把数据库改成 PostgreSQL 了",
+        "我喜欢看纪录片。",
+        "我喜欢看科幻小说。",
+    }
+    assert all(item["text"] != "我喜欢喝拿铁" for item in store.get_all())
+
+
+def test_pending_selection_not_found_carries_committed_protection(tmp_path):
+    """上一轮待确认纠错挑中了、但那条已经不在库里（not_found）：直接
+    保存新说法，上一轮提交的保护失败也要带到最终返回里。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我喜欢看科幻电影。")
+    store.add_memory_text("我喜欢看科幻小说。")
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    result = store.add_turn([
+        {"role": "user", "content": "不对，我喜欢看纪录片。我喜欢喝拿铁。"},
+        {"role": "assistant", "content": "明白，你现在喜欢看纪录片，我更新一下。"},
+    ])
+    assert result["correction"]["status"] == "ambiguous"
+    assert store._pending_correction is not None
+    # 挑中的两条候选在下一句之前都被删了：挑中了也改不着。
+    for item in store.get_all():
+        if item["text"].startswith("我喜欢看科幻"):
+            store._memory.delete(item["id"])
+    store._memory.get_all_failures = [
+        RuntimeError("库读不出来。"),
+        RuntimeError("库还是读不出来。"),
+    ]
+    resolved = store.add_turn([
+        {"role": "user", "content": "第 1 条"},
+        {"role": "assistant", "content": "好的，改第一条。"},
+    ])
+    assert resolved["correction"]["status"] == "not_found"
+    assert resolved.get("protection_failed") is True
+    assert resolved.get("protection_reason") == "snapshot_failed"
+    assert {item["text"] for item in store.get_all()} == {
+        "我现在把数据库改成 PostgreSQL 了",
+        "我喜欢看纪录片。",
+    }
