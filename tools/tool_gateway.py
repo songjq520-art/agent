@@ -2,8 +2,11 @@
 # 作用：模型调工具的唯一入口。所有工具调用都走这里，不走直通车。
 # 原理：按顺序过六道关——登记检查 → 参数校验 → 权限检查 →
 #       确认检查 → 执行 → 结果格式检查；每一步的结果都记审计日志。
-#       执行那关按登记的 timeout 真掐表（线程跑、超时按失败返回，
-#       见 _run_with_timeout）；重复执行按登记的 replay_safe 拦
+#       执行那关：无副作用的工具按登记的 timeout 掐表（线程跑、
+#       超时只算“等不及了”，结果未知——见 _run_with_timeout）；
+#       会改东西的工具同步执行，不走线程超时（线程杀不掉，超时后
+#       后台还会接着跑，等于一次调用可能改两次）；重复执行按登记的
+#       replay_safe 拦
 #       （见 can_replay：只读的能重跑，会改东西的执行过一次就绝不
 #       再执行，恢复时一律喂存下来的结果）。
 #       预算不由网关拦：工具执行本身不直接花钱，花的钱是模型每一轮
@@ -21,7 +24,14 @@
 #       BOOS 点了确认后，resolve_approval() 用 TaskStore.cas 原子抢占，
 #       只执行存着的那份参数——页面新传来的参数一律不认，
 #       这样中途改参数、重复点确认都执行不了第二次。
+#       确认执行完马上把结果存盘：对应的 tool_calls 记录改成最终状态
+#       （ok/failed），工具结果也存进任务（pending_tool_result），
+#       恢复时优先读存下来的结果；执行完了、还没存盘时进程崩了，
+#       结果才可能丢——保存发生在返回之前，窗口只剩执行完到存盘
+#       这一小段（中间没有模型调用和网络），不是执行完还隔着一整轮。
 
+import contextvars
+import json
 import threading
 
 from tasks.task_store import approval_expired, approval_sha256, make_approval
@@ -121,10 +131,16 @@ def _validate_result_envelope(result, tool_name):
 def _run_with_timeout(func, args, timeout):
     """按登记的超时秒数跑一次工具函数：线程跑、主线程等 timeout 秒。
 
-    超时按执行失败返回（调用方按 ok=False 处理，不抛异常）；
-    线程是 daemon：超时的线程杀不掉，会在后台跑完自己结束，
-    但循环不等它——Windows 上 signal 那套行不通，所以用线程，
-    笔记本和 Linux 都能跑。timeout 不是正数时按 60 秒算。
+    注意：这只是“等待超时”，不是“硬超时”——超时的线程杀不掉，
+    会在后台跑完自己结束，主线程只是不等它了。所以超时返回不等
+    于工具没执行：工具可能晚几秒就成功了，也可能正在改东西。
+    超时时返回 ok=False + timeout=True（结果未知），调用方不许把它
+    当成普通失败、不许自动重试（见 tools/agent_loop.py）。
+    工作线程里跑 func 之前，先把调用方的上下文拷过去
+    （contextvars.copy_context），这样线程里也能读到循环绑的
+    搜索服务等上下文绑定——新线程默认是空上下文，不拷就读不到。
+    Windows 上 signal 那套行不通，所以用线程，笔记本和 Linux
+    都能跑。timeout 不是正数时按 60 秒算。
     工具函数自己抛的错原样抛出去，由调用方按执行失败记。"""
     try:
         timeout = float(timeout)
@@ -140,14 +156,22 @@ def _run_with_timeout(func, args, timeout):
         except Exception as exc:  # noqa: BLE001 - 记下来由主线程处理
             box["error"] = exc
 
-    worker = threading.Thread(target=_target, daemon=True)
+    # 把调用方的上下文拷进工作线程：func 里读到的 ContextVar
+    # （比如搜索服务）才和主线程是同一份绑定。
+    ctx = contextvars.copy_context()
+    worker = threading.Thread(target=lambda: ctx.run(_target), daemon=True)
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
         return {
             "ok": False,
             "data": None,
-            "error": f"工具执行超时（超过 {timeout:g} 秒还没返回），按失败处理。",
+            "error": (
+                f"工具执行超时（超过 {timeout:g} 秒还没返回）：这只是等不及了，"
+                "结果未知，执行可能仍在后台继续——不要当成没执行，"
+                "也不要重复调用。"
+            ),
+            "timeout": True,
         }
     if "error" in box:
         raise box["error"]
@@ -239,11 +263,18 @@ class ToolGateway:
                 "approval": approval,
             }
 
-        # 第 5 关：执行。按登记的 timeout 真掐表跑（见 _run_with_timeout），
-        #   超时按执行失败返回，不把异常抛回循环——循环靠 ok=False 计数、
-        #   做重复失败停表。工具函数自己抛错也一样算执行失败。
+        # 第 5 关：执行。无副作用的工具（replay_safe=True，如搜索）按登记的
+        #   timeout 掐表跑（见 _run_with_timeout）：超时只算“等不及了”，
+        #   结果未知，不按普通失败处理、不自动重试。
+        #   会改东西的工具（replay_safe=False）不用线程超时，直接同步跑：
+        #   线程杀不掉，超时后后台还会接着跑，等于一次调用可能改两次；
+        #   同步跑就没有“超时了但还在改”这回事，跑完才有结果。
+        #   工具函数自己抛错也一样算执行失败。
         try:
-            result = _run_with_timeout(tool["func"], args, tool.get("timeout", 60))
+            if tool.get("replay_safe", True):
+                result = _run_with_timeout(tool["func"], args, tool.get("timeout", 60))
+            else:
+                result = tool["func"](args)
         except Exception as exc:  # noqa: BLE001 - 工具内部错统一记成失败
             reason = f"工具 {tool_name} 执行时出错：{exc}"
             self._audit(tool_name, "execute", False, reason, extra)
@@ -274,6 +305,59 @@ class ToolGateway:
 
     # ---------- 确认后执行 ----------
 
+    def _persist_confirmed_execution(self, task_store, task_id, tool_name,
+                                     tool_call_id, result):
+        """确认后执行完，马上把结果存盘（返回之前存好）：
+        对应 tool_call_id 的那条 tool_calls 记录改成最终状态
+        （ok/failed），工具结果也写进记录、并存到任务的
+        pending_tool_result 里（恢复时优先读它）。
+        找不到对应记录时（老任务）补一条，不崩。
+        结果先转一道 JSON（default=str），保证存进去的东西一定能
+        写进任务文件；转不过来时只存一句“结果存不下来”，不让存盘
+        本身炸掉整个确认流程。
+        返回存好后的任务记录；存不下来返回 None。"""
+        try:
+            stored_result = json.loads(
+                json.dumps(result, ensure_ascii=False, default=str)
+            )
+        except (TypeError, ValueError):
+            stored_result = {"ok": False, "data": None,
+                             "error": "工具结果不是能存盘的形状。"}
+        status = "ok" if (stored_result or {}).get("ok") else "failed"
+
+        def mutate(current):
+            records = list(current.get("tool_calls") or [])
+            for rec in records:
+                if rec.get("tool_call_id") == tool_call_id:
+                    rec["status"] = status
+                    rec["result"] = stored_result
+                    break
+            else:
+                records.append({
+                    "tool": tool_name,
+                    "args": None,
+                    "tool_call_id": tool_call_id,
+                    "status": status,
+                    "result": stored_result,
+                })
+            current["tool_calls"] = records
+            current["pending_tool_result"] = stored_result
+            current["pending_tool_call_id"] = tool_call_id
+            return current
+
+        ok, updated = task_store.cas(task_id, "RUNNING", mutate)
+        if ok:
+            return updated
+        # 状态已经不是 RUNNING（极少见：有人同时动了任务）：读出来
+        # 改了再存一次，别让执行完的结果丢了。
+        current = task_store.load(task_id)
+        if current is None:
+            return None
+        try:
+            return task_store.save(mutate(dict(current)))
+        except Exception:
+            return None
+
     def resolve_approval(self, task_store, task_id, approval_id, decision):
         """处理 BOOS 对一张确认卡的决定。返回决定字典：
         {"decision": "ok" / "rejected" / "cancelled",
@@ -287,6 +371,11 @@ class ToolGateway:
         最后用 TaskStore.cas 原子抢占——只有状态还是 WAITING_APPROVAL
         的任务才能被处理，重复点确认、超时后才点、别人先处理了，
         都会在这里被拦住，不会执行第二次。
+        确认执行完、返回之前，马上把结果存盘（见
+        _persist_confirmed_execution）：对应记录改成 ok/failed，
+        结果存进任务，恢复时优先读存下来的结果——防重跑检查认的是
+        ok/failed 记录，不存盘它就看不见这次执行，模型再发同一条
+        调用会被当成没执行过而重跑一次。
         """
         task = task_store.load(task_id)
         if task is None:
@@ -411,17 +500,30 @@ class ToolGateway:
                 "task": task_store.load(task_id),
             }
         if outcome["decision"] == "rejected":
+            # 确认后执行被拦（参数、禁令等）：工具没执行，任务不能卡在
+            # RUNNING——放回 WAITING_APPROVAL，卡还在，BOOS 可以再点
+            # 确认或取消。
+            task_store.cas(
+                task_id, "RUNNING",
+                lambda current: {**current, "status": "WAITING_APPROVAL"},
+            )
             return {
                 "decision": "rejected",
                 "result": None,
                 "reason": outcome["reason"],
                 "task": task_store.load(task_id),
             }
+        # 执行完了：先把记录和结果存盘，再返回——恢复时读盘上的，
+        # 不只靠内存里传回去的那份。
+        saved = self._persist_confirmed_execution(
+            task_store, task_id, approval.get("tool", ""),
+            approval.get("tool_call_id", ""), outcome["result"],
+        )
         return {
             "decision": "ok",
             "result": outcome["result"],
             "reason": "",
-            "task": task_store.load(task_id),
+            "task": saved if saved is not None else task_store.load(task_id),
         }
 
     # ---------- 内部 ----------

@@ -22,8 +22,15 @@
 #   - 同一条工具调用（同一个 tool_call_id）执行过一次后，模型又发
 #     同一条调用时，按登记的 replay_safe 拦：False 的不重执行，
 #     True 的才允许再执行；恢复/续跑时一律喂存下来的结果，不重执行。
+#     确认后执行的结果已经存进任务了（见网关 resolve_approval），
+#     恢复时优先读存下来的那份，不只靠内存里传进来的。
+#   - 工具执行超时只算结果未知：不算失败、不触发重复失败停表、
+#     不自动重试，喂给模型时写明“不要重复调用”；会改东西的工具
+#     根本不走线程超时（网关同步跑），没有“超时了但还在改”这回事。
 #   - 计数和记录都要对上实际执行次数：成功、失败、被拒绝的调用都计数、
-#     都留记录，同一参数第二次失败触发停表的那次也算；重复执行被拦的
+#     都留记录，同一参数第二次失败触发停表的那次也算；参数不是合法
+#     JSON 的调用也留一条 invalid_args 记录（带原始参数文本截断），
+#     不然恢复后按列表数的调用次数会少算；重复执行被拦的
 #     那次没执行，不计数、不占 5 次上限。
 #   - 循环只用本轮自己的消息（系统消息 + 本轮 user + 循环各轮），
 #     不用网页上的 plain history——plain history 里的 assistant 消息
@@ -95,9 +102,9 @@ class AgentLoop:
     不传时新建一个；task_store：任务存储，不传时新建一个；
     search_service：搜索服务，不传时循环自己建一个（带翻译器的），
     测试时传假服务；max_tool_calls：每轮最多调几次工具（默认 5）。
-    注意：搜索服务是模块级的绑定（见 tools/search_tool.py），
-    两轮循环不能同时跑——网页层用锁串行（见 web/server.py 的
-    ChatState），命令行一次也只跑一轮。
+    注意：搜索服务按上下文绑定（见 tools/search_tool.py 的
+    ContextVar），每轮循环开始时绑自己的服务，两个任务并行时
+    各用各的，不串线。
     """
 
     def __init__(self, provider, gateway=None, task_store=None,
@@ -136,14 +143,15 @@ class AgentLoop:
         return translator
 
     def _bind_search_service(self, task_id, trace_id):
-        """把带翻译器的搜索服务绑到搜索工具上（循环开始时调一次）。"""
+        """把带翻译器的搜索服务绑到搜索工具上（循环开始时调一次）。
+        没传服务时，每轮新建一个服务 + 一个全新的翻译器；传了服务
+        （测试的假服务）就直接用，不改它的 translator——共享实例的
+        translator 是全局可变的，改它会串到别的任务。"""
         service = self.search_service
         if service is None:
             service = SearchService(
                 translator=self._make_translator(task_id, trace_id)
             )
-        elif getattr(service, "translator", None) is None:
-            service.translator = self._make_translator(task_id, trace_id)
         set_search_service(service)
         return service
 
@@ -167,6 +175,9 @@ class AgentLoop:
         恢复任务：传 resume_task（存着的任务记录），再传
         pending_tool_result（确认后执行完的工具结果，{"ok", "data",
         "error"}）或 user_declined=True（BOOS 取消了）接着跑。
+        恢复时优先读任务里存下来的结果（pending_tool_result 字段，
+        确认执行完就存盘了）；内存里传进来的那份只当后备——老任务
+        没存、或恢复的不是确认那条路时才用它。
         恢复时任务锁定的模型必须和当前 provider 一致，不一致直接报错、
         不接着跑——换模型就另开新任务（最终方案定的任务模型锁定）。
         """
@@ -204,9 +215,20 @@ class AgentLoop:
             total_cost = 0.0
             cost_unknown = False
             if resume_task is not None:
+                # 恢复时先读存下来的确认结果（确认执行完就存盘了，
+                # 优先用它）；没有存过的才用内存里传进来的那份。
+                # 取消时不读存下来的结果（取消本来就没执行，没结果可读）。
+                if not user_declined:
+                    stored_result = task.get("pending_tool_result")
+                    if stored_result is not None:
+                        pending_tool_result = stored_result
                 tool_calls_made, failures, total_cost, cost_unknown = self._resume_round(
                     task, messages, pending_tool_result, user_declined
                 )
+                # 结果已经喂进消息历史了，清掉存着的那份，别让下一次
+                # 恢复（比如连着第二张确认卡）误用旧结果。
+                task.pop("pending_tool_result", None)
+                task.pop("pending_tool_call_id", None)
                 task["tool_calls"] = task.get("tool_calls") or []
                 task["failures"] = failures
                 task["messages"] = messages
@@ -385,10 +407,12 @@ class AgentLoop:
         （这条调用已经执行过了、又不许重跑，没执行）。
         执行完的工具结果（成功或失败）都以 tool 消息喂回模型。
         重复执行规则：同一条调用（同一个 tool_call_id）已经执行过
-        （记录状态是 ok 或 failed）时，模型又发同一条调用，先问网关
-        can_replay——登记的 replay_safe 是 True 才允许再执行，
+        （记录状态是 ok、failed 或 timeout）时，模型又发同一条调用，
+        先问网关 can_replay——登记的 replay_safe 是 True 才允许再执行，
         False 直接拦下、不执行（恢复/续跑时也一样，绝不悄悄重跑
-        一次写操作）；被拦的那次不计数、不占 5 次上限。"""
+        一次写操作）；被拦的那次不计数、不占 5 次上限。
+        超时（timeout）也算执行过：工具可能仍在后台跑，再发一次
+        可能重复改东西。"""
         function = (call or {}).get("function") or {}
         tool_name = function.get("name", "")
         arguments_text = function.get("arguments", "") or ""
@@ -402,6 +426,19 @@ class AgentLoop:
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "content": content}
             )
+            # 非法 JSON 也留一条记录（状态 invalid_args，带原始参数文本
+            # 截断）：计数和列表都要对上实际发生过的调用，不然恢复后
+            # 按列表数的调用次数会少算。
+            task["tool_calls"] = task.get("tool_calls") or []
+            task["tool_calls"].append(
+                {
+                    "tool": tool_name,
+                    "args": None,
+                    "tool_call_id": tool_call_id,
+                    "status": "invalid_args",
+                    "raw_arguments": arguments_text[:200],
+                }
+            )
             failures[_failure_key(tool_name, arguments_text)] = (
                 failures.get(_failure_key(tool_name, arguments_text), 0) + 1
             )
@@ -409,14 +446,16 @@ class AgentLoop:
 
         # 重复执行检查：这条调用（同一个 tool_call_id）已经执行过的，
         # 再执行要看登记的 replay_safe——False 的直接拦下，不执行。
-        # （只认 ok / failed 的记录：waiting_approval 是还没执行、
-        # 等确认的那条，确认流程会执行它，不在这里拦；rejected 是
-        # 没执行就被拦下的，再发也不算重复执行。）
+        # （只认 ok / failed / timeout 的记录：waiting_approval 是还没执行、
+        # 等确认的那条，确认流程会执行它，不在这里拦；timeout 是执行过
+        # 但结果未知，工具可能仍在后台跑，再发一次可能重复改东西，
+        # 也按执行过处理；rejected / invalid_args 是没执行就被拦下的，
+        # 再发也不算重复执行。）
         if tool_call_id:
             executed_ids = {
                 rec.get("tool_call_id")
                 for rec in (task.get("tool_calls") or [])
-                if rec.get("status") in ("ok", "failed")
+                if rec.get("status") in ("ok", "failed", "timeout")
             }
             if tool_call_id in executed_ids and not self.gateway.can_replay(tool_name):
                 messages.append(
@@ -477,12 +516,16 @@ class AgentLoop:
 
         result = outcome["result"] or {"ok": False, "data": None, "error": "工具没有返回结果"}
         task["tool_calls"] = task.get("tool_calls") or []
+        # 超时单独记状态 "timeout"（结果未知），不记成 failed：
+        # 超时不是失败，工具可能仍在后台跑完；记成失败会让模型以为
+        # 没执行而再调一次，也会错误触发重复失败停表。
+        is_timeout = bool(result.get("timeout"))
         task["tool_calls"].append(
             {
                 "tool": tool_name,
                 "args": args,
                 "tool_call_id": tool_call_id,
-                "status": "ok" if result.get("ok") else "failed",
+                "status": "timeout" if is_timeout else ("ok" if result.get("ok") else "failed"),
             }
         )
         messages.append(
@@ -492,6 +535,10 @@ class AgentLoop:
                 "content": self._tool_result_text(result),
             }
         )
+        if is_timeout:
+            # 超时不计失败：不触发重复失败停表，也不让模型以为失败了
+            # 就自动再调一次（重复调用的副作用不可控）。
+            return "done"
         if not result.get("ok"):
             key = _failure_key(tool_name, arguments_text)
             failures[key] = failures.get(key, 0) + 1
@@ -501,7 +548,12 @@ class AgentLoop:
 
     def _tool_result_text(self, result):
         """工具结果转成喂给模型的文本：成功时是包在分隔线里的数据，
-        失败时是一句失败原因。"""
+        失败时是一句失败原因；超时时写明结果未知、不要重复调用。"""
+        if isinstance(result, dict) and result.get("timeout"):
+            return (
+                "工具执行超时：这次调用还没返回结果，结果未知，执行可能仍在"
+                "后台继续——不要重复调用这个工具，也不要把超时当成失败。"
+            )
         if not isinstance(result, dict) or not result.get("ok"):
             error = (result or {}).get("error") or "工具执行失败，原因不明"
             return f"工具执行失败：{error}"

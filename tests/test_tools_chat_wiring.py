@@ -1476,3 +1476,311 @@ def test_rejected_twice_counts_and_records(store, gateway):
     records = outcome["task"]["tool_calls"]
     assert len(records) == 2
     assert [r["status"] for r in records] == ["rejected", "rejected"]
+
+
+# ---------- （GPT 第二轮评审补修）超时结果未知、确认持久化、搜索服务隔离、非法 JSON 记录 ----------
+
+import threading
+import time
+
+# 第二轮补修用的工具（模块导入时登记一次）。
+_SLOW2_DONE = threading.Event()
+
+
+def _slow_tool_2s_fn(args):
+    """睡 2 秒的工具（超时用）：跑完时把事件置位，证明超时返回后
+    它还在后台自己跑完了。"""
+    time.sleep(2)
+    _SLOW2_DONE.set()
+    return {"ok": True, "data": {"done": True}, "error": None}
+
+
+def _slow_no_replay_tool_fn(args):
+    """睡 3 秒、不许重跑的工具（同步执行用）：登记 timeout=1，
+    但它是 replay_safe=False，网关不该用线程超时掐它。"""
+    time.sleep(3)
+    return {"ok": True, "data": {"done": True}, "error": None}
+
+
+if get_tool("test_slow_tool_2s") is None:
+    register_tool(
+        name="test_slow_tool_2s",
+        description="测试用的睡 2 秒的工具（超时结果未知用）。",
+        parameters={"type": "object", "properties": {}},
+        output="正常时 data 是 {done: true}，但它会睡 2 秒。",
+        risk_level="low",
+        needs_confirmation=False,
+        tier2=False,
+        replay_safe=True,
+        timeout=1,
+    )(_slow_tool_2s_fn)
+
+if get_tool("test_slow_no_replay_tool") is None:
+    register_tool(
+        name="test_slow_no_replay_tool",
+        description="测试用的睡 3 秒、不许重跑的工具。",
+        parameters={"type": "object", "properties": {}},
+        output="正常时 data 是 {done: true}，但它会睡 3 秒。",
+        risk_level="low",
+        needs_confirmation=False,
+        tier2=False,
+        replay_safe=False,
+        timeout=1,
+    )(_slow_no_replay_tool_fn)
+
+
+def test_timeout_marked_unknown_and_tool_keeps_running(gateway):
+    """（第二轮 1）超时只算“等不及了”，不是“没执行”：
+    登记 timeout=1 的工具睡 2 秒，网关 1 秒多就返回，带 timeout=True、
+    “结果未知”；返回时工具还没跑完，等一会儿它在后台自己跑完了。"""
+    _SLOW2_DONE.clear()
+    started = time.monotonic()
+    outcome = gateway.execute("test_slow_tool_2s", {})
+    elapsed = time.monotonic() - started
+    assert outcome["decision"] == "ok"
+    result = outcome["result"]
+    assert result["ok"] is False
+    assert result.get("timeout") is True
+    assert "超时" in result["error"]
+    assert "结果未知" in result["error"]
+    assert "不要重复调用" in result["error"]
+    assert elapsed < 1.5
+    # 超时返回时工具还没跑完（仍在后台执行），等一会儿它自己跑完了。
+    assert not _SLOW2_DONE.is_set()
+    assert _SLOW2_DONE.wait(timeout=3)
+
+
+def test_no_replay_tool_runs_synchronously_without_timeout(gateway):
+    """（第二轮 1）会改东西的工具不走线程超时：登记 timeout=1、
+    睡 3 秒、不许重跑的工具，网关同步跑完 3 秒才返回成功，
+    不提前按超时返回，也没有 timeout 标记。"""
+    started = time.monotonic()
+    outcome = gateway.execute("test_slow_no_replay_tool", {})
+    elapsed = time.monotonic() - started
+    assert outcome["decision"] == "ok"
+    assert outcome["result"]["ok"] is True
+    assert outcome["result"].get("timeout") is None
+    assert elapsed >= 2.5
+
+
+def test_timeout_not_counted_as_failure_and_not_retried(store, gateway):
+    """（第二轮 1）超时不算失败、不自动重试：循环里调一次睡 2 秒的
+    工具（timeout=1），记录是 timeout、失败次数是空的，喂给模型的
+    是“结果未知、不要重复调用”，不是“执行失败”。"""
+    _SLOW2_DONE.clear()
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(tool_calls=[_tool_call("call_1", "test_slow_tool_2s", {})]),
+            _tool_response(text="答完了。"),
+        ]
+    )
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    outcome = loop.run("慢慢查一下")
+    assert outcome["mode"] == "done"
+    assert outcome["tool_calls"] == 1
+    records = outcome["task"]["tool_calls"]
+    assert len(records) == 1
+    assert records[0]["status"] == "timeout"
+    assert outcome["task"]["failures"] == {}
+    tool_msg = [
+        m for m in provider.tool_calls_log[1]["messages"] if m.get("role") == "tool"
+    ][0]
+    assert "结果未知" in tool_msg["content"]
+    assert "不要重复调用" in tool_msg["content"]
+    assert "工具执行失败" not in tool_msg["content"]
+    # 超时返回后，工具在后台自己跑完了（不是被杀掉的）。
+    assert _SLOW2_DONE.wait(timeout=3)
+
+
+def test_confirm_execution_persisted_and_not_reexecuted(store, gateway):
+    """（第二轮 2）确认执行后马上存盘：记录改成 ok、结果存进任务；
+    从磁盘重读还在；恢复时模型又发同一条调用（同一个 tool_call_id），
+    replay_safe=False 的工具不许再执行；恢复读的是存盘的结果，
+    不是内存里传进来的（这里恢复时故意不传内存里的那份）。"""
+    _CONFIRM_CALLS.clear()
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(
+                tool_calls=[_tool_call("call_1", "test_confirm_tool", {"path": "a.txt"})]
+            ),
+            _tool_response(text="写好了。"),
+        ]
+    )
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    outcome = loop.run("帮我写个文件")
+    assert outcome["mode"] == "waiting_approval"
+    approval = outcome["approval"]
+    resolved = gateway.resolve_approval(
+        store, outcome["task"]["task_id"], approval["approval_id"], "confirm"
+    )
+    assert resolved["decision"] == "ok"
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]
+    # 从磁盘重读（新开一个 TaskStore，模拟关了服务再回来）：
+    # 记录是 ok、结果存着。
+    reopened = TaskStore(file_path=store.file_path)
+    saved = reopened.load(outcome["task"]["task_id"])
+    record = [r for r in saved["tool_calls"] if r["tool_call_id"] == "call_1"][0]
+    assert record["status"] == "ok"
+    assert record["result"]["ok"] is True
+    assert saved["pending_tool_result"]["ok"] is True
+    # 恢复：模型又发同一条调用，不许再执行；恢复时不传内存里的结果。
+    resumer = ScriptedProvider(
+        script=[
+            _tool_response(
+                tool_calls=[_tool_call("call_1", "test_confirm_tool", {"path": "a.txt"})]
+            ),
+        ]
+    )
+    loop2 = AgentLoop(resumer, gateway=gateway, task_store=reopened,
+                      search_service=FakeSearchService())
+    resumed = loop2.run("帮我写个文件", resume_task=saved, pending_tool_result=None)
+    assert resumed["mode"] == "done"
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]  # 还是只执行了一次
+    assert resumed["tool_calls"] == 1  # 被拦的那次不计数
+    # 恢复的那轮喂给模型的是存下来的结果。
+    resumed_messages = resumer.tool_calls_log[0]["messages"]
+    tool_msgs = [m for m in resumed_messages if m.get("role") == "tool"]
+    assert tool_msgs and "done" in tool_msgs[0]["content"]
+    # 盘上的记录还是 ok，没被改回去。
+    again = reopened.load(outcome["task"]["task_id"])
+    assert [r for r in again["tool_calls"] if r["tool_call_id"] == "call_1"][0]["status"] == "ok"
+
+
+def test_confirm_rejected_restores_waiting_approval(store, gateway, monkeypatch):
+    """（第二轮 2）确认后执行被拦时，任务不卡在 RUNNING：
+    放回 WAITING_APPROVAL，卡还在，BOOS 可以再点确认或取消。"""
+    _CONFIRM_CALLS.clear()
+    task, approval = _make_waiting_task(store, gateway)
+    monkeypatch.setattr(
+        gateway, "execute",
+        lambda *args, **kwargs: {
+            "decision": "rejected", "result": None,
+            "reason": "测试拒绝", "approval": None,
+        },
+    )
+    resolved = gateway.resolve_approval(
+        store, task["task_id"], approval["approval_id"], "confirm"
+    )
+    assert resolved["decision"] == "rejected"
+    assert resolved["reason"] == "测试拒绝"
+    assert store.load(task["task_id"])["status"] == "WAITING_APPROVAL"
+    assert _CONFIRM_CALLS == []
+
+
+class BarrierSearchService(FakeSearchService):
+    """两边同时进搜索才放行的假服务：逼两个任务真正交错执行，
+    而不是一个跑完再跑另一个。"""
+
+    def __init__(self, barrier, title):
+        super().__init__()
+        self.barrier = barrier
+        self.title = title
+
+    def search(self, query, kind="normal", max_results=5, cross_check=False,
+               force_provider=None):
+        self.queries.append(query)
+        self.barrier.wait(timeout=10)
+        return SearchOutcome(
+            query=query,
+            provider="fake",
+            status="ok",
+            results=[
+                SearchResult(title=self.title, url="https://example.com", snippet="x")
+            ],
+        )
+
+
+def test_two_concurrent_loops_use_own_search_service(tmp_path):
+    """（第二轮 3）两个任务并行交错执行，各用各的搜索服务和翻译器：
+    两个线程同时跑循环，搜索里用屏障逼它们同时在跑；各家的服务
+    只收到各家自己的查询，各家模型收到的也是各家的结果。"""
+    barrier = threading.Barrier(2)
+    service_a = BarrierSearchService(barrier, "结果A")
+    service_b = BarrierSearchService(barrier, "结果B")
+    results = {}
+    errors = []
+
+    def run_one(name, query, service, store_file, audit_file, reply):
+        try:
+            provider = ScriptedProvider(
+                script=[
+                    _tool_response(
+                        tool_calls=[_tool_call("call_1", "search", {"query": query})]
+                    ),
+                    _tool_response(text=reply),
+                ]
+            )
+            loop = AgentLoop(
+                provider,
+                gateway=ToolGateway(audit_log=AuditLog(audit_file)),
+                task_store=TaskStore(file_path=store_file),
+                search_service=service,
+            )
+            results[name] = (loop.run(query), provider)
+        except Exception as exc:  # noqa: BLE001 - 线程里的错攒起来主线程再断言
+            errors.append(exc)
+
+    thread_a = threading.Thread(
+        target=run_one,
+        args=("a", "问题A", service_a, str(tmp_path / "a_tasks.json"),
+              str(tmp_path / "a_audit.log"), "答A。"),
+    )
+    thread_b = threading.Thread(
+        target=run_one,
+        args=("b", "问题B", service_b, str(tmp_path / "b_tasks.json"),
+              str(tmp_path / "b_audit.log"), "答B。"),
+    )
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=15)
+    thread_b.join(timeout=15)
+    assert not errors
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    # 各家的服务只收到各家自己的查询，没串。
+    assert service_a.queries == ["问题A"]
+    assert service_b.queries == ["问题B"]
+    outcome_a, provider_a = results["a"]
+    outcome_b, provider_b = results["b"]
+    assert outcome_a["reply"] == "答A。"
+    assert outcome_b["reply"] == "答B。"
+    # 各家模型收到的工具结果也是各家的。
+    tool_a = [
+        m for m in provider_a.tool_calls_log[1]["messages"] if m.get("role") == "tool"
+    ][0]
+    tool_b = [
+        m for m in provider_b.tool_calls_log[1]["messages"] if m.get("role") == "tool"
+    ][0]
+    assert "结果A" in tool_a["content"]
+    assert "结果B" in tool_b["content"]
+
+
+def test_invalid_json_call_leaves_record_and_counts_match(store, gateway):
+    """（第二轮 4）非法 JSON 也留记录：参数不是合法 JSON 的调用，
+    留一条 invalid_args 记录（带原始参数文本截断）；从磁盘重读，
+    列表长度和计数一致。"""
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(tool_calls=[{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{不是 JSON"},
+            }]),
+            _tool_response(text="答完了。"),
+        ]
+    )
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    outcome = loop.run("查一下")
+    assert outcome["mode"] == "done"
+    assert outcome["tool_calls"] == 1
+    records = outcome["task"]["tool_calls"]
+    assert len(records) == 1
+    assert records[0]["status"] == "invalid_args"
+    assert records[0]["tool_call_id"] == "call_1"
+    assert records[0]["raw_arguments"] == "{不是 JSON"
+    # 从磁盘重读：列表长度和计数一致。
+    reopened = TaskStore(file_path=store.file_path)
+    reloaded = reopened.load(outcome["task"]["task_id"])
+    assert len(reloaded["tool_calls"]) == outcome["tool_calls"] == 1

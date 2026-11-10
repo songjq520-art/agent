@@ -16,25 +16,36 @@
 #   保证形状固定，模型不用猜）和 answer；结果条目缺 title 或 url
 #   时整条丢弃，不把脏数据喂给模型。
 
+import contextvars
+
 from tools.search import SearchService
 from tools.tool_registry import get_tool, register_tool
 
-# 绑定的搜索服务（循环开始时由 agent_loop 换成带翻译器的那个；
-# 测试里也可以换成假服务，不用真的联网）。
-_SERVICE = {"service": None}
+# 绑定的搜索服务：用 ContextVar 存，不用模块全局字典——每个任务
+# （每个线程 / 每个上下文）有自己的服务，两个任务并行时各用各的，
+# 不会串线。翻译器是绑在服务实例上的（见 agent_loop._bind_search_service，
+# 每轮新建服务 + 全新翻译器），所以服务串了，翻译和记账上下文也会
+# 跟着串——这就是为什么不能用全局。
+# 注意：新线程默认是空上下文，读不到调用方绑的服务；网关跑工具时
+# 会把调用方的上下文拷进工作线程（见 tool_gateway._run_with_timeout），
+# 所以线程里跑搜索也能读到同一份绑定。
+_SERVICE_VAR = contextvars.ContextVar("tools_search_service", default=None)
 
 
 def set_search_service(service):
     """换绑定的搜索服务（循环开始绑带翻译器的，测试绑假的）。
-    传 None 时恢复成默认的 SearchService（不带翻译器）。"""
-    _SERVICE["service"] = service or SearchService()
+    传 None 时恢复成默认的 SearchService（不带翻译器）。
+    只改当前上下文里的绑定，不影响别的任务。"""
+    _SERVICE_VAR.set(service or SearchService())
 
 
 def get_search_service():
-    """当前绑定的搜索服务（没绑过时建一个默认的）。"""
-    if _SERVICE["service"] is None:
-        _SERVICE["service"] = SearchService()
-    return _SERVICE["service"]
+    """当前上下文绑定的搜索服务（没绑过时建一个默认的）。"""
+    service = _SERVICE_VAR.get()
+    if service is None:
+        service = SearchService()
+        _SERVICE_VAR.set(service)
+    return service
 
 
 def _validate_search_data(data):
