@@ -846,3 +846,49 @@ def test_translator_cross_check_partner_gets_original_query():
     outcome = service.search("广州天气", cross_check=True)
     assert tavily.calls == ["广州天气"]
     assert len(outcome.results) == 1
+
+
+def test_translator_cross_check_partner_anysearch_gets_translated_query():
+    # Bug A 回归：交叉验证的搭档是 AnySearch 且查询含中文时，搭档也要拿
+    # 翻过的英文查询去搜，不能拿中文原文（否则 AnySearch 返回法院文书，
+    # 烂结果混进好结果里）。搭档那路搜回来的结果也要翻回中文。
+    translator = FakeTranslator(
+        {
+            ("广州天气", "en"): "Guangzhou weather",
+            ("Sunny in Guangzhou", "zh"): "广州晴",
+        }
+    )
+    tavily = FakeProvider(
+        "tavily", [ok_outcome("广州天气", "tavily", ["https://t.com/1"])]
+    )
+    anysearch = FakeProvider(
+        "anysearch",
+        [
+            SearchOutcome(
+                query="Guangzhou weather",
+                provider="anysearch",
+                status="ok",
+                results=[
+                    SearchResult(
+                        title="Sunny in Guangzhou",
+                        url="https://a.com/1",
+                        snippet="Clear sky",
+                    )
+                ],
+            )
+        ],
+    )
+    service = SearchService(
+        anysearch=anysearch,
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+        translator=translator,
+    )
+    outcome = service.search("广州天气", kind="structured", cross_check=True)
+    assert outcome.provider == "tavily"
+    assert tavily.calls == ["广州天气"]  # Tavily 中文直接搜，不翻
+    assert anysearch.calls == ["Guangzhou weather"]  # 搭档 AnySearch 拿翻过的英文
+    assert ("广州天气", "en") in translator.calls
+    # 搭档新并进来的结果翻回了中文
+    assert outcome.results[1].title == "广州晴"
+    assert outcome.quality["translated_back"] is True

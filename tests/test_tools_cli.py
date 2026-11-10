@@ -101,6 +101,23 @@ def test_cli_tampered_preview_refused_and_files_kept(cli_env):
     )
 
 
+def test_cli_downgraded_algo_preview_refused_and_files_kept(cli_env):
+    # Bug B 回归（CLI 端到端变种）：带钥匙的预览被降级成普通 SHA-256
+    #（改 checksum_algo 再重算校验和）——必须拒绝且原文件保留。
+    # 注意：这个变种在 CLI 层就被拦住（checksum_algo 不是 hmac-sha256
+    # 直接拒绝）；库函数层那道防线由 test_keyed_preview_downgrade_refused 测。
+    preview_path = _scan(cli_env)
+    downgraded = json.loads(preview_path.read_text(encoding="utf-8"))
+    downgraded["checksum_algo"] = "sha256"
+    payload = {k: v for k, v in downgraded.items() if k != "checksum"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    downgraded["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    preview_path.write_text(json.dumps(downgraded, ensure_ascii=False, indent=2), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        _delete(cli_env, preview_path)
+    assert (cli_env["root"] / "temp" / "a.tmp").exists()  # 拒绝是整单的，什么都没删
+
+
 def test_cli_delete_requires_key(cli_env, monkeypatch):
     # 删除时没钥匙：拒绝删除，原文件保留。
     preview_path = _scan(cli_env)

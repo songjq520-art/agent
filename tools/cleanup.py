@@ -388,6 +388,15 @@ def delete_preview(preview, confirmed_categories, trash_dir, *, roots, key=None,
         _record_delete_rejection(audit_log, preview, actor, reason, "no-roots")
         raise ToolError(reason)
     trusted_roots = [Path(r) for r in roots]
+    if key is not None and preview.get("checksum_algo") != "hmac-sha256":
+        # 调用方传了钥匙，预览却不是带钥匙的 HMAC 校验：要么是调用方拿错了
+        # 预览，要么是有人把带钥匙的预览降级改成普通 SHA-256 再重算（校验和
+        # 算的是去掉 checksum 字段后的 JSON，algo 字段本身也在被算的内容里，
+        # 改了 algo 再重算照样对得上，verify_preview 那关拦不住）。两种情况
+        # 都拒绝，宁可重新扫。CLI 那层也有同样的检查，这里是库函数层的防线。
+        reason = "调用方传了钥匙，但这份预览不是带钥匙的 HMAC 校验，拒绝删除（预览可能被降级改过，请重新扫描）"
+        _record_delete_rejection(audit_log, preview, actor, reason, "algo")
+        raise ToolError(reason)
     if not verify_preview(preview, key=key):
         reason = "预览校验和对不上，拒绝删除（预览可能被改过，请重新扫描）"
         _record_delete_rejection(audit_log, preview, actor, reason, "checksum")

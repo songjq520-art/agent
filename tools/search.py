@@ -626,15 +626,29 @@ class SearchService:
         }
         self.translator = translator
 
-    def _translate_back(self, outcome):
-        """把翻成英文搜回来的结果，标题和摘要翻回中文给 BOOS 看。
-
-        只翻中过英文的那一路（AnySearch）赢来的结果；Tavily、Parallel
-        中文直接搜回来的不用翻。翻不成功不影响结果本身。
+    def _send_query_for(self, provider_name, query):
+        """主链路和交叉验证共用的发查询规则：AnySearch + 中文查询时，
+        先翻成英文再搜（AnySearch 中文相关性差，直接搜中文会返回不相干的
+        法院文书）；翻译失败就回落原文。Tavily、Parallel 中文直接搜，不翻。
         """
+        if (
+            self.translator is not None
+            and provider_name in _TRANSLATE_TO_ENGLISH_PROVIDERS
+            and _contains_cjk(query)
+        ):
+            try:
+                translated = self.translator(query, "en")
+            except Exception:
+                translated = None
+            if translated and translated.strip() and translated.strip() != query.strip():
+                return translated.strip()
+        return query
+
+    def _translate_results_back(self, results):
+        """把一批结果的标题和摘要翻回中文给 BOOS 看。翻不成功不影响结果本身。"""
         if self.translator is None:
             return False
-        for result in outcome.results:
+        for result in results:
             if result.title:
                 try:
                     translated = self.translator(result.title, "zh")
@@ -651,6 +665,14 @@ class SearchService:
                 if translated:
                     result.snippet = translated + result.snippet[_TRANSLATE_BACK_SNIPPET_CHARS:]
         return True
+
+    def _translate_back(self, outcome):
+        """把翻成英文搜回来的结果，标题和摘要翻回中文给 BOOS 看。
+
+        只翻中过英文的那一路（AnySearch）赢来的结果；Tavily、Parallel
+        中文直接搜回来的不用翻。翻不成功不影响结果本身。
+        """
+        return self._translate_results_back(outcome.results)
 
     def available_providers(self):
         """每个服务是否可用、不可用是什么原因。"""
@@ -691,18 +713,7 @@ class SearchService:
                     }
                 )
                 continue
-            send_query = query
-            if (
-                self.translator is not None
-                and name in _TRANSLATE_TO_ENGLISH_PROVIDERS
-                and _contains_cjk(query)
-            ):
-                try:
-                    translated = self.translator(query, "en")
-                except Exception:
-                    translated = None
-                if translated and translated.strip() and translated.strip() != query.strip():
-                    send_query = translated.strip()
+            send_query = self._send_query_for(name, query)
             try:
                 candidate = provider.search(send_query, max_results=max_results)
             except QuotaExhausted as exc:
@@ -760,13 +771,19 @@ class SearchService:
             partner = self.providers.get(partner_name) if partner_name else None
             if partner is not None and partner.available:
                 try:
-                    partner_outcome = partner.search(query, max_results=max_results)
+                    # 搭档也走同一套翻译规则：搭档是 AnySearch 且查询含中文时，
+                    # 先翻成英文再搜，不然交叉验证会把 AnySearch 的中文烂结果
+                    #（法院文书）混进好结果里。
+                    partner_query = self._send_query_for(partner_name, query)
+                    partner_outcome = partner.search(partner_query, max_results=max_results)
                     if partner_outcome.status == "ok":
                         seen_urls = {r.url for r in outcome.results}
                         merged = list(outcome.results)
+                        new_results = []
                         for result in partner_outcome.results:
                             if result.url not in seen_urls:
                                 merged.append(result)
+                                new_results.append(result)
                                 seen_urls.add(result.url)
                         primary_domains = {_domain_of(r.url) for r in outcome.results}
                         partner_domains = {
@@ -774,6 +791,10 @@ class SearchService:
                         }
                         corroborated = sorted(primary_domains & partner_domains)
                         outcome.results = merged
+                        # 搭档那路翻成英文搜的，新并进来的结果也要翻回中文。
+                        if partner_query != query and new_results:
+                            if self._translate_results_back(new_results):
+                                translated_back = True
                         attempts.append(
                             {"provider": partner_name, "status": "ok", "reason": "交叉验证"}
                         )

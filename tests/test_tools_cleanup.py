@@ -324,6 +324,29 @@ def test_keyed_preview_tamper_detected(tmp_path):
                        roots=[str(root)], key=b"session-key")
 
 
+def test_keyed_preview_downgrade_refused(tmp_path):
+    # Bug B 回归：带钥匙的预览被降级成普通 SHA-256（改 checksum_algo 再
+    # 重算校验和）——verify_preview 那关拦不住（algo 字段本身在被算的
+    # 内容里，改了再重算照样对得上），delete_preview 必须在传了钥匙时
+    # 要求 algo 就是 hmac-sha256。
+    import hashlib
+
+    root = build_tree(tmp_path / "tree")
+    keyed = build_preview(scan(root, root_kind="other", large_threshold_mb=10), key=b"session-key")
+    downgraded = json.loads(json.dumps(keyed))
+    downgraded["checksum_algo"] = "sha256"
+    payload = {k: v for k, v in downgraded.items() if k != "checksum"}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    downgraded["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    # 降级后的校验和本身算得对，verify_preview 会返回 True——拦住它的
+    # 是 delete_preview 的 algo 检查。
+    assert verify_preview(downgraded, key=b"session-key") is True
+    with pytest.raises(ToolError):
+        delete_preview(downgraded, ["temp"], trash_dir=tmp_path / "trash",
+                       roots=[str(root)], key=b"session-key")
+    assert (root / "temp" / "a.tmp").exists()
+
+
 def test_keyed_preview_roundtrip(tmp_path):
     root = build_tree(tmp_path / "tree")
     keyed = build_preview(scan(root, root_kind="other", large_threshold_mb=10), key="session-key")
