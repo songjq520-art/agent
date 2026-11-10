@@ -1947,7 +1947,8 @@ class Mem0Store:
             ]
         return out
 
-    def _record_protection_event(self, kind, reason, failed_ids=None, failed_texts=None):
+    def _record_protection_event(self, kind, reason, failed_ids=None, failed_texts=None,
+                                 rollback_leftover_ids=None, rollback_leftover_texts=None):
         """记一条保护事件（失败关闭的可见留痕）。
 
         快照失败、恢复失败这些事不能只写日志——日志 BOOS 看不到，
@@ -1955,12 +1956,15 @@ class Mem0Store:
         （memory/protection-events.jsonl，gitignore 覆盖，不进仓库），
         面板上有接口能读到（GET /api/protection-events）。
         kind：snapshot_failed（快照两次都失败，本轮没写）、
-        restore_unverified（恢复前读库失败，没法核对，本轮新存的已回滚）、
+        restore_unverified（恢复时读库失败，没法核对，本轮新存的已回滚）、
         restore_partial（个别旧记忆没恢复回来，跟它们同一话题的新记忆已回滚）。
         failed_ids 是旧记忆的 id，failed_texts 是它们的原文——面板上
         BOOS 要看得出是哪条记忆，光给 id 他认不出来。文件只在本地，
         和 history.db 一个待遇（里面本来就有全文），不上传、不导出；
         logger 里的警告照旧不带内容。
+        rollback_leftover_ids/texts 是回滚删不掉、还留在库里的新记忆
+        （id 和原文）：有残留时才记，没有就不写这两个键——保护事件
+        不能写成“已回滚”，而实际仍有记录残留。
         记不下来时只记日志、不抛异常——留痕本身坏了不能把聊天搞崩。
         """
         try:
@@ -1971,6 +1975,10 @@ class Mem0Store:
                 "failed_ids": list(failed_ids or []),
                 "failed_texts": list(failed_texts or []),
             }
+            if rollback_leftover_ids:
+                event["rollback_leftover_ids"] = list(rollback_leftover_ids)
+            if rollback_leftover_texts:
+                event["rollback_leftover_texts"] = list(rollback_leftover_texts)
             self.protection_events_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.protection_events_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -2191,6 +2199,7 @@ class Mem0Store:
         protection_failed = False
         protection_reason = None
         failed_ids = None
+        rollback_leftover_ids = None
         filtered = _filter_extraction_messages(fresh)
         if filtered:
             extracted = self._extract_and_save_turn(filtered)
@@ -2198,9 +2207,12 @@ class Mem0Store:
             # 保护失败的标记要往上传：本轮没写成、或回滚过，调用方
             # （add_turn / 面板）得知道，不能只留在提取那一层。
             # failed_ids 是没恢复回来的旧记忆 id（只有恢复个别失败时有）。
+            # rollback_leftover_ids 是回滚删不掉、还留在库里的新记忆 id，
+            # 和 failed_ids 同一条路往上传，半路不能丢。
             protection_failed = bool((extracted or {}).get("protection_failed"))
             protection_reason = (extracted or {}).get("protection_reason")
             failed_ids = (extracted or {}).get("failed_ids")
+            rollback_leftover_ids = (extracted or {}).get("rollback_leftover_ids")
         if not results and not identity_outcomes and not protection_failed:
             return {}
         out = {"results": results, "identity": identity_outcomes}
@@ -2209,6 +2221,8 @@ class Mem0Store:
             out["protection_reason"] = protection_reason
             if failed_ids:
                 out["failed_ids"] = failed_ids
+            if rollback_leftover_ids:
+                out["rollback_leftover_ids"] = rollback_leftover_ids
         return out
 
     def flush_pending(self):
@@ -2696,6 +2710,10 @@ class Mem0Store:
                 out["protection_reason"] = (committed or {}).get("protection_reason")
                 if (committed or {}).get("failed_ids"):
                     out["failed_ids"] = (committed or {}).get("failed_ids")
+                if (committed or {}).get("rollback_leftover_ids"):
+                    out["rollback_leftover_ids"] = (committed or {}).get(
+                        "rollback_leftover_ids"
+                    )
             return out
 
     def _drop_sensitive_results(self, result):
@@ -2739,6 +2757,94 @@ class Mem0Store:
     # 共享“预算”）的，不拦——那点重合说明不了是同一件事。
     _COVERAGE_GUARD_MIN_WEIGHT = 4
 
+    def _verify_after_repair(self, expect_present, expect_absent_ids):
+        """改完库再读一遍核对（恢复和回滚共用的核对办法）。
+
+        病根（2026-11-10 GPT 再审）：恢复和回滚以前都信“没报错就
+        是成功了”——update/add/delete 没抛异常就数成做完了。没报错
+        只能说明调用没炸，不能说明库里的东西真对了（update 可能假装
+        成功根本没改，delete 可能假装成功根本没删）。所以凡是动手改
+        了库的动作，做完都要再读一遍、按期望的样子逐条核对，对上了
+        才算数——恢复、回滚都调这一个办法，以后第三处改库也调它，
+        不会再犯同一个错。
+        只读本地库、只做本地比对，不调模型、不花钱；调用方已经持有
+        写锁（提取那条路），这里不另起锁。
+        参数：
+          expect_present：应在库里的条目，每项 {"lookup_id", "report_id",
+            "text", "metadata"}——lookup_id 是按 id 找的凭据（update
+            恢复的旧记忆，id 没变）；重新 add 的那条 id 变了，
+            lookup_id 是 None，改按内容找（文本 + 规整后的 metadata
+            都对上）。report_id 是核对不上时要报的 id（重新 add 的
+            也记旧 id——调用方只认得旧 id，新 id 它不知道）。
+            metadata 只比我们自己的字段（created_at、created_at_source、
+            write_seq、source、confidence、user_confirmed、slot、
+            pending_confirmation），用 _normalize_metadata 规整后比——
+            mem0 自己加的字段（比如它内部的 hash、更新时间）不比，
+            不然会误判。
+            含糊点（写明）：库里有多条内容一样的，有一条对得上就算
+            恢复了——重新 add 的那条和库里本来就有的重复项分不开，
+            但这条路只在“旧记忆被删了、按快照重存”时走，重存的文本
+            和 metadata 和快照一致就是恢复的目的；多一条重复顶多是
+            多占一条，不会把错的当成对的。
+          expect_absent_ids：应在库里消失的 id（回滚删掉的新记忆）。
+        返回 {"read_ok", "missing", "still_present"}：
+          read_ok False 表示核对那一下读库失败，什么都不知道——
+            调用方按“没法核对”失败关闭，不能按成功处理；这时
+            missing 是全部 expect_present 的 report_id、
+            still_present 是全部 expect_absent_ids（一个都没确认，
+            保守全算没对上）。
+          missing：expect_present 里没对上的 report_id；
+          still_present：expect_absent_ids 里读回来还在的 id。
+        """
+        try:
+            current = self._snapshot_all()
+        except Exception:
+            logger.warning("改完库核对时读库失败，没法确认结果。", exc_info=True)
+            return {
+                "read_ok": False,
+                "missing": [
+                    (item or {}).get("report_id")
+                    for item in (expect_present or [])
+                    if (item or {}).get("report_id")
+                ],
+                "still_present": list(expect_absent_ids or []),
+            }
+        by_id = {}
+        contents = []
+        for item in current:
+            mem_id = (item or {}).get("id")
+            text = (item or {}).get("text") or ""
+            meta = _normalize_metadata((item or {}).get("metadata"))
+            if mem_id:
+                by_id[mem_id] = {"text": text, "metadata": meta}
+            contents.append({"text": text, "metadata": meta})
+        missing = []
+        for expected in expect_present or []:
+            text = (expected or {}).get("text") or ""
+            meta = _normalize_metadata((expected or {}).get("metadata"))
+            lookup_id = (expected or {}).get("lookup_id")
+            found = False
+            if lookup_id:
+                now = by_id.get(lookup_id)
+                found = (
+                    now is not None
+                    and now["text"] == text
+                    and now["metadata"] == meta
+                )
+            else:
+                found = any(
+                    entry["text"] == text and entry["metadata"] == meta
+                    for entry in contents
+                )
+            if not found:
+                report_id = (expected or {}).get("report_id")
+                if report_id:
+                    missing.append(report_id)
+        still_present = [
+            mem_id for mem_id in (expect_absent_ids or []) if mem_id in by_id
+        ]
+        return {"read_ok": True, "missing": missing, "still_present": still_present}
+
     def _restore_snapshot_memories(self, before_items):
         """按提取前的快照，把被改动过的旧记忆恢复原样（守卫的第二道）。
 
@@ -2758,9 +2864,16 @@ class Mem0Store:
         读库失败时不猜：分不清“全被删了”还是“读失败了”，宁可本次
         不恢复（记一条警告），也别把没删的东西重复存一遍。
         恢复只记日志、不抛异常——守卫坏了不能把聊天回答搞崩。
+        恢复完再读一遍核对（见 _verify_after_repair）：update 或重新
+        add 没报错不等于恢复了，读回来文本 + metadata 都对上了才算；
+        底层 update 不支持 metadata、只恢复了文本的那种，metadata 对
+        不上，数成失败。restored 只数核对上了的。核对那一下读库失败
+        时 verified=False、failed_ids 是本轮试着恢复的 id（一个都没
+        确认，保守全算没恢复）；没什么要恢复时不读第二遍——第一遍
+        读已经比过、都没动过，没必要再读。
         返回一个小结构（调用方要分得出三种情况，不能只给个数）：
         {"verified": 本次到底核没核对上（读库失败时是 False）、
-         "restored": 恢复了几条、
+         "restored": 核对上了几条、
          "failed_ids": 没恢复回来的旧记忆 id（空表示都恢复了、
          或本来就没什么要恢复的）}。
         """
@@ -2781,8 +2894,7 @@ class Mem0Store:
                 "text": text,
                 "metadata": _normalize_metadata((item or {}).get("metadata")),
             }
-        restored = 0
-        failed_ids = []
+        attempted = []
         for old in before_items:
             mem_id = (old or {}).get("id")
             old_text = (old or {}).get("text") or ""
@@ -2792,6 +2904,7 @@ class Mem0Store:
             now = current.get(mem_id)
             if now is None:
                 # 没了：重新存一条，文本和 metadata 原样带上。
+                # 存完不数成功——成没成等下面统一核对。
                 try:
                     self._mem0_add(
                         [{"role": "user", "content": old_text}],
@@ -2801,13 +2914,20 @@ class Mem0Store:
                     )
                 except Exception:
                     logger.warning("覆盖守卫：恢复被删的旧记忆失败。", exc_info=True)
-                    failed_ids.append(mem_id)
-                    continue
-                restored += 1
+                # 新存的 id 是 mem0 生成的，核对时按内容找，失败报旧 id。
+                attempted.append(
+                    {
+                        "lookup_id": None,
+                        "report_id": mem_id,
+                        "text": old_text,
+                        "metadata": old_meta,
+                    }
+                )
                 continue
             if now["text"] == old_text and now["metadata"] == old_meta:
                 continue
             # 文本被改了、或者 metadata 被动了：原地恢复，保住原 id。
+            # 改完不数成功——成没成等下面统一核对。
             try:
                 try:
                     self._memory.update(
@@ -2821,9 +2941,27 @@ class Mem0Store:
                     self._memory.update(memory_id=mem_id, text=old_text)
             except Exception:
                 logger.warning("覆盖守卫：恢复被改的旧记忆失败。", exc_info=True)
-                failed_ids.append(mem_id)
-                continue
-            restored += 1
+            attempted.append(
+                {
+                    "lookup_id": mem_id,
+                    "report_id": mem_id,
+                    "text": old_text,
+                    "metadata": old_meta,
+                }
+            )
+        if not attempted:
+            return {"verified": True, "restored": 0, "failed_ids": []}
+        # 改完再读一遍核对：没报错不等于恢复了，读回来对上了才算。
+        # 核对读库失败时一个都没确认，全算没恢复（失败关闭）。
+        check = self._verify_after_repair(attempted, [])
+        if not check["read_ok"]:
+            return {
+                "verified": False,
+                "restored": 0,
+                "failed_ids": [item["report_id"] for item in attempted],
+            }
+        failed_ids = check["missing"]
+        restored = len(attempted) - len(failed_ids)
         if restored:
             logger.info("提取后守卫：按快照恢复了 %d 条被改动的旧记忆。", restored)
         return {"verified": True, "restored": restored, "failed_ids": failed_ids}
@@ -2833,22 +2971,31 @@ class Mem0Store:
 
         删的办法复用 _drop_sensitive_results 里现成的
         self._memory.delete——刚存进来的记录，删掉就是回到写之前
-        的样子。删失败只记日志、不抛异常：删不掉的那条留在库里、
-        也留在返回的 results 里，如实反映（不能谎称删掉了）。
+        的样子。删失败只记日志、不抛异常。
+        删完再读一遍核对（见 _verify_after_repair）：delete 没报错
+        不等于删掉了，读回来不在才算删掉；delete 抛了错也不等于还
+        在——到底在不在，以读回来的为准，残留的判定只看核对结果。
+        没 id 的条目删不掉、也核对不了，保守算残留。核对那一下读
+        库失败时，一个都确认不了，全算残留（失败关闭）。
         返回删完还留着的条目（删失败的还在里面）。
         """
-        survivors = []
+        no_id = []
+        with_id = []
         for item in items or []:
-            mem_id = (item or {}).get("id")
-            if not mem_id:
-                survivors.append(item)
-                continue
+            if (item or {}).get("id"):
+                with_id.append(item)
+            else:
+                no_id.append(item)
+        for item in with_id:
             try:
-                self._memory.delete(mem_id)
+                self._memory.delete(item["id"])
             except Exception:
-                logger.warning("回滚新记忆失败：id=%s。", mem_id, exc_info=True)
-                survivors.append(item)
-        return survivors
+                logger.warning("回滚新记忆失败：id=%s。", item["id"], exc_info=True)
+        if not with_id:
+            return list(no_id)
+        check = self._verify_after_repair([], [item["id"] for item in with_id])
+        still = set(check["still_present"])
+        return list(no_id) + [item for item in with_id if item["id"] in still]
 
     def _apply_coverage_guard(self, results, before_items, new_metadata):
         """提取后覆盖守卫：刚提取出的推断记忆，别把 BOOS 确认过的事实顶掉。
@@ -2881,12 +3028,15 @@ class Mem0Store:
         恢复失败时失败关闭，不当成保护成功（恢复的返回值不能丢掉）：
         (a) 连库都读不出来、根本没法核对——本轮新存的都删掉回滚，
         结果里标 protection_failed=True、原因 restore_unverified，
-        记一条保护事件，提前返回，不再打标记；
+        记一条保护事件，提前返回，不再打标记；回滚删不掉、还留在
+        库里的新记忆，id 写进结果（rollback_leftover_ids）、原文写
+        进保护事件，事件里不写“已删掉回滚”；
         (b) 个别旧记忆没恢复回来——只回滚跟它们同一话题的新记忆，
         其他新记忆照常走打标记的流程，结果里同样标 protection_failed、
         原因 restore_partial、并写明是哪几条旧记忆（failed_ids），
-        也记一条保护事件。没恢复回来的旧记忆本身还是坏的，这事
-        标出来、记下来，不能当成保护成功。
+        也记一条保护事件；回滚的残留同样写进结果和保护事件。
+        没恢复回来的旧记忆本身还是坏的，这事标出来、记下来，
+        不能当成保护成功。
         """
         if not before_items:
             return results
@@ -2896,15 +3046,40 @@ class Mem0Store:
         if not restore.get("verified", False):
             # (a) 没法核对：旧记忆到底被动了没有根本不知道。光标个
             #     失败不够——新记忆已经存进去了，得把本轮新存的都
-            #     删掉回滚，让库回到写之前的样子。
+            #     删掉回滚，让库回到写之前的样子。删完还剩下的（回滚
+            #     核对出来的残留）要写进结果和保护事件，不能写成
+            #     “已删掉回滚”——没删掉就是没删掉。
             survivors = self._rollback_new_memories(items)
             results["results"] = survivors
             results["protection_failed"] = True
             results["protection_reason"] = "restore_unverified"
+            leftover_ids = [
+                (item or {}).get("id")
+                for item in survivors
+                if (item or {}).get("id")
+            ]
+            leftover_texts = [(item or {}).get("memory") or "" for item in survivors]
+            if leftover_ids or leftover_texts:
+                results["rollback_leftover_ids"] = leftover_ids
+                reason = (
+                    "恢复时读库失败，没法核对 %d 条旧记忆有没有被改动，"
+                    "本轮新存的 %d 条记忆里删掉了 %d 条，还有 %d 条没删掉"
+                    "（仍在库里）。"
+                    % (
+                        len(before_items),
+                        len(items),
+                        len(items) - len(survivors),
+                        len(survivors),
+                    )
+                )
+            else:
+                reason = (
+                    "恢复时读库失败，没法核对 %d 条旧记忆有没有被改动，"
+                    "本轮新存的记忆已删掉回滚。" % len(before_items)
+                )
             self._record_protection_event(
                 "restore_unverified",
-                "恢复前读库失败，没法核对 %d 条旧记忆有没有被改动，"
-                "本轮新存的记忆已删掉回滚。" % len(before_items),
+                reason,
                 failed_ids=[
                     (old or {}).get("id")
                     for old in before_items
@@ -2913,6 +3088,8 @@ class Mem0Store:
                 failed_texts=[
                     (old or {}).get("text") or "" for old in before_items
                 ],
+                rollback_leftover_ids=leftover_ids or None,
+                rollback_leftover_texts=leftover_texts or None,
             )
             return results
         failed_ids = restore.get("failed_ids") or []
@@ -2939,19 +3116,39 @@ class Mem0Store:
                     doomed.append(item)
                 else:
                     kept.append(item)
-            self._rollback_new_memories(doomed)
+            survivors = self._rollback_new_memories(doomed)
             items = kept
             results["results"] = items
             results["protection_failed"] = True
             results["protection_reason"] = "restore_partial"
             results["failed_ids"] = list(failed_ids)
+            leftover_ids = [
+                (item or {}).get("id")
+                for item in survivors
+                if (item or {}).get("id")
+            ]
+            leftover_texts = [(item or {}).get("memory") or "" for item in survivors]
+            if leftover_ids or leftover_texts:
+                # 回滚不完整：删不掉的那条还留在库里（results 里没有
+                # 它），id 写进结果往上传，原文写进保护事件——调用方
+                # 和面板都得看得见，不能假装删掉了。
+                results["rollback_leftover_ids"] = leftover_ids
+                reason = (
+                    "有旧记忆没恢复回来，跟它们同一话题的新记忆里删掉了 %d 条，"
+                    "还有 %d 条没删掉（仍在库里）。"
+                    % (len(doomed) - len(survivors), len(survivors))
+                )
+            else:
+                reason = "有旧记忆没恢复回来，跟它们同一话题的新记忆已删掉回滚。"
             self._record_protection_event(
                 "restore_partial",
-                "有旧记忆没恢复回来，跟它们同一话题的新记忆已删掉回滚。",
+                reason,
                 failed_ids=list(failed_ids),
                 failed_texts=[
                     (old or {}).get("text") or "" for old in failed_old
                 ],
+                rollback_leftover_ids=leftover_ids or None,
+                rollback_leftover_texts=leftover_texts or None,
             )
         if not items:
             return results

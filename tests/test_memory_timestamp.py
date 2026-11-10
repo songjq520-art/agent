@@ -1,7 +1,8 @@
 # tests/test_memory_timestamp.py（记忆整理第一步：时间戳 + 覆盖规则）
-# 测四件事：时间戳够细不撞车、覆盖规则按“时间戳定新旧、可信度定资格”判、
+# 测五件事：时间戳够细不撞车、覆盖规则按“时间戳定新旧、可信度定资格”判、
 # 提取后守卫拦得住“模型推断顶掉 BOOS 确认的事实”、守卫按快照恢复被改动
-# 的旧记忆（用会捣乱的假 mem0 模拟 add 里改、删旧记忆）。
+# 的旧记忆（用会捣乱的假 mem0 模拟 add 里改、删旧记忆）、恢复和回滚做完
+# 都要再读一遍核对（没报错不等于做完了），残留要写进结果和保护事件。
 # 全部离线（FakeMemory），不碰真实 mem0、不联网、不产生费用。
 
 from datetime import datetime, timezone
@@ -242,6 +243,66 @@ class MutatingFakeMemory(FakeMemory):
                     self.delete(item["id"])
                 break
         return result
+
+
+class NoopMetadataUpdateFakeMemory(FakeMemory):
+    """update 带 metadata 时假装成功、实际什么都不改。
+
+    模拟“update 不报错但根本没恢复”：底层接口返回了成功，库里的
+    文本和 metadata 动都没动。只拦带 metadata 的 update——恢复和
+    打标记都带 metadata；捣乱假对象改旧记忆时不带，不受影响。
+    noop_update_ids 不为空时，只对里面的 id 假装成功，其余的照常
+    真改——用来模拟“多条旧记忆部分恢复：一半真恢复、一半悄悄失败”。
+    """
+
+    def __init__(self, noop_update_ids=None):
+        super().__init__()
+        self.noop_update_ids = set(noop_update_ids or [])
+
+    def update(self, memory_id, text=None, metadata=None):
+        if metadata is not None and (
+            not self.noop_update_ids or memory_id in self.noop_update_ids
+        ):
+            self.update_calls.append((memory_id, text, metadata))
+            return {"message": "Memory updated successfully!"}
+        return super().update(memory_id, text=text, metadata=metadata)
+
+
+class IncompleteMetadataFakeMemory(FakeMemory):
+    """原文直存（infer=False）时把 metadata 存残。
+
+    模拟“重新 add 不报错但 metadata 不完整”：add 返回了成功，文本
+    存进去了，但 write_seq 丢了——读回来规整后对不上快照里的原样。
+    只动恢复重存那条路：恢复传的是规整过的 metadata（带 confirmed
+    键），种子和手动存传的是 _provenance 拼的（没有 confirmed 键），
+    靠这个区分——种子那条正常存，不受影响。
+    """
+
+    def add(self, messages, user_id=None, infer=True, metadata=None):
+        if not infer and metadata and "confirmed" in metadata:
+            metadata = {k: v for k, v in metadata.items() if k != "write_seq"}
+        return super().add(messages, user_id=user_id, infer=infer, metadata=metadata)
+
+
+class FailDeleteMutatingFakeMemory(MutatingFakeMemory):
+    """捣乱（add 里改旧记忆）+ delete 一律抛错。
+
+    模拟“新记忆删除失败、仍然残留”：回滚删的时候抛错，记录还在。
+    """
+
+    def delete(self, memory_id):
+        raise RuntimeError("delete 删不掉（测试注入的失败）。")
+
+
+class NoopDeleteMutatingFakeMemory(MutatingFakeMemory):
+    """捣乱（add 里改旧记忆）+ delete 假装成功、实际不删。
+
+    模拟“delete 不报错但记录还在”：回滚删的时候返回了成功，记录
+    还躺在库里。只靠返回值看不出来，只能靠删完再读一遍核对抓住。
+    """
+
+    def delete(self, memory_id):
+        return {"deleted": True}
 
 
 def test_sqlite_guard_holds_inferred_change_as_pending(tmp_path):
@@ -621,3 +682,206 @@ def test_restore_result_tells_verified_and_failed(tmp_path):
         "restored": 0,
         "failed_ids": [],
     }
+
+
+# ---------- 恢复/回滚核对：没报错不等于做完了 ----------
+
+
+def test_restore_verify_catches_update_that_did_nothing(tmp_path):
+    """update 不报错但根本没恢复：核对要抓住它，标失败。
+
+    底层 update 返回了成功，实际文本和 metadata 动都没动——以前
+    “没报错就数成功”会把它算成恢复了。现在恢复完读回来比对，
+    对不上就进 failed_ids；verified 还是 True（核对本身成功了，
+    是恢复没成）。
+    """
+    store = make_fake_store(tmp_path, memory=NoopMetadataUpdateFakeMemory())
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = store.get_all()
+    old_id = before[0]["id"]
+    # 假装 add 里把旧记忆改了：不带 metadata 改文本（捣乱的口径）。
+    store._memory.update(memory_id=old_id, text="我现在把数据库改成 PostgreSQL 了。")
+    result = store._restore_snapshot_memories(before)
+    assert result == {"verified": True, "restored": 0, "failed_ids": [old_id]}
+    # 旧记忆还是被改过的样子（没恢复回来，如实保留现状）。
+    items = {item["id"]: item for item in store.get_all()}
+    assert items[old_id]["text"] == "我现在把数据库改成 PostgreSQL 了。"
+
+
+def test_restore_verify_catches_readd_with_incomplete_metadata(tmp_path):
+    """重新 add 不报错但 metadata 不完整：核对要抓住它，标失败。
+
+    旧记忆被删了，恢复时重新存了一条，add 返回了成功、文本也对，
+    但 write_seq 丢了——读回来规整后对不上快照里的原样。以前只看
+    add 有没有报错，会把它算成恢复了。
+    """
+    store = make_fake_store(tmp_path, memory=IncompleteMetadataFakeMemory())
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = store.get_all()
+    old_id = before[0]["id"]
+    old_seq = before[0]["metadata"]["write_seq"]
+    assert old_seq is not None
+    # 假装 add 里把旧记忆删了。
+    store._memory.delete(old_id)
+    result = store._restore_snapshot_memories(before)
+    assert result == {"verified": True, "restored": 0, "failed_ids": [old_id]}
+    # 那条是重新存回来了，但 metadata 不全（write_seq 没了）。
+    items = store.get_all()
+    assert len(items) == 1
+    assert items[0]["text"] == "数据库用 SQLite。"
+    assert items[0]["metadata"]["write_seq"] is None
+
+
+def test_restore_verify_read_failure_marks_unverified(tmp_path):
+    """恢复后核对读库失败：verified=False，不能算恢复成功。
+
+    update 写进去了，但核对那一下读不出来——到底恢复没恢复根本
+    不知道，不能返回 verified=True。failed_ids 是本轮试着恢复的 id。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = store.get_all()
+    old_id = before[0]["id"]
+    store._memory.update(memory_id=old_id, text="我现在把数据库改成 PostgreSQL 了。")
+    # 第一次读（恢复前核对）正常，第二次读（恢复后核对）读不出来。
+    store._memory.get_all_failures = [None, RuntimeError("库读不出来。")]
+    result = store._restore_snapshot_memories(before)
+    assert result == {"verified": False, "restored": 0, "failed_ids": [old_id]}
+
+
+def test_restore_verify_read_failure_rolls_back_new_memories(tmp_path):
+    """恢复后核对读库失败：走没法核对那支，本轮新存的全删掉回滚。
+
+    端到端：假 mem0 在 add 里把旧的改了，守卫恢复时写进去了，但
+    核对那一下读不出来——恢复到底成没成不知道，按失败关闭：新存
+    的几条全删掉回滚，add_turn 返回里标 protection_failed；回滚
+    删干净了，事件里写“已删掉回滚”是真的，没有残留要报。
+    注意：恢复的 update 本身是写进去了的（旧记忆改回了 SQLite，
+    只是核对读不到、没法确认），所以库里最后是 SQLite 在、
+    新存的 PostgreSQL 不在——不是旧记忆还坏着。
+    """
+    store = make_fake_store(tmp_path, memory=MutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 快照正常、恢复前核对正常，恢复后核对读不出来。
+    store._memory.get_all_failures = [None, None, RuntimeError("库读不出来。")]
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "restore_unverified"
+    assert "rollback_leftover_ids" not in out
+    items = store.get_all()
+    # 旧记忆改回了 SQLite（update 写进去了，只是没法核对确认）。
+    assert "数据库用 SQLite。" in {item["text"] for item in items}
+    # 新存的那条被删掉回滚了：PostgreSQL 不在库里了。
+    assert all(item["text"] != "我现在把数据库改成 PostgreSQL 了" for item in items)
+    events = store.list_protection_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "restore_unverified"
+    assert "已删掉回滚" in events[0]["reason"]
+    assert "rollback_leftover_ids" not in events[0]
+
+
+def test_rollback_delete_failure_leaves_visible_leftover(tmp_path):
+    """新记忆删除失败、仍然残留：残留要记下来，不能写成“已回滚”。
+
+    端到端：恢复没法核对（库读不出来），本轮新存的全删掉回滚，
+    可 delete 抛错、新记忆还在库里。add_turn 返回里要有
+    rollback_leftover_ids，保护事件里要有残留的 id 和原文，
+    事件文案不能写“已删掉回滚”。
+    """
+    store = make_fake_store(tmp_path, memory=FailDeleteMutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 第一次读（快照）正常，第二次读（恢复前核对）读不出来。
+    store._memory.get_all_failures = [None, RuntimeError("库读不出来。")]
+    store.add_turn([{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。"}])
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "restore_unverified"
+    leftover_ids = out.get("rollback_leftover_ids") or []
+    assert len(leftover_ids) == 1
+    # 残留的那条就是新存的 PostgreSQL，旧的 id 不是它。
+    assert leftover_ids[0] != old_id
+    items = {item["id"]: item for item in store.get_all()}
+    assert leftover_ids[0] in items
+    assert items[leftover_ids[0]]["text"] == "我现在把数据库改成 PostgreSQL 了"
+    events = store.list_protection_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "restore_unverified"
+    assert events[0].get("rollback_leftover_ids") == leftover_ids
+    assert "我现在把数据库改成 PostgreSQL 了" in (
+        events[0].get("rollback_leftover_texts") or []
+    )
+    assert "已删掉回滚" not in events[0]["reason"]
+    assert "没删掉" in events[0]["reason"]
+
+
+def test_restore_partial_success_and_failure(tmp_path):
+    """多条旧记忆部分恢复：成功的数成恢复，失败的进 failed_ids。
+
+    两条旧记忆都被改了，恢复时一条真写进去了、一条 update 不报错
+    但悄悄没改——以前“没报错就数成功”会把两条都算成恢复了，现在
+    核对读回来比对，成功的数 1 条，悄悄失败的那条进 failed_ids，
+    verified 还是 True（核对本身成功了）。
+    """
+    store = make_fake_store(tmp_path, memory=NoopMetadataUpdateFakeMemory())
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    store.add_memory_text("我喜欢喝咖啡。", source="user")
+    before = store.get_all()
+    ids = {item["text"]: item["id"] for item in before}
+    old_sqlite = ids["数据库用 SQLite。"]
+    old_coffee = ids["我喜欢喝咖啡。"]
+    # 两条都被改了（假装 add 里动了旧记忆）。
+    store._memory.update(memory_id=old_sqlite, text="我现在把数据库改成 PostgreSQL 了。")
+    store._memory.update(memory_id=old_coffee, text="我现在把咖啡改成拿铁了。")
+    # 恢复时咖啡那条 update 不报错、但悄悄没改。
+    store._memory.noop_update_ids = {old_coffee}
+    result = store._restore_snapshot_memories(before)
+    assert result == {"verified": True, "restored": 1, "failed_ids": [old_coffee]}
+    items = {item["id"]: item for item in store.get_all()}
+    assert items[old_sqlite]["text"] == "数据库用 SQLite。"
+    assert items[old_coffee]["text"] == "我现在把咖啡改成拿铁了。"
+
+
+def test_rollback_delete_noop_leaves_visible_leftover(tmp_path):
+    """delete 不报错但记录还在：回滚核对要抓住它。
+
+    端到端：恢复个别失败，只回滚跟没恢复回来的旧记忆同一话题的
+    新记忆；可 delete 返回了成功、记录还躺在库里。光看返回值
+    看不出来，删完再读一遍才抓住：add_turn 返回里要有
+    rollback_leftover_ids，保护事件里要有残留，拿铁那条照常留下。
+    """
+    store = make_fake_store(tmp_path, memory=NoopDeleteMutatingFakeMemory("update"))
+    store.add_memory_text("数据库用 SQLite。", source="user")
+    before = {item["id"]: item for item in store.get_all()}
+    old_id = next(iter(before))
+    # 恢复时写不进去：守卫原地 update 旧的 SQLite 那条就抛错。
+    store._memory.fail_update_ids = {old_id}
+    store.add_turn(
+        [{"role": "user", "content": "我现在把数据库改成 PostgreSQL 了。我喜欢喝拿铁。"}]
+    )
+    out = store.add_turn([{"role": "user", "content": "今天天气不错。"}])
+    assert out.get("protection_failed") is True
+    assert out.get("protection_reason") == "restore_partial"
+    assert out.get("failed_ids") == [old_id]
+    leftover_ids = out.get("rollback_leftover_ids") or []
+    assert len(leftover_ids) == 1
+    items = {item["id"]: item for item in store.get_all()}
+    assert leftover_ids[0] in items
+    assert items[leftover_ids[0]]["text"] == "我现在把数据库改成 PostgreSQL 了"
+    # 拿铁照常留下，不标待确认。
+    latte_items = [item for item in items.values() if item["text"] == "我喜欢喝拿铁"]
+    assert len(latte_items) == 1
+    assert latte_items[0]["metadata"]["pending_confirmation"] is False
+    events = store.list_protection_events()
+    assert len(events) == 1
+    assert events[0]["kind"] == "restore_partial"
+    assert events[0].get("rollback_leftover_ids") == leftover_ids
+    assert "我现在把数据库改成 PostgreSQL 了" in (
+        events[0].get("rollback_leftover_texts") or []
+    )
+    assert "已删掉回滚" not in events[0]["reason"]
+    assert "没删掉" in events[0]["reason"]

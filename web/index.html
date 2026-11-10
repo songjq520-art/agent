@@ -679,6 +679,10 @@
     if (failed.length) {
       metaLine.appendChild(document.createTextNode('　没恢复回来的记忆：' + failed.join('；')));
     }
+    const leftover = (ev && ev.rollback_leftover_texts) || [];
+    if (leftover.length) {
+      metaLine.appendChild(document.createTextNode('　回滚没删掉的记忆：' + leftover.join('；')));
+    }
     item.appendChild(metaLine);
     return item;
   }
