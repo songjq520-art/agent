@@ -1210,3 +1210,269 @@ def test_chat_state_chained_approval_keeps_original_position(monkeypatch, store,
         {"role": "user", "content": "新消息"},
         {"role": "assistant", "content": "新消息答完了。"},
     ]
+
+
+# ---------- （GPT 评审补修）超时、number/bool、replay_safe、FAILED、计数 ----------
+
+# 补修用的两个工具（模块导入时登记一次）。
+_SLOW_CALLS = []
+_NO_REPLAY_CALLS = []
+
+
+def _slow_tool_fn(args):
+    import time
+
+    _SLOW_CALLS.append(dict(args))
+    time.sleep(5)
+    return {"ok": True, "data": {"done": True}, "error": None}
+
+
+def _no_replay_tool_fn(args):
+    _NO_REPLAY_CALLS.append(dict(args))
+    return {"ok": True, "data": {"done": True}, "error": None}
+
+
+if get_tool("test_slow_tool") is None:
+    register_tool(
+        name="test_slow_tool",
+        description="测试用的故意睡死的工具（超时用）。",
+        parameters={"type": "object", "properties": {}},
+        output="正常时 data 是 {done: true}，但它会睡 5 秒。",
+        risk_level="low",
+        needs_confirmation=False,
+        tier2=False,
+        replay_safe=True,
+        timeout=1,
+    )(_slow_tool_fn)
+
+if get_tool("test_no_replay_tool") is None:
+    register_tool(
+        name="test_no_replay_tool",
+        description="测试用的不许重跑的工具。",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+        output="成功时 data 是 {done: true}。",
+        risk_level="low",
+        needs_confirmation=False,
+        tier2=False,
+        replay_safe=False,
+        timeout=60,
+    )(_no_replay_tool_fn)
+
+
+class RaisingProvider:
+    """一调模型就抛错的假模型（任务 FAILED 用）。"""
+
+    model = "deepseek-flash"
+
+    def chat(self, prompt, ledger="chat", task_id=None, trace_id=None, thinking=None):
+        return {"text": "translated", "usage": None, "cost_usd": 0.0, "model": self.model}
+
+    def chat_with_tools(self, messages, tools, thinking="disabled", ledger="tool",
+                        task_id=None, trace_id=None):
+        raise RuntimeError("模型调用失败")
+
+    def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
+                      thinking=None):
+        return {"text": "最终回答", "usage": None, "cost_usd": 0.001, "model": self.model}
+
+
+def test_gateway_timeout_returns_failure_fast(gateway):
+    """（GPT 评审补修 1）登记 timeout=1 的工具睡 5 秒：网关 1 秒多就
+    按超时失败返回，不等它睡完；工具本身还是执行了。"""
+    import time
+
+    _SLOW_CALLS.clear()
+    started = time.monotonic()
+    outcome = gateway.execute("test_slow_tool", {})
+    elapsed = time.monotonic() - started
+    assert outcome["decision"] == "ok"
+    assert outcome["result"]["ok"] is False
+    assert "超时" in outcome["result"]["error"]
+    assert elapsed < 3
+    assert _SLOW_CALLS == [{}]
+
+
+def test_gateway_fast_tool_not_slowed_by_timeout(gateway):
+    """（GPT 评审补修 1）正常工具不受超时包装影响：要确认的工具确认后
+    立刻执行成功。"""
+    _CONFIRM_CALLS.clear()
+    outcome = gateway.execute("test_confirm_tool", {"path": "a.txt"}, confirmed=True)
+    assert outcome["decision"] == "ok"
+    assert outcome["result"]["ok"] is True
+    assert _CONFIRM_CALLS == [{"path": "a.txt"}]
+
+
+def test_number_bool_rejected_and_values_pass():
+    """（GPT 评审补修 2）number 传 true/false 必须报错；传 1 / 1.5 通过；
+    integer 传 true 本来就拦，回归。"""
+    from tools.tool_gateway import validate_args
+
+    schema = {"type": "object", "properties": {"n": {"type": "number"}}}
+    assert validate_args({"n": True}, schema) != ""
+    assert validate_args({"n": False}, schema) != ""
+    assert validate_args({"n": 1}, schema) == ""
+    assert validate_args({"n": 1.5}, schema) == ""
+    int_schema = {"type": "object", "properties": {"n": {"type": "integer"}}}
+    assert validate_args({"n": True}, int_schema) != ""
+    assert validate_args({"n": 3}, int_schema) == ""
+
+
+def test_can_replay_flag(gateway):
+    """（GPT 评审补修 3）can_replay 按登记的 replay_safe 来：
+    搜索 True、不许重跑的工具 False、没登记的 False。"""
+    assert gateway.can_replay("search") is True
+    assert gateway.can_replay("test_no_replay_tool") is False
+    assert gateway.can_replay("no_such_tool") is False
+
+
+def test_replay_safe_false_not_reexecuted_same_round(store, gateway):
+    """（GPT 评审补修 3）同一轮里模型发了两条一样的调用（同一个
+    tool_call_id）：replay_safe=False 的工具只执行一次，第二条被拦，
+    不计数、不占上限。"""
+    _NO_REPLAY_CALLS.clear()
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(tool_calls=[
+                _tool_call("call_1", "test_no_replay_tool", {"path": "a.txt"}),
+                _tool_call("call_1", "test_no_replay_tool", {"path": "a.txt"}),
+            ]),
+            _tool_response(text="答完了。"),
+        ]
+    )
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    outcome = loop.run("写个文件")
+    assert outcome["mode"] == "done"
+    assert _NO_REPLAY_CALLS == [{"path": "a.txt"}]
+    assert outcome["tool_calls"] == 1
+    records = outcome["task"]["tool_calls"]
+    assert len(records) == 1
+    assert records[0]["tool_call_id"] == "call_1"
+
+
+def test_replay_safe_true_reexecuted(store, gateway):
+    """（GPT 评审补修 3）同一条搜索调用发两次：replay_safe=True，
+    允许再执行一次，两次都执行、都计数。"""
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(tool_calls=[
+                _tool_call("call_1", "search", {"query": "广州天气"}),
+                _tool_call("call_1", "search", {"query": "广州天气"}),
+            ]),
+            _tool_response(text="答完了。"),
+        ]
+    )
+    search_service = FakeSearchService([_ok_outcome(), _ok_outcome()])
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=search_service)
+    outcome = loop.run("广州天气")
+    assert outcome["mode"] == "done"
+    assert search_service.queries == ["广州天气", "广州天气"]
+    assert outcome["tool_calls"] == 2
+
+
+def test_resume_does_not_reexecute_no_replay_tool(store, gateway):
+    """（GPT 评审补修 3）续跑路径：任务里已经有一条执行完的
+    test_no_replay_tool 调用记录，模型续跑时又发同一条调用（同一个
+    tool_call_id），不许再执行；循环直接回答，不空转。"""
+    _NO_REPLAY_CALLS.clear()
+    task = make_task(goal="写个文件", model="deepseek-flash")
+    task["status"] = "RUNNING"
+    task["messages"] = [
+        {"role": "system", "content": "你是助理。"},
+        {"role": "user", "content": "写个文件"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            _tool_call("call_9", "test_no_replay_tool", {"path": "a.txt"})
+        ]},
+        {"role": "tool", "tool_call_id": "call_9", "content": "执行完了。"},
+    ]
+    task["tool_calls"] = [
+        {"tool": "test_no_replay_tool", "args": {"path": "a.txt"},
+         "tool_call_id": "call_9", "status": "ok"}
+    ]
+    store.save(task)
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(tool_calls=[
+                _tool_call("call_9", "test_no_replay_tool", {"path": "a.txt"})
+            ]),
+        ]
+    )
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    outcome = loop.run("写个文件", resume_task=task)
+    assert outcome["mode"] == "done"
+    assert _NO_REPLAY_CALLS == []
+    assert outcome["tool_calls"] == 1
+
+
+def test_model_error_marks_task_failed(store, gateway, tmp_path):
+    """（GPT 评审补修 4）模型一调用就抛错：异常原样抛出去，
+    任务在库里是 FAILED，不永远挂着 RUNNING。"""
+    provider = RaisingProvider()
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    with pytest.raises(RuntimeError, match="模型调用失败"):
+        loop.run("广州天气")
+    data = json.loads((tmp_path / "tasks.json").read_text(encoding="utf-8"))
+    assert len(data) == 1
+    task = next(iter(data.values()))
+    assert task["status"] == "FAILED"
+
+
+def test_resume_model_error_marks_task_failed(store, gateway):
+    """（GPT 评审补修 4）恢复路径也一样：恢复时模型抛错，
+    任务标 FAILED 存盘，异常原样抛出去。"""
+    task = make_task(goal="广州天气", model="deepseek-flash")
+    task["status"] = "RUNNING"
+    task["messages"] = [
+        {"role": "system", "content": "你是助理。"},
+        {"role": "user", "content": "广州天气"},
+    ]
+    store.save(task)
+    provider = RaisingProvider()
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    with pytest.raises(RuntimeError, match="模型调用失败"):
+        loop.run("广州天气", resume_task=task)
+    assert store.load(task["task_id"])["status"] == "FAILED"
+
+
+def test_repeat_failure_counts_both_attempts(store, gateway):
+    """（GPT 评审补修 5）同一参数失败两次：两次都计数、列表里都有记录。"""
+    failed = SearchOutcome(query="广州天气", provider="fake",
+                           status="failed", error="搜不到")
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(tool_calls=[_tool_call("call_1", "search", {"query": "广州天气"})]),
+            _tool_response(tool_calls=[_tool_call("call_2", "search", {"query": "广州天气"})]),
+        ]
+    )
+    search_service = FakeSearchService([failed, failed])
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=search_service)
+    outcome = loop.run("广州天气")
+    assert outcome["mode"] == "done"
+    assert outcome["tool_calls"] == 2
+    records = outcome["task"]["tool_calls"]
+    assert len(records) == 2
+    assert [r["status"] for r in records] == ["failed", "failed"]
+
+
+def test_rejected_twice_counts_and_records(store, gateway):
+    """（GPT 评审补修 5）同一参数被拒绝两次（参数类型不对）：两次都计数、
+    列表里都有记录（状态 rejected）。"""
+    provider = ScriptedProvider(
+        script=[
+            _tool_response(tool_calls=[_tool_call("call_1", "search", {"query": 123})]),
+            _tool_response(tool_calls=[_tool_call("call_2", "search", {"query": 123})]),
+        ]
+    )
+    loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                     search_service=FakeSearchService())
+    outcome = loop.run("查一下")
+    assert outcome["mode"] == "done"
+    assert outcome["tool_calls"] == 2
+    records = outcome["task"]["tool_calls"]
+    assert len(records) == 2
+    assert [r["status"] for r in records] == ["rejected", "rejected"]

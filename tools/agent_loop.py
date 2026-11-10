@@ -17,6 +17,14 @@
 #     不把 5 次都烧在同一个失败上。
 #   - 工具中间结果（tool_calls / tool 消息）绝不进网页历史和长期记忆，
 #     只有 BOOS 的原话和最后的回答才存（见 main.py 的收尾）。
+#   - 模型调用或循环里抛错时，任务先标成 FAILED 存盘，再把异常原样
+#     抛出去——调用方该报的错照样报，别让任务永远挂着 RUNNING。
+#   - 同一条工具调用（同一个 tool_call_id）执行过一次后，模型又发
+#     同一条调用时，按登记的 replay_safe 拦：False 的不重执行，
+#     True 的才允许再执行；恢复/续跑时一律喂存下来的结果，不重执行。
+#   - 计数和记录都要对上实际执行次数：成功、失败、被拒绝的调用都计数、
+#     都留记录，同一参数第二次失败触发停表的那次也算；重复执行被拦的
+#     那次没执行，不计数、不占 5 次上限。
 #   - 循环只用本轮自己的消息（系统消息 + 本轮 user + 循环各轮），
 #     不用网页上的 plain history——plain history 里的 assistant 消息
 #     没有 reasoning_content，思考开着时发过去会报 400。
@@ -182,31 +190,43 @@ class AgentLoop:
             task["status"] = "RUNNING"
             self.task_store.save(task)
 
-        task_id = task["task_id"]
-        trace_id = task.get("trace_id")
-        self._bind_search_service(task_id, trace_id)
+        try:
+            task_id = task["task_id"]
+            trace_id = task.get("trace_id")
+            self._bind_search_service(task_id, trace_id)
 
-        # 恢复时：先把确认结果（或取消）喂回去，再把同轮其他没执行的
-        # 工具调用补上占位回复，保证每条 tool_call 都有对应的 tool 消息
-        # （接口要求：assistant 消息里的每个 tool_call 都要有 tool 消息回应，
-        # 不然下次发请求会报错）。
-        tool_calls_made = len(task.get("tool_calls") or [])
-        failures = dict(task.get("failures") or {})
-        total_cost = 0.0
-        cost_unknown = False
-        if resume_task is not None:
-            tool_calls_made, failures, total_cost, cost_unknown = self._resume_round(
-                task, messages, pending_tool_result, user_declined
+            # 恢复时：先把确认结果（或取消）喂回去，再把同轮其他没执行的
+            # 工具调用补上占位回复，保证每条 tool_call 都有对应的 tool 消息
+            # （接口要求：assistant 消息里的每个 tool_call 都要有 tool 消息回应，
+            # 不然下次发请求会报错）。
+            tool_calls_made = len(task.get("tool_calls") or [])
+            failures = dict(task.get("failures") or {})
+            total_cost = 0.0
+            cost_unknown = False
+            if resume_task is not None:
+                tool_calls_made, failures, total_cost, cost_unknown = self._resume_round(
+                    task, messages, pending_tool_result, user_declined
+                )
+                task["tool_calls"] = task.get("tool_calls") or []
+                task["failures"] = failures
+                task["messages"] = messages
+                task["status"] = "RUNNING"
+                self.task_store.save(task)
+
+            reply = self._run_rounds(
+                task, messages, failures, tool_calls_made, total_cost, cost_unknown
             )
-            task["tool_calls"] = task.get("tool_calls") or []
-            task["failures"] = failures
-            task["messages"] = messages
-            task["status"] = "RUNNING"
-            self.task_store.save(task)
-
-        reply = self._run_rounds(
-            task, messages, failures, tool_calls_made, total_cost, cost_unknown
-        )
+        except Exception:
+            # 模型调用或循环里抛错（API 报错、reasoning 缺失等）：先把任务
+            # 状态改成 FAILED 存盘，再把异常原样抛出去——调用方（命令行/
+            # 网页）该报的错照样报，不吞；别让任务永远挂着 RUNNING。
+            # 存盘本身失败也不拦原异常（原异常更重要）。
+            try:
+                task["status"] = "FAILED"
+                self.task_store.save(task)
+            except Exception:
+                pass
+            raise
         return reply
 
     # ---------- 恢复 ----------
@@ -300,6 +320,7 @@ class AgentLoop:
                                     tool_calls_made, total_cost, cost_unknown)
 
             # 3. 模型要调工具：逐个执行。
+            executed_this_round = False
             for call in tool_calls:
                 if tool_calls_made >= self.max_tool_calls:
                     stopped_reason = f"本轮工具调用已到上限（{self.max_tool_calls} 次），没执行的部分跳过。"
@@ -312,17 +333,30 @@ class AgentLoop:
                     return self._wait_approval(
                         task, messages, tool_calls_made, total_cost, cost_unknown
                     )
+                if outcome == "skipped":
+                    # 重复执行被拦下来了：这次没执行，不计数、不占上限，
+                    # 继续处理同轮的下一条调用。
+                    continue
+                # 每次真实执行了都计数（成功、失败、被拒绝都算；
+                # 同一参数第二次失败触发 repeat_failed 的那次也算——
+                # 执行了就要有数，计数不能比执行少，也不能比列表少）。
+                tool_calls_made += 1
+                executed_this_round = True
                 if outcome == "repeat_failed":
                     stopped_reason = "同一工具同一参数已失败两次，停下来了。"
                     self._fill_missing_tool_replies(messages, stopped_reason)
                     break
-                tool_calls_made += 1
             else:
                 # 这一轮的工具调用都执行完了（没触发上限、没等确认、
                 # 没重复失败），继续下一轮，让模型看结果再决定。
                 task["tool_calls"] = task.get("tool_calls") or []
                 task["failures"] = failures
                 self.task_store.save(task)
+                if not executed_this_round:
+                    # 这一轮一条都没执行（全是重复执行被拦的）：不再让模型
+                    # 继续发请求，用已有结果直接回答——不然模型一直重发
+                    # 同一条调用，循环会空转下去。
+                    break
                 continue
             # 到上限或重复失败：不再调工具，用已有结果让模型直接回答。
             break
@@ -346,9 +380,15 @@ class AgentLoop:
 
     def _execute_one(self, task, messages, call, failures):
         """执行模型要调的一个工具。返回 "done"（执行了）、
-        "needs_approval"（在等 BOOS 确认）或 "repeat_failed"
-        （同一工具同一参数失败两次，停下来）。
-        执行完的工具结果（成功或失败）都以 tool 消息喂回模型。"""
+        "needs_approval"（在等 BOOS 确认）、"repeat_failed"
+        （同一工具同一参数失败两次，停下来）或 "skipped"
+        （这条调用已经执行过了、又不许重跑，没执行）。
+        执行完的工具结果（成功或失败）都以 tool 消息喂回模型。
+        重复执行规则：同一条调用（同一个 tool_call_id）已经执行过
+        （记录状态是 ok 或 failed）时，模型又发同一条调用，先问网关
+        can_replay——登记的 replay_safe 是 True 才允许再执行，
+        False 直接拦下、不执行（恢复/续跑时也一样，绝不悄悄重跑
+        一次写操作）；被拦的那次不计数、不占 5 次上限。"""
         function = (call or {}).get("function") or {}
         tool_name = function.get("name", "")
         arguments_text = function.get("arguments", "") or ""
@@ -366,6 +406,27 @@ class AgentLoop:
                 failures.get(_failure_key(tool_name, arguments_text), 0) + 1
             )
             return "done"
+
+        # 重复执行检查：这条调用（同一个 tool_call_id）已经执行过的，
+        # 再执行要看登记的 replay_safe——False 的直接拦下，不执行。
+        # （只认 ok / failed 的记录：waiting_approval 是还没执行、
+        # 等确认的那条，确认流程会执行它，不在这里拦；rejected 是
+        # 没执行就被拦下的，再发也不算重复执行。）
+        if tool_call_id:
+            executed_ids = {
+                rec.get("tool_call_id")
+                for rec in (task.get("tool_calls") or [])
+                if rec.get("status") in ("ok", "failed")
+            }
+            if tool_call_id in executed_ids and not self.gateway.can_replay(tool_name):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": "这条工具调用已经执行过了，不能重复执行。",
+                    }
+                )
+                return "skipped"
 
         outcome = self.gateway.execute(
             tool_name, args,
@@ -393,9 +454,20 @@ class AgentLoop:
         if outcome["decision"] == "rejected":
             # 被拒绝（没登记、参数不对、禁令）：也喂回去，让模型知道、
             # 自己改；同一工具同一参数被拒绝两次也停。
+            # 被拒绝的也留一条记录（状态 rejected）：计数和列表都要对上
+            # 实际发生过的调用，不能有的执行没留痕。
             content = f"工具调用被拒绝：{outcome['reason']}"
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+            )
+            task["tool_calls"] = task.get("tool_calls") or []
+            task["tool_calls"].append(
+                {
+                    "tool": tool_name,
+                    "args": args,
+                    "tool_call_id": tool_call_id,
+                    "status": "rejected",
+                }
             )
             key = _failure_key(tool_name, arguments_text)
             failures[key] = failures.get(key, 0) + 1

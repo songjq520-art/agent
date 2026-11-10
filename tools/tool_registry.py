@@ -19,7 +19,12 @@
 #   tier2：是不是第二级禁令里的操作（True = 永远不许执行，
 #     哪怕 BOOS 点了确认也不行；见 tools/permissions.py）；
 #   replay_safe：重复执行同一份参数安不安全（True = 查天气这类只读操作，
-#     确认超时重跑也没事；False = 写文件这类，重复跑会重复写）；
+#     确认超时重跑也没事；False = 写文件这类，重复跑会重复写）。
+#     重复执行规则（网关按这个拦，见 tools/tool_gateway.py 的 can_replay）：
+#     同一条工具调用（同一个 tool_call_id）执行过一次后，模型又发同一条
+#     调用时，True 的允许再执行一次，False 的直接拒绝、不执行；
+#     恢复/续跑时一律喂存下来的结果，不重执行——这条规则是真的关口，
+#     不是只登记不用的摆设（见 tools/agent_loop.py 的 _execute_one）。
 #   timeout：执行超时秒数（默认 60 秒，见 tools/commands.py）；
 #   func：真正干活的函数，签名 func(args: dict) -> dict，
 #     返回 {"ok": True/False, "data": ..., "error": ...}。

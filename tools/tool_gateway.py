@@ -2,6 +2,10 @@
 # 作用：模型调工具的唯一入口。所有工具调用都走这里，不走直通车。
 # 原理：按顺序过六道关——登记检查 → 参数校验 → 权限检查 →
 #       确认检查 → 执行 → 结果格式检查；每一步的结果都记审计日志。
+#       执行那关按登记的 timeout 真掐表（线程跑、超时按失败返回，
+#       见 _run_with_timeout）；重复执行按登记的 replay_safe 拦
+#       （见 can_replay：只读的能重跑，会改东西的执行过一次就绝不
+#       再执行，恢复时一律喂存下来的结果）。
 #       预算不由网关拦：工具执行本身不直接花钱，花的钱是模型每一轮
 #       的调用费，已经在 providers 里按账本记了（工具循环传
 #       ledger="tool"）；网关只负责“该不该跑、跑没跑成”，绝不因为
@@ -17,6 +21,8 @@
 #       BOOS 点了确认后，resolve_approval() 用 TaskStore.cas 原子抢占，
 #       只执行存着的那份参数——页面新传来的参数一律不认，
 #       这样中途改参数、重复点确认都执行不了第二次。
+
+import threading
 
 from tasks.task_store import approval_expired, approval_sha256, make_approval
 from tools.audit import AuditLog
@@ -41,8 +47,8 @@ def _check_value(value, schema, where):
     minLength / maxLength、minItems / maxItems、required（对象内）、
     properties（对象内，未知字段直接报错，模型不能自造参数）。
     注意：JSON 里的 true/false 在 Python 里是 bool 的实例，
-    而 bool 又是 int 的子类——校验 integer 时要先把 bool 排除掉，
-    不然 True 会被当成整数 1 蒙混过去。
+    而 bool 又是 int 的子类——校验 integer 和 number 时都要先把
+    bool 排除掉，不然 True 会被当成整数 1（或数字 1.0）蒙混过去。
     """
     expected = schema.get("type")
     if expected:
@@ -51,6 +57,8 @@ def _check_value(value, schema, where):
             return f"{where} 的类型 {expected!r} 不支持校验"
         if expected == "integer" and isinstance(value, bool):
             return f"{where} 应为整数，不能是 true/false"
+        if expected == "number" and isinstance(value, bool):
+            return f"{where} 应为数字，不能是 true/false"
         if not isinstance(value, python_type):
             return f"{where} 应为 {expected}，实际是 {type(value).__name__}"
     if "enum" in schema and value not in schema["enum"]:
@@ -110,6 +118,42 @@ def _validate_result_envelope(result, tool_name):
     return ""
 
 
+def _run_with_timeout(func, args, timeout):
+    """按登记的超时秒数跑一次工具函数：线程跑、主线程等 timeout 秒。
+
+    超时按执行失败返回（调用方按 ok=False 处理，不抛异常）；
+    线程是 daemon：超时的线程杀不掉，会在后台跑完自己结束，
+    但循环不等它——Windows 上 signal 那套行不通，所以用线程，
+    笔记本和 Linux 都能跑。timeout 不是正数时按 60 秒算。
+    工具函数自己抛的错原样抛出去，由调用方按执行失败记。"""
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        timeout = 60.0
+    if timeout <= 0:
+        timeout = 60.0
+    box = {}
+
+    def _target():
+        try:
+            box["result"] = func(args)
+        except Exception as exc:  # noqa: BLE001 - 记下来由主线程处理
+            box["error"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return {
+            "ok": False,
+            "data": None,
+            "error": f"工具执行超时（超过 {timeout:g} 秒还没返回），按失败处理。",
+        }
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
 class ToolGateway:
     """工具网关：模型调工具的唯一入口。
 
@@ -119,6 +163,20 @@ class ToolGateway:
 
     def __init__(self, audit_log=None):
         self.audit_log = audit_log or AuditLog(_default_audit_path())
+
+    def can_replay(self, tool_name):
+        """这工具能不能重复执行同一份参数（登记的 replay_safe）。
+
+        重复执行规则：只读操作（replay_safe=True，如搜索）可以再执行一次；
+        会改东西的操作（replay_safe=False，如写文件）执行过一次就绝不
+        再执行——恢复/续跑时模型又发同一条调用（同一个 tool_call_id），
+        循环直接拒绝，不执行（见 tools/agent_loop.py 的 _execute_one）。
+        恢复时一律喂存下来的结果，不重执行。没登记的工具一律按不能
+        重跑处理（宁可不跑，不可错跑）。"""
+        tool = get_tool(tool_name)
+        if tool is None:
+            return False
+        return bool(tool.get("replay_safe", False))
 
     # ---------- 执行入口 ----------
 
@@ -181,10 +239,11 @@ class ToolGateway:
                 "approval": approval,
             }
 
-        # 第 5 关：执行。工具函数自己抛错也算执行失败（返回 ok=False），
-        #   不把异常抛回循环——循环靠 ok=False 计数、做重复失败停表。
+        # 第 5 关：执行。按登记的 timeout 真掐表跑（见 _run_with_timeout），
+        #   超时按执行失败返回，不把异常抛回循环——循环靠 ok=False 计数、
+        #   做重复失败停表。工具函数自己抛错也一样算执行失败。
         try:
-            result = tool["func"](args)
+            result = _run_with_timeout(tool["func"], args, tool.get("timeout", 60))
         except Exception as exc:  # noqa: BLE001 - 工具内部错统一记成失败
             reason = f"工具 {tool_name} 执行时出错：{exc}"
             self._audit(tool_name, "execute", False, reason, extra)
