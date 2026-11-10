@@ -9,6 +9,8 @@ from memory.mem0_store import (
     _detect_identity_statement,
     _filter_extraction_messages,
     _is_bare_retraction,
+    _is_joke_or_exaggeration,
+    _strip_correction_sentences,
 )
 from conftest import make_fake_store
 
@@ -234,6 +236,105 @@ def test_filter_extraction_messages_drops_conditionals_and_identity():
     assert user_texts == ["我喜欢喝咖啡。"]
     assert not any("英国" in text for text in user_texts)
     assert not any("小宋" in text for text in user_texts)
+
+
+# ---------- 1 号：玩笑/夸张的代码兜底 ----------
+
+
+def test_joke_or_exaggeration_gate():
+    """1 号：代码兜底只认最稳的三类——明确玩笑标记、年龄超 120、
+    身高超 3 米；没超线的正常话不拦。"""
+    assert _is_joke_or_exaggeration("我开玩笑的") is True
+    assert _is_joke_or_exaggeration("逗你玩呢") is True
+    assert _is_joke_or_exaggeration("我一百五十岁了") is True
+    assert _is_joke_or_exaggeration("我 150 岁了") is True
+    assert _is_joke_or_exaggeration("身高 3.5 米") is True
+    assert _is_joke_or_exaggeration("我 3.5 米高") is True
+    assert _is_joke_or_exaggeration("我一百岁了") is False  # 100 岁不拦
+    assert _is_joke_or_exaggeration("我今年三十岁") is False
+    assert _is_joke_or_exaggeration("姚明 2.26 米") is False
+    assert _is_joke_or_exaggeration("我 100 米跑了 10 秒") is False  # 跑步距离不是身高
+    assert _is_joke_or_exaggeration("我喜欢开玩笑") is False  # 真偏好不拦
+    assert _is_joke_or_exaggeration("我喜欢喝咖啡") is False
+
+
+def test_filter_extraction_messages_drops_jokes_and_exaggerations():
+    """1 号：闸门 1 拦住玩笑句和夸张句，真事实留下来。"""
+    filtered = _filter_extraction_messages(
+        [
+            {"role": "user", "content": "我开玩笑的，我一百岁了。我今年一百五十岁了。我喜欢喝咖啡。"},
+            {"role": "assistant", "content": "好的。"},
+        ]
+    )
+    user_texts = [m["content"] for m in filtered if m["role"] == "user"]
+    assert user_texts == ["我喜欢喝咖啡。"]
+
+
+def test_joke_marker_sentence_not_stored(tmp_path):
+    """1 号：带玩笑标记的句子整句不进提取——假提取本来会存
+    “我是开玩笑的，我一百岁了”（以“我是”开头），闸门拦住后不存；
+    同一轮的真事实照常存。"""
+    store = make_fake_store(tmp_path)
+    store.add_turn([{"role": "user", "content": "我是开玩笑的，我一百岁了。我喜欢喝咖啡。"}])
+    store.add_turn([{"role": "user", "content": "今天天气真好。"}])
+    texts = store._memory.all_texts()
+    assert not any("一百岁" in t for t in texts)
+    assert not any("开玩笑" in t for t in texts)
+    assert any("我喜欢喝咖啡" in t for t in texts)
+
+
+def test_joke_rename_not_stored(tmp_path):
+    """1 号：玩笑里的改名不当真——“开玩笑的，你叫十三”不改名，
+    名字还是十二。"""
+    store = make_fake_store(tmp_path)
+    store.ensure_identity_memories()
+    store.add_turn([{"role": "user", "content": "开玩笑的，你叫十三。"}])
+    store.flush_pending()
+    name_texts = [t for t in store._memory.all_texts() if "Agent 的名字是" in t]
+    assert len(name_texts) == 1
+    assert "十二" in name_texts[0]
+
+
+# ---------- 2 号：纠正轮里别的句子不丢 ----------
+
+
+def test_correction_turn_keeps_other_sentences(tmp_path):
+    """2 号：纠正那一轮里别的句子不丢——“不对，你叫十三。我喜欢喝咖啡。”
+    纠正生效（名字改成十三），同一轮的“我喜欢喝咖啡”也进了待定区、
+    下一轮正常存下来了；纠错句本身没被当成新记忆重复存。"""
+    store = make_fake_store(tmp_path)
+    store.ensure_identity_memories()
+    result = store.add_turn(
+        [
+            {"role": "user", "content": "不对，你叫十三。我喜欢喝咖啡。"},
+            {"role": "assistant", "content": "好的，我叫十三。"},
+        ]
+    )
+    assert result["correction"]["status"] == "updated"
+    # 纠正那轮还没提交：偏好还在待定区，库里只有改过的新名字。
+    assert any("十三" in t for t in store._memory.all_texts())
+    assert not any("喝咖啡" in t for t in store._memory.all_texts())
+    # 下一轮来了，待定区提交，偏好也存下来了。
+    store.add_turn([{"role": "user", "content": "今天天气真好。"}])
+    assert any("我喜欢喝咖啡" in t for t in store._memory.all_texts())
+    # 纠错句本身没被当成新记忆重复存。
+    assert not any("不对" in t for t in store._memory.all_texts())
+
+
+def test_correction_turn_keeps_sentence_before_comma(tmp_path):
+    """2 号：纠错说法在句中时，说法前面的真话也留——
+    “我喜欢喝咖啡，你记错了，你叫十三”里留“我喜欢喝咖啡”。"""
+    assert _strip_correction_sentences("我喜欢喝咖啡，你记错了，你叫十三") == ["我喜欢喝咖啡"]
+    assert _strip_correction_sentences("不对，你叫十三。我喜欢喝咖啡。") == ["我喜欢喝咖啡"]
+    assert _strip_correction_sentences("不对，你叫十三。") == []
+    store = make_fake_store(tmp_path)
+    store.ensure_identity_memories()
+    result = store.add_turn(
+        [{"role": "user", "content": "我喜欢喝咖啡，你记错了，你叫十三。"}]
+    )
+    assert result["correction"]["status"] == "updated"
+    store.add_turn([{"role": "user", "content": "今天天气真好。"}])
+    assert any("我喜欢喝咖啡" in t for t in store._memory.all_texts())
 
 
 # ---------- 场景 4：纠正能覆盖旧值（同槽位 UPDATE，不并存） ----------

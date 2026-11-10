@@ -697,7 +697,8 @@ def _detect_correction(text):
     认法（保守，只认明确的）：
     - 说法必须在句首，或在句号/逗号/换行等分隔符之后；
     - “不对”后面必须是个边界（标点/语气词/人称），排除“不对劲”这种词；
-    - 新说法 = 说法后面的话，去掉开头的标点/空格；
+    - 新说法 = 说法后面那一句的话（到第一个句号为止），同一轮里
+      后面的句子是别的内容，不算进新说法里；
     - “我不是 X，Y”这种否定句式：Y 才是新说法——先看“而是/其实是”，
       没有就取第一个逗号后面的；两个都没有（比如“我不是很确定”）
       就不是纠错，返回 None；
@@ -751,6 +752,12 @@ def _detect_correction(text):
             else:
                 return None
     fact = fact.strip()
+    # 新说法只取纠错说法所在的那一句——同一轮里后面的句子是别的内容，
+    # 不该被纠正的新文本吞进去（2 号：不然“我喜欢喝咖啡”会被存进
+    # 名字记忆里，后面待定区提交时又存一条，重复且文本被污染）。
+    term = re.search(r"[。！？\n]", fact)
+    if term:
+        fact = fact[:term.end()].strip()
     # 新说法太短（去掉句末标点只剩一个字、或空）不算纠错，走正常保存。
     if len(fact.rstrip("。！？；，、.!?;,")) < 2:
         return None
@@ -768,6 +775,31 @@ def _latest_user_content(messages):
         if (message or {}).get("role") == "user":
             return (message or {}).get("content") or ""
     return ""
+
+
+def _strip_correction_sentences(latest_user):
+    """去掉纠错句，留非纠正部分（Plan C 2 号）。
+
+    一句一句看：含纠错说法的那句，只留说法前面的部分（有实质内容
+    才留，比如“我喜欢喝咖啡，你记错了，我叫小宋”里留“我喜欢喝咖啡”），
+    说法后面的新说法已由 correct_memory 处理，不再重复存；
+    没有纠错说法的句子原样留。
+    返回剩下的句子列表，没有剩下时返回 []。
+    """
+    kept = []
+    for sentence in re.split(r"[。！？\n]+", latest_user or ""):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        detected = _detect_correction(sentence)
+        if detected is None:
+            kept.append(sentence)
+            continue
+        before = sentence[:sentence.find(detected["phrase"])].strip()
+        before = before.strip("，,：:、；; \t")
+        if len(before) >= 2:
+            kept.append(before)
+    return kept
 
 
 # ---------- Plan C：记忆信任修复（2026-11-09，BOOS 批准动手） ----------
@@ -844,6 +876,33 @@ _RETRACTION_TRAILING_PUNCT = "。！？.!?~～ \t\n"
 # 条件句开头：不是既定事实，提取时整句去掉（和 FakeMemory 认同一套）。
 _CONDITIONAL_LEADS = ("如果", "假设", "假如", "要是", "万一")
 
+# 玩笑标记：句里出现这些词，这句就是在开玩笑/说着玩，不是既定事实
+# （Plan C 闸门 1 的代码兜底；提示词第 13 条仍在，模型判断是第一道，
+# 这里是第二道——模型哪天没拦住，代码拦）。
+# 写法收紧：只认带明确标记的说法——“我喜欢开玩笑”这种真偏好不带
+# 这些标记，不会被误拦。
+_JOKE_MARKERS = (
+    "开玩笑的", "开玩笑呢", "开玩笑了", "我开玩笑", "只是开玩笑",
+    "开个玩笑", "逗你玩", "闹着玩", "说着玩", "别当真",
+    "瞎说的", "胡说的",
+)
+
+# 明显不可能的数字（只认这两类最稳的，其余交给模型判断）：
+# - 年龄超过 120 岁（人类最长寿 122 岁，留一点余量）；
+# - 身高超过 3 米（人类最高 2.72 米）。
+_JOKE_AGE_LIMIT = 120
+_JOKE_HEIGHT_LIMIT_M = 3.0
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000}
+_AGE_RE = re.compile(r"([一二三四五六七八九十百千两\d]+)\s*岁")
+# 身高只认两种写法：“身高 3.5 米”“我 3.5 米高”——“我 100 米跑”
+# 这种跑步距离不认（“米”后面没有“高”，也不是“身高”开头）。
+_HEIGHT_RE = re.compile(
+    r"(?:身高\s*([一二三四五六七八九十百千两\d]+(?:\.\d+)?)\s*米"
+    r"|我\s*([一二三四五六七八九十百千两\d]+(?:\.\d+)?)\s*米高)"
+)
+
 # 身份陈述的触发词：按“先 user、后 agent”试——“你叫我小宋”里的
 # “你叫”是叫“我”，不是在给 Agent 起名；每组内按触发词从长到短试。
 _IDENTITY_USER_TRIGGERS = ("我的名字是", "我的名字叫", "你叫我", "叫我", "我叫")
@@ -888,6 +947,9 @@ def _detect_identity_statement(sentence):
         return None
     if any(q in text for q in ("什么", "吗", "？", "?")):
         return None
+    if any(marker in text for marker in _JOKE_MARKERS):
+        # 玩笑里的起名不当真（“开玩笑的，你叫十三”不是在改名）。
+        return None
     for triggers, slot in (
         (_IDENTITY_USER_TRIGGERS, SLOT_USER_NAME),
         (_IDENTITY_AGENT_TRIGGERS, SLOT_AGENT_NAME),
@@ -916,14 +978,84 @@ def _detect_identity_statement(sentence):
     return None
 
 
+def _parse_chinese_number(text):
+    """把“十/百/千”组合的中文数字转成整数（只做年龄、身高这点小事）。
+
+    一百五十 → 150，二十 → 20，一千二百三十四 → 1234。
+    认不出来（混了阿拉伯数字、带“点”这种）返回 None，不猜。
+    """
+    if not text or not all(ch in _CN_DIGITS or ch in _CN_UNITS for ch in text):
+        return None
+    total = 0
+    current = 0
+    seen_unit = False
+    for ch in text:
+        if ch in _CN_DIGITS:
+            current = _CN_DIGITS[ch]
+        else:
+            unit = _CN_UNITS[ch]
+            if current == 0:
+                current = 1  # “十”就是 10，“百”就是 100
+            total += current * unit
+            current = 0
+            seen_unit = True
+    total += current
+    if not seen_unit and total == 0:
+        return None
+    return total
+
+
+def _is_joke_or_exaggeration(sentence):
+    """Plan C 闸门 1 的代码兜底：明显是玩笑/夸张的句子返回 True。
+
+    只认最稳的三类，其余交给提示词第 13 条（模型判断）：
+    - 句里带明确玩笑标记（开玩笑的/逗你玩/闹着玩/说着玩/别当真/
+      瞎说的/胡说的）——整句当玩笑处理，连着的真话也一起去掉，
+      宁可漏记一句（用户会再说），不把玩笑存成事实；
+    - 年龄超过 120 岁（阿拉伯数字或中文数字，如 150 岁/一百五十岁）；
+    - 身高超过 3 米（身高 3.5 米/我 3.5 米高）。
+    “我一百岁了”（100 岁）、“姚明 2.26 米”这种没超线的正常话不拦。
+    """
+    if not isinstance(sentence, str) or not sentence:
+        return False
+    if any(marker in sentence for marker in _JOKE_MARKERS):
+        return True
+    age_match = _AGE_RE.search(sentence)
+    if age_match:
+        raw = age_match.group(1)
+        age = int(raw) if raw.isdigit() else _parse_chinese_number(raw)
+        if age is not None and age > _JOKE_AGE_LIMIT:
+            return True
+    height_match = _HEIGHT_RE.search(sentence)
+    if height_match:
+        raw = height_match.group(1) or height_match.group(2)
+        if raw is None:
+            return False
+        if "." in raw:
+            try:
+                height = float(raw)
+            except ValueError:
+                height = None
+        elif raw.isdigit():
+            height = float(raw)
+        else:
+            parsed = _parse_chinese_number(raw)
+            height = float(parsed) if parsed is not None else None
+        if height is not None and height > _JOKE_HEIGHT_LIMIT_M:
+            return True
+    return False
+
+
 def _filter_extraction_messages(messages):
     """Plan C 闸门 1：从待提交的对话里去掉不该进提取的东西，
     返回过滤后的消息列表（assistant 的话原样透传，只当提取上下文）。
 
-    去掉两类 user 句子：
+    去掉三类 user 句子：
     - 条件/假设句开头的（如果/假设/假如/要是/万一）——不是既定事实；
     - 身份/称呼陈述句——身份事实只走确定性的槽位路径
-      （_upsert_slot_memory），不经过模型提取，避免同一事实存两份。
+      （_upsert_slot_memory），不经过模型提取，避免同一事实存两份；
+    - 玩笑/夸张句（_is_joke_or_exaggeration）——明确玩笑标记、
+      年龄超 120 岁、身高超 3 米；其余玩笑仍靠提示词第 13 条拦。
     一条 user 消息里句子全被去掉时，整条消息不要了。
     """
     kept = []
@@ -943,6 +1075,8 @@ def _filter_extraction_messages(messages):
             if sentence.startswith(_CONDITIONAL_LEADS):
                 continue
             if _detect_identity_statement(sentence) is not None:
+                continue
+            if _is_joke_or_exaggeration(sentence):
                 continue
             kept_sentences.append(sentence)
         if kept_sentences:
@@ -1973,6 +2107,32 @@ class Mem0Store:
                 }
         return outcomes
 
+    def _pend_correction_remainder(self, safe_messages, latest_user):
+        """纠正轮里非纠正部分的句子进待定区（Plan C 2 号）。
+
+        safe_messages 是本轮及最近几轮的完整消息；把其中最后一条
+        user 消息换成去掉纠错句后剩下的句子，其余原样保留，按正常
+        轮次放进待定区（下一轮提交）。没有剩下的句子时不放。
+        身份陈述也按正常轮次认（只在剩下的句子里认）。
+        """
+        kept = _strip_correction_sentences(latest_user)
+        if not kept:
+            return
+        remainder = "。".join(kept) + "。"
+        messages = [dict(m) for m in safe_messages]
+        for i in range(len(messages) - 1, -1, -1):
+            if (messages[i] or {}).get("role") == "user":
+                messages[i] = {"role": "user", "content": remainder}
+                break
+        else:
+            return
+        identity_items = []
+        for sentence in kept:
+            detected = _detect_identity_statement(sentence)
+            if detected is not None:
+                identity_items.append(detected)
+        self._pending_turn = {"messages": messages, "identity": identity_items}
+
     def add_turn(self, messages):
         """把本轮对话存进长期记忆（回答后调一次）。
 
@@ -2098,6 +2258,9 @@ class Mem0Store:
                 )
                 handled = self._handle_correction_outcome(outcome)
                 if handled is not None:
+                    # 2 号：纠正那一轮里别的句子别丢——去掉纠错句，
+                    # 剩下的按正常轮次进待定区，下一轮正常存。
+                    self._pend_correction_remainder(safe_messages, latest_user)
                     return handled
                 # not_found：库里没有冲突的旧记忆——新说法当成一条新记忆，
                 # 走正常提取保存（下面），结果里附上这次纠错的尝试记录。
