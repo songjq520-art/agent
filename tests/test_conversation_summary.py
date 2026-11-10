@@ -11,6 +11,7 @@
 import http.client
 import json
 import threading
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import pytest
@@ -376,6 +377,45 @@ def test_open_conversation_restores_summary_and_recent(tmp_path):
     # 正在聊的换成旧的了：提示块用的是旧对话的摘要。
     assert "广州天气" in store.prompt_block()
     assert store.open_conversation("不存在的id") is None
+
+
+def test_now_iso_strictly_increases_when_clock_frozen(tmp_path, monkeypatch):
+    """时钟钉死不动时，_now_iso() 每次发的仍严格递增（Windows 上粒度粗会撞时间）。"""
+    import memory.conversation_summary as cs
+
+    fixed = datetime(2026, 11, 10, 3, 0, 0, tzinfo=timezone.utc)
+
+    class FrozenClock:
+        @staticmethod
+        def now(tz=None):
+            return fixed
+
+    monkeypatch.setattr(cs, "datetime", FrozenClock)
+    monkeypatch.setattr(cs, "_NOW_LAST", None, raising=False)
+    values = [cs._now_iso() for _ in range(5)]
+    assert values == sorted(values)
+    assert len(set(values)) == len(values)
+
+
+def test_frozen_clock_still_orders_new_conversation_first(tmp_path, monkeypatch):
+    """时钟钉死不动（模拟 Windows 上两次读到同一个时间戳），新对话仍排列表第一。"""
+    import memory.conversation_summary as cs
+
+    fixed = datetime(2026, 11, 10, 3, 0, 0, tzinfo=timezone.utc)
+
+    class FrozenClock:
+        @staticmethod
+        def now(tz=None):
+            return fixed
+
+    monkeypatch.setattr(cs, "datetime", FrozenClock)
+    monkeypatch.setattr(cs, "_NOW_LAST", None, raising=False)
+    stub = StubSummarizer()
+    store = _store(tmp_path, summarizer=stub)
+    store.flush(_messages(2, topic="广州天气"))
+    store.begin_conversation()
+    store.sync(_messages(1, topic="改名十三"))
+    assert store.list_conversations()[0]["title"].startswith("改名十三")
 
 
 # ---------- 摘要器接线 ----------

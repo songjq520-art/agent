@@ -41,8 +41,9 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from memory.mem0_store import _redact_sensitive
@@ -84,9 +85,32 @@ def _is_cjk_char(ch):
     return "\u4e00" <= ch <= "\u9fff"
 
 
+# _NOW_LOCK / _NOW_LAST：保证 _now_iso() 发出的时间戳严格递增。
+# Windows 上时钟粒度粗，两次连着调用会读出同一个时间戳；“最近”列表
+# 按 updated_at 排序，时间一撞就分不出新旧（BOOS 笔记本上跑全套时
+# 就撞上过一次，旧对话留在列表前面）。每次发值时如果新值 <= 上一次
+# 发的值，就在上一次的值上加 1 微秒再发。格式不变，还是 UTC ISO 带 Z。
+# 时钟往回调也不会乱：每次只比上一次大 1 微秒，墙上时间追上来就恢复正常。
+# web server 是多线程的，读-改-写上锁，别让两个线程同时拿到同一个值。
+_NOW_LOCK = threading.Lock()
+_NOW_LAST = None
+
+
 def _now_iso():
-    """现在时间的 UTC ISO 串（带 Z），存进文件、前端按 Asia/Shanghai 显示。"""
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    """现在时间的 UTC ISO 串（带 Z），存进文件、前端按 Asia/Shanghai 显示。
+
+    小数部分固定 6 位：isoformat() 默认会省略微秒为 0 时的小数点，
+    '...T03:00:00Z' 按字符串排会比 '...T03:00:00.000001Z' 大——
+    字符串顺序就和时间顺序反了，“最近”列表按 updated_at 字符串
+    排序会排错。固定 6 位后，字符串顺序就是时间顺序。
+    """
+    global _NOW_LAST
+    now = datetime.now(timezone.utc)
+    with _NOW_LOCK:
+        if _NOW_LAST is not None and now <= _NOW_LAST:
+            now = _NOW_LAST + timedelta(microseconds=1)
+        _NOW_LAST = now
+    return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def estimate_tokens(text):
