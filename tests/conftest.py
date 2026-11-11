@@ -87,6 +87,16 @@ class FakeMemory:
         self._next_id = 1
         self.add_calls = []  # 每次 add() 的 (messages, user_id, infer)
         self.update_calls = []  # 每次 update() 的 (memory_id, text, metadata) 记录
+        # 失败注入（测试专用，默认全关着，生产代码不依赖它们）：
+        # get_all_failures：排队等着的结果，get_all 每调一次就从队头
+        #   拿一个：None 表示这次正常返回，异常对象表示这次抛出来——
+        #   模拟库读不出来（快照重试、快照失败的测试用；要排出“第一
+        #   次成功、第二次失败”这种顺序时就放 [None, 异常]）。
+        # fail_update_ids：update 时指定 id 且带了 metadata 就抛错——
+        #   模拟恢复写不进去。只拦带 metadata 的：恢复和打标记都带
+        #   metadata，捣乱假对象改旧记忆时不带 metadata，不受影响。
+        self.get_all_failures = []
+        self.fail_update_ids = set()
 
     # ---------- 内部工具 ----------
 
@@ -187,8 +197,17 @@ class FakeMemory:
             return {"results": scored[:top_k]}
 
     def get_all(self, filters=None):
-        """返回全部已存记忆（id + 文本 + metadata）。"""
+        """返回全部已存记忆（id + 文本 + metadata）。
+
+        get_all_failures 里排着结果时，先按顺序拿一个：None 表示
+        这次正常返回，异常对象表示这次抛出来（模拟库读不出来）。
+        队空了就正常返回。
+        """
         with self._lock:
+            if self.get_all_failures:
+                outcome = self.get_all_failures.pop(0)
+                if outcome is not None:
+                    raise outcome
             return {
                 "results": [
                     {
@@ -210,6 +229,10 @@ class FakeMemory:
         """
         with self._lock:
             self.update_calls.append((memory_id, text, metadata))
+            if metadata is not None and memory_id in self.fail_update_ids:
+                # 测试注入的失败：模拟恢复写不进去（守卫恢复、打标记
+                # 都带 metadata；捣乱假对象改旧记忆时不带，不受影响）。
+                raise RuntimeError("update 写不进去（测试注入的失败）。")
             for item in self._items:
                 if item["id"] == memory_id:
                     old_text = item["memory"]
@@ -274,20 +297,24 @@ class FakeMemory:
             return [item["memory"] for item in self._items]
 
 
-def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4):
+def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4, memory=None):
     """造一个注了 FakeMemory 的 Mem0Store（离线测试用）。
 
     Mem0Store 注入 memory 时跳过版本校验和真实构建，所以 tmp_path
     随便给也行；没传时用系统临时目录。返回的 store 和真实 Mem0Store
     同一个类，只是底下的 memory 是假的，行为（阈值过滤、关键词补充、
     写锁、迁移、删除两道关）走的都是真实代码。
+    memory 不传时用 FakeMemory；想换个行为的假对象（比如
+    test_memory_timestamp.py 里会改旧记忆的 MutatingFakeMemory）
+    就传进来。
     """
     base = Path(tmp_path) if tmp_path is not None else Path(tempfile.mkdtemp())
     return Mem0Store(
-        memory=FakeMemory(),
+        memory=memory if memory is not None else FakeMemory(),
         chroma_path=base / "mem0_chroma",
         history_db_path=base / "history.db",
         version_path=base / "mem0_versions.json",
+        protection_events_path=base / "protection-events.jsonl",
         budget_tracker=budget_tracker,
         threshold=threshold,
     )
@@ -318,3 +345,13 @@ def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4):
 # 8. update / metadata 是假的“够测流程”的近似：真实 mem0 的 update
 #    会重新算向量、写 UPDATE 审计行，metadata 是随记忆一起存进 Chroma
 #    的；假对象只改内存里的文本和 metadata 字典，不算向量。
+# 9. add 从不改、删旧记忆：真实 mem0 2.2.1 读代码也是只插不改，但
+#    说明书写着 add 会决定增改删——守卫按快照恢复旧记忆的那条路，
+#    光用这个假对象测不到。所以 tests/test_memory_timestamp.py 里
+#    另有一个会捣乱的 MutatingFakeMemory（add 里改、删旧记忆），
+#    专门用来证明“万一 add 里动了旧记忆，守卫也能恢复回来”。
+# 10. 失败注入是测试专用的钩子，不是行为差异：get_all_failures
+#     （按顺序排好的结果：None 正常返回、异常对象抛出来，模拟库
+#     读不出来）、fail_update_ids（带 metadata 的 update 对指定 id
+#     抛错，模拟恢复写不进去）。真实 mem0 没有这两个东西，生产代
+#     码不依赖它们，只在测试里用。

@@ -11,12 +11,12 @@
 #       不调用模型、不产生费用，不要把它当成真实调用成功。
 #       有 Key 且用户确认后，才做真实调用。
 
+import json
 import logging
 import sys
 from pathlib import Path
 
 from config import (
-    MONTHLY_BUDGET_USD,
     BudgetTracker,
     get_api_key,
     get_model_status,
@@ -254,7 +254,129 @@ def _print_correction_result(saved):
     return correction
 
 
-def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None):
+def _print_protection_result(saved):
+    """把 add_turn 的保护失败结果用人话打印一行（只在保护失败时打印）。
+
+    参数 saved：add_turn 的返回字典；没保护失败时里面没有
+    "protection_failed" 键。保护失败就是快照读不出来、或旧记忆
+    没恢复回来——本轮要么没写记忆、要么回滚过，面板“保护记录”
+    里有详细账，这里只提醒 BOOS 一声。
+    """
+    if not (saved or {}).get("protection_failed"):
+        return
+    reason = (saved or {}).get("protection_reason") or ""
+    leftovers = (saved or {}).get("rollback_leftover_ids") or []
+    if reason == "snapshot_failed":
+        print("提醒：这次记忆没存上（提取前快照读不出来），面板“保护记录”里有账。")
+    elif reason == "restore_unverified":
+        if leftovers:
+            print(
+                "提醒：这次没法核对旧记忆有没有被改动，新存的记忆里还有 %d 条没删掉"
+                "（仍在库里），面板“保护记录”里有账，去看一眼。" % len(leftovers)
+            )
+        else:
+            print("提醒：这次没法核对旧记忆有没有被改动，新存的记忆已删掉回滚，面板“保护记录”里有账。")
+    elif reason == "restore_partial":
+        if leftovers:
+            print(
+                "提醒：这次有旧记忆没恢复回来，相关的记忆里还有 %d 条没删掉"
+                "（仍在库里），面板“保护记录”里有账，去看一眼。" % len(leftovers)
+            )
+        else:
+            print("提醒：这次有旧记忆没恢复回来，相关的记忆已删掉回滚，面板“保护记录”里有账。")
+    else:
+        print("提醒：这次记忆保护失败了，面板“保护记录”里有账。")
+
+
+def _cli_confirm_approval(approval):
+    """命令行下的工具确认：把要执行的工具、参数、风险说清楚，
+    等 BOOS 回 y/n。返回 True（确认）/ False（取消）。
+    只有命令行（chat_loop）用这个；网页走确认卡，不调这里。"""
+    print("\nAgent 想用工具，需要你确认：")
+    print(f"工具：{approval.get('tool')}")
+    print(f"参数：{json.dumps(approval.get('args') or {}, ensure_ascii=False)}")
+    print(f"风险：{approval.get('risk_level')}")
+    answer = input("确认执行吗？（y 确认，其他取消）").strip().lower()
+    return answer in ("y", "yes", "确认")
+
+
+def _run_deepseek_with_tools(prompt, original_prompt, model_prompt, provider,
+                             tool_gateway=None, task_store=None,
+                             search_service=None, resume_task=None,
+                             pending_tool_result=None, user_declined=False,
+                             confirm_callback=None):
+    """DeepSeek 走工具循环的那条路（只给 run_question 用）。
+
+    返回 {"mode": "done", "result": {"text", "usage", "cost_usd", "model"}}
+    或 {"mode": "waiting_approval", "task", "approval", "cost_usd"}。
+    confirm_callback 不传时（网页），停在确认卡上就直接返回
+    waiting_approval，等 BOOS 点了卡再调 run_question 恢复；
+    传了时（命令行），当场问 BOOS，确认了就接着跑、取消了也接着跑
+    （模型按“用户没同意”继续答），直到答完或又停在下一张卡上。
+    确认后执行失败（比如超时、参数被改过）时直接抛 RuntimeError——
+    命令行当场问、当场确认，超时几乎不可能发生；真发生了就是内部
+    状态对不上，不能假装没事继续跑。
+    """
+    from tools.agent_loop import AgentLoop
+
+    loop = AgentLoop(
+        provider,
+        gateway=tool_gateway,
+        task_store=task_store,
+        search_service=search_service,
+    )
+    if resume_task is not None:
+        outcome = loop.run(
+            prompt,
+            resume_task=resume_task,
+            pending_tool_result=pending_tool_result,
+            user_declined=user_declined,
+        )
+    else:
+        outcome = loop.run(model_prompt, goal=original_prompt)
+    while outcome["mode"] == "waiting_approval":
+        if confirm_callback is None:
+            return outcome
+        approval = outcome["approval"]
+        task = outcome["task"]
+        if confirm_callback(approval):
+            resolved = loop.gateway.resolve_approval(
+                loop.task_store, task["task_id"], approval["approval_id"], "confirm"
+            )
+            if resolved["decision"] != "ok":
+                raise RuntimeError(f"确认后执行失败：{resolved['reason']}")
+            outcome = loop.run(
+                prompt,
+                resume_task=resolved["task"],
+                pending_tool_result=resolved["result"],
+            )
+        else:
+            resolved = loop.gateway.resolve_approval(
+                loop.task_store, task["task_id"], approval["approval_id"], "cancel"
+            )
+            if resolved["decision"] != "cancelled":
+                raise RuntimeError(f"取消确认失败：{resolved['reason']}")
+            outcome = loop.run(
+                prompt,
+                resume_task=resolved["task"],
+                user_declined=True,
+            )
+    cost_usd = outcome.get("cost_usd")
+    if outcome.get("cost_unknown"):
+        # 有调用没返回 usage：合计不完整，别当精确数报。
+        cost_usd = None
+    return {
+        "mode": "done",
+        "result": {
+            "text": outcome["reply"],
+            "usage": None,
+            "cost_usd": cost_usd,
+            "model": provider.model,
+        },
+    }
+
+
+def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, resume_task=None, pending_tool_result=None, user_declined=False, original_prompt=None, confirm_callback=None):
     """跑一次普通问答任务（最简单的运行示例）.
 
     参数 prompt：用户的问题；task_type：任务类型，默认 "question"。
@@ -274,16 +396,44 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     不带摘要；传了且有摘要时，提问前把“之前对话的摘要”拼进发给模型
     的问题里（历史里仍记原话，摘要只当上下文）；摘要是对话记录、
     不是事实，绝不喂给 mem0 提取（add_turn 只拿 messages 和原话）。
+    参数 tool_gateway / task_store / search_service：工具循环用的网关、
+    任务存储、搜索服务（见 tools/agent_loop.py），不传时循环自己新建；
+    测试时传假的进来。参数 resume_task：恢复一个停在确认卡上的任务时
+    传存着的任务记录（恢复时不再重新检索记忆，记忆提示块已经在存着的
+    消息里了）；参数 pending_tool_result：确认后执行完的工具结果；
+    参数 user_declined：BOOS 取消了那次工具调用时传 True。
+    参数 original_prompt：BOOS 的原话（网页调用时传，run_question 收到
+    的 prompt 已经是拼了记忆提示块的 model_prompt，原话要另外传）；
+    不传时就用 prompt 当原话。任务记录里的 goal 和存记忆的收尾
+    都只拿原话，不拿拼了提示块的那份。
+    参数 confirm_callback：命令行下用的确认函数，收到 approval 字典
+    返回 True（确认）/ False（取消）；网页不传——网页要先把确认卡
+    推给 BOOS，等他点了再调 run_question 恢复。
     返回：字典，含 mode（模式）、route（路由结果）、result（模型结果或 None）、message（提示）。
     模式：
       - "demo"（演示模式）：无 Key，只演示配置 + 路由，不调用模型；
       - "real"（真实模式）：有 Key，真实调用对应模型的 API（默认 DeepSeek）。
+      - "waiting_approval"（等确认）：DeepSeek 的工具循环停在确认卡上，
+        任务已存盘，result 为 None，另带 task（任务记录）和 approval
+        （确认记录：approval_id、工具名、参数、风险、过期时间）；
+        调用方不要把本轮写进历史和记忆，等确认结果回来恢复再说。
     注意：本函数不修改传入的 messages 列表；调用方在成功拿到回答后，
     再把本轮 user 问题和 assistant 回答追加进历史。
+    DeepSeek 走工具循环（tools/agent_loop.py）：需要查实时信息的问题
+    先调搜索工具再回答，每轮最多 5 次工具调用；Muse 还是老路
+    （没有 chat_with_tools）。工具中间结果绝不进网页历史和长期记忆，
+    只有 BOOS 的原话和最后的回答才存（收尾的 add_turn 只拿原话 + 回答）。
     """
     tracker = budget_tracker or BudgetTracker()
     status = get_model_status()
     routing = route(prompt, task_type)
+    # 恢复确认卡上的任务时，路由必须还是 DeepSeek：任务锁定的是
+    # DeepSeek 的工具循环，路由给了别的模型就没法接着跑（Muse 没有
+    # 工具循环，恢复用的 pending_tool_result 会被悄悄丢掉）。
+    if resume_task is not None and routing["provider"] != "deepseek":
+        raise RuntimeError(
+            "恢复的任务是 DeepSeek 的工具任务，路由却给了别的模型，不能接着跑。"
+        )
 
     # 预算文件损坏时明确提示：原文件已保留、未被覆盖，人工修复后才能恢复。
     if getattr(tracker, "corrupted", False):
@@ -320,10 +470,12 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             "model_status": status,
         }
 
-    # 有 Key：真实调用。先找相关记忆，拼进发给模型的问题里（历史里仍记原话，
+    # 有 Key：真实调用。恢复确认卡上的任务时不再重新检索记忆和摘要：
+    # 记忆提示块和摘要已经在存着的循环消息里了，再拼一份会重复。
+    # 先找相关记忆，拼进发给模型的问题里（历史里仍记原话，
     # 这里只改发给模型的那一份）；找不到记忆时原样提问，不注入近似记忆。
     model_prompt = prompt
-    if mem0_store is not None:
+    if mem0_store is not None and resume_task is None:
         try:
             memories = mem0_store.search(prompt, top_k=5)
             # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
@@ -338,7 +490,8 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             model_prompt = block + "\n\n" + prompt
     # 对话摘要：有摘要时拼在最前面当上下文（新对话读回上一段对话的摘要，
     # 靠的就是这一块）；摘要只进发给模型的问题，不进历史、不进 mem0。
-    if summary_store is not None:
+    # 恢复任务时不拼（摘要已经在存着的循环消息里了）。
+    if summary_store is not None and resume_task is None:
         try:
             summary_text = summary_store.prompt_block()
         except Exception:
@@ -352,7 +505,37 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     provider_cls = PROVIDER_CLASSES[routing["provider"]]
     provider = provider_cls(api_key=api_key, budget_tracker=tracker, model=routing["model"])
     try:
-        if messages is None:
+        if routing["provider"] == "deepseek":
+            # DeepSeek 走工具循环（见 tools/agent_loop.py）：需要查实时信息
+            # 的问题先调搜索工具再回答；Muse 还是老路（没有 chat_with_tools）。
+            # 循环停在确认卡上时，这里直接返回 waiting_approval（不进下面
+            # 的收尾：本轮还没答完，不写历史、不存记忆）。
+            tools_outcome = _run_deepseek_with_tools(
+                prompt=prompt,
+                original_prompt=original_prompt or prompt,
+                model_prompt=model_prompt,
+                provider=provider,
+                tool_gateway=tool_gateway,
+                task_store=task_store,
+                search_service=search_service,
+                resume_task=resume_task,
+                pending_tool_result=pending_tool_result,
+                user_declined=user_declined,
+                confirm_callback=confirm_callback,
+            )
+            if tools_outcome["mode"] == "waiting_approval":
+                return {
+                    "mode": "waiting_approval",
+                    "route": routing,
+                    "result": None,
+                    "message": "等 BOOS 确认工具调用。",
+                    "model_status": status,
+                    "task": tools_outcome["task"],
+                    "approval": tools_outcome["approval"],
+                    "cost_usd": tools_outcome.get("cost_usd"),
+                }
+            result = tools_outcome["result"]
+        elif messages is None:
             # 单次问答：只发本轮问题（带记忆提示）。
             result = provider.chat(model_prompt)
         else:
@@ -387,15 +570,18 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # BOOS（见 _print_correction_result），并放进返回里供调用方看。
     correction = None
     if mem0_store is not None:
+        # 收尾只存 BOOS 的原话 + 最后的回答：记忆提示块、摘要、
+        # 工具中间结果都不进长期记忆。
         recent = (
             list(messages or [])
             + [
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": original_prompt or prompt},
                 {"role": "assistant", "content": result["text"]},
             ]
         )[-6:]
         saved = mem0_store.add_turn(recent)
         correction = _print_correction_result(saved)
+        _print_protection_result(saved)
         # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
         # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
         if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
@@ -444,7 +630,7 @@ def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
     messages = []
     print("=== 个人多模型 Agent（连续对话）===")
     print(f"模型状态：{get_model_status()}")
-    print(f"每月预算：${MONTHLY_BUDGET_USD:.2f}，到 $5（100%）时提醒，不自动停")
+    print("每月预算：工具调用 ¥33.35（$5），到 5 美元提醒一次，永不自动停；平时聊天只记账、不设限")
     print("输入问题开始对话，输入 exit、quit 或 退出 结束。")
     if mem0_store is None:
         print("提示：记忆未启用（未配置 DEEPSEEK_API_KEY 或未安装 mem0），本次对话不会被记住。")
@@ -469,7 +655,7 @@ def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
             handle_remember(tracker, prompt)
             continue
         try:
-            outcome = run_question(prompt, budget_tracker=tracker, messages=messages, mem0_store=mem0_store, summary_store=summary_store)
+            outcome = run_question(prompt, budget_tracker=tracker, messages=messages, mem0_store=mem0_store, summary_store=summary_store, confirm_callback=_cli_confirm_approval)
         except RuntimeError as exc:
             # 调用失败：历史不动，继续等下一句，不伪造回答。
             print(f"调用失败：{exc}")
@@ -477,6 +663,11 @@ def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
         if outcome["mode"] == "demo":
             # 演示模式：未调用模型，没有回答可追加，历史不动。
             print("（演示模式，未调用模型）")
+            continue
+        if outcome["mode"] == "waiting_approval":
+            # 命令行下确认是当场问的（confirm_callback），正常走不到这里；
+            # 万一走到了，说明确认没完成，本轮不写历史、不存记忆。
+            print("（工具调用在等确认，本轮还没答完）")
             continue
         result = outcome["result"]
         # 成功拿到回答后，再把本轮 user 问题和 assistant 回答追加进历史。
@@ -563,14 +754,17 @@ def main(argv=None, mem0_store=None):
 
     print("=== 个人多模型 Agent（最小骨架）===")
     print(f"模型状态：{get_model_status()}")
-    print(f"每月预算：${MONTHLY_BUDGET_USD:.2f}，到 $5（100%）时提醒，不自动停")
+    print("每月预算：工具调用 ¥33.35（$5），到 5 美元提醒一次，永不自动停；平时聊天只记账、不设限")
 
     # 单次问答：不传记忆库时不自动加载 mem0。
+    # 确认走命令行当场问（和 chat_loop 一样），不然停在确认卡上时
+    # 下面 result 是 None 会报错。
     try:
         outcome = run_question(
             prompt,
             mem0_store=mem0_store,
             summary_store=_default_summary_store(),
+            confirm_callback=_cli_confirm_approval,
         )
     except RuntimeError as exc:
         print(f"调用失败：{exc}")
@@ -579,6 +773,10 @@ def main(argv=None, mem0_store=None):
     print(f"任务类型：{outcome['route']['task_type']}，交给模型：{outcome['route']['model']}")
     if outcome["mode"] == "demo":
         print("（演示模式，未调用模型）")
+    elif outcome["mode"] == "waiting_approval":
+        # 有确认回调时正常走不到这里；万一走到了，说明确认没完成，
+        # 任务已存盘，请去网页确认，本次不算答完。
+        print("（工具调用在等确认，本轮还没答完，任务已存盘，请去网页确认。）")
     else:
         result = outcome["result"]
         print(f"\n--- {result['model']} 的回答 ---")

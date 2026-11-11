@@ -13,6 +13,14 @@
 #       里提取的）、created_at（形成时间）、confidence（可信度）、
 #       user_confirmed（BOOS 是否逐条确认过）。没有 metadata 的旧记忆，
 #       取回时一律按“未确认”处理，绝不默认当成已确认的事实（安全降级）。
+#       时间戳（第一步，2026-11-10）：created_at 是微秒级、严格单调递增
+#       的 UTC ISO 时间串（带 Z），同一批写进去的几条各拿一个 write_seq
+#       序号分先后；created_at_source 说明这个时间是哪来的
+#       （written：这次写进去的；backfilled：老记忆后补的；
+#       migrated：迁移时沿用的旧日期）。覆盖规则：时间戳决定新旧，
+#       来源可信度决定有没有资格覆盖——低可信度的新记忆不能直接覆盖
+#       高可信度的旧事实，改标 pending_confirmation（待确认）挂起来，
+#       只有真用上时才问 BOOS（见 _resolve_conflict、_apply_coverage_guard）。
 #       只有 user_confirmed=True 的记忆才能在回答里直接当作事实；
 #       inferred 的只能当背景参考；未确认的不能当作事实（见 main.py
 #       的 _memory_block，那里按来源给每条记忆打标签、分层）。
@@ -90,7 +98,7 @@ import sqlite3
 import threading
 import unicodedata
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger("agent")
@@ -287,7 +295,13 @@ def _today():
 #   source：记忆从哪来。"user"——BOOS 亲口说的/让记住的/亲口纠正的；
 #           "inferred"——DeepSeek 从对话里提取的（用户明确说过的话，
 #           但 BOOS 没逐条确认过那个写法）。
-#   created_at：记忆形成的时间（UTC 的 ISO 时间串，精确到秒）。
+#   created_at：记忆形成的时间（UTC 的 ISO 时间串，微秒级、严格单调递增，
+#           固定 6 位小数、带 Z——见 _now_iso）。
+#   write_seq：同一批写进去的序号（进程内严格递增，和 created_at 一起
+#           排新旧，见 _memory_order_key）。
+#   created_at_source：这个时间是哪来的——"written"（这次写进去的）、
+#           "backfilled"（老记忆后补的，见 backfill_timestamps）、
+#           "migrated"（迁移时沿用的旧日期，见 migrate_from_v1）。
 #   confidence：可信度 0–1。BOOS 亲口说的记 1.0；提取的记 0.7——
 #           不是因为提取得不准，而是因为“模型提的”本身就比“用户
 #           亲口确认的”低一档；模型用它来判断这条记忆有多可信。
@@ -304,13 +318,70 @@ SOURCE_UNCONFIRMED = "unconfirmed"
 CONFIDENCE_USER = 1.0
 CONFIDENCE_INFERRED = 0.7
 
+# 可信度分级（覆盖规则用，见 _resolve_conflict）：
+#   3 = BOOS 亲口确认的（source=user 且 user_confirmed=True）；
+#   2 = 来源是 user、但没逐条确认（旧数据损坏/写坏了才有，正常写不到）；
+#   1 = 模型从对话里提取的（inferred）；
+#   0 = 没来源信息的旧记忆（unconfirmed）。
+# 时间戳决定新旧，可信度决定有没有资格覆盖：级别低的新记忆不能
+# 直接覆盖级别高的旧事实。
+CREDIBILITY_CONFIRMED = 3
+CREDIBILITY_USER = 2
+CREDIBILITY_INFERRED = 1
+CREDIBILITY_UNCONFIRMED = 0
+
+# created_at 的合法来源（见 _provenance 的 created_at_source 参数）。
+CREATED_AT_SOURCES = ("written", "backfilled", "migrated")
+
+# _NOW_LOCK / _NOW_LAST：保证 _now_iso() 发出的时间戳严格递增。
+# 秒级精度时，两轮对话同一秒写进去，created_at 一撞就分不出新旧——
+# 和 conversation_summary 的 _now_iso 修过的是同一类问题（PR #13，
+# BOOS 笔记本上跑全套时撞上过一次）。这里不能直接 import 那边
+# （conversation_summary 反过来 import 本模块的 _redact_sensitive，
+# 循环了），所以同一套算法、各自一份状态，各管各的域。
+# 每次发值时如果新值 <= 上一次发的值，就在上一次的值上加 1 微秒再发。
+# 时钟往回调也不会乱：每次只比上一次大 1 微秒，墙上时间追上来就恢复正常。
+# 写记忆是多线程的（网页服务），读-改-写上锁，别让两个线程同时拿到同一个值。
+_NOW_LOCK = threading.Lock()
+_NOW_LAST = None
+
 
 def _now_iso():
-    """现在的时间，UTC 的 ISO 时间串（精确到秒），供 metadata 用。"""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    """现在的时间，UTC 的 ISO 时间串（固定 6 位微秒，带 Z），供 metadata 用。
+
+    小数部分固定 6 位：isoformat() 默认会省略微秒为 0 时的小数点，
+    '...T03:00:00Z' 按字符串排会比 '...T03:00:00.000001Z' 大——
+    字符串顺序就和时间顺序反了。固定 6 位后，字符串顺序就是时间顺序。
+    """
+    global _NOW_LAST
+    now = datetime.now(timezone.utc)
+    with _NOW_LOCK:
+        if _NOW_LAST is not None and now <= _NOW_LAST:
+            now = _NOW_LAST + timedelta(microseconds=1)
+        _NOW_LAST = now
+    return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _provenance(source, confidence, user_confirmed, created_at=None, slot=None):
+# _WRITE_SEQ_LOCK / _WRITE_SEQ：同一批写进去的序号（进程内严格递增）。
+# 同一批写进去的几条记忆，时间戳也可能撞在同一微秒——单调 +1 微秒能
+# 分开绝大多数，但序号是更稳的第二道：同一批里每条各拿一个号，先后
+# 一目了然。序号只管同一进程里的先后，跨进程重启从 0 再来——新旧判断
+# 先看 created_at，序号只是平局时的决胜（见 _memory_order_key）。
+# 真正的写操作本来就串在 _WRITE_LOCK 里，这里这把锁只是兜底。
+_WRITE_SEQ_LOCK = threading.Lock()
+_WRITE_SEQ = 0
+
+
+def _next_write_seq():
+    """下一条写入序号（进程内严格递增）。"""
+    global _WRITE_SEQ
+    with _WRITE_SEQ_LOCK:
+        _WRITE_SEQ += 1
+        return _WRITE_SEQ
+
+
+def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
+                created_at_source="written"):
     """拼一份来源元数据（存记忆时传给 mem0.add 的 metadata 参数）。
 
     source 不是 "user" 时一律按 "inferred" 存（调用方传错也不让它
@@ -318,11 +389,20 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None):
     slot（Plan C）：身份/称呼类记忆的槽位名（agent_name/user_name/
     soul），只认 KNOWN_SLOTS 里的，其他值不进库——同槽位只留一条，
     新值盖旧值时靠它找旧记忆。
+    created_at 不传时取新鲜的单调时间（_now_iso）；传了就用传的
+    （迁移沿用旧日期、纠错回滚恢复旧时间时用）。created_at_source
+    说明这个时间是哪来的，只认 CREATED_AT_SOURCES 里的三个值，
+    传错了按 "written" 算——时间来源不能靠猜，必须是明确的。
+    每次调都新拿一个 write_seq（同一批里的先后靠它分）。
     """
     source = SOURCE_USER if source == SOURCE_USER else SOURCE_INFERRED
+    if created_at_source not in CREATED_AT_SOURCES:
+        created_at_source = "written"
     metadata = {
         "source": source,
         "created_at": created_at or _now_iso(),
+        "created_at_source": created_at_source,
+        "write_seq": _next_write_seq(),
         "confidence": confidence,
         "user_confirmed": bool(user_confirmed) and source == SOURCE_USER,
     }
@@ -342,17 +422,24 @@ def _normalize_metadata(raw):
       "yes"/1 这类非布尔值不算——确认必须是明确的，不能靠猜；
     - confidence 不是 0–1 之间的数字时记成 None（不知道就是不知道）；
     - created_at 不是字符串时记成 None；
+    - write_seq 不是整数时记成 None；created_at_source 不是三个合法值
+      时记成 None；pending_confirmation 只有明确是 True（布尔值）
+      才算待确认——这三样也一样，不能靠猜；
     - slot 不是 KNOWN_SLOTS 里的已知槽位时记成 None（旧记忆、新旧
       版本混用、损坏数据都走这条路——槽位只认这三个，别的都不认）。
-    返回：{"source", "created_at", "confidence", "user_confirmed",
-           "confirmed", "slot"}，其中 confirmed 就是 user_confirmed
+    返回：{"source", "created_at", "created_at_source", "write_seq",
+           "confidence", "user_confirmed", "confirmed", "slot",
+           "pending_confirmation"}，其中 confirmed 就是 user_confirmed
     （取了个短名字，方便调用方判断“能不能当作事实用”）。
     """
     source = SOURCE_UNCONFIRMED
     created_at = None
+    created_at_source = None
+    write_seq = None
     confidence = None
     user_confirmed = False
     slot = None
+    pending_confirmation = False
     if isinstance(raw, dict):
         raw_source = raw.get("source")
         if raw_source in (SOURCE_USER, SOURCE_INFERRED):
@@ -360,6 +447,12 @@ def _normalize_metadata(raw):
         raw_created = raw.get("created_at")
         if isinstance(raw_created, str) and raw_created:
             created_at = raw_created
+        raw_created_source = raw.get("created_at_source")
+        if raw_created_source in CREATED_AT_SOURCES:
+            created_at_source = raw_created_source
+        raw_seq = raw.get("write_seq")
+        if isinstance(raw_seq, int) and not isinstance(raw_seq, bool):
+            write_seq = raw_seq
         raw_conf = raw.get("confidence")
         if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool):
             if 0 <= raw_conf <= 1:
@@ -368,14 +461,194 @@ def _normalize_metadata(raw):
         raw_slot = raw.get("slot")
         if raw_slot in KNOWN_SLOTS:
             slot = raw_slot
+        pending_confirmation = raw.get("pending_confirmation") is True
     return {
         "source": source,
         "created_at": created_at,
+        "created_at_source": created_at_source,
+        "write_seq": write_seq,
         "confidence": confidence,
         "user_confirmed": user_confirmed,
         "confirmed": user_confirmed,
         "slot": slot,
+        "pending_confirmation": pending_confirmation,
     }
+
+
+# ---------- 时间戳 + 覆盖规则（第一步，2026-11-10） ----------
+# 规则（BOOS 定的）：时间戳决定新旧，来源可信度决定有没有资格覆盖。
+# 同级里新的胜出，旧的标“被取代”但原话留着；低可信度的新记忆不能
+# 直接覆盖高可信度的旧事实——新记忆挂起来“待确认”，只有真用上时
+# 才问 BOOS；时间戳相同或缺失、真分不出先后的，问 BOOS；核心记忆
+# 钉住不动，模型推断一律不能顶掉。
+# 这几个函数都是纯函数（只“判”，不动库），调用方见 _resolve_conflict
+# 的注释——它不管两条记忆是不是同一件事，“是不是同一件事”由调用方
+# 按各自的证据定（槽位相同、BOOS 亲口指的、提取后守卫的关键词邻居）。
+
+
+def _credibility_rank(metadata):
+    """一条记忆的可信度级别（覆盖规则用，见 _resolve_conflict）。
+
+    只看规整过的 metadata：confirmed（user 且逐条确认）最高；
+    source=user 但没确认次之；inferred 再次；没来源信息的最低。
+    raw 和规整过的都能传——里面先过一遍 _normalize_metadata，
+    所以两种形状结果一样。
+    """
+    meta = _normalize_metadata(metadata)
+    if meta["confirmed"]:
+        return CREDIBILITY_CONFIRMED
+    if meta["source"] == SOURCE_USER:
+        return CREDIBILITY_USER
+    if meta["source"] == SOURCE_INFERRED:
+        return CREDIBILITY_INFERRED
+    return CREDIBILITY_UNCONFIRMED
+
+
+def _is_core_memory(metadata):
+    """是不是核心记忆（第一步的口径）。
+
+    核心记忆 = 原四类（名字、SOUL、你的决定、钱的规矩）+ 安全权限 +
+    项目基础决策。第一步里先按“用户已确认”来认：名字/SOUL 有槽位
+    标记，其余几类都是 BOOS 亲口确认过的记忆（记住/纠正/迁移都记
+    source=user、user_confirmed=True）；对话里随口说的决定是提取的
+    （inferred），要等 BOOS 逐条确认才算核心——这是 Plan C 已有的
+    区分，第一步不改它。以后做衰减/删除时，这里换成正式的
+    “类别/重要性”字段（见下面“以后留的位置”）。
+    raw 和规整过的都能传。
+    """
+    meta = _normalize_metadata(metadata)
+    return bool(meta["confirmed"]) or meta["slot"] in KNOWN_SLOTS
+
+
+def _parse_created_at(value):
+    """把 created_at 字符串解析成带时区的 datetime，解析不出返回 None。
+
+    认三种写法：新版微秒 + Z（"2026-11-10T12:00:00.000001Z"）、
+    旧版秒级 +00:00（"2026-11-09T10:00:00+00:00"）、迁移带来的
+    纯日期（"2026-11-07"，算当天 0 点）。没时区的当 UTC。
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if len(text) == 10:
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+            return parsed.replace(tzinfo=timezone.utc)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _memory_order_key(metadata):
+    """一条记忆的新旧排序键：(形成时间, 写入序号)。
+
+    没时间戳的按最早算：缺时间戳的都是时间戳功能上线之前存的，
+    一定比新写的旧——这是时间线本身，不是猜；序号缺失按 -1 算。
+    后补的时间戳也按没时间算：backfill 补时间时是按库里随手排的
+    顺序给的“现在时间”，根本不知道历史上谁先谁后——那个先后是
+    假的，不能拿来判新旧。两条后补的排出来键一样，_resolve_conflict
+    就会走“分不出先后、问 BOOS”那条；后补的对新写的，新写的赢，
+    因为后补的本来就是功能上线前的老记忆，本来就比新写的旧。
+    迁移沿用的旧日期（migrated）是旧数据里的真日期，照常用。
+    raw 和规整过的都能传。
+    """
+    meta = _normalize_metadata(metadata)
+    if meta.get("created_at_source") == "backfilled":
+        return (datetime.min.replace(tzinfo=timezone.utc), -1)
+    when = _parse_created_at(meta.get("created_at"))
+    if when is None:
+        when = datetime.min.replace(tzinfo=timezone.utc)
+    seq = meta.get("write_seq")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        seq = -1
+    return (when, seq)
+
+
+def _resolve_conflict(old_metadata, new_metadata):
+    """新旧两条记忆打架时，时间戳 + 可信度怎么判（纯函数，不动库）。
+
+    判法：
+    - 两条都没有时间戳、或时间戳 + 序号全撞：真分不出先后，问 BOOS。
+      （只有一边缺时间戳不问：缺的那条一定是时间戳功能上线之前存的，
+      一定比新写的旧——这是时间线本身，不是猜。后补的时间戳在排序
+      时按没时间算（见 _memory_order_key），所以两条后补的也走问 BOOS。）
+    - 新的可信度比旧的低：旧的赢，新记忆挂起来“待确认”（pending_new），
+      不覆盖——时间戳再新也没用，新旧管不了覆盖资格。
+    - 新的可信度比旧的高：新的胜出，旧的标“被取代”（supersede_old）。
+    - 同级：新的胜出，旧的标“被取代”；但新记忆比旧的还早（迟到的
+      旧写入）时不覆盖，旧的留着（keep_old）。
+    - 核心记忆钉住不动：核心记忆都是用户已确认的（见 _is_core_memory），
+      可信度最高，模型推断（最低档）永远判成 pending_new——上面
+      “新低旧高”那条已经盖住了，这里不用再单列。
+    返回 {"winner": "old" | "new" | "ask",
+           "action": "supersede_old" | "pending_new" | "keep_old" | "ask",
+           "reason": 给人看的一句话}。
+    注意：这个函数只“判”，不“认”——它不管两条记忆是不是同一件事。
+    “是不是同一件事”由调用方按各自的证据定：同槽位就是同一件事
+    （_upsert_slot_memory）；纠正是 BOOS 亲口指的（correct_memory）；
+    提取后守卫只凭关键词重合找“同一话题”的邻居（_apply_coverage_guard），
+    所以同级的新胜出在那里不自动标被取代——关键词重合分不出
+    “同一条事实的新版本”还是“同一话题的不同事实”（“喜欢喝咖啡”
+    和“喜欢喝拿铁”能同时是真的），宁可不标，不标错。等以后有模型判
+    “同一事实”时，再把 supersede_old 接到提取后守卫上。
+    """
+    old = _normalize_metadata(old_metadata)
+    new = _normalize_metadata(new_metadata)
+    old_rank = _credibility_rank(old)
+    new_rank = _credibility_rank(new)
+    old_key = _memory_order_key(old)
+    new_key = _memory_order_key(new)
+    if old.get("created_at") is None and new.get("created_at") is None:
+        return {
+            "winner": "ask",
+            "action": "ask",
+            "reason": "两条记忆都没有时间戳，分不出先后，请 BOOS 定。",
+        }
+    if old_key == new_key:
+        return {
+            "winner": "ask",
+            "action": "ask",
+            "reason": "两条记忆时间戳和序号都一样，分不出先后，请 BOOS 定。",
+        }
+    if new_rank < old_rank:
+        return {
+            "winner": "old",
+            "action": "pending_new",
+            "reason": "新记忆可信度比旧的低，不能直接覆盖，挂起来待确认。",
+        }
+    if new_rank > old_rank:
+        return {
+            "winner": "new",
+            "action": "supersede_old",
+            "reason": "新记忆可信度比旧的高，新的胜出，旧的标被取代。",
+        }
+    if new_key > old_key:
+        return {
+            "winner": "new",
+            "action": "supersede_old",
+            "reason": "同一级别，新的胜出，旧的标被取代。",
+        }
+    return {
+        "winner": "old",
+        "action": "keep_old",
+        "reason": "同一级别，但新记忆比旧的还早，不覆盖。",
+    }
+
+
+# 以后留的位置（第二步衰减 / 删除时再用，第一步不实现，只把名字占住，
+# 免得以后各写各的、又要迁移一次）：
+#   - "importance"（重要性，high/normal/low）：和用得多不多分开算——
+#     低频不等于低价值（原则②）；衰减速度看 importance，不看调用次数。
+#     钉住的核心记忆 importance=high、衰减是零。
+#   - "superseded"（被取代标记，bool）：同级新胜出时旧记忆标上，原话保留；
+#     第一步里只有 _resolve_conflict 会判，真正标上去要等模型能判断
+#     “同一条事实”时再接（见 _resolve_conflict 注释）。
+#   - 真删前检查（原则③）：删之前查三样——是不是核心记忆、是不是
+#     BOOS 明确让记的、有没有别的记忆连着它；有一条不满足就继续
+#     归档、不删。delete_memory() 现在不改。
 
 
 # ---------- 关键词补充信号（从 v1 main.py 搬过来，只做补充用） ----------
@@ -1312,6 +1585,46 @@ def _check_version_file(version_path, chroma_path, embedding_model, embedding_di
         )
 
 
+# 保护失败时结果里附带的列表字段：没恢复回来的旧记忆 id、回滚删不掉
+# 的新记忆 id 和原文。保护信息要经过守卫 → 提交 → add_turn 三层往上传，
+# 以前每层手写一个键一个键地传，加个字段就得改三处，漏一处就半路丢了
+# （回滚残留的原文就是这么丢的：守卫算出来了，只进了保护事件，没进
+# 返回结果）。现在三层都调 _carry_protection_fields，以后再加字段只改
+# 下面这个元组一行。
+_PROTECTION_RESULT_KEYS = (
+    "failed_ids",
+    "rollback_leftover_ids",
+    "rollback_leftover_texts",
+)
+
+
+def _carry_protection_fields(src, dst):
+    """把保护失败的字段从一个结果字典带到另一个。
+
+    只在源字典标了 protection_failed 时才带；没标时什么都不动。
+    只填空、不覆盖：目标字典里已经有 protection_failed 时，目标
+    那份是更新鲜的（比如纠错返回路里，本轮自己的提取也失败了），
+    原样留着、一个键都不盖——上一轮的只在目标没有时才补。不能按
+    键一个一个填：上一轮的 failed_ids、残留 id/原文都是上一轮那次
+    失败的，单拎几个键填进本轮的失败里会串味（比如原因写着快照
+    失败，failed_ids 却是上一轮没恢复回来的旧记忆）。
+    失败标记和原因照原样带（原因即使是 None 也带，和以前手写时
+    一样）；三个列表字段只在非空时带，空的就不写进结果——返回的
+    样子不变，同样的顶层键，调用方（web 面板、命令行）不用动。
+    """
+    src = src or {}
+    if not src.get("protection_failed"):
+        return
+    if dst.get("protection_failed"):
+        return
+    dst["protection_failed"] = True
+    dst["protection_reason"] = src.get("protection_reason")
+    for key in _PROTECTION_RESULT_KEYS:
+        value = src.get(key)
+        if value:
+            dst[key] = value
+
+
 class Mem0Store:
     """mem0 长期记忆的适配器（项目里唯一直接碰 mem0 的类）。
 
@@ -1334,6 +1647,7 @@ class Mem0Store:
         chroma_path=None,
         history_db_path=None,
         version_path=None,
+        protection_events_path=None,
         user_id=DEFAULT_USER_ID,
         budget_tracker=None,
         threshold=RETRIEVAL_THRESHOLD,
@@ -1350,6 +1664,14 @@ class Mem0Store:
         )
         self.version_path = (
             Path(version_path) if version_path else project_root / "memory" / "mem0_versions.json"
+        )
+        # 保护事件记录（失败关闭的可见留痕）：快照失败、恢复失败这些事
+        # 不能只写日志——记到本地 JSONL 里（memory/protection-events.jsonl，
+        # gitignore 覆盖，不进仓库），面板上有接口能读到，BOOS 看得见。
+        self.protection_events_path = (
+            Path(protection_events_path)
+            if protection_events_path
+            else project_root / "memory" / "protection-events.jsonl"
         )
         self.user_id = user_id
         self.budget_tracker = budget_tracker
@@ -1481,7 +1803,7 @@ class Mem0Store:
                         prompt_tokens / 1_000_000 * price_in
                         + completion_tokens / 1_000_000 * price_out
                     )
-                    tracker.add_cost(cost, model=LLM_MODEL)
+                    tracker.add_cost(cost, model=LLM_MODEL, ledger="chat")
                 except Exception:
                     logger.warning("mem0 用量记录失败：本次提取调用未记账。", exc_info=True)
                 return resp
@@ -1617,6 +1939,30 @@ class Mem0Store:
         except Exception:
             logger.warning("记对话上下文失败：本次上下文未记录。", exc_info=True)
 
+    def _snapshot_all(self):
+        """拍一张库快照（提取前、恢复核对时用）。
+
+        内容口径和 get_all(include_sensitive=True) 一样：全部记忆，
+        空文本跳过，metadata 规整过。区别只有一点：读库失败时抛
+        异常、不吞掉——调用方要分得出“库是空的”还是“库读不出来”，
+        分不出来就没法失败关闭（快照读不出来还往里写，就是没保护
+        硬写，见 _extract_and_save_turn）。
+        """
+        raw = self._memory.get_all(filters={"user_id": self.user_id})
+        out = []
+        for item in (raw or {}).get("results", []):
+            text = item.get("memory") or ""
+            if not text:
+                continue
+            out.append(
+                {
+                    "id": item.get("id"),
+                    "text": text,
+                    "metadata": _normalize_metadata(item.get("metadata")),
+                }
+            )
+        return out
+
     def get_all(self, include_sensitive=False):
         """返回当前用户的所有记忆（列表，每项 {"id", "text", "metadata"}，
         metadata 是规整过的来源信息，见 _normalize_metadata）。
@@ -1629,24 +1975,82 @@ class Mem0Store:
         出问题时返回空列表，不抛异常。
         """
         try:
-            raw = self._memory.get_all(filters={"user_id": self.user_id})
-            out = []
-            for item in (raw or {}).get("results", []):
-                text = item.get("memory") or ""
-                if not text:
-                    continue
-                if not include_sensitive and _contains_sensitive(text):
-                    continue
-                out.append(
-                    {
-                        "id": item.get("id"),
-                        "text": text,
-                        "metadata": _normalize_metadata(item.get("metadata")),
-                    }
-                )
-            return out
+            out = self._snapshot_all()
         except Exception:
             logger.warning("mem0 取全部记忆失败。", exc_info=True)
+            return []
+        if not include_sensitive:
+            out = [
+                item
+                for item in out
+                if not _contains_sensitive(item.get("text") or "")
+            ]
+        return out
+
+    def _record_protection_event(self, kind, reason, failed_ids=None, failed_texts=None,
+                                 rollback_leftover_ids=None, rollback_leftover_texts=None):
+        """记一条保护事件（失败关闭的可见留痕）。
+
+        快照失败、恢复失败这些事不能只写日志——日志 BOOS 看不到，
+        悄悄跳过一轮他也不知道。记到本地 JSONL 里
+        （memory/protection-events.jsonl，gitignore 覆盖，不进仓库），
+        面板上有接口能读到（GET /api/protection-events）。
+        kind：snapshot_failed（快照两次都失败，本轮没写）、
+        restore_unverified（恢复时读库失败，没法核对，本轮新存的已回滚）、
+        restore_partial（个别旧记忆没恢复回来，跟它们同一话题的新记忆已回滚）。
+        failed_ids 是旧记忆的 id，failed_texts 是它们的原文——面板上
+        BOOS 要看得出是哪条记忆，光给 id 他认不出来。文件只在本地，
+        和 history.db 一个待遇（里面本来就有全文），不上传、不导出；
+        logger 里的警告照旧不带内容。
+        rollback_leftover_ids/texts 是回滚删不掉、还留在库里的新记忆
+        （id 和原文）：有残留时才记，没有就不写这两个键——保护事件
+        不能写成“已回滚”，而实际仍有记录残留。
+        记不下来时只记日志、不抛异常——留痕本身坏了不能把聊天搞崩。
+        """
+        try:
+            event = {
+                "time": _now_iso(),
+                "kind": kind,
+                "reason": reason,
+                "failed_ids": list(failed_ids or []),
+                "failed_texts": list(failed_texts or []),
+            }
+            if rollback_leftover_ids:
+                event["rollback_leftover_ids"] = list(rollback_leftover_ids)
+            if rollback_leftover_texts:
+                event["rollback_leftover_texts"] = list(rollback_leftover_texts)
+            self.protection_events_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.protection_events_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.warning("保护事件没记下来。", exc_info=True)
+
+    def list_protection_events(self, limit=50):
+        """返回最近的保护事件（给面板看，新的在前，最多 limit 条）。
+
+        文件没有、读不出来、某一行写坏了，都跳过不报错——面板上
+        显示“暂无保护记录”，不拦聊天。
+        """
+        try:
+            path = self.protection_events_path
+            if not path.exists():
+                return []
+            events = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(event, dict) and event.get("kind"):
+                        events.append(event)
+            events.reverse()
+            return events[:limit]
+        except Exception:
+            logger.warning("读保护事件失败。", exc_info=True)
             return []
 
     # ---------- 写入（回答后自动存 / 手动存） ----------
@@ -1742,19 +2146,52 @@ class Mem0Store:
 
         调 mem0.add 提取本轮对话、去重、存入；提取出的记忆里万一
         还带着敏感信息，_drop_sensitive_results 会再删掉。
-        失败时返回 {}，绝不抛异常——存记忆失败不能把聊天回答搞崩。
+        再过一道覆盖守卫（_apply_coverage_guard）：刚提取出的推断记忆
+        别把 BOOS 确认过的事实顶掉——守卫要拿提取前的库快照找邻居，
+        所以快照在调 mem0.add 之前拍（快照里没有本次新存的，就不会
+        把新记忆和自己/同一批的兄弟认成邻居）；快照还有第二个用处：
+        万一 add 在里面动了旧记忆，守卫按快照原样恢复（见
+        _restore_snapshot_memories）。
+        失败关闭：快照是保护的前提——快照读不出来，就不知道旧记忆
+        长什么样，写进去就是没保护硬写。所以快照先重试一次（很多
+        时候就是抖一下，重试之间不睡、保持简单），还失败就不调
+        mem0.add，本轮不写，记一条保护事件、结果里带上
+        protection_failed 标记（调用方和面板能读到）。代价只是这轮
+        的事实这次没存进长期记忆，对话摘要里还留着，还能再说——
+        比悄悄顶掉已确认的事实强得多。
+        失败时返回 {} 或带 protection_failed 的字典，绝不抛异常——
+        存记忆失败不能把聊天回答搞崩。
         """
+        before = None
+        for _attempt in range(2):
+            try:
+                before = self._snapshot_all()
+                break
+            except Exception:
+                before = None
+        if before is None:
+            logger.warning("提取前快照两次都失败：本轮不写记忆。", exc_info=True)
+            self._record_protection_event(
+                "snapshot_failed", "提取前快照两次都失败，本轮没有存记忆。"
+            )
+            return {
+                "protection_failed": True,
+                "protection_reason": "snapshot_failed",
+                "results": [],
+            }
+        metadata = _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
         try:
             result = self._mem0_add(
                 safe_messages,
                 self.user_id,
                 True,
-                _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False),
+                metadata,
             )
         except Exception:
             logger.warning("mem0 自动存记忆失败：本轮对话未存入长期记忆。", exc_info=True)
             return {}
-        return self._drop_sensitive_results(result or {})
+        result = self._drop_sensitive_results(result or {})
+        return self._apply_coverage_guard(result, before, metadata)
 
     # ---------- Plan C：待定区提交 + 同槽位 UPDATE + 身份种子 ----------
 
@@ -1799,13 +2236,22 @@ class Mem0Store:
             ) == "assistant":
                 fresh.append(messages[i + 1])
         results = []
+        protection_failed = False
         filtered = _filter_extraction_messages(fresh)
         if filtered:
             extracted = self._extract_and_save_turn(filtered)
             results = (extracted or {}).get("results") or []
-        if not results and not identity_outcomes:
+            # 保护失败的标记要往上传：本轮没写成、或回滚过，调用方
+            # （add_turn / 面板）得知道，不能只留在提取那一层。
+            # 用共用的 _carry_protection_fields 一次带过去——以前这里
+            # 手写一个键一个键地传，残留原文就是这么漏掉的。
+            protection_failed = bool((extracted or {}).get("protection_failed"))
+        if not results and not identity_outcomes and not protection_failed:
             return {}
-        return {"results": results, "identity": identity_outcomes}
+        out = {"results": results, "identity": identity_outcomes}
+        if protection_failed:
+            _carry_protection_fields(extracted, out)
+        return out
 
     def flush_pending(self):
         """立刻提交待定区（Plan C）。
@@ -2238,6 +2684,10 @@ class Mem0Store:
                     )
                     handled = self._handle_correction_outcome(outcome)
                     if handled is not None:
+                        # 上一轮提交的保护失败不能丢在半路：纠错结果
+                        # 里没有保护字段，上一轮的才补进来；只填空、
+                        # 不覆盖（见 _carry_protection_fields）。
+                        _carry_protection_fields(committed, handled)
                         return handled
                     # not_found：挑中的那条已经不在库里了（被删了），
                     # 新说法还是他确认过的，直接当新记忆存下来。
@@ -2247,6 +2697,7 @@ class Mem0Store:
                     if isinstance(saved, dict):
                         saved = dict(saved)
                         saved["correction"] = _correction_result(outcome)
+                        _carry_protection_fields(committed, saved)
                     return saved
                 # 没挑中（说了别的、或说“都不是”）：当作放弃这次纠错，
                 # 继续按本轮消息正常处理（下面可能又是一次新的纠错）。
@@ -2261,6 +2712,9 @@ class Mem0Store:
                     # 2 号：纠正那一轮里别的句子别丢——去掉纠错句，
                     # 剩下的按正常轮次进待定区，下一轮正常存。
                     self._pend_correction_remainder(safe_messages, latest_user)
+                    # 上一轮提交的保护失败不能丢在半路：纠错结果里
+                    # 没有保护字段，上一轮的才补进来；只填空、不覆盖。
+                    _carry_protection_fields(committed, handled)
                     return handled
                 # not_found：库里没有冲突的旧记忆——新说法当成一条新记忆，
                 # 走正常提取保存（下面），结果里附上这次纠错的尝试记录。
@@ -2268,6 +2722,9 @@ class Mem0Store:
                 if isinstance(normal, dict):
                     normal = dict(normal)
                     normal["correction"] = _correction_result(outcome)
+                    # 上一轮提交的保护失败不能丢在半路：本轮自己的
+                    # 提取也可能带保护失败，留本轮的、只填空不覆盖。
+                    _carry_protection_fields(committed, normal)
                 return normal
             # 3. 正常轮次：不立即存，放进待定区等下一轮。
             #    身份陈述（名字/称呼）只在最新一句里认——旧轮次的
@@ -2282,11 +2739,16 @@ class Mem0Store:
                 "messages": safe_messages,
                 "identity": identity_items,
             }
-            return {
+            out = {
                 "pending": True,
                 "results": (committed or {}).get("results") or [],
                 "identity": [item["slot"] for item in identity_items],
             }
+            # 保护失败的字段用共用的 _carry_protection_fields 一次带过去，
+            # 和 _commit_pending_turn 里是同一个函数——以后再加字段只改
+            # 它里面那一行，不会再漏。
+            _carry_protection_fields(committed, out)
+            return out
 
     def _drop_sensitive_results(self, result):
         """提取后二次过滤：检查本次提取出的记忆，万一哪条还带着敏感信息
@@ -2319,6 +2781,462 @@ class Mem0Store:
         filtered = dict(result)
         filtered["results"] = kept
         return filtered
+
+    # 提取后守卫用的关键词门槛：和检索补充信号（KEYWORD_MIN_WEIGHT=2）
+    # 不是同一把尺子——守卫一旦拦下就要挂起来、以后真用上时问 BOOS，
+    # 多拦的代价是以后多问一句，所以宁严不宽：新记忆和旧记忆至少
+    # 共享两个两字词（或一个更长的共有词）才算“同一话题”。
+    # 例子：新记忆“数据库改成 PostgreSQL”和旧记忆“数据库用 SQLite”
+    # 共享“数据”“据库”，权重 2+2=4，刚好够；只共享一个词（比如只
+    # 共享“预算”）的，不拦——那点重合说明不了是同一件事。
+    _COVERAGE_GUARD_MIN_WEIGHT = 4
+
+    def _verify_after_repair(self, expect_present, expect_absent_ids):
+        """改完库再读一遍核对（恢复和回滚共用的核对办法）。
+
+        病根（2026-11-10 GPT 再审）：恢复和回滚以前都信“没报错就
+        是成功了”——update/add/delete 没抛异常就数成做完了。没报错
+        只能说明调用没炸，不能说明库里的东西真对了（update 可能假装
+        成功根本没改，delete 可能假装成功根本没删）。所以凡是动手改
+        了库的动作，做完都要再读一遍、按期望的样子逐条核对，对上了
+        才算数——恢复、回滚都调这一个办法，以后第三处改库也调它，
+        不会再犯同一个错。
+        只读本地库、只做本地比对，不调模型、不花钱；调用方已经持有
+        写锁（提取那条路），这里不另起锁。
+        参数：
+          expect_present：应在库里的条目，每项 {"lookup_id", "report_id",
+            "text", "metadata"}——lookup_id 是按 id 找的凭据（update
+            恢复的旧记忆，id 没变）；重新 add 的那条 id 变了，
+            lookup_id 是 None，改按内容找（文本 + 规整后的 metadata
+            都对上）。report_id 是核对不上时要报的 id（重新 add 的
+            也记旧 id——调用方只认得旧 id，新 id 它不知道）。
+            metadata 只比我们自己的字段（created_at、created_at_source、
+            write_seq、source、confidence、user_confirmed、slot、
+            pending_confirmation），用 _normalize_metadata 规整后比——
+            mem0 自己加的字段（比如它内部的 hash、更新时间）不比，
+            不然会误判。
+            含糊点（写明）：库里有多条内容一样的，有一条对得上就算
+            恢复了——重新 add 的那条和库里本来就有的重复项分不开，
+            但这条路只在“旧记忆被删了、按快照重存”时走，重存的文本
+            和 metadata 和快照一致就是恢复的目的；多一条重复顶多是
+            多占一条，不会把错的当成对的。
+          expect_absent_ids：应在库里消失的 id（回滚删掉的新记忆）。
+        返回 {"read_ok", "missing", "still_present"}：
+          read_ok False 表示核对那一下读库失败，什么都不知道——
+            调用方按“没法核对”失败关闭，不能按成功处理；这时
+            missing 是全部 expect_present 的 report_id、
+            still_present 是全部 expect_absent_ids（一个都没确认，
+            保守全算没对上）。
+          missing：expect_present 里没对上的 report_id；
+          still_present：expect_absent_ids 里读回来还在的 id。
+        """
+        try:
+            current = self._snapshot_all()
+        except Exception:
+            logger.warning("改完库核对时读库失败，没法确认结果。", exc_info=True)
+            return {
+                "read_ok": False,
+                "missing": [
+                    (item or {}).get("report_id")
+                    for item in (expect_present or [])
+                    if (item or {}).get("report_id")
+                ],
+                "still_present": list(expect_absent_ids or []),
+            }
+        by_id = {}
+        contents = []
+        for item in current:
+            mem_id = (item or {}).get("id")
+            text = (item or {}).get("text") or ""
+            meta = _normalize_metadata((item or {}).get("metadata"))
+            if mem_id:
+                by_id[mem_id] = {"text": text, "metadata": meta}
+            contents.append({"text": text, "metadata": meta})
+        missing = []
+        for expected in expect_present or []:
+            text = (expected or {}).get("text") or ""
+            meta = _normalize_metadata((expected or {}).get("metadata"))
+            lookup_id = (expected or {}).get("lookup_id")
+            found = False
+            if lookup_id:
+                now = by_id.get(lookup_id)
+                found = (
+                    now is not None
+                    and now["text"] == text
+                    and now["metadata"] == meta
+                )
+            else:
+                found = any(
+                    entry["text"] == text and entry["metadata"] == meta
+                    for entry in contents
+                )
+            if not found:
+                report_id = (expected or {}).get("report_id")
+                if report_id:
+                    missing.append(report_id)
+        still_present = [
+            mem_id for mem_id in (expect_absent_ids or []) if mem_id in by_id
+        ]
+        return {"read_ok": True, "missing": missing, "still_present": still_present}
+
+    def _restore_snapshot_memories(self, before_items):
+        """按提取前的快照，把被改动过的旧记忆恢复原样（守卫的第二道）。
+
+        背景：守卫本来只给新记忆打“待确认”标记——这够用的前提，是
+        mem0.add 只插新记忆、不动旧记忆。实际装着的 mem0 2.2.1 读
+        代码确实是只插不改，但说明书上写着 add 会决定增改删，升级
+        就可能变；万一哪天 add 在里面把旧记忆改了、删了，事后只打
+        标记就救不回来了。所以这里加一道事后核对：add 完拿快照跟
+        现在的库比对，快照里有、现在文本被改了或者没了的旧记忆，
+        都按快照原样恢复（文本 + metadata 全套，包括时间戳、时间
+        来源、序号、来源和确认状态）。恢复的对象是快照里所有的旧
+        记忆，不只核心记忆——提取这条路只会存推断事实，纠正走
+        correct_memory 不走这里，所以恢复全部被改的旧记忆是安全、
+        对的。恢复的办法：还在库里的，原地 update 回去（保住原 id）；
+        已经没了的，重新存一条（mem0 的 id 是它自己生成的，恢复
+        不回来旧 id；文本和 metadata 原样带上，一样不少）。
+        读库失败时不猜：分不清“全被删了”还是“读失败了”，宁可本次
+        不恢复（记一条警告），也别把没删的东西重复存一遍。
+        恢复只记日志、不抛异常——守卫坏了不能把聊天回答搞崩。
+        恢复完再读一遍核对（见 _verify_after_repair）：update 或重新
+        add 没报错不等于恢复了，读回来文本 + metadata 都对上了才算；
+        底层 update 不支持 metadata、只恢复了文本的那种，metadata 对
+        不上，数成失败。restored 只数核对上了的。核对那一下读库失败
+        时 verified=False、failed_ids 是本轮试着恢复的 id（一个都没
+        确认，保守全算没恢复）；没什么要恢复时不读第二遍——第一遍
+        读已经比过、都没动过，没必要再读。
+        返回一个小结构（调用方要分得出三种情况，不能只给个数）：
+        {"verified": 本次到底核没核对上（读库失败时是 False）、
+         "restored": 核对上了几条、
+         "failed_ids": 没恢复回来的旧记忆 id（空表示都恢复了、
+         或本来就没什么要恢复的）}。
+        """
+        if not before_items:
+            return {"verified": True, "restored": 0, "failed_ids": []}
+        try:
+            raw = self._memory.get_all(filters={"user_id": self.user_id})
+        except Exception:
+            logger.warning("覆盖守卫：核对快照时读库失败，本次不恢复。", exc_info=True)
+            return {"verified": False, "restored": 0, "failed_ids": []}
+        current = {}
+        for item in (raw or {}).get("results", []):
+            mem_id = (item or {}).get("id")
+            text = (item or {}).get("memory") or ""
+            if not mem_id or not text:
+                continue
+            current[mem_id] = {
+                "text": text,
+                "metadata": _normalize_metadata((item or {}).get("metadata")),
+            }
+        attempted = []
+        for old in before_items:
+            mem_id = (old or {}).get("id")
+            old_text = (old or {}).get("text") or ""
+            if not mem_id or not old_text:
+                continue
+            old_meta = _normalize_metadata((old or {}).get("metadata"))
+            now = current.get(mem_id)
+            if now is None:
+                # 没了：重新存一条，文本和 metadata 原样带上。
+                # 存完不数成功——成没成等下面统一核对。
+                try:
+                    self._mem0_add(
+                        [{"role": "user", "content": old_text}],
+                        self.user_id,
+                        False,
+                        dict(old_meta),
+                    )
+                except Exception:
+                    logger.warning("覆盖守卫：恢复被删的旧记忆失败。", exc_info=True)
+                # 新存的 id 是 mem0 生成的，核对时按内容找，失败报旧 id。
+                attempted.append(
+                    {
+                        "lookup_id": None,
+                        "report_id": mem_id,
+                        "text": old_text,
+                        "metadata": old_meta,
+                    }
+                )
+                continue
+            if now["text"] == old_text and now["metadata"] == old_meta:
+                continue
+            # 文本被改了、或者 metadata 被动了：原地恢复，保住原 id。
+            # 改完不数成功——成没成等下面统一核对。
+            try:
+                try:
+                    self._memory.update(
+                        memory_id=mem_id, text=old_text, metadata=dict(old_meta)
+                    )
+                except TypeError:
+                    logger.warning(
+                        "覆盖守卫：底层 update 不支持 metadata 参数，"
+                        "只恢复了文本、没恢复 metadata。"
+                    )
+                    self._memory.update(memory_id=mem_id, text=old_text)
+            except Exception:
+                logger.warning("覆盖守卫：恢复被改的旧记忆失败。", exc_info=True)
+            attempted.append(
+                {
+                    "lookup_id": mem_id,
+                    "report_id": mem_id,
+                    "text": old_text,
+                    "metadata": old_meta,
+                }
+            )
+        if not attempted:
+            return {"verified": True, "restored": 0, "failed_ids": []}
+        # 改完再读一遍核对：没报错不等于恢复了，读回来对上了才算。
+        # 核对读库失败时一个都没确认，全算没恢复（失败关闭）。
+        check = self._verify_after_repair(attempted, [])
+        if not check["read_ok"]:
+            return {
+                "verified": False,
+                "restored": 0,
+                "failed_ids": [item["report_id"] for item in attempted],
+            }
+        failed_ids = check["missing"]
+        restored = len(attempted) - len(failed_ids)
+        if restored:
+            logger.info("提取后守卫：按快照恢复了 %d 条被改动的旧记忆。", restored)
+        return {"verified": True, "restored": restored, "failed_ids": failed_ids}
+
+    def _rollback_new_memories(self, items):
+        """删掉本轮新存的几条记忆（恢复失败时的回滚）。
+
+        删的办法复用 _drop_sensitive_results 里现成的
+        self._memory.delete——刚存进来的记录，删掉就是回到写之前
+        的样子。删失败只记日志、不抛异常。
+        删完再读一遍核对（见 _verify_after_repair）：delete 没报错
+        不等于删掉了，读回来不在才算删掉；delete 抛了错也不等于还
+        在——到底在不在，以读回来的为准，残留的判定只看核对结果。
+        没 id 的条目删不掉、也核对不了，保守算残留。核对那一下读
+        库失败时，一个都确认不了，全算残留（失败关闭）。
+        返回删完还留着的条目（删失败的还在里面）。
+        """
+        no_id = []
+        with_id = []
+        for item in items or []:
+            if (item or {}).get("id"):
+                with_id.append(item)
+            else:
+                no_id.append(item)
+        for item in with_id:
+            try:
+                self._memory.delete(item["id"])
+            except Exception:
+                logger.warning("回滚新记忆失败：id=%s。", item["id"], exc_info=True)
+        if not with_id:
+            return list(no_id)
+        check = self._verify_after_repair([], [item["id"] for item in with_id])
+        still = set(check["still_present"])
+        return list(no_id) + [item for item in with_id if item["id"] in still]
+
+    def _apply_coverage_guard(self, results, before_items, new_metadata):
+        """提取后覆盖守卫：刚提取出的推断记忆，别把 BOOS 确认过的事实顶掉。
+
+        只处理一种情况：新记忆是推断的（inferred），而库里已经有一条
+        同一话题（关键词重合 ≥ _COVERAGE_GUARD_MIN_WEIGHT，和检索
+        补充信号同一类尺子、但更严）的用户已确认记忆——这时新记忆
+        不能直接当成事实，改标“待确认”挂起来（metadata 里
+        pending_confirmation=True，时间戳和序号原样保留），旧记忆
+        原封不动；只有真用上时才问 BOOS（问的那一步以后再接，
+        先挂起来——挂起来本身就有用：面板上看得到，主流程里它
+        本来就是 inferred、不会被当成确认过的事实）。
+        同级冲突在这里不自动标“被取代”：关键词重合分不出“同一条事实
+        的新版本”还是“同一话题的不同事实”，宁可不标，不标错（见
+        _resolve_conflict 注释）。用户亲口说的（记住/纠正/槽位）不走
+        这里——那是 BOOS 本人的话，可信度最高，不该被守卫拦。
+        before_items：提取前库里的记忆快照（get_all 的结果），用来找邻居、
+        也防止新记忆和自己/同一批的兄弟互相认成邻居。
+        new_metadata：本次提取传给 mem0.add 的那份 metadata（兄弟们共用
+        的同一份），打待确认标记时在它的基础上加 pending_confirmation，
+        时间戳和序号原样保留。
+        返回：标注过的结果字典（没拦下任何东西时原样返回；结果里被拦下
+        的那条多一个 "pending_confirmation": True，调用方不用再查库）。
+        拦下/失败只记日志（不记内容），绝不抛异常——守卫坏了不能把
+        聊天回答搞崩。标记打不上（底层 update 不支持 metadata）时，
+        记忆本身还在，只丢了标记，记一条警告。
+        打标记之前先按快照核对恢复（见 _restore_snapshot_memories）：
+        万一 add 在里面动了旧记忆，先恢复原样，再谈新记忆待确认——
+        旧事实丢了，打再多标记也没用。
+        恢复失败时失败关闭，不当成保护成功（恢复的返回值不能丢掉）：
+        (a) 连库都读不出来、根本没法核对——本轮新存的都删掉回滚，
+        结果里标 protection_failed=True、原因 restore_unverified，
+        记一条保护事件，提前返回，不再打标记；回滚删不掉、还留在
+        库里的新记忆，id 写进结果（rollback_leftover_ids）、原文写
+        进保护事件，事件里不写“已删掉回滚”；
+        (b) 个别旧记忆没恢复回来——只回滚跟它们同一话题的新记忆，
+        其他新记忆照常走打标记的流程，结果里同样标 protection_failed、
+        原因 restore_partial、并写明是哪几条旧记忆（failed_ids），
+        也记一条保护事件；回滚的残留同样写进结果和保护事件。
+        没恢复回来的旧记忆本身还是坏的，这事标出来、记下来，
+        不能当成保护成功。
+        """
+        if not before_items:
+            return results
+        results = dict(results or {})
+        restore = self._restore_snapshot_memories(before_items)
+        items = (results or {}).get("results") or []
+        if not restore.get("verified", False):
+            # (a) 没法核对：旧记忆到底被动了没有根本不知道。光标个
+            #     失败不够——新记忆已经存进去了，得把本轮新存的都
+            #     删掉回滚，让库回到写之前的样子。删完还剩下的（回滚
+            #     核对出来的残留）要写进结果和保护事件，不能写成
+            #     “已删掉回滚”——没删掉就是没删掉。
+            survivors = self._rollback_new_memories(items)
+            results["results"] = survivors
+            results["protection_failed"] = True
+            results["protection_reason"] = "restore_unverified"
+            leftover_ids = [
+                (item or {}).get("id")
+                for item in survivors
+                if (item or {}).get("id")
+            ]
+            leftover_texts = [(item or {}).get("memory") or "" for item in survivors]
+            if leftover_ids or leftover_texts:
+                results["rollback_leftover_ids"] = leftover_ids
+                results["rollback_leftover_texts"] = leftover_texts
+                reason = (
+                    "恢复时读库失败，没法核对 %d 条旧记忆有没有被改动，"
+                    "本轮新存的 %d 条记忆里删掉了 %d 条，还有 %d 条没删掉"
+                    "（仍在库里）。"
+                    % (
+                        len(before_items),
+                        len(items),
+                        len(items) - len(survivors),
+                        len(survivors),
+                    )
+                )
+            else:
+                reason = (
+                    "恢复时读库失败，没法核对 %d 条旧记忆有没有被改动，"
+                    "本轮新存的记忆已删掉回滚。" % len(before_items)
+                )
+            self._record_protection_event(
+                "restore_unverified",
+                reason,
+                failed_ids=[
+                    (old or {}).get("id")
+                    for old in before_items
+                    if (old or {}).get("id")
+                ],
+                failed_texts=[
+                    (old or {}).get("text") or "" for old in before_items
+                ],
+                rollback_leftover_ids=leftover_ids or None,
+                rollback_leftover_texts=leftover_texts or None,
+            )
+            return results
+        failed_ids = restore.get("failed_ids") or []
+        if failed_ids:
+            # (b) 个别旧记忆没恢复回来：只回滚跟它们同一话题的新记忆，
+            #     其他新记忆照常走打标记的流程。
+            failed_set = set(failed_ids)
+            failed_old = [
+                old for old in before_items if (old or {}).get("id") in failed_set
+            ]
+            doomed = []
+            kept = []
+            for item in items:
+                new_text = (item or {}).get("memory") or ""
+                keywords = _extract_keywords(new_text) if new_text else set()
+                same_topic = False
+                for old in failed_old:
+                    old_text = (old or {}).get("text") or ""
+                    weight, _matched = _keyword_weight(old_text, keywords)
+                    if weight >= self._COVERAGE_GUARD_MIN_WEIGHT:
+                        same_topic = True
+                        break
+                if same_topic:
+                    doomed.append(item)
+                else:
+                    kept.append(item)
+            survivors = self._rollback_new_memories(doomed)
+            items = kept
+            results["results"] = items
+            results["protection_failed"] = True
+            results["protection_reason"] = "restore_partial"
+            results["failed_ids"] = list(failed_ids)
+            leftover_ids = [
+                (item or {}).get("id")
+                for item in survivors
+                if (item or {}).get("id")
+            ]
+            leftover_texts = [(item or {}).get("memory") or "" for item in survivors]
+            if leftover_ids or leftover_texts:
+                # 回滚不完整：删不掉的那条还留在库里（results 里没有
+                # 它），id 和原文都写进结果往上传，原文也写进保护事件——
+                # 调用方和面板都得看得见，不能假装删掉了。
+                results["rollback_leftover_ids"] = leftover_ids
+                results["rollback_leftover_texts"] = leftover_texts
+                reason = (
+                    "有旧记忆没恢复回来，跟它们同一话题的新记忆里删掉了 %d 条，"
+                    "还有 %d 条没删掉（仍在库里）。"
+                    % (len(doomed) - len(survivors), len(survivors))
+                )
+            else:
+                reason = "有旧记忆没恢复回来，跟它们同一话题的新记忆已删掉回滚。"
+            self._record_protection_event(
+                "restore_partial",
+                reason,
+                failed_ids=list(failed_ids),
+                failed_texts=[
+                    (old or {}).get("text") or "" for old in failed_old
+                ],
+                rollback_leftover_ids=leftover_ids or None,
+                rollback_leftover_texts=leftover_texts or None,
+            )
+        if not items:
+            return results
+        base_meta = dict(new_metadata or {})
+        held = []
+        for item in items:
+            new_text = (item or {}).get("memory") or ""
+            mem_id = (item or {}).get("id")
+            if not new_text or not mem_id:
+                continue
+            keywords = _extract_keywords(new_text)
+            if not keywords:
+                continue
+            for old in before_items:
+                old_meta = (old or {}).get("metadata") or {}
+                if not _is_core_memory(old_meta):
+                    continue
+                old_text = (old or {}).get("text") or ""
+                weight, _matched = _keyword_weight(old_text, keywords)
+                if weight < self._COVERAGE_GUARD_MIN_WEIGHT:
+                    continue
+                resolution = _resolve_conflict(old_meta, base_meta)
+                if resolution.get("action") != "pending_new":
+                    continue
+                try:
+                    try:
+                        self._memory.update(
+                            memory_id=mem_id,
+                            text=new_text,
+                            metadata={
+                                **base_meta,
+                                "pending_confirmation": True,
+                            },
+                        )
+                    except TypeError:
+                        logger.warning(
+                            "覆盖守卫：底层 update 不支持 metadata 参数，"
+                            "待确认标记没打上。"
+                        )
+                        self._memory.update(memory_id=mem_id, text=new_text)
+                except Exception:
+                    logger.warning("覆盖守卫：打待确认标记失败。", exc_info=True)
+                    continue
+                item["pending_confirmation"] = True
+                held.append(mem_id)
+                break
+        if held:
+            logger.info(
+                "提取后守卫：%d 条推断记忆撞上 BOOS 确认过的事实，已标待确认。",
+                len(held),
+            )
+        return results
 
     def _add_text_with_metadata(self, text, metadata):
         """原文存一条记忆（infer=False），带上来源元数据。
@@ -2454,7 +3372,13 @@ class Mem0Store:
             created_at = item.get("date") if isinstance(item.get("date"), str) else None
             result = self._add_text_with_metadata(
                 text,
-                _provenance(SOURCE_USER, CONFIDENCE_USER, True, created_at=created_at),
+                _provenance(
+                    SOURCE_USER,
+                    CONFIDENCE_USER,
+                    True,
+                    created_at=created_at,
+                    created_at_source="migrated",
+                ),
             )
             if result and not result.get("duplicate"):
                 added += 1
@@ -2496,6 +3420,69 @@ class Mem0Store:
         if added:
             logger.info("已记录 %d 条初始记忆。", added)
         return added
+
+    def backfill_timestamps(self):
+        """给没有时间戳的老记忆补时间戳（第一步的一次性迁移）。
+
+        只补缺的：created_at 不是非空字符串的才补；补的时候时间戳用
+        新鲜的单调时间（_now_iso），created_at_source 记 "backfilled"——
+        诚实标明这是后补的，不是原来就有的；其他 metadata（来源、
+        置信度、是否确认、槽位）原样保留，绝不因为补时间就把可信度
+        抬上去（后补的时间戳不能让一条没确认的记忆变成已确认）。
+        幂等：补过的不会再补，重复调也没事。失败只记日志、不抛异常，
+        返回补了几条（-1 表示连库都读不出来）。
+        网页服务启动时调一次（web/server.py）；命令行“记住”不调——
+        后补是一次性的事，服务启动时补完就够了，平时不用反复跑。
+        """
+        with _WRITE_LOCK:
+            try:
+                raw = self._memory.get_all(filters={"user_id": self.user_id})
+            except Exception:
+                logger.warning("补时间戳：读记忆库失败，本次不补。", exc_info=True)
+                return -1
+            items = (raw or {}).get("results") or []
+            backfilled = 0
+            for item in items:
+                mem_id = (item or {}).get("id")
+                text = (item or {}).get("memory") or ""
+                if not mem_id or not text:
+                    continue
+                raw_meta = (item or {}).get("metadata")
+                if (
+                    isinstance(raw_meta, dict)
+                    and isinstance(raw_meta.get("created_at"), str)
+                    and raw_meta.get("created_at")
+                ):
+                    continue
+                new_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+                new_meta["created_at"] = _now_iso()
+                new_meta["created_at_source"] = "backfilled"
+                new_meta["write_seq"] = _next_write_seq()
+                try:
+                    try:
+                        self._memory.update(
+                            memory_id=mem_id, text=text, metadata=new_meta
+                        )
+                    except TypeError:
+                        # 老版本 update 不支持 metadata 参数：退一步只传
+                        # text（文本不变），再记一条警告——时间戳没补上，
+                        # 下次启动还会再试，不丢记忆。
+                        logger.warning(
+                            "补时间戳：底层 update 不支持 metadata 参数，"
+                            "时间戳没补上。"
+                        )
+                        self._memory.update(memory_id=mem_id, text=text)
+                        continue
+                except Exception:
+                    logger.warning("补时间戳：更新记忆失败，已跳过。", exc_info=True)
+                    continue
+                backfilled += 1
+            if backfilled:
+                logger.info(
+                    "补时间戳：给 %d 条老记忆补了时间戳（标记为后补）。",
+                    backfilled,
+                )
+            return backfilled
 
     # ---------- 纠错（改）与深度删除（忘） ----------
     # 改和忘是两件不同的事，别搞混：
@@ -3004,6 +3991,8 @@ class Mem0Store:
                             else CONFIDENCE_INFERRED,
                             bool(old_metadata.get("user_confirmed")),
                             created_at=old_metadata.get("created_at"),
+                            created_at_source=old_metadata.get("created_at_source")
+                            or "written",
                             slot=old_metadata.get("slot"),
                         )
                     )

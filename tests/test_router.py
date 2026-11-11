@@ -205,16 +205,17 @@ def test_muse_provider_no_usage_means_cost_unknown(tmp_path):
 
 
 def test_budget_tracker_warn_at_full_budget_no_block(tmp_path):
-    """预算控制：到 100%（$5）提醒，永不自动停（BOOS 2026-11-08 定）。
+    """预算控制：工具账本到 100%（$5）提醒，永不自动停（BOOS 2026-11-08 定）。
 
     提醒比例已从 80% 改成 100%：$4 时不提醒、也不拦截；到 $5 时
-    提醒一次，之后调用照常进行。"""
+    提醒一次，之后调用照常进行。提醒只看工具账本（BOOS 2026-11-11 定：
+    $5 只算工具的钱，聊天账本不设限）。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     assert tracker.can_call() is True
-    tracker.add_cost(4.0)
+    tracker.add_cost(4.0, ledger="tool")
     assert tracker.is_over_warn() is False  # 未到 $5，不提醒
     assert tracker.can_call() is True
-    tracker.add_cost(1.0)
+    tracker.add_cost(1.0, ledger="tool")
     assert tracker.is_over_budget() is True
     assert tracker.is_over_warn() is True  # 到 $5，提醒
     assert tracker.can_call() is True  # 只提醒，永不拦截
