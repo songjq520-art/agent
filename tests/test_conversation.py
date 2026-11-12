@@ -124,27 +124,30 @@ def test_chat_messages_rejects_bad_history(tmp_path):
 def test_deepseek_estimate_covers_full_history_not_just_latest(tmp_path):
     """预算预估覆盖完整历史：历史很长、最新问题很短时，预估仍按完整历史算。
 
-    累计 $4.998、只剩 $0.002。历史里第一轮有 10000 个汉字（约 15000 Token），
-    完整历史预估约 $0.00348，超过剩余 $0.002；如果只算最新问题
-    “你好吗”（3 个汉字），预估只有约 $0.00123。
+    累计 $4.997、只剩 $0.003。历史里第一轮有 10000 个汉字（约 15000 Token），
+    完整历史预估约 $0.00471，超过剩余 $0.003；如果只算最新问题
+    “你好吗”（3 个汉字），预估只有约 $0.00246。
+    （2026-11-13：输出上限 2048→4096，预估里的输出部分翻倍，
+    所以剩余预算从 $0.002 调到 $0.003，逻辑不变：最新问题能过、
+    完整历史超了。）
     新规矩（BOOS 2026-11-08 定）：预估只作参考、不再拦截——所以这里
     只验证预估数本身算的是完整历史，并验证 chat_messages 照常发请求。
     """
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    tracker.add_cost(4.998)
+    tracker.add_cost(4.997)
     provider = DeepSeekProvider(api_key="fake-key-for-test", budget_tracker=tracker)
     history = [
         {"role": "user", "content": "你好" * 5000},  # 10000 个汉字
         {"role": "assistant", "content": "你好"},
         {"role": "user", "content": "你好吗"},  # 最新问题很短
     ]
-    # 只算最新问题时预估约 $0.00123，远小于剩余 $0.002，不会拦截。
-    assert tracker.estimate_cost("你好吗", provider="deepseek") < 0.002
-    # 算完整历史时预估约 $0.00348，超过剩余 $0.002——证明预估算的是
+    # 只算最新问题时预估约 $0.00246，小于剩余 $0.003，不会拦截。
+    assert tracker.estimate_cost("你好吗", provider="deepseek") < 0.003
+    # 算完整历史时预估约 $0.00471，超过剩余 $0.003——证明预估算的是
     # 完整历史，不是最新问题（这里把历史内容拼起来算，和旧版
     # chat_messages 内部的算法一致）。
     history_text = "\n".join(item["content"] for item in history)
-    assert tracker.estimate_cost(history_text, provider="deepseek") == pytest.approx(0.00348)
+    assert tracker.estimate_cost(history_text, provider="deepseek") == pytest.approx(0.0047088)
     # 预估超了也不拦截：chat_messages 照常发请求。
     with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
         result = provider.chat_messages(history)

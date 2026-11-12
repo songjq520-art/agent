@@ -497,13 +497,16 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     注意：本函数不修改传入的 messages 列表；调用方在成功拿到回答后，
     再把本轮 user 问题和 assistant 回答追加进历史。
     DeepSeek 走工具循环（tools/agent_loop.py）：需要查实时信息的问题
-    先调搜索工具再回答，每轮最多 5 次工具调用；Muse 还是老路
+    先调搜索工具再回答，每轮最多 8 次工具调用；Muse 还是老路
     （没有 chat_with_tools）。工具中间结果绝不进网页历史和长期记忆，
     只有 BOOS 的原话和最后的回答才存（收尾的 add_turn 只拿原话 + 回答）。
     """
     tracker = budget_tracker or BudgetTracker()
     status = get_model_status()
-    routing = route(prompt, task_type)
+    # 满血路由（2026-11-13）：按 BOOS 原话分难易，不按拼了记忆提示块的
+    # model_prompt 分——记忆块里提到的词不能左右模型选择；original_prompt
+    # 没传时（命令行）prompt 本来就是原话，直接用它。
+    routing = route(original_prompt or prompt, task_type)
     # 第 0 步地基：计时——搜记忆、读摘要、调模型、存记忆各花多久都记下来，
     # 26 号“慢在哪”才有数。只量时间、不改行为；提前返回时已量的还在。
     timer = Timer()

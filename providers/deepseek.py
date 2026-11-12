@@ -22,8 +22,17 @@
 # 工具调用（Tool Calls，2026-11-11 核实，来源 DeepSeek 官方文档）：
 #   deepseek-flash 支持工具调用；请求带 tools 时，之后每次请求都必须把
 #   之前所有轮次 assistant 消息的 reasoning_content 原样带回（全量回传），
-#   哪怕那一轮没调工具也不例外，否则接口报 400。reasoning_content 缺了
-#   不能补空字符串蒙混——发请求前就要报错（见 chat_with_tools）。
+#   哪怕那一轮没调工具也不例外，否则接口报 400。带 tools 的请求
+#   （chat_with_tools）思考开着时，发请求前就要检查、缺了直接报错，
+#   不补空字符串（那条路没经过真机核实，不能拿来赌，见
+#   _check_reasoning_complete）。
+#   不带 tools 的最后回答（chat_messages）传 thinking="enabled" 时，
+#   接口同样要求历史里带 tool_calls 的 assistant 消息带
+#   reasoning_content，缺了报 400；但这条路 2026-11-13 真机核实过：
+#   工具那几轮思考关着、模型没产生 reasoning_content，补空字符串
+#   接口接受（空字符串只表示“本轮没有推理内容”），见
+#   _fill_missing_reasoning。不带 tool_calls 的纯文本 assistant 消息
+#   不需要补，接口不查它。
 #   思考开关通过请求体顶层 "thinking": {"type": "disabled"/"enabled"} 传，
 #   不是 extra_body 专属写法；关掉思考时没有 reasoning_content 可回传，
 #   也就不需要回传检查。
@@ -92,8 +101,13 @@ class DeepSeekProvider:
         参数 ledger / task_id / trace_id：记账用（见 chat_messages）。
         参数 thinking：不传时不发思考开关（和原来一样，思考默认开）；
         传 "enabled" / "disabled" 时通过请求体顶层 "thinking" 字段
-        显式开关——工具循环的最后一次回答要关掉思考再发，
-        不然历史里没有 reasoning_content 的 assistant 消息会报 400。
+        显式开关——工具循环里：中间调工具那几轮传 "disabled"（只做路由
+        判断），最后回答那轮传 "enabled"（2026-11-13 改，原来最后回答
+        也关着）。注意：最后回答传 "enabled" 时，历史里带 tool_calls 的
+        assistant 消息必须带 reasoning_content，否则接口报 400——工具那
+        几轮思考关着、模型没产生 reasoning_content，chat_messages 会
+        给这类消息补空字符串（2026-11-13 真机核实可过），见
+        _fill_missing_reasoning。
         """
         return self.chat_messages(
             [{"role": "user", "content": prompt}],
@@ -113,7 +127,8 @@ class DeepSeekProvider:
         或 "tool"（工具循环里的每一轮）；task_id / trace_id 用来把
         模型请求、工具请求、授权、执行结果和费用串起来查。
         参数 thinking：见 chat()——工具循环的最后一次回答传
-        "disabled"，平时聊天不传（行为和原来一样）。
+        "enabled"（2026-11-13 改，原来传 "disabled"），中间调工具那几轮
+        传 "disabled"；平时聊天不传（行为和原来一样）。
         返回格式与 chat() 相同。
         - 无 Key 时：抛出明确错误，不返回假成功。
         - 预算文件损坏时：抛出明确错误（原因见 status_reason），不偷偷调用。
@@ -165,9 +180,16 @@ class DeepSeekProvider:
         payload = {
             "model": self.model,
             # 直接发送完整消息历史（本轮及之前所有轮次），不只发最新问题。
-            "messages": messages,
+            # 思考开着时（"enabled"，或不传、接口默认开），带 tool_calls 的
+            # assistant 消息缺 reasoning_content 会被接口报 400，见
+            # _fill_missing_reasoning（2026-11-13 真机核实，补空字符串可过）。
+            "messages": (
+                self._fill_missing_reasoning(messages)
+                if thinking != "disabled"
+                else messages
+            ),
             # max_tokens（最大输出 Token 数）：实际生效的输出上限，
-            # 与调用前预估用的 MAX_OUTPUT_TOKENS 是同一个值（2048），
+            # 与调用前预估用的 MAX_OUTPUT_TOKENS 是同一个值（4096），
             # 所以预估里的输出量不是凭空假设。
             "max_tokens": MAX_OUTPUT_TOKENS,
         }
@@ -234,6 +256,37 @@ class DeepSeekProvider:
 
     # ---------- 工具调用（Tool Calls）：给 tools/agent_loop.py 用 ----------
     # 规则只写在这里（适配层），循环本身不碰这些细节，换模型时只改这里。
+
+    @staticmethod
+    def _fill_missing_reasoning(messages):
+        """给思考开着的无工具请求补齐 reasoning_content（空字符串）。
+
+        2026-11-13 真机核实：chat_messages（不带 tools）传 thinking="enabled"
+        时，历史里每一个带 tool_calls 的 assistant 消息都必须带
+        reasoning_content，缺了接口报 400（"The `reasoning_content` in the
+        thinking mode must be passed back to the API."）；不带 tool_calls 的
+        纯文本 assistant 消息不需要。工具那几轮思考是关着的，模型本来就没
+        产生 reasoning_content，没东西可回传——真机试过，补空字符串接口
+        接受（空字符串只表示“本轮没有推理内容”，不编造推理）。
+        只补带 tool_calls 又缺 reasoning_content 的 assistant 消息，
+        其余原样不动；不改调用方传进来的列表（复制后再补）。
+        注意：这只管不带 tools 的 chat_messages。带 tools 的
+        chat_with_tools 思考开着时仍走 _check_reasoning_complete 的
+        严格检查（缺了直接报错、不补），那条路没经过真机核实，不动它。
+        """
+        filled = []
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and not msg.get("reasoning_content")
+            ):
+                patched = dict(msg)
+                patched["reasoning_content"] = ""
+                filled.append(patched)
+            else:
+                filled.append(msg)
+        return filled
 
     @staticmethod
     def _normalize_messages(messages):

@@ -10,6 +10,7 @@
 #       可以把这张表换成新主控的决策逻辑，其他模块不用改。
 
 from config import DEFAULT_MODEL, MODEL_CONFIG
+from tools.model_router import select_model
 
 # TASK_TYPES（任务类型）：本次先实现三种。
 #   question：普通问答任务；code：代码相关任务；general：通用任务。
@@ -44,10 +45,18 @@ def route(task_text, task_type="question"):
     if not cfg["enabled"]:
         raise RuntimeError(f"模型 {provider} 未启用，请先在 config.py 里启用它。")
 
+    model = cfg["model"]
+    if provider == "deepseek":
+        # 满血路由（2026-11-13）：难问题走 deepseek-v4-pro，
+        # 日常问题走 deepseek-flash（见 tools/model_router.py）。
+        # 分类是原话的纯函数：同一句话每次都分到同一个模型，
+        # 任务恢复时按原话重算也不会换模型，不触发模型锁定报错。
+        model, _difficulty, _reason = select_model(task_text)
+
     return {
         "task_type": task_type,
         "provider": provider,
-        "model": cfg["model"],
+        "model": model,
     }
 
 

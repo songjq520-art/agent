@@ -1,7 +1,8 @@
 # tests/test_batch4_prompts_ui.py（第 4 批：提示词规矩 24/31/32/47/49）
 # 24 号：先查后说（系统消息第 3 条那个“不调的借口”堵死）；
 # 31 号：别每句追问；32 号：有证据就敢下结论；47 号：不许编日期；
-# 49 号：回答要短。全部离线检查，不调真实 API、不花钱。
+# 49 号：先给结论、再给必要的解释（2026-11-13 放宽，原来“一两句就够”
+# 太干巴）。全部离线检查，不调真实 API、不花钱。
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -23,9 +24,9 @@ def test_loop_system_message_has_batch4_rules():
     # 47 号：不许编日期。
     assert "日期不许编" in LOOP_SYSTEM_MESSAGE
     assert "不许凭自己的“现在”推断日期" in LOOP_SYSTEM_MESSAGE
-    # 49 号：回答要短。
-    assert "回答要短，先给结论" in LOOP_SYSTEM_MESSAGE
-    assert "一两句就够" in LOOP_SYSTEM_MESSAGE
+    # 49 号：先给结论、再给必要的解释（2026-11-13 放宽）。
+    assert "先给结论，再给必要的解释" in LOOP_SYSTEM_MESSAGE
+    assert "结论在前，把道理说清楚" in LOOP_SYSTEM_MESSAGE
 
 
 def test_build_loop_system_message_adds_date_and_date_range_rule():

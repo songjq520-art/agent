@@ -89,7 +89,7 @@ def test_deepseek_provider_no_key_raises():
 
 def test_deepseek_provider_sends_correct_request(tmp_path):
     """模型接口：请求应发到 DeepSeek 官方地址，模型 deepseek-flash，
-    输出上限 max_tokens=2048，用模拟的 requests，不联网。"""
+    输出上限 max_tokens=4096（2026-11-13 从 2048 放宽），用模拟的 requests，不联网。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好，我是 DeepSeek。"}}],
@@ -107,7 +107,7 @@ def test_deepseek_provider_sends_correct_request(tmp_path):
     assert called_url == "https://api.deepseek.com/chat/completions"
     sent_payload = mock_post.call_args.kwargs["json"]
     assert sent_payload["model"] == "deepseek-flash"
-    assert sent_payload["max_tokens"] == 2048
+    assert sent_payload["max_tokens"] == 4096
     sent_headers = mock_post.call_args.kwargs["headers"]
     assert sent_headers["Authorization"] == "Bearer fake-key-for-test"
 
@@ -216,7 +216,7 @@ def test_deepseek_estimated_cost_no_block_before_api_request(tmp_path):
     超过剩余预算，chat() 也不应抛错，应正常发请求、拿到回答。
 
     DeepSeek 闲时价预估：10000 个汉字估 15000 Token，
-    15000/1e6*0.15 + 2048/1e6*0.60 = 0.0034788 美元，超过剩余 $0.002，
+    15000/1e6*0.15 + 4096/1e6*0.60 = 0.0047076 美元，超过剩余 $0.002，
     但新规矩下预估只作参考，不在请求前拦截。"""
     fake_response = Mock()
     fake_response.json.return_value = {
@@ -228,7 +228,7 @@ def test_deepseek_estimated_cost_no_block_before_api_request(tmp_path):
     tracker.add_cost(4.998)
     provider = DeepSeekProvider(api_key="fake-key-for-test", budget_tracker=tracker)
     long_prompt = "你好" * 5000  # 10000 个汉字
-    assert tracker.estimate_cost(long_prompt, provider="deepseek") == pytest.approx(0.0034788)
+    assert tracker.estimate_cost(long_prompt, provider="deepseek") == pytest.approx(0.0047076)
     with patch("providers.deepseek.requests.post", return_value=fake_response) as mock_post:
         result = provider.chat(long_prompt)
         mock_post.assert_called_once()
