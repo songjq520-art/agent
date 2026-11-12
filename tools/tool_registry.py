@@ -47,12 +47,19 @@ _REGISTRY = {}
 
 def register_tool(name, description, parameters, output, risk_level,
                   needs_confirmation, tier2=False, replay_safe=True,
-                  side_effect_free=False, timeout=60):
+                  side_effect_free=False, timeout=60, precheck=None):
     """登记一个工具。返回一个装饰器，装饰真正干活的函数。
 
     参数说明见文件头。risk_level 只认 "low" / "medium" / "high"，
     写错了直接报错，不让含糊的登记混进去。
     同一个名字登记两次也报错——重名会让模型分不清调的是哪个。
+    precheck（57 号）：可选的确认前校验函数，签名 precheck(args)，
+    返回 (error, augment)：error 是字符串时拒绝这次调用（不建确认卡、
+    不执行，错误直接回给模型，让它重新列出再动手）；error 为 None
+    时通过，augment 是要补进参数里的程序算好的字段（比如删记忆的
+    匹配结果，确认卡上原样显示——卡只显示 args，不改卡片渲染）。
+    precheck 只读、不改库，确认前和执行前各跑一次（执行前再验一遍，
+    防卡建好后库变了）。
     """
 
     if risk_level not in ("low", "medium", "high"):
@@ -75,6 +82,7 @@ def register_tool(name, description, parameters, output, risk_level,
             "replay_safe": bool(replay_safe),
             "side_effect_free": bool(side_effect_free),
             "timeout": timeout,
+            "precheck": precheck,
             "func": func,
         }
         return func

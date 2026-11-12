@@ -282,6 +282,45 @@ class ToolGateway:
             self._audit(tool_name, "execute", False, reason, extra)
             return {"decision": "rejected", "result": None, "reason": reason, "approval": None}
 
+        # 第 3.5 关：确认前校验（57 号 precheck）——登记了 precheck 的工具，
+        #   在建确认卡之前和执行之前各验一次。precheck 只读、不改库：
+        #   返回 (error, augment)，error 非空时拒绝这次调用（不建卡、
+        #   不执行，错误直接回给模型，让它重新列出再动手）；通过时
+        #   augment 里的程序算好的字段补进参数（确认卡上原样显示）。
+        #   校验本身出错也按拒绝处理——验不出来就别建卡，宁可不删，
+        #   不可删错。augment 的键必须在工具登记的参数里，否则重验
+        #   参数时会被“多余参数”拦住（等于这次校验没通过）。
+        precheck = tool.get("precheck")
+        if precheck is not None:
+            try:
+                precheck_error, precheck_augment = precheck(args)
+            except Exception as exc:  # noqa: BLE001 - 校验出错按拒绝处理
+                precheck_error = f"确认前校验出错：{exc}"
+                precheck_augment = None
+            if precheck_error:
+                self._audit(
+                    tool_name, "rejected", False,
+                    f"确认前校验没通过：{precheck_error}", extra,
+                )
+                return {
+                    "decision": "rejected",
+                    "result": None,
+                    "reason": precheck_error,
+                    "approval": None,
+                }
+            if precheck_augment:
+                args = {**args, **precheck_augment}
+                error = validate_args(args, tool["parameters"])
+                if error:
+                    reason = f"工具 {tool_name} 的参数不对：{error}。"
+                    self._audit(tool_name, "rejected", False, reason, extra)
+                    return {
+                        "decision": "rejected",
+                        "result": None,
+                        "reason": reason,
+                        "approval": None,
+                    }
+
         # 第 4 关：确认检查——要确认的工具，没确认就不执行，只返回确认记录。
         if tool["needs_confirmation"] and not confirmed:
             approval = make_approval(

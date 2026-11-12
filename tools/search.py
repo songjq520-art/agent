@@ -22,10 +22,15 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import requests
 
+from tools.date_numbers import (
+    english_market_close_query,
+    extract_dated_numbers,
+    parse_date_mentions,
+)
 from tools.errors import QuotaExhausted, ToolError
 
 ANYSEARCH_API_URL = "https://api.anysearch.com/v1/search"
@@ -87,12 +92,21 @@ class SearchResult:
     score: float = None
 
     def to_dict(self):
+        # 50/54 号：每条结果带 dated_numbers（数字-日期对照，只留配上日期的；
+        # 没配上日期的数不放进来，模型就知道“这个数没日期，别当某天的数用”。
+        # 注意：这里只看标题 + 摘要里的文字日期，绝不拿 published_at 当数的日期。）
+        dated = [
+            {"number": item["number"], "date": item["date"]}
+            for item in extract_dated_numbers(f"{self.title}. {self.snippet}")
+            if item["date"] is not None
+        ]
         return {
             "title": self.title,
             "url": self.url,
             "snippet": self.snippet,
             "published_at": self.published_at,
             "score": self.score,
+            "dated_numbers": dated,
         }
 
 
@@ -660,6 +674,51 @@ def _quality_notes(results, corroborated_domains):
     return notes
 
 
+def _outcome_has_close_candidate(outcome, day_iso):
+    """这一批结果里有没有可能是收盘价的数：plain number（kind=price，
+    不是百分比）且配上了要的那天的日期。百分比不算——财联社“跌幅达
+    0.9%”配上了 2026-11-10，但那是盘中跌幅，不是收盘价；2025 年表里
+    的数配的是 2025 年的日期，也不算。"""
+    for result in (outcome.results or []):
+        for item in extract_dated_numbers(f"{result.title}. {result.snippet}"):
+            if item.get("kind") == "price" and item.get("date") == day_iso:
+                return True
+    return False
+
+
+def _outcome_has_undated_price_for_day(outcome, day_iso):
+    """这一批结果里有没有没配上日期的 plain number，同时整条结果提到了
+    要的那天（日期在标题里、数在正文里这种——句内配对够不着，但整条
+    结果就是讲那天的，比如美联社“Tuesday 11/10/2026”标题 + 正文里的
+    7,520.93）。重试的接受条件用这个：模型自己会读正文判断哪个数是
+    收盘价，重试只要把像样的 raw 材料带回来就行。"""
+    day = date.fromisoformat(day_iso)
+    for result in (outcome.results or []):
+        if _result_rank_for_day(result, day_iso) == 1:
+            return True
+    return False
+
+
+def _result_rank_for_day(result, day_iso):
+    """一条结果对要的那天的有用程度（51 号排序用）：0 = 有配上那天的
+    plain number（收盘价候选）；1 = 有没配上日期的 plain number、同时
+    整条结果提到了那天（日期在标题里、数在正文里）；2 = 其他。
+    排序时 0 在前、1 其次，2 垫底。"""
+    text = f"{result.title}. {result.snippet}"
+    dated = extract_dated_numbers(text)
+    if any(
+        item.get("kind") == "price" and item.get("date") == day_iso
+        for item in dated
+    ):
+        return 0
+    day = date.fromisoformat(day_iso)
+    if any(m["date"] == day for m in parse_date_mentions(text)) and any(
+        item.get("kind") == "price" and item.get("date") is None for item in dated
+    ):
+        return 1
+    return 2
+
+
 class SearchService:
     """统一搜索调度器：按任务路由、失败切备选、必要时交叉验证。
 
@@ -874,6 +933,71 @@ class SearchService:
                 quality={"results": 0, "with_url": 0, "notes": [error]},
                 fetched_at=_now_iso(),
             )
+        # 51 号实测（2026-11-12）：Tavily 中文查询召回差——“标普500指数
+        # 11月10日 收盘”只搜回一则盘中快讯（0.9% 是百分比，不是收盘价）
+        # 和一张 2025 年的表，没有 2026-11-10 的收盘数；同一问题翻成英文
+        # 一次就搜到美联社的收盘数（7,520.93）。链路只在“没结果”时才切
+        # 备选，“有结果、但没有要的那天的收盘价”就停了，模型只能说没查到。
+        # 所以：带单日 date_range 且结果里一个收盘价候选都没有时，翻成英文
+        # 整条链重跑一次；重跑后有了收盘价候选（配上那天的 plain number，
+        # 或整条结果讲那天、数没配上日期）就用重跑的，还是没有就留第一份
+        #（别把已有的结果弄丢）。只重试一次——翻出来的查询不再含中文，
+        # 不会再触发。
+        # 英文查询优先用程序拼的（行情问题：实体英文名 + close + 日期，
+        # 确定的、不花钱）：模型翻译器对短词组不稳，实测“纳斯达克指数 收盘”
+        # 翻回来还是中文，重试就触发不了；非行情问题才走模型翻译器。
+        if (
+            range_start is not None
+            and range_start == range_end
+            and _contains_cjk(query)
+            and not _outcome_has_close_candidate(outcome, range_start.isoformat())
+        ):
+            retry_query = english_market_close_query(query, range_start)
+            if retry_query is None and self.translator is not None:
+                translated = None
+                try:
+                    translated = self.translator(query, "en")
+                except Exception:
+                    translated = None
+                if (
+                    translated
+                    and translated.strip()
+                    and translated.strip() != query.strip()
+                    and not _contains_cjk(translated)
+                ):
+                    retry_query = translated.strip()
+            if retry_query:
+                retry = self.search(
+                    retry_query,
+                    kind=kind,
+                    max_results=max_results,
+                    cross_check=cross_check,
+                    force_provider=force_provider,
+                    date_range=date_range,
+                )
+                if retry.status == "ok" and (
+                    _outcome_has_close_candidate(retry, range_start.isoformat())
+                    or _outcome_has_undated_price_for_day(
+                        retry, range_start.isoformat()
+                    )
+                ):
+                    attempts.append(
+                        {
+                            "provider": retry.provider,
+                            "status": "ok",
+                            "reason": "中文查询没有要的那天的收盘价，翻成英文重搜后找到",
+                        }
+                    )
+                    outcome = retry
+        # 51 号实测（2026-11-12）：道指 11.10 那轮，第一轮搜回来的结果里
+        # 本来就有 2026-11-10 的收盘数（英为财情历史表：收 52,231.89），
+        # 但排在维基百科那条巨型摘要后面，工具结果 4000 字截断把它截掉了，
+        # 模型根本没看到、只能说没查到。所以：带单日 date_range 时，把
+        # 有那天收盘价候选的结果排前面（稳定排序，只提顺序、不丢结果），
+        # 其次是整条结果讲那天、数没配上日期的，让模型先看到能用的数。
+        if range_start is not None and range_start == range_end:
+            day_iso = range_start.isoformat()
+            outcome.results.sort(key=lambda r: _result_rank_for_day(r, day_iso))
         if not outcome.fetched_at:
             outcome.fetched_at = _now_iso()
         outcome.attempts = attempts

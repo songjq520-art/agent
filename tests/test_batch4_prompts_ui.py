@@ -37,3 +37,42 @@ def test_build_loop_system_message_adds_date_and_date_range_rule():
     assert "换算成具体日期再查" in text
     # 基础规矩本身没被改写：开头还是 LOOP_SYSTEM_MESSAGE 原文。
     assert text.startswith(LOOP_SYSTEM_MESSAGE)
+
+
+# ---------- 42 号：定投默认按交易日算（2026-11-12 BOOS 定） ----------
+
+# 42 号 5 条新问法（实测换说法验默认口径用）：前 3 条没点明口径，
+# 默认按交易日算；后 2 条明确说了日历天，按日历天算。
+DCA_42_PHRASES = [
+    # （问法，期望口径）
+    ("从今天定投到年底，每天 5 块，一共投多少钱", "trading"),
+    ("从今天起一个月，每天定投 5 块，一共多少钱", "trading"),
+    ("从今天起一年，每天定投 5 块，一共多少钱", "trading"),
+    ("从今天定投到年底，每天 5 块，按日历天算，一共投多少钱", "calendar"),
+    ("从今天起一个月，每天定投 5 块，按自然日算，一共多少钱", "calendar"),
+]
+
+
+def test_42_system_message_defaults_to_trading_days():
+    """42 号：第 11 条写明定投默认按交易日算，只有明确说日历天/
+    自然日时才按日历天算；回答里要说明口径。"""
+    text = build_loop_system_message()
+    assert "默认按交易日算" in text
+    assert "定投只在美股交易日扣款" in text
+    assert "按日历天/自然日算时" in text
+    assert "回答里说明是按交易日算的" in text
+    # 42 号实测（2026-11-12）：“从今天起一年”那轮模型先给了 1825（日历天）
+    # 再补交易日——第 11 条加一句：先给交易日的数，别先给日历天再补充；
+    # 不确定就先搜，别先给大概数。
+    assert "先给交易日的数" in text
+    assert "别先给日历天的数再补充" in text
+    assert "别先给个大概数" in text
+
+
+def test_42_phrases_cover_default_and_calendar():
+    """42 号 5 条新问法：3 条默认口径（交易日）+ 2 条明确日历天，
+    条条不一样（实测换说法验泛化用）。"""
+    assert len(DCA_42_PHRASES) == 5
+    assert len({phrase for phrase, _ in DCA_42_PHRASES}) == 5
+    assert [basis for _, basis in DCA_42_PHRASES].count("trading") == 3
+    assert [basis for _, basis in DCA_42_PHRASES].count("calendar") == 2

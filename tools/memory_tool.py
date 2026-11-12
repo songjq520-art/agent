@@ -91,6 +91,85 @@ def _same_text(a, b):
     return bool(norm_a) and norm_a == norm_b
 
 
+def _norm_anchor_text(text):
+    """anchor/原文归一化：去首尾空白和句末标点，子串比对用。"""
+    return (text or "").strip().strip("。！？；，、.!?;, \t\n")
+
+
+def _find_anchor_matches(store, anchor):
+    """库里哪些记忆的原文含有 anchor（归一化后子串比对）。
+    返回 [(id, text)]，按库里的顺序排。anchor 为空时返回 []。"""
+    norm = _norm_anchor_text(anchor)
+    if not norm:
+        return []
+    out = []
+    try:
+        items = store.get_all(include_sensitive=True) or []
+    except Exception:
+        return []
+    for item in items:
+        text = (item or {}).get("text") or ""
+        if norm in _norm_anchor_text(text):
+            out.append(((item or {}).get("id") or "", text))
+    return out
+
+
+def _check_delete_anchor(args):
+    """删记忆的确认前校验（57 号 precheck）：程序核对模型挑的这条
+    是不是用户要删的那条。
+    返回 (error, augment)：error 非空时拒绝（不建卡、不执行，错误
+    直接回给模型，让它重新列出再动手）；通过时 augment 带程序算好
+    的匹配结果（确认卡上原样显示）。
+    只做一件事：模型挑的那条（memory_id + text）的原文里必须含 anchor。
+    09:01（拉面）和 09:03（Agent 目标）就是这么露的——挑的条目真实存在、
+    原文逐字对得上，但原文里根本没有用户说的“鸡杂面”。
+    多命中不拦：库里常有“关于同一件事的说法”（比如撤回句本身也含“鸡杂面”），
+    命中多条不代表挑错了——只要挑的这条对得上 anchor 就放行，卡上会注明
+    库里还有几条相关记忆，让 BOOS 再看一眼；挑的这条对不上才拒绝。
+    只读、不改库，确认前和执行前各跑一次。
+    """
+    store, error = _store_or_error()
+    if error is not None:
+        return error["error"], None
+    memory_id = (args or {}).get("memory_id") or ""
+    text = (args or {}).get("text") or ""
+    anchor = (args or {}).get("anchor_text") or ""
+    if not _norm_anchor_text(anchor):
+        return (
+            "删记忆要写 anchor_text：用户原话里的删除目标"
+            "（比如“鸡杂面”），没写没法核对。",
+            None,
+        )
+    matches = _find_anchor_matches(store, anchor)
+    if not matches:
+        return (
+            f"库里没找到含“{anchor}”的记忆，没删。"
+            "请先列出全部记忆，确认要删的是哪条。",
+            None,
+        )
+    picked = next((m for m in matches if m[0] == memory_id), None)
+    if picked is None:
+        shown = "；".join(t for _i, t in matches[:3])
+        more = f"（等共 {len(matches)} 条）" if len(matches) > 3 else ""
+        return (
+            f"你要删的是“{anchor}”，但挑的这条原文里没有它，挑错了，"
+            f"没删：{text}。库里提到“{anchor}”的是：{shown}{more}"
+            "请先列出全部记忆，照原文再删。",
+            None,
+        )
+    _picked_id, picked_text = picked
+    if not _same_text(picked_text, text):
+        return (
+            "原文对不上库里存的那条（可能列表旧了、或抄错了），没删。"
+            "请先列出全部记忆，照原文再删。",
+            None,
+        )
+    note = f"程序已核对：anchor“{anchor}”对得上“{picked_text}”"
+    if len(matches) > 1:
+        note += f"（库里还有 {len(matches) - 1} 条提到“{anchor}”的记忆，确认删的是这一条。）"
+    return None, {"_anchor_match": note}
+
+
 def _store_or_error():
     """取绑定的记忆库，没绑时返回（None，错误包络），调用方直接返回它。"""
     store = get_memory_store()
@@ -128,6 +207,10 @@ def _run_list_memories(args):
                 "confirmed": bool(meta.get("user_confirmed")),
             }
         )
+    # 57 号截断悬崖：工具结果一律截到前 4000 字，列表按存入顺序排时，
+    # 尾巴上最新、最可能要删的那几条会被静默截掉，模型连挑的机会都没有。
+    # 新在前：最新的条目排在前面，截断也先截掉最老的（和面板 36 号一致）。
+    entries.reverse()
     return {
         "ok": True,
         "data": {"count": total, "memories": entries},
@@ -258,6 +341,11 @@ def _run_delete_memory(args):
             "data": None,
             "error": "删记忆要传 memory_id 和 text（列出来的原文），缺了没法删。",
         }
+    # 57 号：执行前再验一次 anchor（确认卡建好后库可能变了，防卡上的
+    # 条目在确认前被改掉/删掉）。precheck 已经验过一次，这里是第二道。
+    anchor_error, _augment = _check_delete_anchor(args)
+    if anchor_error:
+        return {"ok": False, "data": None, "error": anchor_error}
     try:
         scope = store.deletion_scope(memory_id)
     except Exception as exc:  # noqa: BLE001 - 读范围失败也算执行失败
@@ -306,12 +394,14 @@ def _run_delete_memory(args):
 
 
 def _register_one(name, description, parameters, output, risk_level,
-                  needs_confirmation, func, replay_safe, side_effect_free):
+                  needs_confirmation, func, replay_safe, side_effect_free,
+                  precheck=None):
     """登记一个记忆工具（已登记过时跳过，重复调不报错）。
 
     replay_safe / side_effect_free 每项显式写清楚，不推导：
     只读的列（list_memories）才能重跑、才能走线程超时；会改东西的
     记/改/删一律不可重跑、同步跑（见 tool_gateway.py 的执行规则）。
+    precheck（57 号）：确认前校验，见 tools/tool_registry.py。
     """
     if get_tool(name) is not None:
         return
@@ -326,6 +416,7 @@ def _register_one(name, description, parameters, output, risk_level,
         replay_safe=replay_safe,
         side_effect_free=side_effect_free,
         timeout=60,
+        precheck=precheck,
     )(func)
 
 
@@ -358,11 +449,14 @@ def register_memory_tools():
     _register_one(
         name="add_memory",
         description=(
-            "往长期记忆里加一条 BOOS 明确让记的事。只在 BOOS 明确说"
-            "“记住…”、“记下来”、“帮我记住”时用；别自己决定把对话内容"
-            "存成长久记忆（对话结束会自动提取）。text 写 BOOS 让记的原话。"
+            "往长期记忆里加一条 BOOS 的事实/偏好/决定/习惯。BOOS 明确表达"
+            "出来的就调——不只认“记住”两个字：他说“我想以后每天7点起床”"
+            "“我爱吃拉面”“以后每天定投5块”这种明确的事实/偏好/决定/习惯"
+            "都算，直接存；只有一次性的请求（“帮我查一下”“发个消息”）"
+            "和闲聊不存。text 写 BOOS 原话里的那条事实。"
             "返回 {memory_id, text, duplicate}（duplicate 表示库里已经有"
-            "同一条，没重复存）。"
+            "同一条，没重复存）。成功返回 ok=True 才算存进去了，才能跟"
+            "BOOS 说“记下了”；没调这个工具时别说“记下了”。"
         ),
         parameters={
             "type": "object",
@@ -432,10 +526,16 @@ def register_memory_tools():
         name="delete_memory",
         description=(
             "删一条长期记忆。先调 list_memories 列出全部，找到要删的那条，"
-            "把 memory_id、text（列出来的原文，一字不差地抄）一起传来；"
-            "原文对不上库里的就不删。删之前会先弹确认卡，BOOS 点了确认才"
-            "执行，取消了就不删；删了就彻底没了（向量和审计记录都清掉），"
-            "别删错。返回 {memory_id, text, history_cleared}。"
+            "把 memory_id、text（列出来的原文，一字不差地抄）和 anchor_text"
+            "（用户原话里的删除目标，比如 BOOS 说“删掉鸡杂面”时 anchor_text"
+            "就是“鸡杂面”）一起传来；原文对不上库里的就不删。"
+            "程序会先核对 anchor：挑的这条原文里含 anchor 才建确认卡，"
+            "对不上、没找到时直接拒绝、不建卡；库里还有别的提到 anchor 的，"
+            "卡上会注明，确认删的是这一条；"
+            "先问清楚再删，别自己挑。删之前会先弹确认卡，卡上显示 anchor"
+            "和程序算好的匹配结果，BOOS 点了确认才执行，取消了就不删；"
+            "删了就彻底没了（向量和审计记录都清掉），别删错。"
+            "返回 {memory_id, text, history_cleared}。"
         ),
         parameters={
             "type": "object",
@@ -451,8 +551,19 @@ def register_memory_tools():
                     "minLength": 1,
                     "maxLength": 1000,
                 },
+                "anchor_text": {
+                    "type": "string",
+                    "description": "用户原话里的删除目标（比如“鸡杂面”）",
+                    "minLength": 1,
+                    "maxLength": 200,
+                },
+                "_anchor_match": {
+                    "type": "string",
+                    "description": "程序算好的匹配结果，确认卡上显示用；模型不用填",
+                    "maxLength": 500,
+                },
             },
-            "required": ["memory_id", "text"],
+            "required": ["memory_id", "text", "anchor_text"],
         },
         output=(
             "成功时 data 是 {memory_id, text, history_cleared}；"
@@ -463,4 +574,5 @@ def register_memory_tools():
         func=_run_delete_memory,
         replay_safe=False,
         side_effect_free=False,
+        precheck=_check_delete_anchor,
     )

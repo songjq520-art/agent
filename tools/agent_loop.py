@@ -44,6 +44,7 @@
 #     失败的轮次也记——钱花了就要有数。
 
 import json
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -75,6 +76,8 @@ TOOL_RESULT_MAX_CHARS = 4000
 #   47 号：第 7 条，日期不许编（30 号的日期注入是地基，这条是死规矩）。
 #   45 号：第 8 条，长期记忆用记忆工具——先列出全部再动手，改/删过确认卡，
 #     记新事只有 BOOS 明确说“记住”时才调。
+#   50/54 号：第 10 条在 build_loop_system_message 里现加（数字-日期对照），
+#     LOOP_SYSTEM_MESSAGE 本身不动（测试直接拿它拼消息）。
 # 日期本身不在这里写死：build_loop_system_message 每次循环现算现加，
 # 再补第 9 条（相对日期换算 + date_range，见 28 号）。
 LOOP_SYSTEM_MESSAGE = (
@@ -89,13 +92,23 @@ LOOP_SYSTEM_MESSAGE = (
     "“要查吗”；只有不需要实时信息的问题才直接答。\n"
     "4. 工具结果可能被截断，截断处会标明；截断的部分不要猜、不要补。\n"
     "5. 回答完就停，不要每句追问；能自己决定的就自己决定，只有真缺关键"
-    "信息才问，一次只问一个。\n"
+    "信息才问，一次只问一个。用户撤回上一句时，直接说收到了、那句不算数，"
+    "别反问“要不要删掉”——删的动作走确认卡，BOOS 想删会说的。\n"
     "6. 回答要短，先给结论，一两句就够，细节只在用户追问时展开。\n"
     "7. 日期不许编：没给日期就说不知道，不许凭自己的“现在”推断日期。\n"
     "8. BOOS 让你看/改/删长期记忆时，用记忆工具：先调 list_memories 列出全部"
     "再动手，别只凭提问前检索到的几条就改删；改和删要先过确认卡"
-    "（BOOS 点了确认才执行），别自己悄悄改删；记新事只有 BOOS 明确说"
-    "“记住”时才调 add_memory，别自己决定存。"
+    "（BOOS 点了确认才执行），别自己悄悄改删；删记忆时把 BOOS 原话里的"
+    "删除目标写进 anchor_text（比如他说“删掉鸡杂面”时 anchor_text 就是"
+    "“鸡杂面”），程序核对过挑的这条原文里有 anchor 才建卡，对不上、没找到时"
+    "先问清楚，别自己挑一条；记新事：BOOS 明确表达的事实/偏好/决定/习惯"
+    "就调 add_memory 存，不只认“记住”两个字（他说“我想以后每天7点起床”"
+    "“我爱吃拉面”都算）；一次性的请求和闲聊不存。只有 add_memory 成功"
+    "返回已存入后，才能说“记下了”；没调 add_memory 时只说“好的/知道了”，"
+    "别说“记下了”。BOOS 说了新的定投/习惯/决定时，先把能确定的部分"
+    "（金额、周期、对象）存下来，不确定的只追问一句、或记成待确认——"
+    "别把句子里已经给过的数（比如“5刀”就是 5 美元）又反问一遍，"
+    "也别反问一串才肯记。"
 )
 
 # 工具返回数据的分隔线：包在分隔线里，模型就知道这段是数据、不是指令。
@@ -142,6 +155,15 @@ def build_loop_system_message():
         "问具体某天（比如“昨天纳指收盘多少”“11 月 10 日纳指多少”）时，"
         "把换算好的日期放进搜索的 date_range 里再查，回答时标明每组数是哪天的、"
         "分不清就说分不清，别挑一组当答案。"
+        "\n10. 搜索结果里每条都带 dated_numbers（数字-日期对照，程序标好的）:"
+        "引用收盘价/涨跌幅时，只用日期和你要问的那天对得上的那条；"
+        "不同日期的数不算冲突，别让它拉低你对正确答案的把握；"
+        "没有你要的那天的数就说不知道，不许拿别的日子的数顶上。"
+        "\n11. 定投/扣款类计算默认按交易日算：定投只在美股交易日扣款，"
+        "没点明口径时按交易日算（扣周末和美股休市日，比如感恩节、圣诞节），"
+        "先给交易日的数、回答里说明是按交易日算的，别先给日历天的数再补充；"
+        "只有 BOOS 明确说按日历天/自然日算时，才按日历天算。算交易日天数"
+        "不确定时先搜一下当年美股休市日历再算，别先给个大概数。"
     )
 
 
@@ -530,9 +552,23 @@ class AgentLoop:
             messages.append(assistant_msg)
             task["messages"] = messages
 
-            # 2. 模型直接回答了：本轮结束。
+            # 2. 模型直接回答了：先过 51 号门禁（行情数据没搜过不能直接答），
+            #    再校验引用的数是不是要问的那天的（50/54 号），有错就纠正一轮，
+            #    再结束本轮。
             if not tool_calls:
-                return self._finish(task, messages, response.get("text") or "",
+                reply = response.get("text") or ""
+                reply, gate_outcome = self._search_first_gate(task, messages, reply)
+                if gate_outcome == "remind":
+                    # 提醒过了，继续循环等模型去搜。
+                    round_no += 1
+                    continue
+                if gate_outcome is False:
+                    return self._finish(task, messages, reply,
+                                        tool_calls_made, total_cost, cost_unknown, timer)
+                reply, total_cost, cost_unknown = self._correct_reply_dates(
+                    reply, task, messages, total_cost, cost_unknown, timer
+                )
+                return self._finish(task, messages, reply,
                                     tool_calls_made, total_cost, cost_unknown, timer)
 
             # 3. 模型要调工具：逐个执行。
@@ -611,6 +647,19 @@ class AgentLoop:
         final_text = final.get("text") or ""
         messages.append({"role": "assistant", "content": final_text})
         task["messages"] = messages
+        # 51 号：最后这轮回答也要过门禁（工具次数用完后的兜底回答
+        # 同样可能没搜就给数；这里没下一轮可走了，不提醒，直接回不知道）。
+        final_text, gate_outcome = self._search_first_gate(
+            task, messages, final_text, allow_remind=False
+        )
+        if gate_outcome is False:
+            return self._finish(task, messages, final_text,
+                                tool_calls_made, total_cost, cost_unknown, timer)
+        # 50/54 号：最后这轮回答也要校验日期（工具次数用完后的兜底回答
+        # 同样可能拿错日子的数）。
+        final_text, total_cost, cost_unknown = self._correct_reply_dates(
+            final_text, task, messages, total_cost, cost_unknown, timer
+        )
         return self._finish(task, messages, final_text,
                             tool_calls_made, total_cost, cost_unknown, timer)
 
@@ -806,8 +855,222 @@ class AgentLoop:
                 "executed_query": data.get("executed_query") or query,
                 "kind": args.get("kind") or "normal",
                 "date_range": args.get("date_range"),
+                # 51 号：门禁认“搜过（实体，日期）”时，搜失败了/没结果不算搜过。
+                "ok": bool(result.get("ok")),
+                "result_count": len(data.get("results") or []),
             }
         )
+        # 50/54 号：把每条结果的 dated_numbers 也记进任务（校验回答时用）。
+        # 只记配上日期的——没配上的数没法按日期验证，记了也没用。
+        task.setdefault("search_dated_numbers", [])
+        for item in data.get("results") or []:
+            for entry in item.get("dated_numbers") or []:
+                if isinstance(entry, dict) and entry.get("number") and entry.get("date"):
+                    task["search_dated_numbers"].append(
+                        {"number": entry["number"], "date": entry["date"]}
+                    )
+
+    # ---------- 51 号：先查后说（程序级门禁） ----------
+
+    def _search_first_status(self, task):
+        """51 号：行情数据问题必须先搜再答，落到程序上（不只靠提示词）。
+        返回 (entity_key, entity_label, requested_date, covered)；
+        门禁不开时返回 None（普通聊天、定投算钱、未来日期都不强制搜）。
+        covered = 本轮任务里已经搜过（实体，日期）这一对。
+        未来日期豁免：要问的那天还没到，模型按日期逻辑答“还没到”就行，
+        不用先搜——搜了也没结果。"""
+        from tools.date_numbers import (
+            extract_market_entity,
+            is_market_data_question,
+            resolve_requested_date,
+            search_covers_pair,
+        )
+
+        goal = task.get("goal") or ""
+        if not is_market_data_question(goal):
+            return None
+        today = datetime.now(_SHANGHAI_TZ).date()
+        requested = resolve_requested_date(goal, today)
+        if requested is not None and requested > today:
+            return None
+        entity_key, entity_label = extract_market_entity(goal)
+        covered = search_covers_pair(task.get("searches") or [], entity_key, requested)
+        return entity_key, entity_label, requested, covered
+
+    @staticmethod
+    def _answer_needs_evidence(reply):
+        """51 号：这句直接回答里有没有“需要证据的主张”——引用了数、
+        说了涨跌方向、或声称“没查到/不知道”。三者都没有时（比如
+        “还没到那天”这种纯日期逻辑），门禁不拦。"""
+        from tools.date_numbers import extract_numbers
+
+        text = reply or ""
+        if extract_numbers(text):
+            return True
+        if any(word in text for word in ("涨", "跌", "持平")):
+            return True
+        return any(
+            phrase in text
+            for phrase in (
+                "没有查到", "查不到", "没有找到", "没找到", "没有数据",
+                "没有可靠数据", "还没确认", "不知道", "不清楚",
+            )
+        )
+
+    def _search_first_gate(self, task, messages, reply, allow_remind=True):
+        """51 号门禁：在模型直接回答（没调工具）时跑。
+        返回 (reply, proceed)：proceed 为 True 时回答可以交出；
+        为 False 时回答不能交出——调用方按返回的 reply 收尾。
+        - （实体，日期）搜过了：直接放行。
+        - 没搜过、且回答里有需要证据的主张：第一次提醒模型去搜
+          （消息追加进对话、继续循环），提醒过一次还直接答，
+          就如实回不知道，不把没查过的数交出去。
+        allow_remind=False 时（兜底轮，没下一轮可走了），第一次也直接
+        回不知道，不提醒。"""
+        gate = self._search_first_status(task)
+        if gate is None:
+            return reply, True
+        _key, label, requested, covered = gate
+        if covered:
+            return reply, True
+        if not self._answer_needs_evidence(reply):
+            return reply, True
+        date_str = requested.isoformat() if requested else "当天"
+        if allow_remind and not task.get("search_first_reminded"):
+            # 第一次：把模型刚给的没证据的回答换掉（别留进任务记录里，
+            # 不然以后提取记忆会把它当事实），提醒它先去搜，继续循环。
+            self._replace_last_assistant_reply(
+                messages, "（这个问题我得先查一下再答。）"
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "（系统提醒：这个问题要先联网查——请调 search 工具查一下"
+                        f"{date_str}{label}的收盘，拿到结果再回答，不要凭记忆直接答。）"
+                    ),
+                }
+            )
+            task["search_first_reminded"] = True
+            task["messages"] = messages
+            self.task_store.save(task)
+            return reply, "remind"
+        dont_know = f"{date_str}{label}的收盘数据我这边没有查到可靠的，所以不敢给数。"
+        self._replace_last_assistant_reply(messages, dont_know)
+        return dont_know, False
+
+    # ---------- 50/54 号：数字-日期校验 ----------
+
+    def _requested_date_for_task(self, task):
+        """本轮问的是哪一天（50/54 号根治：相对日期先换算成绝对日期）。
+        先从用户原话（task["goal"]）里解析：明确写出来的日期
+        （11月11日 / Nov 11）或相对说法（昨天/今天/前天）；都没有时，
+        用最近一次搜索的 date_range（起止同一天才算一天）；都没有就
+        返回 None（不校验，别拿错日期去拦正确答案）。
+        今天按上海时间算（和系统消息里给的今天一致）。"""
+        from tools.date_numbers import is_market_date_question, resolve_requested_date
+
+        goal = task.get("goal") or ""
+        if not is_market_date_question(goal):
+            return None
+        today = datetime.now(_SHANGHAI_TZ).date()
+        resolved = resolve_requested_date(goal, today)
+        if resolved is not None:
+            return resolved
+        # 回落：最近一次搜索的 date_range（起止同一天才算一天）。
+        for entry in reversed(task.get("searches") or []):
+            date_range = entry.get("date_range") or {}
+            start = date_range.get("start")
+            end = date_range.get("end")
+            if start and start == end:
+                try:
+                    return datetime.strptime(start, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+        return None
+
+    def _collect_dated_numbers(self, task):
+        """本轮所有搜索结果里的数字-日期对照（去重后）。
+        存在 task["search_dated_numbers"] 里（_record_search 时记的）。"""
+        seen = set()
+        out = []
+        for entry in task.get("search_dated_numbers") or []:
+            key = (entry.get("number"), entry.get("date"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"number": entry.get("number"), "date": entry.get("date")})
+        return out
+
+    def _validate_reply_dates(self, reply, task):
+        """50/54 号：校验回答里引用的数是不是要问的那天的。
+        返回 (ok, mismatches)：ok 为 True 时没问题；为 False 时
+        mismatches 是 [{"number", "found_dates"}]（这个数只出现在别的日期上）。
+        问的不是行情/收盘、没解析出要问的那天、回答里没数、
+        搜索结果里没数时都返回 (True, [])——不校验、不拦。"""
+        from tools.date_numbers import find_date_mismatches
+
+        requested = self._requested_date_for_task(task)
+        if requested is None:
+            return True, []
+        dated = self._collect_dated_numbers(task)
+        if not dated:
+            return True, []
+        mismatches, _unverified = find_date_mismatches(reply, dated, requested)
+        return (not mismatches), mismatches
+
+    def _correct_reply_dates(self, reply, task, messages, total_cost, cost_unknown, timer=None):
+        """50/54 号：一轮纠正——回答里引用了别的日子的数时，让模型重答一次。
+        返回 (reply, total_cost, cost_unknown)。
+        纠正后还错，就直接回“不知道”（不把错数交给 BOOS）。
+        纠正消息不进任务的 messages（不污染对话历史），只放进
+        纠正那次调用的消息里；重答的结果替换掉原来那条 assistant 消息。"""
+        ok, mismatches = self._validate_reply_dates(reply, task)
+        if ok:
+            return reply, total_cost, cost_unknown
+        requested = self._requested_date_for_task(task)
+        date_str = requested.isoformat() if requested else "要问的那天"
+        wrong = "、".join(
+            f"{item['number']}（{item['found_dates'][0]}的数）"
+            for item in mismatches
+            if item.get("found_dates")
+        ) or "别的日子的数"
+        correction = (
+            f"（系统提醒：你刚才回答里引用的 {wrong}，不是 {date_str} 的数。"
+            f"请只用 {date_str} 的数回答；如果没有 {date_str} 的数，就说不知道，"
+            "不要拿别的日子的数顶上。）"
+        )
+        correction_messages = list(messages) + [
+            {"role": "user", "content": correction}
+        ]
+        timer_measure = timer.measure("model_ms") if timer is not None else nullcontext()
+        with timer_measure:
+            final = self.provider.chat_messages(
+                correction_messages,
+                ledger="tool",
+                task_id=task["task_id"],
+                trace_id=task.get("trace_id"),
+                thinking="disabled",
+            )
+        total_cost, cost_unknown = self._add_cost(final, total_cost, cost_unknown)
+        new_reply = final.get("text") or ""
+        ok2, _mismatches2 = self._validate_reply_dates(new_reply, task)
+        if ok2:
+            self._replace_last_assistant_reply(messages, new_reply)
+            return new_reply, total_cost, cost_unknown
+        # 还错：直接回不知道，不把错数交给 BOOS。
+        dont_know = f"{date_str} 的数据我这边没有查到可靠的，所以不敢给数。"
+        self._replace_last_assistant_reply(messages, dont_know)
+        return dont_know, total_cost, cost_unknown
+
+    @staticmethod
+    def _replace_last_assistant_reply(messages, new_text):
+        """把 messages 里最后一条 assistant 消息的内容换掉
+        （纠正重答后，任务记录里只留纠正过的那份回答）。"""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                msg["content"] = new_text
+                return
 
     def _tool_result_text(self, result):
         """工具结果转成喂给模型的文本：成功时是包在分隔线里的数据，

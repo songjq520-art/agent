@@ -301,3 +301,138 @@ def test_backfill_does_not_relabel_timestamps(tmp_path):
     # 再调一次也还是 0（幂等，不反复改写）。
     assert store.backfill_timestamps() == 0
     assert store.get_all()[0]["metadata"]["created_at_source"] == "written"
+
+
+# ---------- 56 号：不知道变通——自然语言新指令先理解、先存能确定的部分 ----------
+
+# 56 号 5 条新说法（和实测用过的不一样）：金额/币种/周期/对象都要抠对。
+MONEY_56_PHRASES = [
+    ("每天定投5刀的沪深300", {"amount": 5, "currency": "USD", "period": "day", "target": "沪深300"}),
+    ("每月定投10刀买标普", {"amount": 10, "currency": "USD", "period": "month", "target": "标普"}),
+    ("每周定投20块的沪深300", {"amount": 20, "currency": "CNY", "period": "week", "target": "沪深300"}),
+    ("每天定投5美元的纳指", {"amount": 5, "currency": "USD", "period": "day", "target": "纳指"}),
+    ("每周定投 5 块买万家纳指", {"amount": 5, "currency": "CNY", "period": "week", "target": "万家纳指"}),
+]
+
+
+def test_56_money_metadata_dao_and_weekly_cases():
+    """56 号：BOOS 说“我现在要每天定投5刀的沪深300”——“5刀”就是 5 美元，
+    “定投<金额>的<目标>”里的目标（沪深300）要抠出来，每周也要认。"""
+    for text, wanted in MONEY_56_PHRASES:
+        assert _extract_money_metadata(text) == wanted, text
+    # 没目标时 target 是 None，不硬猜。
+    assert _extract_money_metadata("以后每天定投5刀") == {
+        "amount": 5, "currency": "USD", "period": "day", "target": None,
+    }
+    # 旧说法不能坏：买后面的目标、预算还是老样子。
+    assert _extract_money_metadata("每天定投 5 块买万家纳指") == {
+        "amount": 5, "currency": "CNY", "period": "day", "target": "万家纳指",
+    }
+    assert _extract_money_metadata("每月预算 5 美元，到 5 美元提醒") == {
+        "amount": 5, "currency": "USD", "period": "month", "target": "工具预算",
+    }
+
+
+def test_56_normalize_accepts_week_period():
+    """56 号：period 加了 "week"，规整时要认，别当坏形状丢了。"""
+    assert _normalize_money_metadata(
+        {"amount": 20, "currency": "CNY", "period": "week", "target": "沪深300"}
+    ) == {"amount": 20, "currency": "CNY", "period": "week", "target": "沪深300"}
+
+
+def test_56_add_memory_text_attaches_dao_metadata(tmp_path):
+    """56 号：直存“每天定投5刀的沪深300”，库里那条要带金额字段
+    （5 美元/天/沪深300），回答“每月定投多少钱”时才有据可依。"""
+    fake = PromotingFakeMemory()
+    store = make_fake_store(tmp_path, memory=fake)
+    store.add_memory_text("BOOS 想每天定投5刀的沪深300")
+    items = store.get_all()
+    assert len(items) == 1
+    assert items[0]["metadata"]["money"] == {
+        "amount": 5, "currency": "USD", "period": "day", "target": "沪深300",
+    }
+
+
+def test_56_system_message_stores_determined_parts_first():
+    """56 号：第 8 条要写明——新指令先把能确定的部分存下来，
+    不确定的只追问一句；句子里已经给过的数（“5刀”就是 5 美元）
+    别又反问一遍。"""
+    from tools.agent_loop import build_loop_system_message
+
+    system = build_loop_system_message()
+    assert "先把能确定的部分" in system
+    assert "只追问一句" in system
+    assert "5刀" in system
+
+
+# ---------- 56 号补：定投金额后面直接跟目标（没有“的”） ----------
+
+# 56 号补 5 条新说法（实测里模型复述丢了“的”）：金额后直接跟目标也要认；
+# 时间状语（“到年底”）和货币词（“钱”）不是目标，不能认。
+DCA_NO_DE_56_CASES = [
+    ("每天定投5美元沪深300", {"amount": 5, "currency": "USD", "period": "day", "target": "沪深300"}),
+    ("每天定投5块万家纳指", {"amount": 5, "currency": "CNY", "period": "day", "target": "万家纳指"}),
+    ("每月定投10刀标普", {"amount": 10, "currency": "USD", "period": "month", "target": "标普"}),
+    ("从今天定投到年底，每天 5 块", None),  # “到年底”不是目标
+    ("每天定投5块钱", None),  # “钱”不是目标
+]
+
+
+def test_56_dca_amount_target_without_de():
+    """56 号补：模型复述丢了“的”（“每天定投5美元沪深300”）也要抠出目标；
+    “到年底”“钱”这种不是目标，不认。"""
+    from memory.mem0_store import _extract_money_metadata
+
+    for text, wanted in DCA_NO_DE_56_CASES:
+        got = _extract_money_metadata(text)
+        if wanted is None:
+            assert got is None or got.get("target") is None, (text, got)
+        else:
+            assert got == wanted, (text, got)
+
+
+def test_53_live_h_sequence_no_duplicate_without_de(tmp_path):
+    """53 号 + 56 号补的活路回归（2026-11-12 实测）：模型调 add_memory 存的
+    是复述句“我想以后每天定投5美元沪深300”（没有“的”），提取落袋的是
+    原话“我现在要每天定投5刀的沪深300”——两条同槽位同值，必须只留一条，
+    不能因为复述句的 target 没抠出来就漏成两条。"""
+    from conftest import make_fake_store
+
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我想以后每天7点起床")
+    store.save_turn(
+        [
+            {"role": "user", "content": "我想以后每天7点起床"},
+            {"role": "assistant", "content": "记下了：以后每天 7 点起床。"},
+        ]
+    )
+    import time
+
+    time.sleep(0.3)
+    store.add_memory_text("我想以后每天定投5美元沪深300")
+    store.save_turn(
+        [
+            {"role": "user", "content": "我想以后每天7点起床"},
+            {"role": "assistant", "content": "记下了：以后每天 7 点起床。"},
+            {"role": "user", "content": "我现在要每天定投5刀的沪深300"},
+            {"role": "assistant", "content": "记下了：每天定投 5 美元沪深300。"},
+        ]
+    )
+    time.sleep(0.3)
+    store.save_turn(
+        [
+            {"role": "user", "content": "我想以后每天7点起床"},
+            {"role": "assistant", "content": "记下了：以后每天 7 点起床。"},
+            {"role": "user", "content": "我现在要每天定投5刀的沪深300"},
+            {"role": "assistant", "content": "记下了：每天定投 5 美元沪深300。"},
+            {"role": "user", "content": "我每天定投多少钱"},
+            {"role": "assistant", "content": "每天定投 5 美元，对象是沪深300。"},
+        ]
+    )
+    store.flush_pending()
+    if store._outbox is not None:
+        store._outbox.flush()
+    texts = store._memory.all_texts()
+    assert len(texts) == 2, texts
+    assert any("沪深300" in t for t in texts)
+    assert sum("沪深300" in t for t in texts) == 1

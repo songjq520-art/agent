@@ -500,3 +500,24 @@ def test_flush_pending_commits_last_turn(tmp_path):
     assert [item["memory"] for item in result.get("results", [])] == ["我喜欢喝咖啡"]
     assert store.flush_pending() == {}
     assert store._memory.all_texts() == ["我喜欢喝咖啡"]
+
+
+def test_retraction_natural_phrasing_not_extracted_later(tmp_path):
+    """34 号：自然说法的撤回（“其实也不是很喜欢吃”）——模型判撤回后，
+    被撤回的那条不进库，撤回句本身也不能在后面被提取成一条新记忆。
+    （实测 2026-11-12 08:58：撤回句被存成了第二条记忆。）"""
+    store = make_fake_store(tmp_path)
+    # 这里只测“判撤回之后”的程序行为，判本身靠模型——真判由实测验。
+    store._judge_retraction_intent = lambda *a, **k: True
+    result = store.add_turn([{"role": "user", "content": "我喜欢吃鸡杂面。"}])
+    assert result.get("pending") is True
+    result = store.add_turn([{"role": "user", "content": "其实也不是很喜欢吃。"}])
+    assert result.get("retracted") is True
+    # 被撤回的那条没进库。
+    assert not any("鸡杂面" in t for t in store._memory.all_texts())
+    # 再来一轮普通对话、再 flush：撤回句不能借此回来。
+    store.add_turn([{"role": "user", "content": "今天天气真好。"}])
+    store.flush_pending()
+    texts = store._memory.all_texts()
+    assert not any("不是很喜欢吃" in t for t in texts)
+    assert not any("鸡杂面" in t for t in texts)

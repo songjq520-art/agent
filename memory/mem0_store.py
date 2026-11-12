@@ -212,6 +212,11 @@ RETRACTION_CANDIDATE_MARKERS = (
     "不不", "不对", "算了", "收回", "别记", "说错", "撤回", "取消",
     "不算", "当我没说", "忘掉", "删掉", "不要记", "别存", "不记",
     "作废", "刚才那句", "上面那句", "上一句",
+    # 34 号补（2026-11-12）：自然说法的撤回——“其实也不是很喜欢吃”
+    # 里没有上面这些词，0a 根本不跑，撤回句就被当成新事实提出来了。
+    # “也不是”“不是很”只是请模型判意图的触发词，判不是撤回就走正常路；
+    # 新偏好（“我不是很喜欢吃辣”）判完不是撤回，照常存，不会丢。
+    "也不是", "不是很",
 )
 
 # RETRACTED_TRASH_FILENAME（撤回软删除的回收站文件）：34 号。
@@ -435,7 +440,7 @@ def _next_write_seq():
 # （两笔钱 normally 各是一条记忆，混在一条里的极少，真混了就靠兜底句）。
 
 _MONEY_CURRENCIES = ("CNY", "USD")
-_MONEY_PERIODS = ("day", "month", "year", "once")
+_MONEY_PERIODS = ("day", "week", "month", "year", "once")
 # 金额：数字 + 单位（块/元/人民币/¥ 是元，美元/美金/刀/$ 是美元），
 # 万是乘数（1 万块 = 10000 元）；$ / ¥ 也可以写在数字前面（$5）。
 _MONEY_AMOUNT_RE = re.compile(
@@ -444,6 +449,7 @@ _MONEY_AMOUNT_RE = re.compile(
 _MONEY_SYMBOL_AMOUNT_RE = re.compile(r"(\$|＄|¥)\s*(\d+(?:\.\d+)?)")
 _MONEY_PERIOD_WORDS = (
     ("每天", "day"), ("每日", "day"),
+    ("每周", "week"), ("每星期", "week"), ("每个星期", "week"),
     ("每月", "month"), ("每个月", "month"),
     ("每年", "year"), ("每一年", "year"),
     ("一次", "once"), ("一次性", "once"),
@@ -456,6 +462,25 @@ _MONEY_BUY_TARGET_RE = re.compile(r"买\s*([^\s，。,、；;：:！!？?]{1,12}
 _MONEY_DCA_TARGET_RE = re.compile(
     r"定投\s*([^是的了\s，。,、；;：:！!？?][^\s，。,、；;：:！!？?]{0,11})"
 )
+# 56 号：定投金额后面的“的+目标”（“每天定投5刀的沪深300”→“沪深300”）——
+# 金额夹在“定投”和“的”中间时，上面那条会抠出“5刀的沪深300”又因数字
+# 开头被丢掉；这条直接认“定投<金额>的<目标>”。
+_MONEY_DCA_AMOUNT_TARGET_RE = re.compile(
+    r"定投\s*\d+(?:\.\d+)?\s*(?:万)?\s*(?:块|元|人民币|美元|美金|刀|\$|＄|¥)?\s*的\s*([^\s，。,、；;：:！!？?]{1,12})"
+)
+# 56 号补（2026-11-12 实测）：定投金额后面直接跟目标、没有“的”也没有
+# “买”——模型复述时常把“的”丢了（“每天定投5美元沪深300”→“沪深300”），
+# 上面三条都认不出来，target 存成 None，53 号的槽位比对就认不出是同一
+# 对象、同值重复的定投就漏进来了。这条认“定投<金额><目标>”。
+_MONEY_DCA_AMOUNT_TARGET_NO_DE_RE = re.compile(
+    r"定投\s*\d+(?:\.\d+)?\s*(?:万)?\s*(?:块|元|人民币|美元|美金|刀|\$|＄|¥)?\s*([^是的了钱块元美刀\$＄¥\s，。,、；;：:！!？?][^\s，。,、；;：:！!？?]{0,11})"
+)
+# 上面那条抠出来的目标如果是时间/状语开头（“到年底”“从今天起”“以后”
+# 这类），不算目标——宁可 target 为空（53 号走兜底），也别把时间当对象。
+_MONEY_NON_TARGET_LEADS = (
+    "到", "从", "以后", "之前", "开始", "结束", "为止",
+    "每天", "每月", "每年", "每周", "一次",
+)
 
 
 def _extract_money_metadata(text):
@@ -463,9 +488,10 @@ def _extract_money_metadata(text):
 
     返回 {"amount", "currency", "period", "target"}，没金额返回 None。
     amount 是 int（整数）或 float；currency 是 "CNY"（元）或 "USD"（美元）；
-    period 是 "day"/"month"/"year"/"once"，没写周期就是 None；
+    period 是 "day"/"week"/"month"/"year"/"once"，没写周期就是 None；
     target 是对象（比如“万家纳指”“工具预算”），没写就是 None。
     纯正则，不调模型；抠不出来（写法太怪）就返回 None，不猜。
+    “刀”就是美元（56 号：BOOS 说“5刀”就是 5 美元）。
     """
     if not isinstance(text, str) or not text.strip():
         return None
@@ -505,10 +531,34 @@ def _extract_money_metadata(text):
             if candidate and not candidate[0].isdigit():
                 target = candidate
         if target is None:
+            # 56 号：先认“定投<金额>的<目标>”，再认“定投<金额><目标>”
+            #（没有“的”的，模型复述常丢“的”），最后认“定投<名词>”。
+            dca_amount_match = _MONEY_DCA_AMOUNT_TARGET_RE.search(text)
+            if dca_amount_match:
+                candidate = dca_amount_match.group(1)
+                if candidate and not candidate[0].isdigit():
+                    target = candidate
+        if target is None:
+            dca_no_de_match = _MONEY_DCA_AMOUNT_TARGET_NO_DE_RE.search(text)
+            if dca_no_de_match:
+                candidate = dca_no_de_match.group(1)
+                if (
+                    candidate
+                    and not candidate[0].isdigit()
+                    and not candidate.startswith(_MONEY_NON_TARGET_LEADS)
+                ):
+                    target = candidate
+        if target is None:
             dca_match = _MONEY_DCA_TARGET_RE.search(text)
             if dca_match:
                 candidate = dca_match.group(1)
-                if candidate and not candidate[0].isdigit():
+                if (
+                    candidate
+                    and not candidate[0].isdigit()
+                    # 56 号补：时间/状语开头（“定投到年底”里的“到年底”）
+                    # 不是目标，和上面那条同一个拦截。
+                    and not candidate.startswith(_MONEY_NON_TARGET_LEADS)
+                ):
                     target = candidate
     return {
         "amount": amount,
@@ -516,6 +566,40 @@ def _extract_money_metadata(text):
         "period": period,
         "target": target,
     }
+
+
+def _known_money(item):
+    """一条已有记忆的金额字段（53 号）：metadata 里的 money 字典优先，
+    没有就从文本里现抠（快照/老数据可能没贴字段）。"""
+    money = _normalize_money_metadata(((item or {}).get("metadata") or {}).get("money"))
+    if money is not None:
+        return money
+    return _extract_money_metadata((item or {}).get("text") or "")
+
+
+def _money_slot_relation(new_money, known_money):
+    """53 号：两条金额记忆的槽位关系。
+    - 任一边没金额字段 → None（不归槽位管，走老路：向量+模型判）。
+    - 对象不明（任一边 target 为空）→ None（没法归槽位，不猜）。
+    - （对象，周期）不同 → "different"（同主题不同槽位，分别保留，
+      别拿去给模型判重复——向量相似度分不开“万家纳指”和“沪深300”）。
+    - （对象，周期）相同：金额+币种相同 → "duplicate"（重复，不存新的）；
+      不同 → "supersede"（同槽位新值，旧条更新成新说法）。
+    """
+    if not new_money or not known_money:
+        return None
+    new_target = new_money.get("target")
+    known_target = known_money.get("target")
+    if not new_target or not known_target:
+        return None
+    if new_target != known_target or new_money.get("period") != known_money.get("period"):
+        return "different"
+    if (
+        new_money.get("amount") == known_money.get("amount")
+        and new_money.get("currency") == known_money.get("currency")
+    ):
+        return "duplicate"
+    return "supersede"
 
 
 def _normalize_money_metadata(raw):
@@ -2461,8 +2545,10 @@ class Mem0Store:
         protection_failed 标记（调用方和面板能读到）。代价只是这轮
         的事实这次没存进长期记忆，对话摘要里还留着，还能再说——
         比悄悄顶掉已确认的事实强得多。
-        失败时返回 {} 或带 protection_failed 的字典，绝不抛异常——
-        存记忆失败不能把聊天回答搞崩。
+        失败时返回带 protection_failed（快照失败）或 extraction_failed
+        （mem0.add 失败）的字典，绝不抛异常——存记忆失败不能把聊天
+        回答搞崩；但失败和“没什么可存”要分得清（52 号），不然调用方
+        以为本轮没什么可存、其实是事实丢了。
         """
         before = None
         for _attempt in range(2):
@@ -2490,8 +2576,16 @@ class Mem0Store:
                 metadata,
             )
         except Exception:
+            # 52 号：提取失败和“没什么可存”必须分得清——以前这里也返回 {}，
+            # 调用方以为本轮没什么可存，其实是 mem0.add 炸了、本轮的事实
+            # 丢了。带上 extraction_failed，让提交那层能重试这一轮，
+            # 而不是把它记成已处理、再也不管。
             logger.warning("mem0 自动存记忆失败：本轮对话未存入长期记忆。", exc_info=True)
-            return {}
+            return {
+                "results": [],
+                "extraction_failed": True,
+                "extraction_reason": "mem0_add_failed",
+            }
         result = self._drop_sensitive_results(result or {})
         result = self._apply_coverage_guard(result, before, metadata)
         # 43 号价值关卡先走（一次判全场，低价值的先清掉），再 46 号去重
@@ -2541,8 +2635,14 @@ class Mem0Store:
         提交过的 user 消息指纹记进 _committed_user_keys——add_turn
         每次收到最近 6 条消息（约 3 轮的滑动窗口），下次提交同一批
         消息时，旧轮次的 user 消息不再重复提。
+        指纹只在提取成功（或没什么可提）后才记：提取失败时不记，
+        失败的那几句原样退回给调用方（failed_messages），下一轮
+        提交时再试一次——以前指纹先记、提取后跑，提取一炸，那几句
+        就被记成“已处理”、再也不会回来（52 号）。
         返回提交结果 {"results": [...], "identity": [...]}，
-        没提交任何东西时返回 {}。
+        没提交任何东西时返回 {}；提取/快照失败时多带
+        extraction_failed / protection_failed 和 failed_messages
+        （没存成的那几句 user 原话）。
         """
         pending = self._pending_turn
         self._pending_turn = None
@@ -2555,10 +2655,11 @@ class Mem0Store:
             )
             identity_outcomes.append(outcome)
         # 提取：只留没提交过的 user 消息，及其后面跟着的那条
-        # assistant 回复（当提取上下文）；指纹先记下来——过滤后
-        # 什么都不剩、提取没调时，下次也不再重复处理这句。
+        # assistant 回复（当提取上下文）；指纹先别记——提取成功
+        # 后再记（见下面），失败时不记、留待重试。
         messages = pending.get("messages") or []
         fresh = []
+        fresh_keys = []
         for i, message in enumerate(messages):
             if (message or {}).get("role") != "user":
                 continue
@@ -2566,7 +2667,7 @@ class Mem0Store:
             key = content.strip()
             if key in self._committed_user_keys:
                 continue
-            self._committed_user_keys.append(key)
+            fresh_keys.append(key)
             fresh.append({"role": "user", "content": content})
             if i + 1 < len(messages) and (messages[i + 1] or {}).get(
                 "role"
@@ -2574,6 +2675,8 @@ class Mem0Store:
                 fresh.append(messages[i + 1])
         results = []
         protection_failed = False
+        extraction_failed = False
+        extracted = {}
         filtered = _filter_extraction_messages(fresh)
         if filtered:
             extracted = self._extract_and_save_turn(filtered)
@@ -2583,11 +2686,32 @@ class Mem0Store:
             # 用共用的 _carry_protection_fields 一次带过去——以前这里
             # 手写一个键一个键地传，残留原文就是这么漏掉的。
             protection_failed = bool((extracted or {}).get("protection_failed"))
-        if not results and not identity_outcomes and not protection_failed:
+            extraction_failed = bool((extracted or {}).get("extraction_failed"))
+        failed = protection_failed or extraction_failed
+        if not failed:
+            # 提取成功（或过滤后什么都不剩，本来就没什么可提）：指纹记下来，
+            # 下次提交同一批消息时不再重复处理。
+            for key in fresh_keys:
+                if key and key not in self._committed_user_keys:
+                    self._committed_user_keys.append(key)
+        if not results and not identity_outcomes and not protection_failed and not extraction_failed:
             return {}
         out = {"results": results, "identity": identity_outcomes}
         if protection_failed:
             _carry_protection_fields(extracted, out)
+        if extraction_failed:
+            out["extraction_failed"] = True
+            out["extraction_reason"] = (extracted or {}).get(
+                "extraction_reason", "mem0_add_failed"
+            )
+        if failed:
+            # 没存成的那几句 user 原话退回给调用方，下一轮再试；
+            # 身份 upsert 已经成功的（identity_outcomes）不退回——
+            # upsert 按槽位幂等，重试也不会重复存。
+            out["failed_messages"] = [
+                (m or {}).get("content") or "" for m in fresh
+                if (m or {}).get("role") == "user"
+            ]
         return out
 
     def flush_pending(self):
@@ -3080,6 +3204,13 @@ class Mem0Store:
             if bare_retraction and pending is not None and not assistant_asked:
                 self._pending_turn = None
                 self._pending_correction = None
+                # 34 号：撤回这句本身也别留给以后提取——把它记成已处理，
+                # 否则下一轮提交滑动窗口时，“不不不”这类撤回句会被当成
+                # 新事实提出来（鸡杂面那次就是撤回句被存成了第二条记忆）。
+                if latest_user:
+                    key = latest_user.strip()
+                    if key and key not in self._committed_user_keys:
+                        self._committed_user_keys.append(key)
                 dropped = sum(
                     1
                     for m in pending.get("messages") or []
@@ -3130,6 +3261,13 @@ class Mem0Store:
                             )
                             self._pending_turn = None
                         self._pending_correction = None
+                        # 34 号：撤回这句本身也别留给以后提取——把它记成
+                        # 已处理，否则下一轮提交滑动窗口时，撤回句
+                        # （“其实也不是很喜欢吃”）会被当成新事实提出来，
+                        # 存成第二条记忆（鸡杂面那次就是这么多出来的）。
+                        key = latest_user.strip()
+                        if key and key not in self._committed_user_keys:
+                            self._committed_user_keys.append(key)
                         soft_deleted = self._soft_delete_same_fact(prev_user)
                         return {
                             "retracted": True,
@@ -3207,8 +3345,32 @@ class Mem0Store:
                     detected = _detect_identity_statement(sentence.strip())
                     if detected is not None:
                         identity_items.append(detected)
+            # 52 号：上一轮提取失败的那几句（committed["failed_messages"]），
+            # 跟着本轮一起进待定区，下一轮提交时再试一次；超过 5 句时
+            # 只留最近的 5 句（服务一直坏时不让待定区无限长大，
+            # 丢掉的最老的几句只记日志）。
+            pending_messages = list(safe_messages)
+            failed_messages = (committed or {}).get("failed_messages") or []
+            if failed_messages:
+                carried = [
+                    {"role": "user", "content": text}
+                    for text in failed_messages[-5:]
+                    if (text or "").strip()
+                ]
+                if carried:
+                    if len(failed_messages) > len(carried):
+                        logger.warning(
+                            "提取失败重试：%d 句里只带回最近 %d 句，丢掉 %d 句旧的。",
+                            len(failed_messages), len(carried),
+                            len(failed_messages) - len(carried),
+                        )
+                    logger.warning(
+                        "上一轮 %d 句没存成，跟着本轮再试一次。",
+                        len(carried),
+                    )
+                    pending_messages = carried + pending_messages
             self._pending_turn = {
-                "messages": safe_messages,
+                "messages": pending_messages,
                 "identity": identity_items,
             }
             out = {
@@ -3216,6 +3378,10 @@ class Mem0Store:
                 "results": (committed or {}).get("results") or [],
                 "identity": [item["slot"] for item in identity_items],
             }
+            if (committed or {}).get("extraction_failed"):
+                out["extraction_failed"] = True
+                out["extraction_reason"] = (committed or {}).get("extraction_reason")
+                out["failed_messages"] = (committed or {}).get("failed_messages") or []
             # 保护失败的字段用共用的 _carry_protection_fields 一次带过去，
             # 和 _commit_pending_turn 里是同一个函数——以后再加字段只改
             # 它里面那一行，不会再漏。
@@ -3753,6 +3919,30 @@ class Mem0Store:
             logger.warning("价值关卡：%d 条低价值记忆没删掉（仍在库里）。", len(survivors))
         return results
 
+    def _supersede_money_memory(self, known_item, new_text, new_money):
+        """53 号：同槽位新值——旧条原地更新成新说法（id 不变，审计里留
+        UPDATE 行），返回更新后的条目字典；更新失败返回 None（调用方
+        按“没合并”处理，新条照常留，别丢事实）。
+        metadata 用旧条的整份 + 新的金额扁平字段（去掉旧的 money 字典，
+        不然读回来时旧字典会盖掉新字段）；只传金额字段在假库（替换式
+        update）里会丢掉来源/时间，真实 mem0 是合并式、不会丢，但两边
+        都按整份传才稳。"""
+        known_id = (known_item or {}).get("id")
+        if not known_id or not new_text:
+            return None
+        metadata = dict((known_item or {}).get("metadata") or {})
+        metadata.pop("money", None)
+        metadata.update(_flatten_money(new_money))
+        try:
+            self._memory.update(memory_id=known_id, text=new_text, metadata=metadata)
+        except Exception:
+            logger.warning("金额槽位更新失败：旧条没改成新说法。", exc_info=True)
+            return None
+        updated = dict(known_item)
+        updated["text"] = new_text
+        updated["metadata"] = metadata
+        return updated
+
     def _dedupe_extraction_results(self, results, before_items):
         """提取路径去重（46 号）：新提取的记忆里，库里已有同一件事的删掉。
 
@@ -3770,18 +3960,61 @@ class Mem0Store:
         embed_cache = {}
         dropped = []
         kept = []
+        superseded_count = 0
         for item in items:
             mem_text = (item or {}).get("memory") or ""
             mem_id = (item or {}).get("id")
             if not mem_text or not mem_id:
                 kept.append(item)
                 continue
+            # 53 号：金额记忆先按（对象，周期）槽位归并，再判。
+            # 同槽位新值直接更新旧条（不经过模型判——向量相似度分不开
+            # “5 块”和“10 块”，交给模型判可能把新值当重复丢掉）；
+            # 不同槽位的排除在近重复候选之外（同主题不同用途，分别保留）。
+            new_money = _extract_money_metadata(mem_text)
+            supersede_target = None
+            slot_duplicate = False
+            judge_pool = []
+            for known_item in known:
+                relation = _money_slot_relation(new_money, _known_money(known_item))
+                if relation == "supersede" and supersede_target is None:
+                    supersede_target = known_item
+                elif relation == "duplicate":
+                    slot_duplicate = True
+                elif relation == "different":
+                    continue
+                judge_pool.append(known_item)
+            if slot_duplicate:
+                # 同槽位已有相同金额的那条：新条就是重复，丢掉。
+                dropped.append(item)
+                continue
+            if supersede_target is not None:
+                updated = self._supersede_money_memory(
+                    supersede_target, mem_text, new_money
+                )
+                if updated is not None:
+                    supersede_target.update(updated)
+                    kept.append(
+                        {
+                            "id": supersede_target.get("id"),
+                            "memory": mem_text,
+                            "event": "UPDATE",
+                        }
+                    )
+                    superseded_count += 1
+                    dropped.append(item)
+                    continue
+                # 更新失败：新条照常留（别丢事实），也不再拿去给模型判重复
+                # （模型可能把它当重复丢掉——新值就真没了）。
+                kept.append(item)
+                known.append({"id": mem_id, "text": mem_text})
+                continue
             # 精确：和已知的某条完全相同（只差标点/空白/大小写）。
             if _find_duplicate_memory(mem_text, known) is not None:
                 dropped.append(item)
                 continue
-            # 近似：向量预筛 + 模型判同一件事。
-            near = self._find_near_duplicate_memory(mem_text, known, embed_cache)
+            # 近似：向量预筛 + 模型判同一件事（不同槽位的已排除在外）。
+            near = self._find_near_duplicate_memory(mem_text, judge_pool, embed_cache)
             if near is not None:
                 dropped.append(item)
                 continue
@@ -3796,6 +4029,8 @@ class Mem0Store:
         ]
         results["results"] = kept + survivors
         results["dedup_dropped"] = len(actually_dropped)
+        if superseded_count:
+            results["money_superseded"] = superseded_count
         if survivors:
             logger.warning("提取去重：%d 条重复记忆没删掉（仍在库里）。", len(survivors))
         return results
@@ -3863,11 +4098,58 @@ class Mem0Store:
                     ],
                     "duplicate": True,
                 }
+            # 53 号：金额记忆先按（对象，周期）槽位归并，再判近重复。
+            # 同槽位同金额是重复（返回已有那条）；同槽位新金额是更新
+            # （旧条原地改成新说法，id 不变）；不同槽位分别保留，
+            # 不拿去给模型判重复（向量相似度分不开“万家纳指”和“沪深300”）。
+            new_money = _extract_money_metadata(safe_text)
+            existing = self.get_all()
+            supersede_target = None
+            slot_duplicate = None
+            judge_pool = []
+            for known_item in existing:
+                relation = _money_slot_relation(new_money, _known_money(known_item))
+                if relation == "duplicate" and slot_duplicate is None:
+                    slot_duplicate = known_item
+                elif relation == "supersede" and supersede_target is None:
+                    supersede_target = known_item
+                elif relation == "different":
+                    continue
+                judge_pool.append(known_item)
+            if slot_duplicate is not None:
+                logger.info("手动存记忆：同槽位已有相同金额的记忆，本次未重复存。")
+                return {
+                    "results": [
+                        {
+                            "id": slot_duplicate["id"],
+                            "memory": slot_duplicate["text"],
+                            "event": "NONE",
+                        }
+                    ],
+                    "duplicate": True,
+                }
+            if supersede_target is not None:
+                updated = self._supersede_money_memory(
+                    supersede_target, safe_text, new_money
+                )
+                if updated is not None:
+                    logger.info("手动存记忆：同槽位新金额，旧条已更新成新说法。")
+                    return {
+                        "results": [
+                            {
+                                "id": updated["id"],
+                                "memory": safe_text,
+                                "event": "UPDATE",
+                            }
+                        ],
+                        "superseded": True,
+                    }
+                # 更新失败：继续往下存新条，别丢事实。
             # 46 号：近似去重——说法不同、事实相同也算重复（比如“助手叫十二”
             # 和“你的名字是十二”）。先按向量相似度预筛，再请模型判是不是
             # 同一件事（只看相似度分不开：5 块和 10 块的相似度比真重复还高）。
             # 判是重复时不存新条，返回已有那条；判不出来时照常存（宁漏勿错）。
-            near = self._find_near_duplicate_memory(safe_text, self.get_all())
+            near = self._find_near_duplicate_memory(safe_text, judge_pool)
             if near is not None:
                 logger.info("手动存记忆：库里已有同一件事的记忆，本次未重复存。")
                 return {

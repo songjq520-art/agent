@@ -175,7 +175,7 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
             return ""
         unit = "元" if money.get("currency") == "CNY" else "美元"
         period = {
-            "day": "/天", "month": "/月", "year": "/年", "once": "/次",
+            "day": "/天", "week": "/周", "month": "/月", "year": "/年", "once": "/次",
         }.get(money.get("period"), "")
         target = money.get("target")
         target_text = f"，对象：{target}" if isinstance(target, str) and target else ""

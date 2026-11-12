@@ -18,6 +18,7 @@
 
 import contextvars
 
+from tools.date_numbers import extract_dated_numbers
 from tools.search import SearchService
 from tools.tool_registry import get_tool, register_tool
 
@@ -75,6 +76,20 @@ def _validate_search_data(data):
                 "url": url,
                 "snippet": item.get("snippet") or "",
                 "published_at": item.get("published_at"),
+                # 50/54 号：数字-日期对照（程序标的，只留配上日期的）。
+                # 没配上的数不在里面——模型引用数字时只认这里面的，
+                # 对不上要问的那天就不算证据。
+                "dated_numbers": [
+                    {"number": dn.get("number"), "date": dn.get("date")}
+                    for dn in (item.get("dated_numbers") or [])
+                    if isinstance(dn, dict) and dn.get("number") and dn.get("date")
+                ] or [
+                    {"number": entry["number"], "date": entry["date"]}
+                    for entry in extract_dated_numbers(
+                        f"{title}. {item.get('snippet') or ''}"
+                    )
+                    if entry["date"] is not None
+                ],
             }
         )
     quality = data.get("quality") or {}
@@ -136,6 +151,10 @@ def register_search_tool():
             "问具体某天（比如“昨天纳指收盘多少”“11 月 10 日纳指多少”）时，"
             "先把“昨天/11 月 10 日”换算成具体日期（系统消息里给了今天是哪天），"
             "再把日期放进 date_range 里查——结果会按 published_at 过滤到这几天。"
+            "每条结果带 dated_numbers（数字-日期对照，程序标的）：引用收盘价/"
+            "涨跌幅时，只用日期和要问的那天对得上的那条；不同日期的数不算冲突，"
+            "别让它拉低你对正确答案的把握；没有要问的那天的数就说不知道，"
+            "不许拿别的日子的数顶上。"
             "返回结果列表（标题、链接、摘要、发布时间）和一句话答案。"
         ),
         parameters={

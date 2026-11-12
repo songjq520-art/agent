@@ -33,6 +33,35 @@ class MemoryOutbox:
         self._thread = None
         self._pending = 0
         self._pending_lock = threading.Lock()
+        # 52 号回执：每轮的存完状态（turn_id → {"status": "committed" /
+        # "failed", "result": add_turn 的返回}），调用方按 turn_id 查；
+        # _failed 是 3 次重试都抛异常、真的丢了的轮次（带原消息）。
+        self._outcomes = {}
+        self._failed = {}
+        self._outcomes_lock = threading.Lock()
+
+    # 后台存记忆抛异常时重试几次（52 号）：add_turn 抛异常才到这里——
+    # 提取失败（mem0.add 炸了）走返回字典里的 extraction_failed，
+    # 由提交那层带着下一轮重试，不在这里重试。
+    _SAVE_RETRIES = 3
+    _SAVE_RETRY_DELAY = 1.0
+
+    def turn_status(self, turn_id):
+        """一轮记忆的回执（52 号）：pending（还在队列里/正在存）、
+        committed（存完了）、failed（存失败了）、unknown（没见过这个 turn_id）。"""
+        with self._outcomes_lock:
+            outcome = self._outcomes.get(turn_id)
+        if outcome is not None:
+            return outcome["status"]
+        with self._seen_lock:
+            return "pending" if turn_id in self._seen else "unknown"
+
+    def failed_turns(self):
+        """真的丢了的轮次（52 号）：重试 3 次都抛异常的，带原消息，
+        调用方能查到、能重发；提取失败但带着下一轮重试的那些不在这里
+        （它们没丢，只是晚一轮）。"""
+        with self._outcomes_lock:
+            return list(self._failed.values())
 
     def submit(self, messages, turn_id=None):
         """把一轮消息放进 outbox（不阻塞、不等存完）。
@@ -60,13 +89,43 @@ class MemoryOutbox:
         self._thread.start()
 
     def _save_one(self, turn_id, messages):
-        try:
-            self._store.add_turn(messages)
-        except Exception:
-            logger.warning("后台存记忆失败：turn_id=%s。", turn_id, exc_info=True)
-        finally:
-            with self._pending_lock:
-                self._pending -= 1
+        outcome = None
+        raised = None
+        for attempt in range(1, self._SAVE_RETRIES + 1):
+            try:
+                outcome = self._store.add_turn(messages)
+                break
+            except Exception as exc:  # noqa: BLE001 - 重试完还失败才记失败清单
+                raised = exc
+                logger.warning(
+                    "后台存记忆失败（第 %d/%d 次）：turn_id=%s。",
+                    attempt, self._SAVE_RETRIES, turn_id, exc_info=True,
+                )
+                if attempt < self._SAVE_RETRIES:
+                    time.sleep(self._SAVE_RETRY_DELAY)
+        with self._pending_lock:
+            self._pending -= 1
+        with self._outcomes_lock:
+            if outcome is None:
+                # 3 次都抛异常：记进失败清单（带原消息，别悄悄丢了）。
+                self._failed[turn_id] = {
+                    "turn_id": turn_id,
+                    "messages": list(messages),
+                    "error": str(raised) if raised is not None else "add_turn 失败",
+                }
+                self._outcomes[turn_id] = {"status": "failed", "result": None}
+            else:
+                # add_turn 的返回里带 extraction_failed / protection_failed
+                # 时，是上一轮的提交没写成——那几句带着下一轮重试，
+                # 这轮记 failed（不是丢了，是“这次没写成、等重试”）。
+                failed = bool(
+                    (outcome or {}).get("extraction_failed")
+                    or (outcome or {}).get("protection_failed")
+                )
+                self._outcomes[turn_id] = {
+                    "status": "failed" if failed else "committed",
+                    "result": outcome,
+                }
 
     def _drain(self):
         """后台线程主循环：按顺序取一轮、存一轮。"""

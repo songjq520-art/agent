@@ -349,15 +349,19 @@ def test_46_same_fact_three_wordings_one_in_store(tmp_path):
 
 
 def test_46_different_numbers_do_not_merge(tmp_path):
-    """46 号：数字不同就是不同事实——“每天定投 5 块”和“每天定投 10 块”
+    """46 号：数字不同就是不同事实——“每天喝 2 杯咖啡”和“每天喝 3 杯咖啡”
     相似度再高（这里故意设成 1.0）也不合并，模型判“不是同一件事”时
-    两条都留着。这是 46 号最关键的一道：只看相似度会错杀。"""
+    两条都留着。这是 46 号最关键的一道：只看相似度会错杀。
+
+    注意：金额记忆（定投 5 块 vs 10 块）现在按 53 号走——同槽位新值
+    更新旧条，不留两条（见 tests/test_dedup_slots_53.py）；这条 46 号
+    守的是非金额的“数字不同就是不同事实”，两条规矩不冲突。"""
     store = make_fake_store(tmp_path)
     _install_fake_embedder(
         store,
         {
-            "每天定投 5 块买万家纳指。": 0.0,
-            "每天定投 10 块买万家纳指。": 0.0,
+            "我每天喝 2 杯咖啡。": 0.0,
+            "我每天喝 3 杯咖啡。": 0.0,
         },
     )
     _install_fake_llm(
@@ -366,12 +370,12 @@ def test_46_different_numbers_do_not_merge(tmp_path):
         if "去重" in system
         else None,
     )
-    store.add_memory_text("每天定投 5 块买万家纳指。")
-    result = store.add_memory_text("每天定投 10 块买万家纳指。")
+    store.add_memory_text("我每天喝 2 杯咖啡。")
+    result = store.add_memory_text("我每天喝 3 杯咖啡。")
     assert result.get("duplicate") is not True
     assert _texts(store) == [
-        "每天定投 5 块买万家纳指。",
-        "每天定投 10 块买万家纳指。",
+        "我每天喝 2 杯咖啡。",
+        "我每天喝 3 杯咖啡。",
     ]
 
 

@@ -164,10 +164,12 @@ def test_register_memory_tools_idempotent():
 
 def test_loop_system_message_has_memory_rule():
     """45 号：循环的系统消息里有第 8 条——长期记忆用记忆工具，
-    改删过确认卡，记新事只有 BOOS 明确说“记住”才调。"""
+    改删过确认卡；55 号：记新事不再只认“记住”两个字——BOOS 明确表达的
+    事实/偏好/决定/习惯都调 add_memory 存。"""
     assert "8. BOOS 让你看/改/删长期记忆时，用记忆工具" in LOOP_SYSTEM_MESSAGE
     assert "改和删要先过确认卡" in LOOP_SYSTEM_MESSAGE
-    assert "只有 BOOS 明确说“记住”时才调 add_memory" in LOOP_SYSTEM_MESSAGE
+    assert "明确表达的事实/偏好/决定/习惯" in LOOP_SYSTEM_MESSAGE
+    assert "不只认“记住”两个字" in LOOP_SYSTEM_MESSAGE
     # 追加的那条（相对日期换算）现在是第 9 条。
     assert "\n9. 用户说“今天/昨天/最新”时" in build_loop_system_message()
 
@@ -283,6 +285,7 @@ def test_delete_memory_requires_approval_guard(mem_store):
             {
                 "memory_id": _mem_id(mem_store, "BOOS 喜欢喝冰美式"),
                 "text": "BOOS 喜欢喝冰美式",
+                "anchor_text": "冰美式",
             }
         )
     assert result["ok"] is True
@@ -299,6 +302,7 @@ def test_delete_memory_refuses_mismatched_text(mem_store):
             {
                 "memory_id": _mem_id(mem_store, "BOOS 喜欢喝冰美式"),
                 "text": "BOOS 喜欢喝热美式",
+                "anchor_text": "冰美式",
             }
         )
     assert result["ok"] is False
@@ -337,7 +341,7 @@ def test_gateway_needs_approval_for_update_delete_not_for_list_add(mem_store, ga
         assert update["decision"] == "needs_approval"
         delete = gateway.execute(
             "delete_memory",
-            {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式"},
+            {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式", "anchor_text": "冰美式"},
         )
         assert delete["decision"] == "needs_approval"
     # 没确认之前，库里一条没动。
@@ -393,7 +397,7 @@ def test_loop_delete_via_approval_then_resume(mem_store, gateway, store):
                     _tool_call(
                         "call_1",
                         "delete_memory",
-                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式"},
+                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式", "anchor_text": "冰美式"},
                     )
                 ]
             ),
@@ -487,7 +491,7 @@ def test_loop_delete_cancel_keeps_memory(mem_store, gateway, store):
                     _tool_call(
                         "call_1",
                         "delete_memory",
-                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式"},
+                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式", "anchor_text": "冰美式"},
                     )
                 ]
             ),
@@ -527,7 +531,7 @@ def test_loop_delete_replay_not_rerun(mem_store, gateway, store):
                     _tool_call(
                         "call_1",
                         "delete_memory",
-                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式"},
+                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式", "anchor_text": "冰美式"},
                     )
                 ]
             ),
@@ -537,7 +541,7 @@ def test_loop_delete_replay_not_rerun(mem_store, gateway, store):
                     _tool_call(
                         "call_1",
                         "delete_memory",
-                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式"},
+                        {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式", "anchor_text": "冰美式"},
                     )
                 ]
             ),
