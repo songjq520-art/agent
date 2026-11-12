@@ -50,6 +50,22 @@ class StubSummarizer:
         return base
 
 
+def _wait_until(condition, timeout=5.0, interval=0.05):
+    """等后台线程把活干完（40 号：reset 的摘要在后台算，测试不能立刻查）。
+
+    假摘要器是立刻算的，正常几毫秒就好；5 秒还没好就是真坏了，
+    直接报失败，别让测试无限等。
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(interval)
+    return condition()
+
+
 def _messages(n_rounds, topic="今天天气真好"):
     """造 n 轮短对话（每轮一问一答）。"""
     out = []
@@ -510,6 +526,9 @@ def test_chat_state_reset_flushes_and_lists(tmp_path):
     items = state.list_conversations()
     assert len(items) == 1
     assert items[0]["title"] == "广州天气第1句"
+    # 40 号：摘要在后台慢慢算（reset 只把记录记进列表、立刻返回），
+    # 这里等它算好再查——假摘要器是立刻算的，等几秒绰绰有余。
+    _wait_until(lambda: "摘要[" in store.current_summary())
     assert "摘要[" in store.current_summary()
 
 
@@ -641,6 +660,8 @@ def test_chat_state_current_summary_after_reset(tmp_path):
     state.messages = _messages(2, topic="广州天气")
     state.reset()
     assert state.messages == []
+    # 40 号：摘要在后台算，等它算好再查（见 test_chat_state_reset_flushes_and_lists）。
+    _wait_until(lambda: "广州天气" in state.current_summary())
     # 刚结束的那段对话的摘要：和存下来的那份一字不差。
     assert state.current_summary() == store.current_summary()
     assert "广州天气" in state.current_summary()
@@ -668,22 +689,38 @@ def test_chat_state_open_without_summary_returns_empty(tmp_path):
 
 
 def test_http_reset_returns_previous_summary(monkeypatch, tmp_path):
-    """HTTP：开新对话时 reset 回包里带上上一段的摘要（卡片就显示这份）。"""
+    """HTTP：开新对话立刻返回（40 号：摘要在后台算，不卡住页面）——
+    回包里 summary 是空串，带 closed_id 和 summarizing；页面拿 closed_id
+    去 GET /api/conversations/<id> 轮询，摘要好了再显示卡片。
+    （旧约定是 reset 回包里直接带上一段的摘要，40 号改后台后不再是这样。）"""
     monkeypatch.setattr("web.server.run_question", _fake_success_run_question)
     server, port, state, store = _start_summary_server(tmp_path)
     try:
-        # 还没聊过就开新对话：没有摘要，回空串。
+        # 还没聊过就开新对话：没有摘要，回空串，也没什么要总结的。
         status, data = _request(port, "POST", "/api/reset")
         assert status == 200
         assert data["ok"] is True
         assert data["summary"] == ""
-        # 聊一句、再开新对话：回包里是上一段的摘要，和存下来的一致。
+        assert data["summarizing"] is False
+        # 聊一句、再开新对话：回包里 summary 还是空串，但带 closed_id、
+        # summarizing 是 True；轮询那段对话，摘要好了就带“你好”。
         status, _ = _request(port, "POST", "/api/chat", {"message": "你好"})
         assert status == 200
         status, data = _request(port, "POST", "/api/reset")
         assert status == 200
-        assert data["summary"] == store.current_summary()
-        assert "你好" in data["summary"]
+        assert data["summary"] == ""
+        assert data["closed_id"]
+        assert data["summarizing"] is True
+
+        def _summary_ready():
+            _status, record = _request(port, "GET", f"/api/conversations/{data['closed_id']}")
+            return _status == 200 and "你好" in (record.get("summary") or "")
+
+        assert _wait_until(_summary_ready), "后台摘要 5 秒还没算好"
+        status, record = _request(port, "GET", f"/api/conversations/{data['closed_id']}")
+        assert status == 200
+        assert record["summary"] == store.current_summary()
+        assert "你好" in record["summary"]
     finally:
         server.shutdown()
         server.server_close()

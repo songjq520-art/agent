@@ -17,6 +17,17 @@ from conftest import make_fake_store
 from main import chat_loop, is_exit_command, main, run_question
 from providers.deepseek import DeepSeekProvider
 from providers.muse import MuseProvider
+from tools.agent_loop import LOOP_SYSTEM_MESSAGE
+
+
+def _assert_loop_messages(sent, *expected_after_system):
+    """断言工具循环发给模型的消息列表：第一条是系统消息（基础规矩 +
+    今天日期，30 号），后面是 expected_after_system（历史 + 本轮问题，
+    29 号起第二轮也带历史）。系统消息只断言“以基础规矩开头”，
+    不断言整句相等——日期是现算的，每天都不一样。"""
+    assert sent[0]["role"] == "system"
+    assert sent[0]["content"].startswith(LOOP_SYSTEM_MESSAGE)
+    assert sent[1:] == list(expected_after_system)
 
 
 def _fake_ok_response(text="你好，我是 DeepSeek。", prompt_tokens=100, completion_tokens=50):
@@ -180,17 +191,13 @@ def test_run_question_multi_turn_shares_one_tracker_and_grows_history(monkeypatc
     费用累计进同一个 tracker（记工具账本）；调用方手里的 messages 列表
     照常增长（每轮成功后追加 user + assistant）。
 
-    工具接进聊天之后（最终方案）：DeepSeek 每轮走工具循环，循环只用
-    本轮自己的消息（系统消息 + 本轮问题），不把调用方传进来的 plain
-    history 发给模型——plain history 里的 assistant 消息没有
-    reasoning_content，思考开着时发过去会报 400；上下文靠记忆提示块
-    和对话摘要（都拼进本轮问题里了）。所以第二轮发出去的也是
-    [系统消息，本轮问题]，不含第一轮的消息。
+    工具接进聊天之后（最终方案）：DeepSeek 每轮走工具循环。29 号修好后，
+    循环带最近几轮历史（系统消息 + 历史 + 本轮问题）：思考是关着的，
+    plain history 的 assistant 消息没有 reasoning_content 也不会报 400。
+    所以第二轮发出去的是 [系统消息，第一轮问答，本轮问题]。
     每轮模拟返回 prompt 100、completion 50，成本为
     100/1e6*0.15 + 50/1e6*0.60 = 0.000045 美元。
     """
-    from tools.agent_loop import LOOP_SYSTEM_MESSAGE
-
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     messages = []
@@ -198,21 +205,23 @@ def test_run_question_multi_turn_shares_one_tracker_and_grows_history(monkeypatc
         # 第一轮：只发循环的系统消息 + 本轮问题（带工具定义）。
         outcome1 = run_question("你好", budget_tracker=tracker, messages=messages)
         assert outcome1["mode"] == "real"
-        assert mock_post.call_args.kwargs["json"]["messages"] == [
-            {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
+        _assert_loop_messages(
+            mock_post.call_args.kwargs["json"]["messages"],
             {"role": "user", "content": "你好"},
-        ]
+        )
         assert "tools" in mock_post.call_args.kwargs["json"]
         # 成功后调用方把本轮 user + assistant 追加进历史（与 chat_loop 一致）。
         messages.append({"role": "user", "content": "你好"})
         messages.append({"role": "assistant", "content": outcome1["result"]["text"]})
-        # 第二轮：循环还是只发本轮自己的消息，不把第一轮的历史发过去。
+        # 第二轮：循环带上第一轮的历史（29 号），再发本轮问题。
         outcome2 = run_question("今天天气怎么样", budget_tracker=tracker, messages=messages)
         assert outcome2["mode"] == "real"
-        assert mock_post.call_args.kwargs["json"]["messages"] == [
-            {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
+        _assert_loop_messages(
+            mock_post.call_args.kwargs["json"]["messages"],
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好，我是 DeepSeek。"},
             {"role": "user", "content": "今天天气怎么样"},
-        ]
+        )
         assert mock_post.call_count == 2
     # 两轮费用都记进同一个 tracker：总数和小计都是 0.00009 美元，
     # 都在工具账本里（工具循环的每一轮都记工具账本）。
@@ -305,14 +314,12 @@ def test_chat_loop_all_exit_commands_call_no_api(monkeypatch, tmp_path, cmd):
 
 def test_chat_loop_two_turns_then_exit_sends_growing_history(monkeypatch, tmp_path):
     """连续对话：两轮对话后输入 exit 结束；调用方手里的历史照常增长，
-    但工具循环每轮只发本轮自己的消息（系统消息 + 本轮问题），
-    不把第一轮的历史发给模型（见 test_run_question_multi_turn_...）。
+    29 号修好后工具循环第二轮也带上第一轮的历史（见
+    test_run_question_multi_turn_...）。
 
     每轮模拟返回 prompt 100、completion 50，成本 0.000045 美元，
     两轮共 0.00009 美元，记进同一个 tracker。
     """
-    from tools.agent_loop import LOOP_SYSTEM_MESSAGE
-
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     with (
@@ -323,17 +330,16 @@ def test_chat_loop_two_turns_then_exit_sends_growing_history(monkeypatch, tmp_pa
         assert mock_post.call_count == 2
     # 第一轮发循环的系统消息 + 本轮问题（带工具定义）。
     first_sent = mock_post.call_args_list[0].kwargs["json"]["messages"]
-    assert first_sent == [
-        {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
-        {"role": "user", "content": "你好"},
-    ]
+    _assert_loop_messages(first_sent, {"role": "user", "content": "你好"})
     assert "tools" in mock_post.call_args_list[0].kwargs["json"]
-    # 第二轮也只发本轮自己的消息，不含第一轮的历史。
+    # 第二轮带上第一轮的历史（29 号），再发本轮问题。
     second_sent = mock_post.call_args_list[1].kwargs["json"]["messages"]
-    assert second_sent == [
-        {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
+    _assert_loop_messages(
+        second_sent,
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "你好，我是 DeepSeek。"},
         {"role": "user", "content": "今天天气怎么样"},
-    ]
+    )
     assert tracker.total_cost_usd == pytest.approx(0.00009)
 
 
@@ -358,10 +364,7 @@ def test_chat_loop_api_error_does_not_fake_answer_and_continues(monkeypatch, tmp
     # 第一轮失败，没追加历史；第二轮只发循环的系统消息 + 本轮问题
     # （没有第一轮的假历史，也不含第一轮的任何消息）。
     second_sent = mock_post.call_args_list[1].kwargs["json"]["messages"]
-    assert second_sent == [
-        {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
-        {"role": "user", "content": "再见"},
-    ]
+    _assert_loop_messages(second_sent, {"role": "user", "content": "再见"})
     # 只有第二轮成功记了账。
     assert tracker.total_cost_usd == pytest.approx(0.000045)
 
@@ -408,12 +411,10 @@ def test_main_with_arg_is_single_question(monkeypatch, tmp_path):
         assert main(["你好"]) == 0
         mock_post.assert_called_once()
         # 工具循环只发本轮自己的消息（系统消息 + 本轮问题），带工具定义。
-        from tools.agent_loop import LOOP_SYSTEM_MESSAGE
-
-        assert mock_post.call_args.kwargs["json"]["messages"] == [
-            {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
+        _assert_loop_messages(
+            mock_post.call_args.kwargs["json"]["messages"],
             {"role": "user", "content": "你好"},
-        ]
+        )
         assert "tools" in mock_post.call_args.kwargs["json"]
 
 
@@ -434,13 +435,8 @@ def test_main_without_arg_enters_chat_loop(monkeypatch, tmp_path):
         # 两次调用：一次是“你好”的问答，一次是退出时总结对话。
         assert mock_post.call_count == 2
         # 工具循环只发本轮自己的消息（系统消息 + 本轮问题），带工具定义。
-        from tools.agent_loop import LOOP_SYSTEM_MESSAGE
-
         first_sent = mock_post.call_args_list[0].kwargs["json"]["messages"]
-        assert first_sent == [
-            {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
-            {"role": "user", "content": "你好"},
-        ]
+        _assert_loop_messages(first_sent, {"role": "user", "content": "你好"})
         second_sent = mock_post.call_args_list[1].kwargs["json"]["messages"]
         assert "对话记录员" in second_sent[0]["content"]
     # 退出时总结的那段对话记进了最近列表（标题取第一句用户话）。
@@ -475,16 +471,10 @@ def test_session_isolation_new_chat_loop_starts_with_empty_history(monkeypatch, 
         assert mock_post.call_count == 2
     # 第一轮发循环的系统消息 + 本轮问题。
     first_sent = mock_post.call_args_list[0].kwargs["json"]["messages"]
-    assert first_sent == [
-        {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
-        {"role": "user", "content": "你好"},
-    ]
+    _assert_loop_messages(first_sent, {"role": "user", "content": "你好"})
     # 第二轮也只发本轮自己的消息，不含第一轮的任何消息，证明历史是独立的空历史。
     second_sent = mock_post.call_args_list[1].kwargs["json"]["messages"]
-    assert second_sent == [
-        {"role": "system", "content": LOOP_SYSTEM_MESSAGE},
-        {"role": "user", "content": "再见"},
-    ]
+    _assert_loop_messages(second_sent, {"role": "user", "content": "再见"})
     assert all(m["content"] != "你好" for m in second_sent)
 
 

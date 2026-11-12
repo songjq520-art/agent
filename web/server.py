@@ -42,10 +42,24 @@
 #                        返回 {"ok": true}。
 #   GET  /api/conversations → 最近对话列表（JSON {"conversations": [...]}，
 #                        每条只有 id、标题、开始/更新时间，不带正文）。
+#   GET  /api/conversations/current → 当前对话（41 号：刷新后恢复用，
+#                        JSON {"id", "title", "summary", "messages",
+#                        "transcript_status"}；没在聊时 messages 为空）。
 #   POST /api/conversations/open → 回到一段旧对话，请求 JSON {"id": 对话 id}，
-#                        返回 {"id", "title", "summary", "messages"}：
-#                        messages 是恢复的最近几轮（原样），页面按它重画
-#                        聊天区，接着聊；找不到时回 404。
+#                        返回 {"id", "title", "summary", "messages",
+#                        "transcript_status"}：
+#                        messages 是恢复的最近几轮（原样），有全文记录时
+#                        恢复全文，页面按它重画聊天区，接着聊；找不到时回 404。
+#   GET  /api/tasks/active → 正在跑的任务 + 进度（12 号：前端轮询用，
+#                        JSON {"tasks": [{task_id, goal, status, progress}]}）。
+#   GET  /api/tasks/unresolved → 没交代的任务（12 号：UNKNOWN + PAUSED，
+#                        JSON {"tasks": [...]}），给页面上“恢复卡住的任务”入口用。
+#   POST /api/tasks/<id>/resume → 续跑一条没交代的任务（12 号），
+#                        跑完后返回和 /api/chat 成功时一样的字典
+#                        （多一个 "ok": True）；又停在确认卡上时返回
+#                        waiting_approval 字典；任务不对时回 409。
+#   POST /api/tasks/<id>/discard → 作废一条没交代的任务（12 号），
+#                        返回 {"ok": true}；任务不对时回 409。
 #   GET  /api/memories → 已存记忆列表（JSON {"memories": [...], "mem0_enabled": bool}，
 #                        每条含 id、text、metadata：source/created_at/confidence/
 #                        user_confirmed/confirmed；记忆未启用时列表为空）。
@@ -95,10 +109,20 @@ from urllib.parse import unquote
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import MONTHLY_BUDGET_USD, BudgetTracker, get_model_status  # noqa: E402
-from main import _memory_block, run_question  # noqa: E402
+from main import (
+    _memory_block,
+    is_remember_command,
+    remember_content,
+    run_question,
+)  # noqa: E402
+from tools.timing import Timer  # noqa: E402
 from memory.conversation_summary import (  # noqa: E402
     ConversationSummaryStore,
     make_deepseek_summarizer,
+)
+from memory.conversation_transcript import (  # noqa: E402
+    TranscriptStore,
+    message_fingerprint,
 )
 from memory.mem0_store import create_mem0_store  # noqa: E402
 
@@ -162,7 +186,8 @@ class ChatState:
     """
 
     def __init__(self, budget_tracker=None, mem0_store=None, summary_store=None,
-                 tool_gateway=None, task_store=None, search_service=None):
+                 tool_gateway=None, task_store=None, search_service=None,
+                 transcript_store=None):
         self.tracker = budget_tracker or BudgetTracker()
         self.messages = []
         self.mem0_store = mem0_store
@@ -173,6 +198,8 @@ class ChatState:
         self._tool_gateway = tool_gateway
         self._task_store = task_store
         self._search_service = search_service
+        # 全文记录存储（38 号）：不传时第一次用才建，测试时传假的进来。
+        self._transcript_store = transcript_store
         # _lock（并发锁）：服务用 ThreadingHTTPServer，每个请求一个线程。
         # 没有这把锁，两个 /api/chat 同时跑会互相污染历史（你问你的、他答他的，
         # 追加顺序乱掉），还可能同时通过预算检查、多记一笔费用。
@@ -205,19 +232,94 @@ class ChatState:
         测试时传假服务进来。"""
         return self._search_service
 
-    def reset(self):
-        """开新对话：先把当前对话总结保存，再清空历史、换一条空记录。
+    @property
+    def transcript_store(self):
+        """全文记录存储（懒加载）：第一次用时才建，测试可注入假的。"""
+        if self._transcript_store is None:
+            self._transcript_store = TranscriptStore()
+        return self._transcript_store
 
+    def reset(self):
+        """开新对话：先开新的，上一段的总结放后台慢慢做（40 号）。
+
+        以前这里拿着锁同步调模型把整段对话总结一遍，长对话那一下要
+        十几秒，期间整个对话都锁着，点“新对话”就卡住。现在锁里只做
+        快事：把当前消息快照下来、换一条空记录、清空历史，立刻返回；
+        总结在后台线程里跑——调模型那十几秒不拿锁，算好了再拿锁写回
+        旧那段记录（按 id 认准，不写串到新对话里），新对话的第一轮
+        不用等它；失败只记日志，不拦聊天。
+        后台写回时拿同一把锁：摘要存储自己不加锁，调用方必须保证一次
+        只有一个地方在调，锁就是这道保证。
+        锁里还有一件快事（第 4 批补的）：先 sync() 一下——只记标题、
+        更新时间、最近几轮，不调模型，很快。作用是把刚结束那段记进
+        列表：没 sync 过的对话（比如只聊了两句就点新对话），旧记录
+        还没进列表，后台 flush 按 id 找它就找不到（_find_record 只
+        查列表），摘要就丢了。sync 过之后列表里立刻有这段，标题也
+        有了，摘要好了后台再补。
         预算不动，只清聊天记录。摘要没启用时就是原来的清空。
+        返回 {"closed_id": 刚结束那段对话的 id（没有时是 None）,
+              "summarizing": 后台是不是在总结（有话要总结时 True）}，
+        页面拿 closed_id 去轮询那段的摘要，好了在顶部显示摘要卡片。
         """
         with self._lock:
-            self._flush_summary_locked()
+            snapshot = [dict(m) for m in self.messages]
+            closed_id = None
+            previous_summary = ""
+            if self.summary_store is not None and snapshot:
+                try:
+                    # 第 4 批（40 号补）：先把刚结束那段记进列表（只记标题、
+                    # 最近几轮，不调模型），再拿它的 id——顺序不能反：
+                    # 全新对话还没 sync 过时 current_id 是 None，先 sync
+                    # 才会建记录、有了 id；后台 flush 按这个 id 才能找到它。
+                    # 没 sync 过的对话（比如只聊了两句就点新对话），不先
+                    # sync，旧记录进不了列表，摘要就丢了。
+                    self.summary_store.sync(snapshot)
+                except Exception:
+                    logger.warning("开新对话时记上一段失败。", exc_info=True)
+            if self.summary_store is not None:
+                try:
+                    closed_id = self.summary_store.current_id
+                    record = self.summary_store.current_record() or {}
+                    previous_summary = record.get("summary") or ""
+                except Exception:
+                    closed_id = None
+                    previous_summary = ""
             if self.summary_store is not None:
                 try:
                     self.summary_store.begin_conversation()
                 except Exception:
                     logger.warning("开新对话失败。", exc_info=True)
             self.messages = []
+        # 锁外再开后台线程：有话要总结、摘要启用了、总结器配了才总结。
+        summarizing = bool(
+            snapshot
+            and self.summary_store is not None
+            and closed_id
+            and self.summary_store.summarizer is not None
+        )
+        if summarizing:
+            store = self.summary_store
+            lock = self._lock
+            summarizer = store.summarizer
+
+            def _flush_old():
+                # 调模型总结是纯函数（只读快照 + 旧摘要），不用拿锁；
+                # 算好了再拿锁写回去，新对话的第一轮不用等这十几秒。
+                try:
+                    summary_text = summarizer(list(snapshot), previous_summary or None)
+                except Exception:
+                    logger.warning("后台总结上一段对话失败。", exc_info=True)
+                    return
+                try:
+                    with lock:
+                        store.flush(
+                            snapshot, record_id=closed_id, summary_text=summary_text
+                        )
+                except Exception:
+                    logger.warning("后台总结上一段对话失败。", exc_info=True)
+
+            threading.Thread(target=_flush_old, daemon=True).start()
+        return {"closed_id": closed_id, "summarizing": summarizing}
 
     def _flush_summary_locked(self):
         """把当前对话收尾总结（调用方已拿着锁）：失败只记日志，不拦聊天。"""
@@ -244,11 +346,31 @@ class ChatState:
                 logger.warning("读最近对话列表失败。", exc_info=True)
                 return []
 
+    def get_conversation(self, conv_id):
+        """按 id 取一条对话记录的完整内容（标题、摘要、最近几轮）。
+
+        40 号：点“新对话”后，上一段的摘要在后台慢慢补，页面拿 reset()
+        返回的 closed_id 来这里轮询，摘要好了就能读到、在顶部显示卡片。
+        找不到（或摘要没启用）时返回 None。
+        """
+        with self._lock:
+            if self.summary_store is None:
+                return None
+            try:
+                return self.summary_store.get_conversation(conv_id)
+            except Exception:
+                logger.warning("读对话记录失败：id=%s。", conv_id, exc_info=True)
+                return None
+
     def open_conversation(self, conv_id):
         """回到一段旧对话：先把当前对话收尾（总结保存），再恢复那段的摘要 + 最近几轮。
 
-        返回 {"id", "title", "summary", "messages"}（messages 是恢复的
-        最近几轮，页面按它重画聊天区，接着聊）；找不到时返回 None。
+        返回 {"id", "title", "summary", "messages", "transcript_status"}：
+        messages 是恢复的最近几轮（原样），页面按它重画
+        聊天区，接着聊；找不到时返回 None。
+        38 号：有全文记录时恢复全文（不只最近 5 轮）；全文已按保留期
+        变摘要时，messages 仍是最近几轮，transcript_status 告诉页面
+        “全文已转成摘要”，页面可以提一句。
         摘要没启用时也返回 None（没有可回的对话）。
         """
         with self._lock:
@@ -263,11 +385,67 @@ class ChatState:
             if record is None:
                 return None
             self.messages = [dict(m) for m in record.get("recent") or []]
+            transcript_status = None
+            try:
+                transcript = self.transcript_store.get(record["id"])
+            except Exception:
+                logger.warning("读对话全文记录失败。", exc_info=True)
+                transcript = None
+            if transcript is not None and transcript.get("status") == "full":
+                # 38 号：全文还在，恢复全文，不只最近 5 轮。
+                self.messages = [dict(m) for m in transcript.get("messages") or []]
+            transcript_status = (transcript or {}).get("status")
             return {
                 "id": record["id"],
                 "title": record.get("title") or "新对话",
                 "summary": record.get("summary") or "",
                 "messages": [dict(m) for m in self.messages],
+                "transcript_status": transcript_status,
+            }
+
+    def current_conversation(self):
+        """当前正在聊的对话（41 号：刷新后恢复用）。
+
+        返回 {"id", "title", "summary", "messages", "transcript_status"}：
+        messages 是服务端内存里的完整历史；有全文记录时优先用全文
+        （摘要压缩裁掉的前面几轮也在里面）。标题/摘要只取正在聊的
+        这一条记录，不回落到“最近”列表最新那条。
+        没在聊（刚启动、或刚开新对话还没说话）时返回 None，
+        页面显示空白欢迎页。
+        """
+        with self._lock:
+            if not self.messages:
+                # 刚启动、刚开新对话还没说话：没什么可恢复的。
+                # 注意：只看 messages——摘要文件里那份是上一段对话，
+                # 不能当成当前对话恢复。
+                return None
+            if self.summary_store is None:
+                return {
+                    "id": None,
+                    "title": "新对话",
+                    "summary": "",
+                    "messages": [dict(m) for m in self.messages],
+                    "transcript_status": None,
+                }
+            record = self.summary_store.current_record() or {}
+            conv_id = record.get("id") or self.summary_store.current_id
+            transcript = None
+            if conv_id:
+                try:
+                    transcript = self.transcript_store.get(conv_id)
+                except Exception:
+                    logger.warning("读对话全文记录失败。", exc_info=True)
+                    transcript = None
+            if transcript is not None and transcript.get("status") == "full":
+                messages = [dict(m) for m in transcript.get("messages") or []]
+            else:
+                messages = [dict(m) for m in self.messages]
+            return {
+                "id": conv_id,
+                "title": record.get("title") or "新对话",
+                "summary": record.get("summary") or "",
+                "messages": messages,
+                "transcript_status": (transcript or {}).get("status"),
             }
 
     def current_summary(self):
@@ -336,11 +514,38 @@ class ChatState:
         不会死锁。
         """
         with self._lock:
+            # 第 0 步地基：计时——搜记忆、调模型、存记忆各花多久都记下来，
+            # 26 号“慢在哪”才有数。只量时间、不改行为。
+            timer = Timer()
+            # 25 号：“记住……”先直存（和命令行同一条路），别等下一轮。
+            # 直存用 add_memory_text：原文存、记 source="user" 已确认、
+            # 自带去重（库里已有就不重复存），不经过提取、不调模型，所以快。
+            # 直存放在搜记忆之前：搜的时候就能找到刚存的这条，模型按
+            # 【用户确认】直接当事实回，不用再 hedging“仅供参考”。
+            # 直存成了，本轮收尾就跳过 add_turn——这条“记住”已经在库里了，
+            # 再让提取跑一遍会多存一条推断出来的重复记忆。
+            # 直存失败时不跳过：走老路（add_turn 待定区），至少记忆不会丢。
+            # （上一轮待定区的提交会因此晚一轮，和命令行“记住”跳过整轮
+            # run_question 的做法一致，不丢数据。）
+            remember_stored = False
+            if self.mem0_store is not None and is_remember_command(prompt):
+                content = remember_content(prompt)
+                if content:
+                    try:
+                        result = self.mem0_store.add_memory_text(
+                            content, source="user"
+                        )
+                        remember_stored = bool(result)
+                    except Exception:
+                        logger.warning(
+                            "“记住”直存失败，本轮仍按正常流程回答。", exc_info=True
+                        )
             # 提问前检索记忆：有结果就拼提示块，没结果就什么都不拼。
             model_prompt = prompt
             if self.mem0_store is not None:
                 try:
-                    memories = self.mem0_store.search(prompt, top_k=5)
+                    with timer.measure("memory_search_ms"):
+                        memories = self.mem0_store.search(prompt, top_k=5)
                     # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
                     # “当前在聊什么”的提示（见 Mem0Store.note_context）。
                     self.mem0_store.note_context(memories)
@@ -351,16 +556,25 @@ class ChatState:
                 block = _memory_block(memories)
                 if block:
                     model_prompt = block + "\n\n" + prompt
-            outcome = run_question(
-                model_prompt,
-                budget_tracker=self.tracker,
-                messages=self.messages,
-                summary_store=self.summary_store,
-                tool_gateway=self.tool_gateway,
-                task_store=self.task_store,
-                search_service=self.search_service,
-                original_prompt=prompt,
-            )
+            # 45 号：记忆工具要用的记忆库绑到当前上下文（循环里调
+            # 记忆工具时能读到；没启用记忆库时等于没绑，工具会报
+            # “记忆库没启用”。出块就恢复，不串到别的请求。）
+            from tools.memory_tool import bound_memory_store
+
+            with bound_memory_store(self.mem0_store):
+                outcome = run_question(
+                    model_prompt,
+                    budget_tracker=self.tracker,
+                    messages=self.messages,
+                    summary_store=self.summary_store,
+                    tool_gateway=self.tool_gateway,
+                    task_store=self.task_store,
+                    search_service=self.search_service,
+                    original_prompt=prompt,
+                )
+            # run_question 里量的时间（调模型、读摘要）并进本轮的计时。
+            for _name, _ms in (outcome.get("timings") or {}).items():
+                timer.record(_name, _ms)
             if outcome["mode"] == "demo":
                 return {
                     "reply": outcome["message"],
@@ -368,6 +582,7 @@ class ChatState:
                     "mode": "demo",
                     "cost_usd": None,
                     "usage": None,
+                    "timings_ms": timer.as_dict(),
                 }
             if outcome["mode"] == "waiting_approval":
                 # 工具循环停在确认卡上：本轮还没答完，历史、摘要、记忆
@@ -384,12 +599,20 @@ class ChatState:
                         self.task_store.save(waiting_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
+                # 第 0 步留的小缺口：停在确认卡上那轮的计时也要进服务端日志
+                # （以前只进返回、不进日志，慢在哪查不到）。
+                logger.info(
+                    "timing | web round total=%.1fms %s",
+                    timer.total_ms(),
+                    timer.as_dict(),
+                )
                 return {
                     "reply": "",
                     "model": None,
                     "mode": "waiting_approval",
                     "cost_usd": outcome.get("cost_usd"),
                     "usage": None,
+                    "timings_ms": timer.as_dict(),
                     "needs_approval": {
                         "task_id": waiting_task.get("task_id"),
                         "run_id": waiting_task.get("run_id"),
@@ -407,10 +630,16 @@ class ChatState:
                 result["model"],
                 result.get("cost_usd"),
                 result.get("usage"),
+                timer=timer,
+                # 25 号：“记住”直存成了就跳过 add_turn，别重复存一条推断版。
+                skip_memory_save=remember_stored,
+                # 48 号：本轮调过的搜索记录，页面显示在回答下面。
+                searches=outcome.get("searches"),
             )
 
     def _finish_turn_locked(self, prompt, reply_text, model_name, cost_usd, usage,
-                            insert_at=None):
+                            insert_at=None, timer=None, skip_memory_save=False,
+                            searches=None):
         """一轮问答答完了的收尾（调用方已拿着锁）：把本轮问答写进历史、
         更新对话摘要、存进长期记忆。返回给页面展示的字典。
         ask() 和 resolve_approval() 共用这一段，保证确认恢复后的那轮
@@ -420,7 +649,14 @@ class ChatState:
         记下的 history_index）。不传时追加在末尾；传了时插回这个位置，
         不追加在后来新消息的后面——等确认时新发的消息不受影响、顺序不乱。
         位置不是数时按追加处理；位置超过当前长度时钳制到末尾。
+        参数 timer：第 0 步地基用的计时器（ask() 传进来的那只，里面已记了
+        搜记忆、调模型的时间）；不传时这里自己 new 一只，只量收尾这两截。
+        参数 skip_memory_save：25 号——本轮是“记住……”且已经直存进库时
+        传 True，收尾跳过 add_turn（这条已经在库里了，再提取会重复存）。
+        直存失败时不跳过，走老路。
         """
+        if timer is None:
+            timer = Timer()
         user_msg = {"role": "user", "content": prompt}
         assistant_msg = {"role": "assistant", "content": reply_text}
         if isinstance(insert_at, bool) or not isinstance(insert_at, int):
@@ -437,13 +673,43 @@ class ChatState:
         if self.summary_store is not None:
             before_len = len(self.messages)
             try:
-                self.summary_store.maybe_compact(self.messages)
-                self.summary_store.sync(self.messages)
+                with timer.measure("summary_save_ms"):
+                    self.summary_store.maybe_compact(self.messages)
+                    self.summary_store.sync(self.messages)
             except Exception:
                 logger.warning("对话摘要更新失败。", exc_info=True)
             removed = before_len - len(self.messages)
             if removed > 0:
                 self._shift_waiting_history_index(removed)
+        # 38 号：全文存盘——本轮两条新消息追加进这场对话的全文记录。
+        # 只追加新消息（恢复回来的旧消息不经过这里，不重复写）；
+        # 摘要压缩裁掉历史前面时不影响这里，全文已经在文件里了。
+        # 恢复的那轮插在历史中间时（insert_at 给了），按后面那条消息
+        # 的指纹定位、插回原来的位置，不排到最后。
+        # 全文存不下来不拦聊天（失败只记日志），摘要和记忆不受影响。
+        if self.summary_store is not None:
+            try:
+                conv_id = self.summary_store.current_id
+                if conv_id:
+                    insert_before = None
+                    if insert_at is not None:
+                        following = self.messages[insert_at + 2 : insert_at + 3]
+                        if following:
+                            insert_before = message_fingerprint(following[0])
+                    title = "新对话"
+                    try:
+                        record = self.summary_store.current_record() or {}
+                        title = record.get("title") or "新对话"
+                    except Exception:
+                        pass
+                    self.transcript_store.append(
+                        conv_id,
+                        title,
+                        [user_msg, assistant_msg],
+                        insert_before_fingerprint=insert_before,
+                    )
+            except Exception:
+                logger.warning("对话全文存盘失败。", exc_info=True)
         # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
         # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
         # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
@@ -452,7 +718,7 @@ class ChatState:
         # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
         # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
         correction = None
-        if self.mem0_store is not None:
+        if self.mem0_store is not None and not skip_memory_save:
             recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
             if insert_at is not None and not any(
                 msg is user_msg for msg in recent
@@ -463,7 +729,10 @@ class ChatState:
                 recent = [user_msg, assistant_msg] + self.messages[
                     -(_MEMORY_SAVE_HISTORY_MAX - 2):
                 ]
-            saved = self.mem0_store.add_turn(recent)
+            with timer.measure("memory_save_ms"):
+                # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
+                # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
+                saved = self.mem0_store.save_turn(recent)
             if isinstance(saved, dict):
                 correction = saved.get("correction")
         response = {
@@ -472,9 +741,20 @@ class ChatState:
             "mode": "real",
             "cost_usd": cost_usd,
             "usage": usage,
+            # 第 0 步地基：本轮各截耗时（毫秒），搜记忆、调模型、存记忆各花多久都在里面。
+            "timings_ms": timer.as_dict(),
         }
+        # 48 号：本轮调过的搜索记录（查询词 + 实际发出的词），页面显示在
+        # 回答下面；没搜过时不加这个键，原来的返回形状不动。
+        if searches:
+            response["searches"] = searches
         if correction is not None:
             response["correction"] = correction
+        logger.info(
+            "timing | web round total=%.1fms %s",
+            timer.total_ms(),
+            timer.as_dict(),
+        )
         return response
 
     def _shift_waiting_history_index(self, removed):
@@ -564,38 +844,51 @@ class ChatState:
                 if task is None:
                     return {"ok": False, "reason": f"找不到任务：{task_id}。"}
                 task_id = task["task_id"]
-            resolved = self.tool_gateway.resolve_approval(
-                self.task_store, task_id, approval_id, decision
-            )
+            # 45 号：记忆工具要用的记忆库绑到当前上下文——确认后执行
+            # 删/改记忆时，网关在这里直接调工具函数，得能读到库；
+            # 下面恢复循环时模型可能再调记忆工具，也得绑着。
+            from tools.memory_tool import bound_memory_store
+
+            with bound_memory_store(self.mem0_store):
+                resolved = self.tool_gateway.resolve_approval(
+                    self.task_store, task_id, approval_id, decision
+                )
             if resolved["decision"] == "rejected":
                 return {"ok": False, "reason": resolved["reason"]}
             goal = (resolved.get("task") or {}).get("goal") or task.get("goal") or ""
             if resolved["decision"] == "cancelled":
-                outcome = run_question(
-                    goal,
-                    budget_tracker=self.tracker,
-                    messages=self.messages,
-                    summary_store=self.summary_store,
-                    tool_gateway=self.tool_gateway,
-                    task_store=self.task_store,
-                    search_service=self.search_service,
-                    resume_task=resolved["task"],
-                    user_declined=True,
-                    original_prompt=goal,
-                )
+                with bound_memory_store(self.mem0_store):
+                    outcome = run_question(
+                        goal,
+                        budget_tracker=self.tracker,
+                        messages=self.messages,
+                        summary_store=self.summary_store,
+                        tool_gateway=self.tool_gateway,
+                        task_store=self.task_store,
+                        search_service=self.search_service,
+                        resume_task=resolved["task"],
+                        user_declined=True,
+                        original_prompt=goal,
+                    )
             else:  # 确认执行了
-                outcome = run_question(
-                    goal,
-                    budget_tracker=self.tracker,
-                    messages=self.messages,
-                    summary_store=self.summary_store,
-                    tool_gateway=self.tool_gateway,
-                    task_store=self.task_store,
-                    search_service=self.search_service,
-                    resume_task=resolved["task"],
-                    pending_tool_result=resolved["result"],
-                    original_prompt=goal,
-                )
+                with bound_memory_store(self.mem0_store):
+                    outcome = run_question(
+                        goal,
+                        budget_tracker=self.tracker,
+                        messages=self.messages,
+                        summary_store=self.summary_store,
+                        tool_gateway=self.tool_gateway,
+                        task_store=self.task_store,
+                        search_service=self.search_service,
+                        resume_task=resolved["task"],
+                        pending_tool_result=resolved["result"],
+                        original_prompt=goal,
+                    )
+            # 第 0 步地基：恢复这轮调模型的时间并进计时，再传给收尾一起记；
+            # 停在下一张确认卡上时也记一条日志（第 0 步留的小缺口）。
+            _timer = Timer()
+            for _name, _ms in (outcome.get("timings") or {}).items():
+                _timer.record(_name, _ms)
             if outcome["mode"] == "waiting_approval":
                 # 恢复后又停在下一张确认卡上：同样不写历史，等下一张卡。
                 # 位置沿用原来那轮记下的（还是同一轮，没写进历史，位置不变）；
@@ -608,6 +901,11 @@ class ChatState:
                         self.task_store.save(next_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
+                logger.info(
+                    "timing | web round total=%.1fms %s",
+                    _timer.total_ms(),
+                    _timer.as_dict(),
+                )
                 return {
                     "ok": True,
                     "reply": "",
@@ -635,9 +933,255 @@ class ChatState:
                 result.get("cost_usd"),
                 result.get("usage"),
                 insert_at=task.get("history_index"),
+                timer=_timer,
+                # 48 号：确认恢复的那轮调过的搜索记录（任务里攒的，确认前
+                # 调过的也在里面），页面显示在回答下面。
+                searches=outcome.get("searches"),
             )
             response["ok"] = True
             return response
+
+    # ---------- 任务状态机（12 号） ----------
+    # 任务状态是显式的（CREATED / RUNNING / PAUSED / WAITING_APPROVAL /
+    # COMPLETED / FAILED / UNKNOWN / CANCELLED / EXPIRED，见
+    # tasks/task_store.py）；重启后不再盲目恢复一个 RUNNING 的任务，
+    # 先判断状态再决定。进度和没交代的任务都在这里管。
+
+    def active_tasks(self):
+        """正在跑的任务 + 进度（12 号：前端轮询进度用）。
+
+        注意：故意不拿 ChatState 的锁——ask() 问答全程都拿着那把锁，
+        拿了锁再读就永远读不到进行中的进度；任务存储自己有锁，
+        直接读它，读到的是循环每次存盘时的最新进度。
+        读失败时返回空列表，页面保持“正在想…”，不拦聊天。
+        """
+        try:
+            tasks = self.task_store.list_by_status("RUNNING")
+        except Exception:
+            logger.warning("读正在跑的任务失败。", exc_info=True)
+            return []
+        return [
+            {
+                "task_id": task.get("task_id"),
+                "goal": task.get("goal") or "",
+                "status": task.get("status"),
+                "progress": task.get("progress") or {},
+            }
+            for task in tasks
+        ]
+
+    def list_unresolved_tasks(self):
+        """没交代的任务（12 号：UNKNOWN + PAUSED），给页面上
+        “恢复卡住的任务”入口用。每条带 task_id、原话 goal、状态、
+        原因、创建时间。只读，不改状态。
+        每条还带 tool_calls 摘要（工具名 + 状态，不带参数）：
+        GPT 第一轮审查 P1 第 4 条——光说任务“结果未知”不够，
+        BOOS 得看得出是哪条调用卡住了：executing / timeout 是
+        “执行过了、结果未知，绝不重跑”；ok / failed 是“执行完了、
+        结果已保存”；waiting_approval 是“还没执行，等确认”。"""
+        with self._lock:
+            try:
+                tasks = self.task_store.list_unresolved()
+            except Exception:
+                logger.warning("读没交代的任务失败。", exc_info=True)
+                return []
+            return [
+                {
+                    "task_id": task.get("task_id"),
+                    "goal": task.get("goal") or "",
+                    "status": task.get("status"),
+                    "reason": task.get("reconciled_reason") or "",
+                    "created_at": task.get("created_at"),
+                    "updated_at": task.get("updated_at"),
+                    "tool_calls": [
+                        {
+                            "tool": rec.get("tool") or "",
+                            "status": rec.get("status") or "",
+                        }
+                        for rec in (task.get("tool_calls") or [])
+                        if isinstance(rec, dict)
+                    ],
+                }
+                for task in tasks
+            ]
+
+    def resume_unresolved_task(self, task_id):
+        """续跑一条没交代的任务（12 号）：UNKNOWN / PAUSED 才能续跑。
+
+        先原子抢占成 RUNNING（别人先抢到了就回绝），再走 run_question
+        的恢复路接着跑——循环接着存着的消息继续，不重执行已经执行过
+        的工具调用（replay_safe + executing 检查在循环里）。
+        跑完后收尾和普通一轮一样（写历史、更新摘要、存记忆，只存原话 +
+        最后回答）。跑完又停在下一张确认卡上时返回 waiting_approval。
+        恢复失败（模型不对、调用报错、没 Key）时把任务放回原来的状态，
+        不让它挂着 RUNNING。调用失败时直接抛 RuntimeError，
+        调用方转成错误返回。
+        """
+        with self._lock:
+            task = self.task_store.load(task_id)
+            if task is None:
+                return {"ok": False, "reason": f"找不到任务：{task_id}。"}
+            status = task.get("status")
+            if status not in ("UNKNOWN", "PAUSED"):
+                return {"ok": False, "reason": f"这个任务现在是{status}，不用恢复。"}
+            ok, current = self.task_store.cas(
+                task_id, status, lambda t: {**t, "status": "RUNNING"}
+            )
+            if not ok:
+                return {"ok": False, "reason": "任务状态变了，可能已经有人处理过了。"}
+            task = current
+            goal = task.get("goal") or ""
+            # 没存下循环消息的任务（老记录、或存盘时正好断了）：不拿空历史
+            # 去问模型（模型会直接报错），按新任务从头跑——原话还在，
+            # 活照样能干完。正常崩溃的任务一定有消息，走恢复路。
+            resume_task = task if task.get("messages") else None
+            timer = Timer()
+            try:
+                outcome = run_question(
+                    goal,
+                    budget_tracker=self.tracker,
+                    messages=self.messages,
+                    summary_store=self.summary_store,
+                    tool_gateway=self.tool_gateway,
+                    task_store=self.task_store,
+                    search_service=self.search_service,
+                    resume_task=resume_task,
+                    original_prompt=goal,
+                )
+            except Exception:
+                # 恢复没跑起来：把任务放回原来的状态，不挂着 RUNNING。
+                try:
+                    task["status"] = status
+                    self.task_store.save(task)
+                except Exception:
+                    logger.warning("恢复失败后任务状态没放回去。", exc_info=True)
+                raise
+            for _name, _ms in (outcome.get("timings") or {}).items():
+                timer.record(_name, _ms)
+            if outcome["mode"] == "waiting_approval":
+                # 又停在下一张确认卡上：同样不写历史，等下一张卡。
+                # 位置按现在历史的长度记一个（续跑的那轮还没写进历史）。
+                approval = outcome["approval"] or {}
+                next_task = outcome["task"] or {}
+                if next_task.get("task_id") and next_task.get("history_index") is None:
+                    try:
+                        next_task["history_index"] = len(self.messages)
+                        self.task_store.save(next_task)
+                    except Exception:
+                        logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
+                logger.info(
+                    "timing | web round total=%.1fms %s",
+                    timer.total_ms(),
+                    timer.as_dict(),
+                )
+                return {
+                    "ok": True,
+                    "reply": "",
+                    "model": None,
+                    "mode": "waiting_approval",
+                    "cost_usd": outcome.get("cost_usd"),
+                    "usage": None,
+                    "needs_approval": {
+                        "task_id": next_task.get("task_id"),
+                        "run_id": next_task.get("run_id"),
+                        "approval_id": approval.get("approval_id"),
+                        "tool": approval.get("tool"),
+                        "args": approval.get("args"),
+                        "risk_level": approval.get("risk_level"),
+                        "expires_at": approval.get("expires_at"),
+                    },
+                }
+            if outcome["mode"] == "demo":
+                # 没 Key：把任务放回原来的状态，别挂着 RUNNING。
+                try:
+                    task["status"] = status
+                    self.task_store.save(task)
+                except Exception:
+                    logger.warning("恢复失败后任务状态没放回去。", exc_info=True)
+                return {"ok": False, "reason": "恢复任务时没有可用的模型 Key。"}
+            result = outcome["result"]
+            response = self._finish_turn_locked(
+                goal,
+                result["text"],
+                result["model"],
+                result.get("cost_usd"),
+                result.get("usage"),
+                timer=timer,
+            )
+            # 循环正常收尾会把任务标 COMPLETED；万一还是 RUNNING（比如
+            # 恢复的那条路没走到收尾），这里补标一下，别留悬案。
+            try:
+                current_task = self.task_store.load(task_id)
+                if current_task is not None and current_task.get("status") == "RUNNING":
+                    current_task["status"] = "COMPLETED"
+                    current_task["result"] = result["text"]
+                    self.task_store.save(current_task)
+            except Exception:
+                logger.warning("续跑任务收尾标 COMPLETED 失败。", exc_info=True)
+            response["ok"] = True
+            return response
+
+    def discard_unresolved_task(self, task_id):
+        """作废一条没交代的任务（12 号）：UNKNOWN / PAUSED 才能作废，
+        原子改成 CANCELLED。别的狀態直接回绝，不改。"""
+        with self._lock:
+            task = self.task_store.load(task_id)
+            if task is None:
+                return {"ok": False, "reason": f"找不到任务：{task_id}。"}
+            if task.get("status") not in ("UNKNOWN", "PAUSED"):
+                return {
+                    "ok": False,
+                    "reason": f"这个任务现在是{task.get('status')}，不用作废。",
+                }
+            ok, _current = self.task_store.cas(
+                task_id, task["status"], lambda t: {**t, "status": "CANCELLED"}
+            )
+            if not ok:
+                return {"ok": False, "reason": "任务状态变了，可能已经有人处理过了。"}
+            return {"ok": True}
+
+    def reconcile_tasks_on_startup(self):
+        """服务启动时扫一遍盘上的任务（12 号）：RUNNING 的改成 UNKNOWN
+        （结果未知，不悄悄重执行），过期的 WAITING_APPROVAL 改成 EXPIRED。
+        返回受影响的任务摘要，没有时返回空列表。失败只记日志，不拦启动。"""
+        try:
+            return self.task_store.reconcile_on_startup()
+        except Exception:
+            logger.warning("启动时核对任务状态失败。", exc_info=True)
+            return []
+
+    def pause_running_tasks_on_shutdown(self):
+        """干净关机时把还在跑的任务标成 PAUSED（12 号）：和崩溃的 UNKNOWN
+        区分开——干净关机知道它停在哪，续跑是安全的。
+        返回受影响的任务摘要，没有时返回空列表。失败只记日志。"""
+        try:
+            return self.task_store.pause_running_on_shutdown()
+        except Exception:
+            logger.warning("关机时暂停任务失败。", exc_info=True)
+            return []
+
+    def prune_transcripts(self):
+        """按保留期流转对话全文（38 号）：满 30 天变摘要、满 1 年再精简。
+        服务启动时跑一遍；失败只记日志，不拦启动。返回流转的动作列表。
+        摘要优先用摘要文件里那份，没有时调模型现生成；都拿不到就不动。"""
+        if self.summary_store is None:
+            return []
+        summarizer = getattr(self.summary_store, "summarizer", None)
+
+        def _lookup(conv_id):
+            try:
+                rec = self.summary_store.get_conversation(conv_id)
+            except Exception:
+                return ""
+            return (rec or {}).get("summary") or ""
+
+        try:
+            return self.transcript_store.prune(
+                summarizer=summarizer, summary_lookup=_lookup
+            )
+        except Exception:
+            logger.warning("对话全文保留期流转失败。", exc_info=True)
+            return []
 
     # ---------- 长期记忆管理（“长期记忆”页面用） ----------
     # 原则：网页层只做“传话”——列出、展示范围、把 BOOS 的确认传下去；
@@ -764,6 +1308,10 @@ def make_handler(state, authenticator=None):
         """处理网页请求的类：只认下面列出的地址，其他一律 404。
 
         聊天：GET /、GET /api/status、POST /api/chat、POST /api/reset；
+        对话：GET /api/conversations、GET /api/conversations/current、
+        POST /api/conversations/open；
+        任务：GET /api/tasks/active、GET /api/tasks/unresolved、
+        POST /api/tasks/<id>/resume、POST /api/tasks/<id>/discard；
         记忆管理：GET /api/memories、GET /api/memories/<id>/scope、
         POST /api/memories/<id>/forget、POST /api/memories/correct。
         """
@@ -860,6 +1408,44 @@ def make_handler(state, authenticator=None):
             elif path == "/api/conversations":
                 # 最近对话列表：摘要没启用时列表为空，页面显示“暂无对话”。
                 self._send_json({"conversations": state.list_conversations()})
+            elif path.startswith("/api/conversations/") and path != "/api/conversations/current":
+                # 40 号：按 id 取一条对话记录（标题、摘要、最近几轮）——
+                # 点“新对话”后，上一段的摘要在后台慢慢补，页面拿 reset()
+                # 返回的 closed_id 来这里轮询，好了在顶部显示摘要卡片。
+                conv_id = unquote(path[len("/api/conversations/"):].strip("/"))
+                if not conv_id:
+                    self._send_json({"error": "请先选一段对话。"}, status=400)
+                    return
+                record = state.get_conversation(conv_id)
+                if record is None:
+                    self._send_json(
+                        {"error": "找不到这段对话，可能已经被删了。"}, status=404
+                    )
+                    return
+                self._send_json(record)
+            elif path == "/api/conversations/current":
+                # 当前对话（41 号）：刷新后恢复用。有内容就接着显示，
+                # 没有返回 messages 为空，页面显示空白欢迎页。
+                current = state.current_conversation()
+                if current is None:
+                    self._send_json(
+                        {
+                            "id": None,
+                            "title": "",
+                            "summary": "",
+                            "messages": [],
+                            "transcript_status": None,
+                        }
+                    )
+                else:
+                    self._send_json(current)
+            elif path == "/api/tasks/active":
+                # 正在跑的任务 + 进度（12 号）：前端发消息后轮询它，
+                # 长任务跑到哪了就显示在哪。正在跑的没有时列表为空。
+                self._send_json({"tasks": state.active_tasks()})
+            elif path == "/api/tasks/unresolved":
+                # 没交代的任务（12 号）：页面上“恢复卡住的任务”入口用。
+                self._send_json({"tasks": state.list_unresolved_tasks()})
             elif path == "/api/memories":
                 # 记忆列表：记忆未启用时 mem0_enabled 为 False、列表为空，
                 # 页面据此显示“记忆未启用”，不报错。
@@ -906,10 +1492,63 @@ def make_handler(state, authenticator=None):
                 return
             path = self.path.split("?", 1)[0]
             if path == "/api/reset":
-                state.reset()
-                # 新对话读回的摘要（上一段对话的）一起带上，页面在顶部
-                # 显示摘要卡片；没有摘要时是空串，页面不显示卡片。
-                self._send_json({"ok": True, "summary": state.current_summary()})
+                # 40 号：开新对话立刻返回（上一段的总结在后台做，不卡住页面）；
+                # closed_id 是刚结束那段对话的 id，summarizing 说后台是不是
+                # 在总结它——页面拿 closed_id 去轮询那段的摘要，好了在顶部
+                # 显示摘要卡片；没话要总结时 summarizing 是 False、没有卡片。
+                result = state.reset()
+                self._send_json(
+                    {
+                        "ok": True,
+                        "summary": "",
+                        "closed_id": result.get("closed_id"),
+                        "summarizing": bool(result.get("summarizing")),
+                    }
+                )
+                return
+            if path.startswith("/api/tasks/") and path.endswith("/resume"):
+                # 续跑一条没交代的任务（12 号）：POST /api/tasks/<id>/resume。
+                # 跑完后返回和 /api/chat 成功时一样的字典（多一个 "ok": True）；
+                # 又停在下一张确认卡上时返回 waiting_approval 字典
+                # （多一个 "ok": True），页面再显示下一张卡；
+                # 任务不对（找不到、状态不对、没 Key）时回 409 + 原因，
+                # 不执行。调用失败时回 502。
+                task_id = unquote(path[len("/api/tasks/") : -len("/resume")].strip("/"))
+                if not task_id:
+                    self._send_json({"error": "请先选一个任务。"}, status=400)
+                    return
+                try:
+                    result = state.resume_unresolved_task(task_id)
+                except Exception:
+                    # 恢复时调用失败（模型不对、网络断等）：任务状态已经
+                    # 放回去了（见 resume_unresolved_task），这里只回 502，
+                    # 不把原始异常暴露出去。
+                    traceback.print_exc()
+                    self._send_json({"error": "调用失败，请稍后再试。"}, status=502)
+                    return
+                if not result.get("ok", True):
+                    self._send_json(
+                        {"error": result.get("reason") or "这个任务恢复不了。"},
+                        status=409,
+                    )
+                    return
+                self._send_json(result)
+                return
+            if path.startswith("/api/tasks/") and path.endswith("/discard"):
+                # 作废一条没交代的任务（12 号）：POST /api/tasks/<id>/discard。
+                # 任务不对（找不到、状态不对）时回 409 + 原因，不改。
+                task_id = unquote(path[len("/api/tasks/") : -len("/discard")].strip("/"))
+                if not task_id:
+                    self._send_json({"error": "请先选一个任务。"}, status=400)
+                    return
+                result = state.discard_unresolved_task(task_id)
+                if not result.get("ok", True):
+                    self._send_json(
+                        {"error": result.get("reason") or "这个任务作废不了。"},
+                        status=409,
+                    )
+                    return
+                self._send_json(result)
                 return
             if path == "/api/chat/confirm":
                 # 处理一张确认卡：请求 {"task_id", "approval_id",
@@ -1095,7 +1734,7 @@ def _is_loopback_host(host):
         return False
 
 
-def create_server(config=None, budget_tracker=None, authenticator=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None):
+def create_server(config=None, budget_tracker=None, authenticator=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, transcript_store=None):
     """建一个网页服务（不启动），方便测试用临时端口和临时预算文件。
 
     config 是 ServerConfig；不传时用环境变量/默认值（ServerConfig.from_env()）。
@@ -1107,6 +1746,8 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
     总结保存，新对话开始时读回最新摘要当上下文。
     tool_gateway / task_store / search_service 是工具循环用的网关、
     任务存储、搜索服务，不传时第一次用才建；测试时可传假的进来。
+    transcript_store 是对话全文记录库（TranscriptStore），不传时第一次
+    用才建；测试时可传假的进来。
     测试时可传一个假 store（有 search/add_turn/get_all 方法即可），不碰真实 mem0。
 
     安全保护：监听地址不是本机回环地址（比如 0.0.0.0 或局域网地址），
@@ -1129,6 +1770,7 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
         tool_gateway=tool_gateway,
         task_store=task_store,
         search_service=search_service,
+        transcript_store=transcript_store,
     )
     handler = make_handler(state, authenticator=authenticator)
     return ThreadingHTTPServer((config.host, config.port), handler), state
@@ -1167,8 +1809,8 @@ def main(argv=None):
     if mem0_store is None:
         print("⚠️ mem0 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
     else:
-        # Plan C：把十二的名字和 SOUL.md 以“已确认”种进长期记忆
-        # （只加没有的，不覆盖已有的；失败只记日志、不拦启动）。
+        # Plan C + 17 号：把十二的名字、SOUL.md 和 BOOS 的电脑配置
+        # 以“已确认”种进长期记忆（只加没有的，不覆盖已有的；失败只记日志、不拦启动）。
         try:
             seeded = mem0_store.ensure_identity_memories()
             added = [
@@ -1211,12 +1853,48 @@ def main(argv=None):
         # 这里只打印一句清楚的原因就退出，不甩一堆堆栈给用户看。
         print(f"启动失败：{exc}", file=sys.stderr, flush=True)
         return 1
+    # 12 号：启动时核对一遍盘上的任务——还在 RUNNING 的改成 UNKNOWN
+    # （结果未知，不悄悄重执行），过期的确认卡改成 EXPIRED；
+    # 有没交代的任务时打印一句，页面上“恢复卡住的任务”入口里也能看到。
+    try:
+        reconciled = _state.reconcile_tasks_on_startup()
+        for item in reconciled:
+            print(
+                f"任务没交代：{item.get('goal') or item.get('task_id')}（"
+                f"{item.get('old_status')} → {item.get('new_status')}），"
+                "页面上可以续跑或作废。",
+                flush=True,
+            )
+    except Exception:
+        logger.warning("启动时核对任务状态失败。", exc_info=True)
+    # 38 号：启动时按保留期流转对话全文——满 30 天变摘要、满 1 年再精简。
+    try:
+        pruned = _state.prune_transcripts()
+        for item in pruned:
+            action = "全文变摘要" if item.get("action") == "full_to_summary" else "摘要再精简"
+            print(
+                f"对话保留期流转：{item.get('title') or item.get('conv_id')}（{action}）。",
+                flush=True,
+            )
+    except Exception:
+        logger.warning("启动时流转对话全文失败。", exc_info=True)
     print(f"本地网页入口已启动：http://{config.host}:{config.port}", flush=True)
     print("在浏览器打开上面的地址就能对话，按 Ctrl+C 停止服务。", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n服务已停止。")
+    # 12 号：干净关机时把还在跑的任务标成 PAUSED（和崩溃的 UNKNOWN
+    # 区分开），下次启动能续跑。
+    try:
+        paused = _state.pause_running_tasks_on_shutdown()
+        for item in paused:
+            print(
+                f"任务已暂停：{item.get('goal') or item.get('task_id')}，下次启动能续跑。",
+                flush=True,
+            )
+    except Exception:
+        logger.warning("关机时暂停任务失败。", exc_info=True)
     # Plan C：服务停之前把待定区里最后一轮提交——否则最后一轮
     # 永远待在内存里。撤回过的那轮在撤回时已经丢掉，不会捞回来。
     if mem0_store is not None:

@@ -109,6 +109,13 @@ class SearchOutcome:
     attempts: list = field(default_factory=list)
     quality: dict = field(default_factory=dict)
     fetched_at: str = ""
+    # 48 号：实际发出去的查询词（走 AnySearch 翻成英文时是英文那份，
+    # 不是模型写的中文原文；没翻译时就等于 query）。界面上显示它，
+    # BOOS 才看得到“到底拿什么词去搜的”。
+    executed_query: str = ""
+    # 28 号：按日期范围过滤的情况（{"start", "end", "dropped", "undated"}），
+    # 没给日期范围时是空字典。
+    date_range: dict = field(default_factory=dict)
 
     def to_dict(self):
         return {
@@ -121,6 +128,8 @@ class SearchOutcome:
             "attempts": self.attempts,
             "quality": self.quality,
             "fetched_at": self.fetched_at,
+            "executed_query": self.executed_query or self.query,
+            "date_range": self.date_range,
         }
 
 
@@ -581,6 +590,51 @@ def _is_stale(published_at, days=30):
     return (_date.today() - parsed).days > days
 
 
+def _parse_date_range(date_range):
+    """把 date_range 参数解析成 (开始日期, 结束日期)，都是 date 对象。
+
+    认 {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}；只给一边时另一边
+    就等于那一边（只查当天）；开始晚于结束、格式不对、不是字典时
+    返回 None——调用方按“没给日期范围”处理，不静默用错范围查。
+    """
+    if not isinstance(date_range, dict):
+        return None
+    start = _parse_date(date_range.get("start"))
+    end = _parse_date(date_range.get("end"))
+    if start is None and end is None:
+        return None
+    if start is None:
+        start = end
+    if end is None:
+        end = start
+    if start > end:
+        return None
+    return start, end
+
+
+def _apply_date_range(results, start, end):
+    """按日期范围过滤结果：返回 (留下的结果, 掉出去的条数, 没带时间的条数)。
+
+    28 号：搜回来的数分属不同日期时，只留要的那几天的——带发布时间的，
+    日期在 [start, end] 里才留；没带时间、或时间解析不出来的，留着：
+    没法按日期判断就别硬丢，丢了可能把对的结果也丢了，数量记下来、
+    让模型知道这几条是没时间信息的（回答时标明“没带时间”）。
+    """
+    kept = []
+    dropped = 0
+    undated = 0
+    for result in results or []:
+        parsed = _parse_date(result.published_at)
+        if parsed is None:
+            undated += 1
+            kept.append(result)
+        elif start <= parsed <= end:
+            kept.append(result)
+        else:
+            dropped += 1
+    return kept, dropped, undated
+
+
 def _quality_notes(results, corroborated_domains):
     """结果质量检查（GPT 的建议）：来源、时间（新旧）、多源印证，写成人话。"""
     notes = []
@@ -682,14 +736,23 @@ class SearchService:
             for name, provider in self.providers.items()
         ]
 
-    def search(self, query, kind="normal", max_results=5, cross_check=False, force_provider=None):
+    def search(self, query, kind="normal", max_results=5, cross_check=False, force_provider=None, date_range=None):
         """搜一次。kind 是 normal（普通查询）或 structured（结构化信息）；
         force_provider 直接指定只用某一个服务（备选链路测试用）；
-        cross_check 为真时，再用搭档服务的结果互相印证。"""
+        cross_check 为真时，再用搭档服务的结果互相印证。
+        date_range 是 {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}（28 号）：
+        结果按 published_at 过滤到这几天——带时间的只留范围内的，没带时间
+        的留着（没法按日期判断）；一家服务过滤后没结果就顺着链路切下一家，
+        都没结果时报错里写明是日期过滤掉的，让模型放宽范围或去掉它再查。"""
         if kind not in _CHAINS:
             raise ToolError(f"未知的搜索类型：{kind}（只认 normal / structured）")
         if not (query or "").strip():
             raise ToolError("查询不能为空")
+        # 28 号：日期范围先解析好（格式不对按没给处理，不静默用错范围查）。
+        parsed_range = _parse_date_range(date_range)
+        range_start = parsed_range[0] if parsed_range else None
+        range_end = parsed_range[1] if parsed_range else None
+        date_filter_stats = {"dropped": 0, "undated": 0}
         if force_provider is not None:
             if force_provider not in self.providers:
                 raise ToolError(f"未知的搜索服务：{force_provider}")
@@ -728,8 +791,29 @@ class SearchService:
                     {"provider": name, "status": "empty", "reason": "这个服务没找到结果"}
                 )
                 continue
+            # 28 号：按日期范围过滤——一家服务过滤后没结果就切下一家，
+            # 别拿着别的日子的数当答案。没带时间的留着，数量记下来。
+            if range_start is not None:
+                kept, dropped, undated = _apply_date_range(
+                    candidate.results, range_start, range_end
+                )
+                if not kept:
+                    attempts.append(
+                        {
+                            "provider": name,
+                            "status": "empty",
+                            "reason": f"按日期过滤（{range_start} 至 {range_end}）后没有结果",
+                            "date_filtered": True,
+                        }
+                    )
+                    continue
+                candidate.results = kept
+                date_filter_stats["dropped"] += dropped
+                date_filter_stats["undated"] += undated
             outcome = candidate
             outcome.query = query
+            # 48 号：实际发出去的查询词（翻成英文时是英文那份）。
+            outcome.executed_query = send_query
             attempt = {"provider": name, "status": "ok"}
             if send_query != query:
                 attempt["translated_query"] = send_query
@@ -755,7 +839,17 @@ class SearchService:
                 status = "failed"
             elif attempted:
                 tried = "、".join(a["provider"] for a in attempted)
-                error = f"试过的服务都没找到结果（{tried}）"
+                if any(a.get("date_filtered") for a in attempted):
+                    # 28 号：不是没搜到，是日期过滤把结果都滤掉了——
+                    # 报错里写明，让模型放宽范围或去掉 date_range 再查，
+                    # 别让它以为“没这个东西”就说不知道。
+                    error = (
+                        f"按日期过滤（{range_start} 至 {range_end}）后没有结果："
+                        "搜到了，但都不是这几天的——"
+                        "可以放宽日期范围或去掉 date_range 再查"
+                    )
+                else:
+                    error = f"试过的服务都没找到结果（{tried}）"
                 status = "no_results"
             else:
                 skipped = "；".join(
@@ -798,6 +892,15 @@ class SearchService:
                     partner_query = self._send_query_for(partner_name, query)
                     partner_outcome = partner.search(partner_query, max_results=max_results)
                     if partner_outcome.status == "ok":
+                        # 28 号：搭档的结果也要按日期过滤（搭档那路没过滤），
+                        # 过滤完再合并、再算互相印证——印证只算范围内的来源。
+                        if range_start is not None:
+                            filtered, dropped, undated = _apply_date_range(
+                                partner_outcome.results, range_start, range_end
+                            )
+                            partner_outcome.results = filtered
+                            date_filter_stats["dropped"] += dropped
+                            date_filter_stats["undated"] += undated
                         seen_urls = {r.url for r in outcome.results}
                         merged = list(outcome.results)
                         new_results = []
@@ -835,6 +938,21 @@ class SearchService:
             "translated_back": translated_back,
             "notes": _quality_notes(outcome.results, corroborated),
         }
+        # 28 号：日期过滤的情况记进结果里（模型看得到、界面也看得到），
+        # 告诉模型哪些去掉了、哪些没带时间——回答时标明每组数是哪天的。
+        if range_start is not None:
+            outcome.date_range = {
+                "start": str(range_start),
+                "end": str(range_end),
+                "dropped": date_filter_stats["dropped"],
+                "undated": date_filter_stats["undated"],
+            }
+            note = f"已按日期过滤到 {range_start} 至 {range_end}"
+            if date_filter_stats["dropped"]:
+                note += f"，去掉了 {date_filter_stats['dropped']} 条其他日期的结果"
+            if date_filter_stats["undated"]:
+                note += f"，{date_filter_stats['undated']} 条没带时间（没法按日期判断，留着）"
+            outcome.quality["notes"].append(note)
         if translated_back:
             outcome.quality["notes"].append(
                 "查询先翻成英文再搜（AnySearch 中文不准），标题和摘要已翻回中文"

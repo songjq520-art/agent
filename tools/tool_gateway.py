@@ -37,6 +37,7 @@
 
 import contextvars
 import json
+import math
 import threading
 
 from tasks.task_store import approval_expired, approval_sha256, make_approval
@@ -76,6 +77,15 @@ def _check_value(value, schema, where):
             return f"{where} 应为数字，不能是 true/false"
         if not isinstance(value, python_type):
             return f"{where} 应为 {expected}，实际是 {type(value).__name__}"
+        if (
+            expected in ("integer", "number")
+            and isinstance(value, float)
+            and not math.isfinite(value)
+        ):
+            # NaN / Infinity / -Infinity 都是 float，会通过上面的类型检查；
+            # NaN 和任何数比大小都是 False，minimum / maximum 也拦不住它，
+            # 必须在这里直接拒掉（GPT 第一轮审查 P2）。
+            return f"{where} 应为有限数字，不能是 NaN 或 Infinity"
     if "enum" in schema and value not in schema["enum"]:
         return f"{where} 只认 {schema['enum']} 里的值，不是 {value!r}"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -239,6 +249,12 @@ class ToolGateway:
         执行校验时核对归属用；不传时确认记录里记 None。
         """
         extra = {"task_id": task_id or "", "trace_id": trace_id or ""}
+
+        # 48 号：搜索调用的审计里记下查询词（连同日期范围），以后查
+        # “词写错了还是结果乱了”有据可查；审计落盘前会给密钥打码，
+        # 查询词是用户的问题原文，不含密钥。
+        if tool_name == "search":
+            extra["args"] = args
 
         # 第 1 关：登记检查——没登记的工具一律不执行。
         tool = get_tool(tool_name)

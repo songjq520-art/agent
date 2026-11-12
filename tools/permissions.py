@@ -316,12 +316,15 @@ def _check_tokens(tokens):
             return 2, f"硬禁命令：{text}"
     # 解释器内联代码（python -c / -m、node -e 等）：现拼的代码直接跑，
     # 没经过“写文件要确认”那一关，必须当 Tier 1。
+    # 例外：python -m pytest 是跑测试（白名单里的日常命令），不是现拼代码——
+    # 测试文件写进去的时候已经要过一次确认，和跑写好的脚本一样，不按内联代码算。
     # 注意：内联代码的内容不做静态分析（Python 代码没法用命令规则查），
     # 所以只升到 Tier 1 而不是 Tier 2——确认时 BOOS 能看到完整命令原文，
     # 由他判断；想彻底堵住要靠 OS 层隔离（Box 上测 gVisor）。
     inline_flags = _INTERPRETER_INLINE_FLAGS.get(prog)
     if inline_flags is not None and any(tok in inline_flags for tok in tokens[1:]):
-        return 1, "跑解释器内联代码，需要确认"
+        if not _is_pytest_module_run(tokens):
+            return 1, "跑解释器内联代码，需要确认"
     # shell 解释器带自由代码：先按 Tier 1 处理，里面的内容另行逐段查。
     if prog in _SHELLS:
         return 1, "跑 shell 自由代码，需要确认"
@@ -413,22 +416,77 @@ def _looks_like_plain_text(text):
     )
 
 
-# PowerShell 里带值的长标志（值是紧跟的下一个 token）：找 -c 时要跳过
-# 值再找，不然 -ExecutionPolicy Bypass 后面的 Bypass 会被当成位置参数、
-# 扫描就停了，真正的 -Command 再也找不到。-file 例外：它的值是脚本，
-# 值后面的全是脚本参数，不再是 powershell 自己的标志，停在那里。
-_POWERSHELL_VALUE_FLAGS = frozenset({
-    "-executionpolicy",
-    "-configurationname",
-    "-workingdirectory",
-    "-inputformat",
-    "-outputformat",
-    "-psconsolefile",
-    "-version",
-    "-windowstyle",
-    "-settingsfile",
-    "-file",
-})
+# PowerShell 的参数表（5 号：powershell.exe 的参数名）。
+# PowerShell 认“无歧义前缀”：-ep 就是 -executionpolicy、-Com 就是
+# -command 的缩写，写全写缩写都一样跑——分类器以前只认全写，
+# 缩写就漏查（-ep Bypass 后面的 Bypass 被当成位置参数，真正的
+# -Command 再也扫不到，硬禁就这么绕过去了）。
+# kind：code（后面跟命令）、encoded（后面跟 base64 命令）、
+# value（后面跟一个值，找 -c 时要跳过值再找）、flag（开关，没值）。
+_POWERSHELL_PARAMS = {
+    "-command": "code",
+    "-commandwithargs": "code",
+    "-encodedcommand": "encoded",
+    "-executionpolicy": "value",
+    "-configurationname": "value",
+    "-workingdirectory": "value",
+    "-inputformat": "value",
+    "-outputformat": "value",
+    "-psconsolefile": "value",
+    "-version": "value",
+    "-windowstyle": "value",
+    "-settingsfile": "value",
+    "-file": "value",
+    "-noprofile": "flag",
+    "-noninteractive": "flag",
+    "-nologo": "flag",
+    "-sta": "flag",
+    "-mta": "flag",
+}
+# 短写法（全写之外的常用缩写，PowerShell 自己也认）：-c 是 -command，
+# -enc 是 -encodedcommand，-ep 是 -executionpolicy——-ep 不是全写的
+# 字符串前缀（全写是 ex…，缩写是 ep），前缀规则认不出来，只能显式映射。
+_POWERSHELL_SHORT_FORMS = {
+    "-c": "-command",
+    "-enc": "-encodedcommand",
+    "-ep": "-executionpolicy",
+}
+
+
+def _resolve_powershell_param(token):
+    """把一个 PowerShell 参数 token 解析成（标准名，kind）。
+
+    先认全写和短写法（-c、-enc）；再认无歧义前缀（-ep → -executionpolicy）；
+    前缀对上多个时按最严的那个算（比如 -Com 同时是 -command 和
+    -commandwithargs 的前缀，两个都是 code，就按 code 算；code 和 value
+    混着的也按 code 算，下一位当内含命令查）——往严里认，宁可多查、
+    不漏查。对不上的返回 (None, None)，调用方当普通选项跳过继续扫。
+    """
+    lower = token.lower()
+    if lower in _POWERSHELL_SHORT_FORMS:
+        name = _POWERSHELL_SHORT_FORMS[lower]
+        return name, _POWERSHELL_PARAMS[name]
+    if lower in _POWERSHELL_PARAMS:
+        return lower, _POWERSHELL_PARAMS[lower]
+    if not (lower.startswith("-") or lower.startswith("/")):
+        return None, None
+    # / 前缀也当 - 用（powershell -Command 和 /Command 都认）。
+    name = "-" + lower.lstrip("-/")
+    matches = [p for p in _POWERSHELL_PARAMS if p.startswith(name)]
+    if not matches:
+        return None, None
+    kinds = {_POWERSHELL_PARAMS[m] for m in matches}
+    if kinds == {"code"} or kinds == {"encoded"}:
+        return matches[0], _POWERSHELL_PARAMS[matches[0]]
+    if kinds == {"value"}:
+        return matches[0], "value"
+    if kinds == {"flag"}:
+        return matches[0], "flag"
+    # 混着的（比如 -c 前缀同时对上 code 和 value）：往严里认，按 code 算。
+    for match in matches:
+        if _POWERSHELL_PARAMS[match] in ("code", "encoded"):
+            return match, _POWERSHELL_PARAMS[match]
+    return matches[0], _POWERSHELL_PARAMS[matches[0]]
 
 
 def _find_shell_code_flag(normalized):
@@ -446,27 +504,31 @@ def _find_shell_code_flag(normalized):
     （脚本名/命令名）出现就停——它后面的 -c 是脚本自己的参数，
     不是 shell 的（比如 bash script.sh -c ... 不查）。
     sh/bash/zsh 的选项以 - 开头（-lc 这种合并短标志簇里带 c 的也算，
-    和 getopt 的拼法一致）；cmd/powershell 的 - 和 / 都算选项前缀，
-    但只认精确匹配——以前 cmd/powershell 分支把任意含 c 的 -xxx 长
-    标志都当成 -c 标志簇，powershell -ExecutionPolicy Bypass
-    -Command "shutdown /s" 里 Bypass 被当成内含命令查了一遍，
-    真正的 -Command 再也没人看，硬禁就这么绕过了。
+    和 getopt 的拼法一致）；cmd 的 - 和 / 都算选项前缀，但只认精确匹配
+    （/c、/k）；PowerShell 的参数走 _resolve_powershell_param 解析——
+    全写、短写法（-c、-enc）、无歧义前缀（-ep、-Com）都认，带值的标志
+    跳过值再找。以前 cmd/powershell 分支把任意含 c 的 -xxx 长标志都
+    当成 -c 标志簇，powershell -ExecutionPolicy Bypass -Command
+    "shutdown /s" 里 Bypass 被当成内含命令查了一遍，真正的 -Command
+    再也没人看，硬禁就这么绕过了。
     带值的标志要跳过值再找：-o vi、-ExecutionPolicy Bypass 里的 vi、
     Bypass 都是值，不是位置参数，不能停在那里。
+    PowerShell 的缩写（5 号）：-ep、-Com、-CommandWithArgs 都要认出来——
+    全写、短写法、无歧义前缀都走 _resolve_powershell_param 解析，
+    只认全写就漏查。
     """
     prog = _program_name(normalized[0])
     is_posix = prog in ("sh", "bash", "zsh")
+    is_powershell = prog in ("powershell", "pwsh")
     i = 1
     while i < len(normalized):
         token = normalized[i]
         lower = token.lower()
-        if lower in ("-c", "-command", "/c", "/k"):
-            return i, "code"
-        if lower in ("-encodedcommand", "-enc"):
-            return i, "encoded"
         if token in ("-", "--", "/"):
             return None
         if is_posix:
+            if lower == "-c":
+                return i, "code"
             if not token.startswith("-"):
                 return None
             if token.startswith("--"):
@@ -480,15 +542,32 @@ def _find_shell_code_flag(normalized):
                 return i, "code"
             i += 1
             continue
-        # cmd / powershell：只认精确匹配，其他长标志跳过继续扫。
+        if is_powershell:
+            # PowerShell：全写、短写法、缩写都先解析再定性。
+            name, kind = _resolve_powershell_param(token)
+            if kind == "code":
+                return i, "code"
+            if kind == "encoded":
+                return i, "encoded"
+            if kind == "value":
+                if name == "-file":
+                    # -file 的值是脚本，值后面的全是脚本参数，不查。
+                    return None
+                i += 2
+                continue
+            if kind == "flag":
+                i += 1
+                continue
+            # 不认识的选项：跳过继续扫（别停在那儿，后面的 -Command 还要找）。
+            if not (token.startswith("-") or token.startswith("/")):
+                return None
+            i += 1
+            continue
+        # cmd：只认精确匹配 /c /k，其他长标志跳过继续扫。
+        if lower in ("/c", "/k"):
+            return i, "code"
         if not (token.startswith("-") or token.startswith("/")):
             return None
-        if lower in _POWERSHELL_VALUE_FLAGS:
-            if lower == "-file":
-                # -file 的值是脚本，值后面的全是脚本参数，不查。
-                return None
-            i += 2
-            continue
         i += 1
     return None
 
@@ -501,6 +580,9 @@ def classify_command(argv):
     分级顺序：先查整条命令的“下载即执行”，再按 argv 原样查命令头
     （带空格的完整路径不能先拼串再切词），再按段逐段查，最后查
     shell -c 里面的自由代码；先硬禁后需确认。
+    5 号（BOOS 2026-11-12 定）：白名单 + 有风险的先问——前面几关都没
+    拦住的命令，不再默认放行：只放行清单上的日常命令（见
+    _is_whitelisted_command），不在清单上的先问 BOOS（Tier 1）。
     """
     if isinstance(argv, str) or not isinstance(argv, (list, tuple)):
         raise ToolError("命令必须用列表传，比如 [\"python\", \"script.py\"]，不接受拼好的字符串")
@@ -569,7 +651,72 @@ def classify_command(argv):
                         worst_tier, worst_reason = 1, f"跑 shell 编码命令，需要确认：{shown}"
     if worst_tier == 1:
         return 1, worst_reason
-    return 0, ""
+    # 5 号（BOOS 2026-11-12 定）：白名单 + 有风险的先问 BOOS。
+    # 前面几关都没拦住的命令，不再默认放行——只放行清单上的日常命令，
+    # 不在清单上的先问 BOOS（Tier 1），硬禁的还是 Tier 2。
+    # 黑名单永远加不完（5 号的缩写绕过就是例子），默认放行等于没设防。
+    if _is_whitelisted_command(normalized):
+        return 0, ""
+    return 1, "不在日常命令白名单里，先问 BOOS 再跑"
+
+
+# ---------- 白名单（5 号） ----------
+
+# 白名单：只放行清单上的日常命令——只看不改的那些（查版本、看状态、
+# 跑测试、跑已经写好的脚本）。不在清单上的命令一律先问 BOOS（Tier 1），
+# 硬禁的还是 Tier 2。清单要加命令时，在这里加一行、写清为什么。
+# 注意：白名单只认“程序名 + 关键参数”，不认完整命令串——参数里拼进
+# 别的命令（比如 echo 后面跟个 ; rm）没有 shell 拼串，跑不起来；
+# 分段检查和 shell 内含命令检查那两关还会再查一遍，多一层保险。
+
+
+def _is_pytest_module_run(tokens):
+    """是不是 python -m pytest（跑测试）：tokens[0] 是 python，
+    后面有 -m pytest。跑测试不是现拼代码——测试文件写进去的时候
+    已经要过一次确认，和跑写好的脚本一样，白名单里有它。"""
+    if _program_name(tokens[0]) not in ("python", "python3", "py"):
+        return False
+    lower = [t.lower() for t in tokens[1:]]
+    if "-m" not in lower:
+        return False
+    idx = lower.index("-m")
+    return idx + 1 < len(lower) and lower[idx + 1] == "pytest"
+
+
+def _is_whitelisted_command(normalized):
+    """这条命令在不在日常命令白名单里（在就 Tier 0，不用问）。
+
+    normalized 是归一化后的 argv（去路径、去后缀、小写在程序名上做过，
+    参数原样）。只认这几类：
+    - 只查版本/帮助：任何程序都行，不改东西；
+    - git 只读子命令：看状态、看差别、看历史、看分支、看某次提交；
+    - 跑测试：pytest 本身，或 python -m pytest；
+    - 跑已经写好的脚本文件（.py / .js）：文件写进去的时候已经要过一次确认；
+    - 只看不改的查看命令：列文件、打印文字、找程序在哪、看是谁在哪台机器。
+    """
+    prog = _program_name(normalized[0])
+    args = [t.lower() for t in normalized[1:]]
+    # 只查版本/帮助：任何程序都行，不改东西。
+    if args and all(a in ("--version", "-v", "--help", "-h", "version") for a in args):
+        return True
+    # git 只读子命令：看状态、看差别、看历史、看分支、看某次提交。
+    if prog == "git" and args and args[0] in ("status", "diff", "log", "branch", "show", "rev-parse"):
+        return True
+    # 跑测试：pytest 本身，或 python -m pytest。
+    if prog == "pytest":
+        return True
+    if prog in ("python", "python3", "py") and args[:2] == ["-m", "pytest"]:
+        return True
+    # 跑已经写好的脚本文件：文件写进去的时候已经要过一次确认，
+    # 这里只跑它，不现拼代码。
+    if prog in ("python", "python3", "py") and args and args[0].endswith(".py"):
+        return True
+    if prog == "node" and args and args[0].endswith(".js"):
+        return True
+    # 只看不改的查看命令：列文件、打印文字、找程序在哪、看是谁在哪台机器。
+    if prog in ("ls", "dir", "echo", "where", "which", "whoami", "hostname"):
+        return True
+    return False
 
 
 # ---------- 确认有效性（十一的做法） ----------

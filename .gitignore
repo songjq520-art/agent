@@ -33,6 +33,9 @@ logs/*
 memory/*.json*
 !memory/.gitkeep
 
+# 对话全文记录（38 号：每场对话一份全文，只保存在本地，不上传）
+memory/conversation_transcripts/
+
 # mem0 长期记忆数据（只保存在本地，不上传）
 # mem0_chroma/ 是本地向量库（记忆内容），history.db 是修改历史记录，
 # mem0_versions.json 是版本文件（记着用的哪个 embedding 模型、多少维，

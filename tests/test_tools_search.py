@@ -963,3 +963,106 @@ def test_translator_cross_check_partner_anysearch_gets_translated_query():
     # 搭档新并进来的结果翻回了中文
     assert outcome.results[1].title == "广州晴"
     assert outcome.quality["translated_back"] is True
+
+
+# ---------- 28 号：date_range 按 published_at 过滤 ----------
+
+
+def _dated_outcome(query, provider, dated):
+    """dated：[(标题, published_at 或 None)]，造一条带时间的结果集。"""
+    return SearchOutcome(
+        query=query,
+        provider=provider,
+        status="ok",
+        results=[
+            SearchResult(title=title, url=f"https://example.com/{i}", snippet=f"s{i}", published_at=published)
+            for i, (title, published) in enumerate(dated)
+        ],
+    )
+
+
+def test_date_range_keeps_in_range_drops_out_of_range():
+    # 28 号：11 月 10 日那天的只留 11 月 10 日的，11 月 9 日的去掉，
+    # 没带时间的留着（没法按日期判断），数量记在 outcome.date_range 里。
+    tavily = FakeProvider(
+        "tavily",
+        [_dated_outcome("q", "tavily", [
+            ("纳指 25065.88", "2026-11-10"),
+            ("纳指 25253.14", "2026-11-09"),
+            ("纳指收盘", None),
+        ])],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-10", "end": "2026-11-10"})
+    assert outcome.status == "ok"
+    titles = [r.title for r in outcome.results]
+    assert titles == ["纳指 25065.88", "纳指收盘"]
+    assert outcome.date_range["dropped"] == 1
+    assert outcome.date_range["undated"] == 1
+    assert outcome.date_range["start"] == "2026-11-10"
+
+
+def test_date_range_empty_falls_through_to_next_provider():
+    # 一家服务过滤后没结果就顺着链路切下一家，别拿别的日子的数当答案。
+    tavily = FakeProvider(
+        "tavily",
+        [_dated_outcome("q", "tavily", [("纳指 25253.14", "2026-11-09")])],
+    )
+    parallel = FakeProvider(
+        "parallel",
+        [_dated_outcome("q", "parallel", [("纳指 25065.88", "2026-11-10")])],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=parallel,
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-10", "end": "2026-11-10"})
+    assert outcome.status == "ok"
+    assert outcome.provider == "parallel"
+    assert [r.title for r in outcome.results] == ["纳指 25065.88"]
+    assert outcome.attempts[0]["status"] == "empty"
+    assert outcome.attempts[0]["date_filtered"] is True
+
+
+def test_date_range_all_filtered_reports_date_filter():
+    # 都没结果时报错里写明是日期过滤掉的，让模型放宽范围或去掉它再查。
+    tavily = FakeProvider(
+        "tavily",
+        [_dated_outcome("q", "tavily", [("纳指 25253.14", "2026-11-09")])],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-10", "end": "2026-11-10"})
+    assert outcome.status == "no_results"
+    assert "按日期过滤" in (outcome.error or "")
+    assert "放宽日期范围" in (outcome.error or "")
+
+
+def test_date_range_bad_input_ignored():
+    # 格式不对（开始比结束晚、日期写错）按没给处理，不静默用错范围查。
+    tavily = FakeProvider(
+        "tavily",
+        [
+            _dated_outcome("q", "tavily", [("纳指 25065.88", "2026-11-10")]),
+            _dated_outcome("q", "tavily", [("纳指 25065.88", "2026-11-10")]),
+        ],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-11", "end": "2026-11-10"})
+    assert outcome.status == "ok"
+    assert len(outcome.results) == 1
+    outcome2 = service.search("q", date_range={"start": "不是日期", "end": "2026-11-10"})
+    assert outcome2.status == "ok"
+    assert len(outcome2.results) == 1
