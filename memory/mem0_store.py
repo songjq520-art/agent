@@ -1414,6 +1414,37 @@ def _slot_values_conflict(new_text, old_text):
     old_neg = any(word in old_lower for word in negative)
     if (new_pos and old_neg) or (new_neg and old_pos):
         return True
+    # 57 号：宾语不同也是槽位值冲突——只对偏好句（喜欢/爱吃/爱喝）用：
+    # “BOOS 爱吃冒菜”vs“BOOS 爱吃拉面”，都是肯定偏好、没数字，旧检查
+    # 认不出冲突，硬合并线会把两条不同事实并成一条。做法：把两边的泛词
+    # 都去掉，剩下实义词再比——冒菜 vs 拉面剩下不同，冲突；“喜欢喝冰美式”
+    # vs“喜欢冰美式”剩下都是冰美式，不冲突，照常合并。
+    # 注意：只在两边都是偏好句时才比——“助手叫十二”vs“你的名字是十二”
+    # 这种换句式的身份陈述，泛词去掉后剩下的也不同，但它是同一件事，
+    # 不能拦，留给模型判。
+    _PREF = ("喜欢", "爱吃", "爱喝")
+    if any(w in (new_text or "") for w in _PREF) and any(
+        w in (old_text or "") for w in _PREF
+    ):
+        _FILLER = (
+            "BOOS", "我", "你", "他", "她", "它", "这", "那", "有", "个", "不",
+            "没", "也", "都", "就", "还", "把", "被", "给", "让", "对", "从",
+            "到", "为", "以及", "或", "但", "若", "如果", "因为", "所以", "虽然",
+            "然而", "可是", "于是", "然后", "接着", "喜欢", "爱吃", "爱喝",
+            "喝", "吃", "想", "要", "的", "了", "是", "在", "和", "助手", "叫",
+            "名字", "你的", "我的",
+        )
+        def _core_text(t):
+            s = t or ""
+            for w in _FILLER:
+                s = s.replace(w, "")
+            # 数字里的逗号是格式，不是内容：“25,466.19”和“25466.19”是同一个数。
+            s = s.replace(",", "")
+            return s.strip(" 。，、")
+        new_core = _core_text(new_text)
+        old_core = _core_text(old_text)
+        if new_core and old_core and new_core != old_core:
+            return True
     # 数字不同也是槽位值冲突（“每天喝 2 杯咖啡”vs“每天喝 3 杯咖啡”——
     # 同一话题、数不同，不是同一件事）。去掉逗号后比数值，
     # 25,466.19 和 25466.19 是同一个数，不算冲突。
@@ -5281,6 +5312,9 @@ class Mem0Store:
         # 硬合并：最高分 ≥0.90 且没有槽位值冲突时，直接算重复，不请模型。
         # 但只在模型能调时才走这条——模型挂了的时候宁漏勿错（46 号），
         # 不靠硬合并线直接合并（见 _judge_available）。
+        # 57 号：_slot_values_conflict 现在也认“宾语不同”（冒菜≠拉面），
+        # 不同事实不会再被硬合并线误并；同义改写（“喜欢喝冰美式”vs
+        # “喜欢冰美式”，宾语都是冰美式）照常走硬合并。
         if (
             top_sim >= DEDUP_HARD_THRESHOLD
             and not _slot_values_conflict(new_text, top_text)

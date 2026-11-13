@@ -923,6 +923,11 @@ def test_slot_values_conflict():
     assert _slot_values_conflict("我每天喝 2 杯咖啡", "我每天喝 3 杯咖啡") is True
     # 同一个数换写法（带逗号/不带）不算冲突。
     assert _slot_values_conflict("纳指收盘 25,466.19", "纳指收盘 25466.19") is False
+    # 57 号回归：偏好句宾语不同是冲突——“爱吃冒菜”vs“爱吃拉面”是两条
+    # 不同事实，不能走硬合并线并成一条；同义改写（“喜欢喝冰美式”vs
+    # “喜欢冰美式”）宾语相同，不冲突，照常合并。
+    assert _slot_values_conflict("BOOS 爱吃冒菜。", "BOOS 爱吃拉面。") is True
+    assert _slot_values_conflict("我喜欢喝冰美式", "我喜欢冰美式") is False
 
 
 def _dedup_store(tmp_path):
