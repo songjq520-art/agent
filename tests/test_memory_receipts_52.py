@@ -108,7 +108,7 @@ class _RecordingStore:
 def test_52_outbox_retries_then_reports_failed(tmp_path):
     """52 号：后台存记忆抛异常要重试（3 次），3 次都失败就进失败清单，
     turn_status 是 failed，别悄悄丢了。"""
-    outbox = MemoryOutbox(_RaisingStore())
+    outbox = MemoryOutbox(_RaisingStore(), pending_dir=tmp_path / "outbox_pending")
     outbox._SAVE_RETRY_DELAY = 0  # 测试里不睡
     outbox.start()
     turn_id = outbox.submit([{"role": "user", "content": "我喜欢吃拉面。"}])
@@ -125,7 +125,7 @@ def test_52_outbox_retries_then_reports_failed(tmp_path):
 def test_52_outbox_success_reports_committed(tmp_path):
     """52 号：后台存完的轮次，turn_status 是 committed，失败清单是空的。"""
     store = _RecordingStore()
-    outbox = MemoryOutbox(store)
+    outbox = MemoryOutbox(store, pending_dir=tmp_path / "outbox_pending")
     outbox.start()
     turn_id = outbox.submit([{"role": "user", "content": "我喜欢吃拉面。"}])
     assert outbox.flush(timeout=10) is True
@@ -137,8 +137,35 @@ def test_52_outbox_success_reports_committed(tmp_path):
 
 def test_52_outbox_unknown_turn_id(tmp_path):
     """没见过的 turn_id 查回执是 unknown，不是报错。"""
-    outbox = MemoryOutbox(_RecordingStore())
+    outbox = MemoryOutbox(_RecordingStore(), pending_dir=tmp_path / "outbox_pending")
     assert outbox.turn_status("no-such-turn") == "unknown"
+
+
+def test_57_outbox_persists_and_recovers(tmp_path):
+    """57 号：submit 当场写盘，存完删盘；进程死前没存完的，重启捞回重存。"""
+    pending_dir = tmp_path / "outbox_pending"
+    store = _RecordingStore()
+    outbox = MemoryOutbox(store, pending_dir=pending_dir)
+    turn_id = outbox.submit([{"role": "user", "content": "我爱吃冒菜。"}])
+    assert (pending_dir / f"{turn_id}.json").exists()
+    outbox.start()
+    assert outbox.flush(timeout=10) is True
+    assert outbox.turn_status(turn_id) == "committed"
+    assert not (pending_dir / f"{turn_id}.json").exists()
+    outbox.stop()
+    # 模拟进程死：提交一轮但不启动、不刷盘，直接建新 outbox 捞回。
+    store2 = _RecordingStore()
+    outbox2 = MemoryOutbox(store2, pending_dir=pending_dir)
+    turn_id2 = outbox2.submit([{"role": "user", "content": "我想每天7点起床。"}])
+    assert (pending_dir / f"{turn_id2}.json").exists()
+    store3 = _RecordingStore()
+    outbox3 = MemoryOutbox(store3, pending_dir=pending_dir)
+    assert outbox3.recover_pending() == 1
+    outbox3.start()
+    assert outbox3.flush(timeout=10) is True
+    assert store3.calls == 1
+    assert not (pending_dir / f"{turn_id2}.json").exists()
+    outbox3.stop()
 
 
 # ---------- 55 号：触发条件放宽 ----------
