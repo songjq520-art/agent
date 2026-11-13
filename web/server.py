@@ -545,7 +545,9 @@ class ChatState:
             if self.mem0_store is not None:
                 try:
                     with timer.measure("memory_search_ms"):
-                        memories = self.mem0_store.search(prompt, top_k=5)
+                        # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
+                        # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
+                        memories = self.mem0_store.search(prompt, top_k=5, reinforce=True)
                     # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
                     # “当前在聊什么”的提示（见 Mem0Store.note_context）。
                     self.mem0_store.note_context(memories)

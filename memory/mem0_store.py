@@ -209,6 +209,43 @@ DEDUP_HARD_THRESHOLD = 0.90
 DEDUP_SLOT_SIMILARITY_FLOOR = 0.55
 DEDUP_RECALL_TOP_K = 20
 
+# 第二步衰减（连续衰减，2026-11-13，BOOS 定稿《十二记忆整理方案》第二版）。
+# 每条记忆自带权重：越久没用、越不重要，自己往下掉；检索里真正用上
+# 的才强化一次。三个工作台挑出来的坑，先定死再写代码：
+#   1. 衰减绝不能跟检索阈值 0.4 打架——资格只看原始语义分（≥0.4 才进），
+#      权重只管进围之后的排序，再低也不会让记忆在观察期内搜不到
+#      （见 search：先按原始分过滤，再按“分 × 权重”排）。
+#   2. 顺序：先标冲突（旧的标“被取代”），再做检索强化——去重裁决
+#      判了“是同一件事”之后，才记一笔“又出现一次”（见
+#      _record_decay_occurrence 的调用点，都在去重返回之后）。
+#   3. 月扫只标记、不直接删（见 sweep_monthly）。
+# 沉底规矩（2026-11-13 晚最终方案，BOOS 定，取代 20:43 的“30 天压摘要、
+# 半年删”）：只打标、不自动压摘要、不自动删——
+#   30 天没人找 / 没用上 → 打标 dormant（decay_state 从 verbatim 变成
+#   dormant，原话和向量文本都不动；被用上就回到原话态、重新强化）；
+#   满半年（180 天，从最后一次用上算起）还没人找 → 再打标 decay_delete_due，
+#   只做标记，等 BOOS 亲口说删才删；
+#   真删是另一件显式的事（见 delete_due_memories：要 BOOS 点头，删前有备份）；
+#   核心记忆钉住不动，不走这条（权重恒为 1，月扫直接跳过）。
+# 半衰期是指数衰减的“多久掉一半”：稳定事实 180 天（慢）、一次性经历
+# 14 天（快）。30 天没用的一次性经历权重 ≈0.23，正好掉到沉底线
+# （DECAY_DORMANT_WEIGHT = 0.30）下面；稳定事实 30 天才掉到 ≈0.89，
+# 不会被标沉底。权重下限 0.10：再久不用也不会归零，排位垫底而已。
+# 晋升：一次性经历在不同天、不同场合出现 3 次就晋升成稳定事实
+# （DECAY_PROMOTION_DAYS = 3）；一次聊天里说 3 遍不算——出现次数
+# 按“不同日期”数（decay_seen_days），同一天重复提不加数。
+DECAY_KIND_STABLE = "stable"
+DECAY_KIND_EPISODIC = "episodic"
+DECAY_HALF_LIFE_DAYS = {DECAY_KIND_STABLE: 180, DECAY_KIND_EPISODIC: 14}
+DECAY_WEIGHT_FLOOR = 0.10
+DECAY_DORMANT_WEIGHT = 0.30
+DECAY_DORMANT_IDLE_DAYS = 30
+DECAY_DELETE_IDLE_DAYS = 180
+DECAY_PROMOTION_DAYS = 3
+DECAY_STATE_VERBATIM = "verbatim"
+DECAY_STATE_DORMANT = "dormant"
+DECAY_DELETE_BACKUP_PREFIX = "decay-delete-backup-"
+
 # 判断 (a) 号：裁决的可信度线。
 # 模型说重复且 confidence ≥0.80 时才合并（新条当证据挂到旧条下）；
 # 低于 0.80 或模型判不出来时，新条照常留，标 needs_review=true
@@ -377,6 +414,16 @@ def _today():
 #           注意：提取的记忆哪怕存下来了，也绝不会因为“存下来了”就
 #           自动变成已确认——source 还是 "inferred"，user_confirmed
 #           还是 False；只有 BOOS 亲口说/纠正/让记住，才是已确认。
+#   衰减字段（第二步，2026-11-13）：decay_kind（stable 稳定事实 /
+#           episodic 一次性经历）、importance（high/normal/low，重要性
+#           和用得多不多分开算）、last_used_at（最后一次用上的时间，
+#           写时就是现在）、decay_seen_days（不同天被提到的天数，写时
+#           记 1）、decay_last_seen_day（上次被提到的日期 YYYY-MM-DD）、
+#           decay_state（verbatim 原话 / dormant 沉底——30 天没人找
+#           只打标，原话和向量文本都不动）、
+#           decay_delete_due（月扫标的“满半年没人找、等 BOOS 亲口说删”，
+#           只做标记，不直接删）。Chroma 只接受标量值，所以这些全是字符串 /
+#           数字 / 布尔，没有字典和列表。
 # 没有 metadata 的旧记忆（2026-11-09 之前存的）：取回时一律按
 # "unconfirmed" 处理（见 _normalize_metadata），绝不默认已确认。
 
@@ -738,6 +785,26 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
         "confidence": confidence,
         "user_confirmed": bool(user_confirmed) and source == SOURCE_USER,
     }
+    # 第二步衰减：新记忆自带衰减字段（见文件头的 DECAY 常量注释）。
+    # kind 按“核心 / BOOS 亲口说的 / 模型提取的”分，不猜关键词——
+    # 核心（已确认、带槽位、规则）记 stable；BOOS 亲口说的稳定事实/
+    # 偏好 / 决定也记 stable；模型提取的记 episodic（一次性经历多半
+    # 在这里），反复出现 3 次不同天再晋升。last_used_at 记这次写的
+    # 时间（写就是一次“用上”；迁移/恢复沿用旧 created_at 时，last_used
+    # 还是现在——刚写回来的记忆不算“很久没用”）。
+    _decay_core = (
+        (source == SOURCE_USER and bool(user_confirmed))
+        or slot in KNOWN_SLOTS
+        or bool(is_rule)
+    )
+    metadata["decay_kind"] = classify_decay_kind(
+        source, _decay_core, bool(is_rule)
+    )
+    metadata["importance"] = "high" if _decay_core else "normal"
+    metadata["last_used_at"] = _now_iso()
+    metadata["decay_seen_days"] = 1
+    metadata["decay_last_seen_day"] = datetime.now(timezone.utc).date().isoformat()
+    metadata["decay_state"] = DECAY_STATE_VERBATIM
     if slot in KNOWN_SLOTS:
         metadata["slot"] = slot
     if is_rule:
@@ -790,8 +857,13 @@ def _normalize_metadata(raw, item=None):
     行为和以前一样。
     返回：{"source", "created_at", "created_at_source", "write_seq",
            "confidence", "user_confirmed", "confirmed", "slot",
-           "pending_confirmation", "is_rule", "money"}，其中 confirmed
+           "pending_confirmation", "is_rule", "money",
+           "decay_kind", "importance", "last_used_at", "decay_seen_days",
+           "decay_last_seen_day", "decay_state", "decay_delete_due",
+           "superseded"}，其中 confirmed
     就是 user_confirmed（取了个短名字，方便调用方判断“能不能当作事实用”）。
+    衰减字段（第二步）：只认合法值，别的按缺失处理；老记忆没有这些
+    字段时走派生默认值（见 return 前的派生段）——不猜、不抬可信度。
     """
     source = SOURCE_UNCONFIRMED
     created_at = None
@@ -862,6 +934,56 @@ def _normalize_metadata(raw, item=None):
         top_created = item.get("created_at")
         if isinstance(top_created, str) and top_created:
             created_at = top_created
+    # 第二步衰减：decay_* 字段只认合法值（字符串/数字/布尔要对得上号），
+    # 别的按缺失处理。派生默认值（老记忆没有衰减字段时）：
+    #   - last_used_at 没有就用 created_at（写时就是最后一次用上）；
+    #     两个都没有的老记忆不衰减（记 None，decay_weight 按 1.0 算——
+    #     宁可不沉，不错沉）；
+    #   - kind 没有就按核心/非核心派生（核心 stable，其余 episodic）；
+    #   - importance 没有就按核心 high、其余 normal。
+    decay_kind = None
+    importance = None
+    last_used_at = None
+    decay_seen_days = None
+    decay_last_seen_day = None
+    decay_state = DECAY_STATE_VERBATIM
+    decay_delete_due = False
+    superseded = False
+    if isinstance(raw, dict):
+        raw_kind = raw.get("decay_kind")
+        if raw_kind in (DECAY_KIND_STABLE, DECAY_KIND_EPISODIC):
+            decay_kind = raw_kind
+        raw_importance = raw.get("importance")
+        if raw_importance in ("high", "normal", "low"):
+            importance = raw_importance
+        raw_last_used = raw.get("last_used_at")
+        if isinstance(raw_last_used, str) and raw_last_used:
+            last_used_at = raw_last_used
+        raw_seen = raw.get("decay_seen_days")
+        if isinstance(raw_seen, int) and not isinstance(raw_seen, bool) and raw_seen >= 0:
+            decay_seen_days = raw_seen
+        raw_seen_day = raw.get("decay_last_seen_day")
+        if isinstance(raw_seen_day, str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}", raw_seen_day
+        ):
+            decay_last_seen_day = raw_seen_day
+        raw_state = raw.get("decay_state")
+        if raw_state in (DECAY_STATE_VERBATIM, DECAY_STATE_DORMANT):
+            decay_state = raw_state
+        elif raw_state == "summarized":
+            # 旧版（未合进 main 的衰减分支）写过的摘要态：那版没上过真库，
+            # 这里只是兜底——摘要态的文本就是原话的短版，按沉底态认，
+            # 照常能搜到、被用上回到原话态。
+            decay_state = DECAY_STATE_DORMANT
+        decay_delete_due = raw.get("decay_delete_due") is True
+        superseded = raw.get("superseded") is True
+    if last_used_at is None:
+        last_used_at = created_at
+    _decay_core_derived = bool(user_confirmed) or slot is not None or bool(is_rule)
+    if decay_kind is None:
+        decay_kind = DECAY_KIND_STABLE if _decay_core_derived else DECAY_KIND_EPISODIC
+    if importance is None:
+        importance = "high" if _decay_core_derived else "normal"
     return {
         "source": source,
         "created_at": created_at,
@@ -880,6 +1002,14 @@ def _normalize_metadata(raw, item=None):
         "conflict_for_review": conflict_for_review,
         "needs_review": needs_review,
         "evidence": evidence,
+        "decay_kind": decay_kind,
+        "importance": importance,
+        "last_used_at": last_used_at,
+        "decay_seen_days": decay_seen_days,
+        "decay_last_seen_day": decay_last_seen_day,
+        "decay_state": decay_state,
+        "decay_delete_due": decay_delete_due,
+        "superseded": superseded,
     }
 
 
@@ -1046,17 +1176,136 @@ def _resolve_conflict(old_metadata, new_metadata):
     }
 
 
-# 以后留的位置（第二步衰减 / 删除时再用，第一步不实现，只把名字占住，
-# 免得以后各写各的、又要迁移一次）：
+# ---------- 第二步衰减（连续衰减，2026-11-13） ----------
+# 下面全是纯函数（只算、不读库、不写库），调用方见 Mem0Store 里
+# 的 reinforce_memories / _record_decay_occurrence / sweep_monthly /
+# delete_due_memories。定稿口径见文件头的 DECAY 常量注释。
 #   - "importance"（重要性，high/normal/low）：和用得多不多分开算——
-#     低频不等于低价值（原则②）；衰减速度看 importance，不看调用次数。
-#     钉住的核心记忆 importance=high、衰减是零。
+#     低频不等于低价值（原则②）；衰减速度看 importance 所在的 kind，
+#     不看调用次数。钉住的核心记忆 importance=high、衰减是零。
 #   - "superseded"（被取代标记，bool）：同级新胜出时旧记忆标上，原话保留；
 #     第一步里只有 _resolve_conflict 会判，真正标上去要等模型能判断
 #     “同一条事实”时再接（见 _resolve_conflict 注释）。
 #   - 真删前检查（原则③）：删之前查三样——是不是核心记忆、是不是
 #     BOOS 明确让记的、有没有别的记忆连着它；有一条不满足就继续
-#     归档、不删。delete_memory() 现在不改。
+#     归档、不删。delete_due_memories 只删满 180 天没人找、且不是
+#     核心的那几条，删前先写备份（见 delete_due_memories）。
+
+
+def _decay_now_dt(now=None):
+    """把 now 规整成带时区的 datetime：不传就是现在（UTC）；
+    传 datetime 就用它（没时区的当 UTC）；传 ISO 时间串就解析，
+    解析不出也当现在——衰减算的是“多久没用”，拿不准就按“刚用过”
+    算（宁可不沉，不错沉）。"""
+    if isinstance(now, datetime):
+        if now.tzinfo is None:
+            return now.replace(tzinfo=timezone.utc)
+        return now
+    if isinstance(now, str) and now.strip():
+        parsed = _parse_created_at(now)
+        if parsed is not None:
+            return parsed
+    return datetime.now(timezone.utc)
+
+
+def _decay_day(value):
+    """取一个时间（datetime / ISO 串 / None）的 UTC 日期 YYYY-MM-DD；
+    取不出返回 None（不猜今天——拿不准就当这一天没数过）。
+    出现次数按“不同日期”数，就靠它。"""
+    if isinstance(value, datetime):
+        parsed = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return parsed.date().isoformat()
+    if isinstance(value, str) and value.strip():
+        parsed = _parse_created_at(value)
+        if parsed is not None:
+            return parsed.date().isoformat()
+    return None
+
+
+def _decay_iso(moment):
+    """把 datetime 格式化成 _now_iso 同款的 ISO 串（6 位微秒，带 Z）。"""
+    parsed = _decay_now_dt(moment)
+    return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def classify_decay_kind(source, is_core, is_rule):
+    """新记忆写进库时定它的衰减档位（stable / episodic）。
+
+    核心（名字、SOUL、决定、钱的规矩、安全权限、项目基础决策）和
+    规则记 stable；BOOS 亲口说的稳定事实/偏好/决定也记 stable；
+    模型提取的记 episodic（一次性经历多半在这里）。不猜关键词——
+    档位只看来源和核心标记，猜错档位顶多是沉得快一点或慢一点，
+    不会把记忆弄丢（月扫只压摘要、不直接删，删还要再等半年）。"""
+    if is_core or is_rule:
+        return DECAY_KIND_STABLE
+    if source == SOURCE_USER:
+        return DECAY_KIND_STABLE
+    return DECAY_KIND_EPISODIC
+
+
+def _decay_idle_days(last_used_at, now=None):
+    """从最后一次用上到 now，闲了多少天（小数天数，负数按 0 算）；
+    last_used_at 没有（没时间的老记忆）返回 None——算不出闲了多久，
+    就当它没闲过（宁可不沉，不错沉）。"""
+    if not isinstance(last_used_at, str) or not last_used_at:
+        return None
+    last = _parse_created_at(last_used_at)
+    if last is None:
+        return None
+    delta = (_decay_now_dt(now) - last).total_seconds() / 86400.0
+    return max(0.0, delta)
+
+
+def decay_weight(kind, last_used_at, now=None, is_core=False):
+    """一条记忆现在的权重（0.10–1.0）：指数衰减，
+    weight = 0.5 ** (闲置天数 / 半衰期)，下限 0.10。
+    核心记忆恒为 1.0（钉住不动，衰减是零，不是慢）；没时间的老记忆
+    也按 1.0 算（算不出闲了多久，就当它没闲过）。
+    权重只管排位、不管对错，更不管“能不能搜到”——检索资格只看
+    原始语义分（见 search），权重再低也不会让记忆搜不到（坑 1）。"""
+    if is_core:
+        return 1.0
+    idle = _decay_idle_days(last_used_at, now)
+    if idle is None:
+        return 1.0
+    half_life = DECAY_HALF_LIFE_DAYS.get(kind, DECAY_HALF_LIFE_DAYS[DECAY_KIND_EPISODIC])
+    weight = 0.5 ** (idle / half_life)
+    return max(DECAY_WEIGHT_FLOOR, min(1.0, weight))
+
+
+def promotion_reached(seen_days):
+    """一次性经历在不同天出现够 3 次没有——够了就晋升成稳定事实。
+    seen_days 不是整数、或没数过时按没够算。"""
+    return (
+        isinstance(seen_days, int)
+        and not isinstance(seen_days, bool)
+        and seen_days >= DECAY_PROMOTION_DAYS
+    )
+
+
+def decay_should_go_dormant(kind, last_used_at, now=None, is_core=False):
+    """这条记忆该标沉底了吗：30 天没人找，且权重已经掉到 0.30 下面。
+    核心记忆永远不标；没时间的老记忆不标（闲了多久都算不出来）。
+    只判“该不该打标”，标了也只是打标——原话和文本都不动（见
+    sweep_monthly）。"""
+    if is_core:
+        return False
+    idle = _decay_idle_days(last_used_at, now)
+    if idle is None or idle < DECAY_DORMANT_IDLE_DAYS:
+        return False
+    return decay_weight(kind, last_used_at, now, is_core=False) < DECAY_DORMANT_WEIGHT
+
+
+def decay_should_delete(last_used_at, now=None, is_core=False):
+    """这条记忆该标待删了吗：从最后一次用上算起满 180 天还没人找。
+    核心记忆永远不标；没时间的老记忆不标。只判“该不该打待删标记”，
+    不管删——删是 delete_due_memories 的事，要 BOOS 点头才删。"""
+    if is_core:
+        return False
+    idle = _decay_idle_days(last_used_at, now)
+    if idle is None:
+        return False
+    return idle >= DECAY_DELETE_IDLE_DAYS
 
 
 # ---------- 关键词补充信号（从 v1 main.py 搬过来，只做补充用） ----------
@@ -2371,20 +2620,31 @@ class Mem0Store:
 
     # ---------- 检索（提问前） ----------
 
-    def search(self, query, top_k=5):
+    def search(self, query, top_k=5, reinforce=False):
         """搜和问题相关的记忆（语义检索 + 关键词补充信号）。
 
         返回：记忆列表，每项为 {"id", "text", "score", "source",
-        "metadata", "confirmed"}，source 是 "semantic"（语义）或
+        "metadata", "confirmed", "decay_weight"}，source 是 "semantic"（语义）或
         "keyword"（关键词补充），metadata 是规整过的来源信息
         （见 _normalize_metadata），confirmed 是“BOOS 是否逐条确认过”
-        （只有 source="user" 的记忆才可能是 True）。
+        （只有 source="user" 的记忆才可能是 True），decay_weight 是
+        这条记忆现在的衰减权重（0.10–1.0，核心记忆恒为 1.0）。
         注意：search 不按来源过滤——提取的（inferred）记忆和未确认的
         旧记忆也会返回，调用方（main.py 的 _memory_block）按来源决定
         怎么用：已确认的才能当作事实，未确认的不能当作事实。
         这样设计的原因：提取的记忆是记忆功能的主力（自动存的都在这），
         过滤掉它们等于记忆功能作废；安全靠“注入时打标签、分层”
         来保证，不靠检索时偷偷丢掉。
+        第二步衰减（2026-11-13）：权重只管排位，不管“能不能搜到”——
+        资格还是只看原始语义分 ≥0.4（工作台坑 1 的定法：衰减再狠，
+        也不让记忆在 30 天观察期内搜不到）；进了围的，语义结果按
+        “原始分 × 权重”排，关键词补充按权重排。压成摘要的记忆照常
+        能搜到（摘要文本在向量里），被用上就恢复原话（见 reinforce）。
+        reinforce（默认 False）：只有真正把记忆用上了（拼进发给模型
+        的问题里）才传 True——这时返回的这几条才刷新 last_used_at，
+        没返回的候选一条也不抬。内部检索（纠错找候选、守卫找邻居）
+        一律不传，绝不能把“找候选”也算成“用上了”（好几个纠错测试
+        都断言了“检索不写回”，见 tests/test_mem0_correction.py）。
         流程：
         1. mem0 语义检索（top_k 条），只留分数 ≥ 阈值（默认 0.4）的。
            分数不够的直接丢掉，不注入——宁可不带记忆，也别把看着像的
@@ -2403,6 +2663,7 @@ class Mem0Store:
         results = []
         seen_texts = set()
         skipped_sensitive = 0
+        now_dt = datetime.now(timezone.utc)
         try:
             raw = self._memory.search(query, filters={"user_id": self.user_id}, top_k=top_k)
             for item in (raw or {}).get("results", []):
@@ -2417,6 +2678,12 @@ class Mem0Store:
                     skipped_sensitive += 1
                     continue
                 metadata = _normalize_metadata(item.get("metadata"), item)
+                weight = decay_weight(
+                    metadata["decay_kind"],
+                    metadata["last_used_at"],
+                    now_dt,
+                    is_core=_is_core_memory(metadata),
+                )
                 results.append(
                     {
                         "id": item.get("id"),
@@ -2425,6 +2692,7 @@ class Mem0Store:
                         "source": "semantic",
                         "metadata": metadata,
                         "confirmed": metadata["confirmed"],
+                        "decay_weight": weight,
                     }
                 )
                 seen_texts.add(text)
@@ -2456,6 +2724,12 @@ class Mem0Store:
                                     "source": "keyword",
                                     "metadata": metadata,
                                     "confirmed": metadata["confirmed"],
+                                    "decay_weight": decay_weight(
+                                        metadata["decay_kind"],
+                                        metadata["last_used_at"],
+                                        now_dt,
+                                        is_core=_is_core_memory(metadata),
+                                    ),
                                 }
                             )
                             seen_texts.add(text)
@@ -2463,6 +2737,30 @@ class Mem0Store:
                 logger.warning("mem0 关键词补充检索失败。", exc_info=True)
         if skipped_sensitive:
             logger.info("检索：%d 条记忆含敏感信息，已跳过，不注入。", skipped_sensitive)
+        # 衰减排位：语义组按“原始分 × 权重”排，关键词组按权重排——
+        # 都是稳定排序，权重全是 1.0 时顺序和原来一模一样；关键词组
+        # 还是排在语义组后面（补充信号不抢主信号的位置）。
+        semantic_end = sum(1 for item in results if item.get("source") == "semantic")
+        results[:semantic_end] = sorted(
+            results[:semantic_end],
+            key=lambda item: (item.get("score") or 0) * (item.get("decay_weight") or 0),
+            reverse=True,
+        )
+        results[semantic_end:] = sorted(
+            results[semantic_end:],
+            key=lambda item: item.get("decay_weight") or 0,
+            reverse=True,
+        )
+        if reinforce and results:
+            # 真正用上了才强化：只强化返回的这几条，没返回的候选不动。
+            # 写回失败也不拦聊天——记忆本身还在，只是这次没刷新时间。
+            try:
+                self.reinforce_memories(
+                    [item.get("id") for item in results if item.get("id")],
+                    now=now_dt,
+                )
+            except Exception:
+                logger.warning("检索强化写回失败：记忆本身还在。", exc_info=True)
         return results
 
     def note_context(self, memories):
@@ -4205,6 +4503,273 @@ class Mem0Store:
             return False
         return True
 
+    # ---------- 第二步衰减：原话备份、强化、月扫、到期删除 ----------
+    # 锁的规矩：下面这几个方法自己不拿 _WRITE_LOCK——_decay_touch /
+    # _record_decay_occurrence 是从写流程里（add_memory_text、提取去重，
+    # 它们已经拿着锁）调的，reinforce 是从读流程里（search）调的；
+    # 只有 sweep_monthly 自己拿锁（它是显式维护操作，不在聊天流程里）。
+    # 写回都走 _raw_metadata_for 拿原始整份 metadata 再改（见
+    # _mark_memory_review 的注释：拿规整过的当整份传回，会把 evidence
+    # 这类字段弄丢）。
+
+    def _decay_touch(self, memory_id, now=None, record_occurrence=False):
+        """用上了一条记忆：刷新 last_used_at，顺带把沉底态唤醒回原话态。
+
+        沉底态的唤醒：decay_state 从 dormant 回到 verbatim，清掉
+        decay_dormant_at；文本从没动过，不用从备份里恢复原话。
+        被用上也顺带清掉 decay_delete_due（用上了就不在待删之列）。
+        核心记忆不写回：权重恒为 1，也不会被月扫收起来，没什么可刷新的。
+        record_occurrence=True 时再记一笔“不同天出现”：今天和上次
+        被提到的日期不同才加数（一次聊天里说 3 遍不算）；够 3 个不同天，
+        一次性经历就晋升成稳定事实（kind 改 stable，衰减变慢；
+        importance 不动——晋升是“沉得慢一点”，不是变成核心）。
+        只在去重已经判了“是同一件事”之后调（先标冲突、再强化）。
+        返回 {"ok", "restored", "promoted"}；写回失败返回 ok=False，
+        不抛异常（记忆本身还在，只是这次没刷新时间）。"""
+        if not memory_id:
+            return {"ok": False, "restored": False, "promoted": False}
+        now_dt = _decay_now_dt(now)
+        today = now_dt.date().isoformat()
+        metadata = self._raw_metadata_for(memory_id)
+        if metadata is None:
+            return {"ok": False, "restored": False, "promoted": False}
+        meta = _normalize_metadata(metadata)
+        if _is_core_memory(meta):
+            return {"ok": True, "restored": False, "promoted": False}
+        text = None
+        restored = False
+        if meta["decay_state"] == DECAY_STATE_DORMANT:
+            metadata["decay_state"] = DECAY_STATE_VERBATIM
+            metadata.pop("decay_dormant_at", None)
+            restored = True
+        metadata["last_used_at"] = _decay_iso(now_dt)
+        metadata.pop("decay_delete_due", None)
+        promoted = False
+        if record_occurrence:
+            last_seen = metadata.get("decay_last_seen_day")
+            seen = metadata.get("decay_seen_days")
+            if not isinstance(seen, int) or isinstance(seen, bool):
+                seen = 0
+            if last_seen != today:
+                seen = seen + 1 if seen else 1
+                metadata["decay_seen_days"] = seen
+                metadata["decay_last_seen_day"] = today
+                if meta["decay_kind"] == DECAY_KIND_EPISODIC and promotion_reached(seen):
+                    metadata["decay_kind"] = DECAY_KIND_STABLE
+                    promoted = True
+        try:
+            self._memory.update(memory_id=memory_id, text=text, metadata=metadata)
+        except Exception:
+            logger.warning("衰减刷新写回失败：记忆本身还在。", exc_info=True)
+            return {"ok": False, "restored": False, "promoted": False}
+        return {"ok": True, "restored": restored, "promoted": promoted}
+
+    def reinforce_memories(self, memory_ids, now=None):
+        """把检索里真正用上的几条记忆强化一次（只强化传进来的这几条，
+        不抬整个候选池——search(reinforce=True) 传的是返回结果的 id）。
+        沉底态的被用上就回到原话态（见 _decay_touch）。核心记忆不写回。
+        返回 {"reinforced", "restored", "failed"}；写回失败只记在 failed
+        里，不抛异常。"""
+        reinforced = []
+        restored = []
+        failed = []
+        for memory_id in memory_ids or []:
+            if not memory_id:
+                continue
+            outcome = self._decay_touch(memory_id, now=now, record_occurrence=False)
+            if outcome["ok"]:
+                reinforced.append(memory_id)
+                if outcome["restored"]:
+                    restored.append(memory_id)
+            else:
+                failed.append(memory_id)
+        return {"reinforced": reinforced, "restored": restored, "failed": failed}
+
+    def _record_decay_occurrence(self, memory_id, now=None):
+        """同一件事又被提到一次：记一笔“不同天出现”，够 3 次不同天就晋升。
+        调用点都在去重返回“重复”之后——裁决已经说了这是同一件事、
+        不是冲突（先标冲突、再强化，坑 2 的定法）。同一天重复提不加数。
+        返回 True（记上了）或 False（记失败，记忆本身还在）。"""
+        try:
+            outcome = self._decay_touch(memory_id, now=now, record_occurrence=True)
+            return bool(outcome["ok"])
+        except Exception:
+            logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
+            return False
+
+    def sweep_monthly(self, now=None):
+        """每月兜底整理（显式调用，不在聊天流程里自动跑）：
+        只打标，不改文本、不压摘要、不删任何东西——
+          1. 标沉底：原话态、30 天没人找、权重已掉到 0.30 下面的，
+             打上 dormant 标记（decay_state 改 dormant，记
+             decay_dormant_at；原话和向量文本都不动）。
+          2. 标待删：从最后一次用上算起满 180 天还没人找的，
+             打上 decay_delete_due 标记，等 BOOS 亲口说删才删（见
+             delete_due_memories）。沉底和待删可以在同一次月扫里
+             一起标，不用等下次。
+        核心记忆直接跳过（钉住不动）。返回台账
+        {"checked", "dormant", "delete_due", "skipped_core", "errors"}，
+        每笔都带 id 和原因，BOOS 扫一眼就能对上。读库失败时返回
+        checked=0、errors 里记一笔，不抛异常。"""
+        now_dt = _decay_now_dt(now)
+        ledger = {
+            "checked": 0,
+            "dormant": [],
+            "delete_due": [],
+            "skipped_core": 0,
+            "errors": [],
+        }
+        try:
+            items = self.get_all(include_sensitive=True)
+        except Exception:
+            logger.warning("月扫：读记忆库失败，本次不整理。", exc_info=True)
+            ledger["errors"].append({"reason": "读记忆库失败"})
+            return ledger
+        with _WRITE_LOCK:
+            for item in items:
+                memory_id = (item or {}).get("id")
+                text = (item or {}).get("text") or ""
+                meta = (item or {}).get("metadata") or {}
+                if not memory_id or not text:
+                    continue
+                ledger["checked"] += 1
+                if _is_core_memory(meta):
+                    ledger["skipped_core"] += 1
+                    continue
+                state = meta.get("decay_state") or DECAY_STATE_VERBATIM
+                last_used_at = meta.get("last_used_at")
+                kind = meta.get("decay_kind") or DECAY_KIND_EPISODIC
+                mark_dormant = state == DECAY_STATE_VERBATIM and decay_should_go_dormant(
+                    kind, last_used_at, now_dt, is_core=False
+                )
+                mark_delete_due = decay_should_delete(last_used_at, now_dt, is_core=False)
+                if not mark_dormant and not mark_delete_due:
+                    continue
+                raw = self._raw_metadata_for(memory_id)
+                if raw is None:
+                    ledger["errors"].append(
+                        {"id": memory_id, "reason": "读原始 metadata 失败"}
+                    )
+                    continue
+                if mark_dormant:
+                    raw["decay_state"] = DECAY_STATE_DORMANT
+                    raw["decay_dormant_at"] = _decay_iso(now_dt)
+                if mark_delete_due:
+                    raw["decay_delete_due"] = True
+                try:
+                    self._memory.update(memory_id=memory_id, metadata=raw)
+                except Exception:
+                    ledger["errors"].append(
+                        {"id": memory_id, "reason": "打标写回失败"}
+                    )
+                    continue
+                if mark_dormant:
+                    ledger["dormant"].append(
+                        {
+                            "id": memory_id,
+                            "text": text,
+                            "weight": decay_weight(kind, last_used_at, now_dt, is_core=False),
+                            "idle_days": _decay_idle_days(last_used_at, now_dt),
+                        }
+                    )
+                if mark_delete_due:
+                    ledger["delete_due"].append(
+                        {
+                            "id": memory_id,
+                            "text": text,
+                            "last_used_at": last_used_at,
+                            "idle_days": _decay_idle_days(last_used_at, now_dt),
+                        }
+                    )
+        return ledger
+
+    def delete_due_memories(self, now=None, backup_path=None, approve=False):
+        """删满半年没人找的记忆（显式调用，BOOS 亲口说删才删）：
+        只删同时满足两条的——从最后一次用上算起满 180 天还没人找、
+        不是核心记忆。月扫只打标、不删，删的入口只在这里，默认不开。
+        删前先写备份（原话 + 原始 metadata，全放一个 JSON 里，
+        临时文件 + 原子替换）：备份写失败，一个也不删。备份好了再一条
+        一条调 delete_memory（approve=True，走深度删除的老路：向量 +
+        history 审计行都清、验三处都干净才算删完）。返回台账
+        {"deleted", "backup_path", "kept", "errors"}。
+        approve=False 时抛 PermissionError（删记忆必须 BOOS 同意，
+        和 delete_memory 一样的规矩）。"""
+        if not approve:
+            raise PermissionError("删除记忆需要 BOOS 同意：请先确认再删。")
+        now_dt = _decay_now_dt(now)
+        candidates = []
+        for item in self.get_all(include_sensitive=True):
+            memory_id = (item or {}).get("id")
+            meta = (item or {}).get("metadata") or {}
+            if not memory_id:
+                continue
+            if _is_core_memory(meta):
+                continue
+            if not decay_should_delete(
+                meta.get("last_used_at"),
+                now_dt,
+                is_core=False,
+            ):
+                continue
+            candidates.append(item)
+        if not candidates:
+            return {"deleted": [], "backup_path": None, "kept": [], "errors": []}
+        backup_entries = []
+        for item in candidates:
+            memory_id = item["id"]
+            backup_entries.append(
+                {
+                    "id": memory_id,
+                    "summary": item.get("text") or "",
+                    # 文本从没被换过（月扫只打标、不压摘要），库里的文本就是原话。
+                    "full_text": item.get("text") or "",
+                    "metadata": self._raw_metadata_for(memory_id) or {},
+                    "delete_at": _decay_iso(now_dt),
+                }
+            )
+        if backup_path is not None:
+            path = Path(backup_path)
+        else:
+            path = (
+                Path(self.chroma_path).parent
+                / (
+                    DECAY_DELETE_BACKUP_PREFIX
+                    + now_dt.strftime("%Y%m%d-%H%M%S")
+                    + ".json"
+                )
+            )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(backup_entries, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"待删备份写失败，本次一个没删（{exc}）。"
+            ) from exc
+        deleted = []
+        kept = []
+        errors = []
+        for item in candidates:
+            memory_id = item["id"]
+            try:
+                if self.delete_memory(memory_id, approve=True):
+                    deleted.append(memory_id)
+                else:
+                    kept.append({"id": memory_id, "reason": "库里已没有"})
+            except Exception as exc:
+                kept.append({"id": memory_id, "reason": str(exc)})
+                errors.append({"id": memory_id, "reason": str(exc)})
+        return {
+            "deleted": deleted,
+            "backup_path": str(path),
+            "kept": kept,
+            "errors": errors,
+        }
+
     def _dedupe_extraction_results(self, results, before_items):
         """提取路径去重（46 号）：新提取的记忆里，库里已有同一件事的删掉。
 
@@ -4296,6 +4861,14 @@ class Mem0Store:
                         new_source=SOURCE_INFERRED,
                         new_confidence=None,
                     )
+                    # 第二步衰减：同一件事又出现一次，记一笔“不同天出现”
+                    # （裁决已经说了这是重复、不是冲突——先标冲突、再强化）。
+                    try:
+                        self._record_decay_occurrence(canonical.get("id"))
+                    except Exception:
+                        logger.warning(
+                            "衰减出现次数写回失败：记忆本身还在。", exc_info=True
+                        )
                 dropped.append(item)
                 continue
             if verdict["verdict"] == "conflict":
@@ -4504,6 +5077,13 @@ class Mem0Store:
             duplicate = _find_duplicate_memory(safe_text, self.get_all())
             if duplicate is not None:
                 logger.info("手动存记忆：库里已有相同记忆，本次未重复存。")
+                # 第二步衰减：同一件事又被提到一次，记一笔“不同天出现”
+                # （去重已经判了这是同一条，不是冲突——先标冲突、再强化）。
+                # 记失败也不拦路：记忆本身还在，只是这次没数上。
+                try:
+                    self._record_decay_occurrence(duplicate["id"])
+                except Exception:
+                    logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
                 return {
                     "results": [
                         {
@@ -4534,6 +5114,11 @@ class Mem0Store:
                 judge_pool.append(known_item)
             if slot_duplicate is not None:
                 logger.info("手动存记忆：同槽位已有相同金额的记忆，本次未重复存。")
+                # 第二步衰减：同槽位同金额又被提到一次，记一笔“不同天出现”。
+                try:
+                    self._record_decay_occurrence(slot_duplicate["id"])
+                except Exception:
+                    logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
                 return {
                     "results": [
                         {
@@ -4568,6 +5153,12 @@ class Mem0Store:
             near = self._find_near_duplicate_memory(safe_text, judge_pool)
             if near is not None:
                 logger.info("手动存记忆：库里已有同一件事的记忆，本次未重复存。")
+                # 第二步衰减：同一件事又被提到一次，记一笔“不同天出现”
+                # （模型已经裁决了这是同一件事、不是冲突——先标冲突、再强化）。
+                try:
+                    self._record_decay_occurrence(near["id"])
+                except Exception:
+                    logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
                 return {
                     "results": [
                         {
