@@ -159,9 +159,9 @@ class _RecordingProvider:
         return dict(self.script.pop(0))
 
     def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                      thinking=None):
+                      thinking=None, model=None, max_tokens=None):
         self.final_calls_log.append(
-            {"messages": copy.deepcopy(messages), "thinking": thinking}
+            {"messages": copy.deepcopy(messages), "thinking": thinking, "model": model, "max_tokens": max_tokens}
         )
         return {"text": "最终回答", "usage": None, "cost_usd": 0.001, "model": self.model}
 
@@ -222,13 +222,14 @@ def test_final_answer_enables_thinking_while_tool_rounds_disable_it(tmp_path):
         search_service=_FakeSearchService(),
         max_tool_calls=1,
     )
-    outcome = loop.run("一直查下去的问题")
+    outcome = loop.run("一直查下去的问题，帮我分析一下为什么")
     assert outcome["mode"] == "done"
     assert outcome["reply"] == "最终回答"
     # 中间调工具的轮次思考关着。
     assert len(provider.tool_calls_log) == 2
     assert all(entry["thinking"] == "disabled" for entry in provider.tool_calls_log)
-    # 最后回答那轮思考开着。
+    # 最后回答那轮思考开着（难问题走 c 档深想；提速 2 号后，
+    # 日常问题走 a/b 档，思考是关着的——见 test_speed_judgment_r2.py）。
     assert len(provider.final_calls_log) == 1
     assert provider.final_calls_log[0]["thinking"] == "enabled"
 

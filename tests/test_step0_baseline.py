@@ -153,7 +153,7 @@ class _DirectAnswerProvider:
         }
 
     def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                      thinking=None):
+                      thinking=None, model=None, max_tokens=None):
         return {"text": "你好，我是十二。", "usage": None, "cost_usd": 0.0,
                 "model": self.model}
 

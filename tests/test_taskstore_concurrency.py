@@ -4,8 +4,9 @@
 #   2. 多线程同时 CAS 抢同一条任务，更新不丢；
 #   3. 两个进程同时写同一个文件，文件不会被写坏（唯一临时文件 +
 #      原子改名），写完不留临时文件；
-#   4. 跨进程 CAS 不是原子的（只保证文件不损坏，不保证更新不丢），
-#      这一点写在 tasks/task_store.py 的文档里，不假装它能跨进程。
+#   4. 跨进程写现在也串行化了（2026-11-13 修：跨进程锁文件 + 替换重试，
+#      Windows 上 os.replace 报 WinError 5 的根因）：两个进程各写 20 条，
+#      40 条一条都不能丢——读-改-写都在锁里，写完不留临时文件。
 # 全部用临时目录，不碰真正的 tasks/tasks.json。
 
 import json
@@ -88,10 +89,12 @@ def test_concurrent_cas_from_threads_no_lost_updates(tmp_path):
 
 def test_concurrent_process_writes_keep_file_valid(tmp_path):
     """两个进程同时写同一个任务文件（各写 20 条）：文件必须保持
-    能解析的 JSON 对象，不留临时文件。第 3 批的真事故就是两个进程
-    同时写把文件写坏了——唯一临时文件 + 原子改名保证不再写坏。
-    注意：跨进程不保证更新不丢（后写的可能盖掉先写的），这里只验
-    文件不损坏，不数条数。"""
+    能解析的 JSON 对象，40 条一条都不能丢，不留临时文件。
+    第 3 批的真事故就是两个进程同时写把文件写坏了——唯一临时文件 +
+    原子改名保证不再写坏；2026-11-13 再修一层：跨进程锁文件把
+    “读-改-写”串行化，Windows 上替换被读进程挡住（WinError 5）时
+    还有重试兜底——所以现在更新也不丢了，不只文件不坏。
+    注意：锁文件（tasks.json.lock）留在盘上是正常的，不算垃圾。"""
     path = tmp_path / "tasks.json"
     code = (
         "import sys\n"
@@ -114,6 +117,35 @@ def test_concurrent_process_writes_keep_file_valid(tmp_path):
         assert proc.wait(timeout=60) == 0
     data = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(data, dict)
-    assert len(data) > 0
+    assert len(data) == 40
+    assert {f"proc-a-{i}" for i in range(20)} <= set(data)
+    assert {f"proc-b-{i}" for i in range(20)} <= set(data)
+    leftovers = [p for p in tmp_path.iterdir() if ".tmp." in p.name]
+    assert leftovers == []
+
+
+def test_replace_retry_survives_transient_permission_error(tmp_path, monkeypatch):
+    """替换重试：os.replace 第一次报 PermissionError（模拟 Windows 上
+    目标文件正被别的进程打开读），第二次成功——save 照样成功，
+    文件是完整 JSON，不留临时文件。"""
+    import tasks.task_store as task_store_module
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def _flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Permission denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(task_store_module.os, "replace", _flaky_replace)
+    path = str(tmp_path / "tasks.json")
+    store = TaskStore(file_path=path)
+    task = make_task(goal="重试", model="deepseek-flash")
+    store.save(task)
+    assert calls["n"] == 2
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert data[task["task_id"]]["goal"] == "重试"
     leftovers = [p for p in tmp_path.iterdir() if ".tmp." in p.name]
     assert leftovers == []

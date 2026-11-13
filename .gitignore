@@ -51,6 +51,7 @@ memory/memories-backup-*.json
 #       任务存储的代码（task_store.py、__init__.py）要上传。
 tasks/tasks.json
 tasks/tasks.json.tmp
+tasks/tasks.json.lock
 
 # 工具审计日志（只保存在本地，不上传）
 .audit/

@@ -75,9 +75,9 @@ class ScriptedProvider:
         return dict(self.script.pop(0))
 
     def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                      thinking=None):
+                      thinking=None, model=None, max_tokens=None):
         self.final_calls_log.append(
-            {"messages": copy.deepcopy(messages), "thinking": thinking}
+            {"messages": copy.deepcopy(messages), "thinking": thinking, "model": model, "max_tokens": max_tokens}
         )
         if self.final_script:
             return dict(self.final_script.pop(0))

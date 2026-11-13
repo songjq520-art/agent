@@ -69,7 +69,7 @@ class ScriptedProvider:
         return dict(self.script.pop(0))
 
     def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                      thinking=None):
+                      thinking=None, model=None, max_tokens=None):
         return {"text": "最终回答", "usage": None, "cost_usd": 0.001, "model": self.model}
 
 
@@ -259,7 +259,9 @@ def test_update_memory_changes_text(mem_store):
 
 
 def test_update_memory_refuses_mismatched_text(mem_store):
-    """改记忆：传的原文和库里对不上，拒绝改——不许凭印象改。"""
+    """改记忆：传的原文和库里对不上，拒绝改——不许凭印象改。
+    判断 c 号后，统一守卫在确认前就拦下（库里根本没有含这句旧原文的
+    记忆），不用等到执行时才发现对不上。"""
     from tools.memory_tool import _run_update_memory
 
     with bound_memory_store(mem_store):
@@ -271,7 +273,7 @@ def test_update_memory_refuses_mismatched_text(mem_store):
             }
         )
     assert result["ok"] is False
-    assert "对不上" in result["error"]
+    assert "没找到" in result["error"]
     assert "BOOS 每月工具预算 5 美元" in _texts(mem_store)
 
 

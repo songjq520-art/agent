@@ -74,9 +74,9 @@ class ScriptedProvider:
         return dict(self.script.pop(0))
 
     def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                      thinking=None):
+                      thinking=None, model=None, max_tokens=None):
         self.final_calls_log.append(
-            {"messages": copy.deepcopy(messages), "thinking": thinking}
+            {"messages": copy.deepcopy(messages), "thinking": thinking, "model": model, "max_tokens": max_tokens}
         )
         if self.final_script:
             return dict(self.final_script.pop(0))
@@ -281,12 +281,13 @@ def test_loop_stops_at_eight_tool_calls(store, gateway):
     search_service = FakeSearchService([_ok_outcome(f"问题{i}") for i in range(1, 10)])
     loop = AgentLoop(provider, gateway=gateway, task_store=store,
                      search_service=search_service)
-    outcome = loop.run("一直查下去的问题")
+    outcome = loop.run("一直查下去的问题，帮我分析一下为什么")
     assert outcome["mode"] == "done"
     assert outcome["tool_calls"] == 8
     assert len(search_service.queries) == 8
-    # 到上限后最后一次是不带工具定义的直接回答：思考在这里开
-    # （2026-11-13 放宽），中间调工具那几轮才关着。
+    # 到上限后最后一次是不带工具定义的直接回答：难问题走 c 档，
+    # 思考在这里开（2026-11-13 放宽），中间调工具那几轮才关着。
+    # 日常问题走 a/b 档，思考是关着的（见 test_speed_judgment_r2.py）。
     assert len(provider.final_calls_log) == 1
     assert provider.final_calls_log[0]["thinking"] == "enabled"
     # 中间调工具的轮次思考还是关着的。
@@ -1283,7 +1284,7 @@ class RaisingProvider:
         raise RuntimeError("模型调用失败")
 
     def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                      thinking=None):
+                      thinking=None, model=None, max_tokens=None):
         return {"text": "最终回答", "usage": None, "cost_usd": 0.001, "model": self.model}
 
 

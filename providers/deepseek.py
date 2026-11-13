@@ -117,7 +117,8 @@ class DeepSeekProvider:
             thinking=thinking,
         )
 
-    def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None, thinking=None):
+    def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
+                      thinking=None, model=None, max_tokens=None):
         """用完整消息历史向 DeepSeek 提问（多轮对话），返回字典。
 
         参数 messages：消息历史列表，按时间顺序排列，每项为
@@ -129,6 +130,13 @@ class DeepSeekProvider:
         参数 thinking：见 chat()——工具循环的最后一次回答传
         "enabled"（2026-11-13 改，原来传 "disabled"），中间调工具那几轮
         传 "disabled"；平时聊天不传（行为和原来一样）。
+        参数 model：本轮改用哪个模型（只认配置里的 deepseek-flash /
+        deepseek-v4-pro，传错直接报错）；不传时用建 provider 时的模型。
+        提速 2 号 b 档（轻改写）用它临时切到 Flash。费用按实际用的
+        模型的价算，不按建 provider 时的模型算。
+        参数 max_tokens：本轮的输出上限（Token 数）；不传时用
+        MAX_OUTPUT_TOKENS（4096）。提速 2 号 b 档传 400–600，
+        让轻改写又短又便宜。
         返回格式与 chat() 相同。
         - 无 Key 时：抛出明确错误，不返回假成功。
         - 预算文件损坏时：抛出明确错误（原因见 status_reason），不偷偷调用。
@@ -172,13 +180,34 @@ class DeepSeekProvider:
         # 3. 发真实请求。timeout（超时）设为 60 秒，避免一直等下去。
         #    注意：DeepSeek 的端点是 /chat/completions，base_url 里没有 /v1，
         #    不要写成 /v1/chat/completions。
+        #    提速 2 号：model / max_tokens 可以本轮覆盖——model 只认配置里
+        #    的两个名字（传错直接报错，别拿 Flash 的价去算一个不存在的模型）；
+        #    费用按本轮实际用的模型的价算。
+        cfg = MODEL_CONFIG["deepseek"]
+        effective_model = model or self.model
+        if effective_model not in (cfg["model"], cfg["model_pro"]):
+            raise ValueError(
+                f"不支持的 DeepSeek 模型：{effective_model}，"
+                f"可选：{cfg['model']}、{cfg['model_pro']}。"
+            )
+        if effective_model == cfg["model_pro"]:
+            price_input = cfg["price_input_per_1m_pro"]
+            price_output = cfg["price_output_per_1m_pro"]
+            price_cached_input = cfg["price_cached_input_per_1m_pro"]
+        else:
+            price_input = cfg["price_input_per_1m"]
+            price_output = cfg["price_output_per_1m"]
+            price_cached_input = cfg["price_cached_input_per_1m"]
+        effective_max_tokens = (
+            max_tokens if max_tokens is not None else MAX_OUTPUT_TOKENS
+        )
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": self.model,
+            "model": effective_model,
             # 直接发送完整消息历史（本轮及之前所有轮次），不只发最新问题。
             # 思考开着时（"enabled"，或不传、接口默认开），带 tool_calls 的
             # assistant 消息缺 reasoning_content 会被接口报 400，见
@@ -190,8 +219,9 @@ class DeepSeekProvider:
             ),
             # max_tokens（最大输出 Token 数）：实际生效的输出上限，
             # 与调用前预估用的 MAX_OUTPUT_TOKENS 是同一个值（4096），
-            # 所以预估里的输出量不是凭空假设。
-            "max_tokens": MAX_OUTPUT_TOKENS,
+            # 所以预估里的输出量不是凭空假设。b 档轻改写时传 400–600，
+            # 上限就是传进来的那个数。
+            "max_tokens": effective_max_tokens,
         }
         if thinking is not None:
             if thinking not in ("enabled", "disabled"):
@@ -232,15 +262,17 @@ class DeepSeekProvider:
             cached_tokens = details.get("cached_tokens", 0) or 0
             # 安全保护：缓存 Token 数不能超过总输入 Token 数。
             cached_tokens = min(cached_tokens, prompt_tokens)
+            # 提速 2 号：费用按本轮实际用的模型的价算（b 档切到 Flash 时，
+            # 按 Flash 的价，不是建 provider 时的 Pro 价）。
             cost_usd = (
-                (prompt_tokens - cached_tokens) / 1_000_000 * self.price_input
-                + cached_tokens / 1_000_000 * self.price_cached_input
-                + completion_tokens / 1_000_000 * self.price_output
+                (prompt_tokens - cached_tokens) / 1_000_000 * price_input
+                + cached_tokens / 1_000_000 * price_cached_input
+                + completion_tokens / 1_000_000 * price_output
             )
             if self.budget_tracker is not None:
                 self.budget_tracker.add_cost(
                     cost_usd,
-                    model=self.model,
+                    model=effective_model,
                     ledger=ledger,
                     task_id=task_id,
                     trace_id=trace_id,
@@ -251,7 +283,7 @@ class DeepSeekProvider:
             "text": text,
             "usage": usage,
             "cost_usd": cost_usd,
-            "model": self.model,
+            "model": effective_model,
         }
 
     # ---------- 工具调用（Tool Calls）：给 tools/agent_loop.py 用 ----------

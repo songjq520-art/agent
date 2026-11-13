@@ -114,6 +114,90 @@ def _find_anchor_matches(store, anchor):
     return out
 
 
+def guard_memory_target(action, memory_id, anchor_text, candidates):
+    """统一守卫（判断 c 号）：删/改记忆时，程序核对模型挑的这条
+    是不是用户要动的那条。模型只能在候选里挑，挑出范围就不行。
+
+    参数：
+    - action："delete" 或 "update"（别的动作直接拦）。
+    - memory_id：模型挑的那条的 id。
+    - anchor_text：用户原话里的目标（delete 时是 anchor_text 参数，
+      比如“鸡杂面”；update 时是 old_text，就是要改的那条旧原文）。
+    - candidates：[(id, text)]，库里原文含 anchor 的候选（调用方
+      用 _find_anchor_matches 现读出来——执行前要重读，不能拿旧的）。
+    返回 {"ok", "reason", "target_id", "needs_user", "choices"}：
+    - ok=True：放行，target_id 是核对过的那条 id，reason 是一句
+      通过原因。
+    - ok=False：拦下，reason 是一句中文原因；needs_user=True 时
+      是“有多条候选、要 BOOS 挑一个”，choices 是候选 [(id, text)]；
+      needs_user=False 时是“程序就认得出不对”，不用问 BOOS。
+    规则（57 号 delete 的行为原样保留，只把“核对”抽出来）：
+    - action / memory_id / anchor 非法 → 拦。
+    - 候选为空（anchor 在库里没命中）→ 拦。
+    - 模型没挑 / 挑的 id 不在候选里 → 拦，附上候选让模型重新列出再挑。
+    - delete：挑的这条在候选里就放行（多命中不拦，确认卡上会注明，
+      BOOS 再看一眼——这是 57 号定下的行为，不改）。
+    - update：anchor 就是旧原文，要求挑的这条原文和 anchor 完全
+      一致（exact，用 _same_text 比）才放行；只有一条候选且是挑的
+      这条时也放行（非 delete 允许一条部分匹配——执行时还会再验
+      一次原文，不对就拒掉）；多条候选、挑的不是唯一的 exact 时，
+      拦下让 BOOS 挑。
+    """
+    norm_anchor = _norm_anchor_text(anchor_text)
+    if action not in ("delete", "update"):
+        return {
+            "ok": False, "reason": f"不支持的动作：{action}。",
+            "target_id": None, "needs_user": False, "choices": [],
+        }
+    if not memory_id:
+        return {
+            "ok": False, "reason": "没给 memory_id，没法核对挑的是哪条。",
+            "target_id": None, "needs_user": False, "choices": [],
+        }
+    if not norm_anchor:
+        return {
+            "ok": False, "reason": "没给 anchor，没法核对目标。",
+            "target_id": None, "needs_user": False, "choices": [],
+        }
+    cand = list(candidates or [])
+    if not cand:
+        return {
+            "ok": False,
+            "reason": f"库里没找到含“{anchor_text}”的记忆。",
+            "target_id": None, "needs_user": False, "choices": [],
+        }
+    picked = next((c for c in cand if c[0] == memory_id), None)
+    if picked is None:
+        return {
+            "ok": False,
+            "reason": "挑的这条不在候选里（原文里没有目标），挑错了。",
+            "target_id": None, "needs_user": True, "choices": cand,
+        }
+    if action == "delete":
+        return {
+            "ok": True, "reason": "挑的这条原文里含目标。",
+            "target_id": picked[0], "needs_user": False, "choices": cand,
+        }
+    # update：anchor 就是旧原文，要求精确一致。
+    exact = [c for c in cand if _same_text(c[1], anchor_text)]
+    if len(exact) == 1 and exact[0][0] == memory_id:
+        return {
+            "ok": True, "reason": "挑的这条原文和旧原文完全一致。",
+            "target_id": picked[0], "needs_user": False, "choices": cand,
+        }
+    if len(cand) == 1 and cand[0][0] == memory_id:
+        return {
+            "ok": True,
+            "reason": "只有一条候选，且是挑的这条（部分匹配）。",
+            "target_id": picked[0], "needs_user": False, "choices": cand,
+        }
+    return {
+        "ok": False,
+        "reason": "多条候选、挑的不是唯一精确的那条，要 BOOS 挑一个。",
+        "target_id": None, "needs_user": True, "choices": cand,
+    }
+
+
 def _check_delete_anchor(args):
     """删记忆的确认前校验（57 号 precheck）：程序核对模型挑的这条
     是不是用户要删的那条。
@@ -127,6 +211,9 @@ def _check_delete_anchor(args):
     命中多条不代表挑错了——只要挑的这条对得上 anchor 就放行，卡上会注明
     库里还有几条相关记忆，让 BOOS 再看一眼；挑的这条对不上才拒绝。
     只读、不改库，确认前和执行前各跑一次。
+    核对走统一守卫 guard_memory_target（判断 c 号），这里只补 delete
+    特有的两句：挑的条目原文必须和模型传来的 text 对得上（_same_text），
+    以及确认卡上显示的匹配备注（57 号定的格式，测试钉死了，别改）。
     """
     store, error = _store_or_error()
     if error is not None:
@@ -141,14 +228,14 @@ def _check_delete_anchor(args):
             None,
         )
     matches = _find_anchor_matches(store, anchor)
-    if not matches:
-        return (
-            f"库里没找到含“{anchor}”的记忆，没删。"
-            "请先列出全部记忆，确认要删的是哪条。",
-            None,
-        )
-    picked = next((m for m in matches if m[0] == memory_id), None)
-    if picked is None:
+    guard = guard_memory_target("delete", memory_id, anchor, matches)
+    if not guard["ok"]:
+        if not matches:
+            return (
+                f"库里没找到含“{anchor}”的记忆，没删。"
+                "请先列出全部记忆，确认要删的是哪条。",
+                None,
+            )
         shown = "；".join(t for _i, t in matches[:3])
         more = f"（等共 {len(matches)} 条）" if len(matches) > 3 else ""
         return (
@@ -157,7 +244,9 @@ def _check_delete_anchor(args):
             "请先列出全部记忆，照原文再删。",
             None,
         )
-    _picked_id, picked_text = picked
+    picked_text = next(
+        (text for _id, text in matches if _id == guard["target_id"]), ""
+    )
     if not _same_text(picked_text, text):
         return (
             "原文对不上库里存的那条（可能列表旧了、或抄错了），没删。"
@@ -167,6 +256,50 @@ def _check_delete_anchor(args):
     note = f"程序已核对：anchor“{anchor}”对得上“{picked_text}”"
     if len(matches) > 1:
         note += f"（库里还有 {len(matches) - 1} 条提到“{anchor}”的记忆，确认删的是这一条。）"
+    return None, {"_anchor_match": note}
+
+
+def _check_update_anchor(args):
+    """改记忆的确认前校验（判断 c 号 precheck）：程序核对模型挑的这条
+    是不是用户要改的那条。anchor 就是 old_text（要改的那条旧原文）。
+    返回 (error, augment)，和 _check_delete_anchor 一样的形状。
+    统一守卫 guard_memory_target 验：挑的这条原文和 old_text 完全
+    一致才放行；多条候选、挑的不是唯一精确的那条时，拦下让 BOOS 挑。
+    只读、不改库，确认前和执行前各跑一次。
+    """
+    store, error = _store_or_error()
+    if error is not None:
+        return error["error"], None
+    memory_id = (args or {}).get("memory_id") or ""
+    old_text = (args or {}).get("old_text") or ""
+    if not _norm_anchor_text(old_text):
+        return (
+            "改记忆要写 old_text：列出来的旧原文，没写没法核对。",
+            None,
+        )
+    matches = _find_anchor_matches(store, old_text)
+    guard = guard_memory_target("update", memory_id, old_text, matches)
+    if not guard["ok"]:
+        if not matches:
+            return (
+                f"库里没找到含“{old_text}”的记忆，没改。"
+                "请先列出全部记忆，确认要改的是哪条。",
+                None,
+            )
+        shown = "；".join(t for _i, t in matches[:3])
+        more = f"（等共 {len(matches)} 条）" if len(matches) > 3 else ""
+        return (
+            f"你要改的是“{old_text}”，但挑的这条对不上，挑错了，"
+            f"没改。库里提到“{old_text}”的是：{shown}{more}"
+            "请先列出全部记忆，照原文再改。",
+            None,
+        )
+    picked_text = next(
+        (text for _id, text in matches if _id == guard["target_id"]), ""
+    )
+    note = f"程序已核对：旧原文对得上“{picked_text}”"
+    if len(matches) > 1:
+        note += f"（库里还有 {len(matches) - 1} 条提到它的记忆，确认改的是这一条。）"
     return None, {"_anchor_match": note}
 
 
@@ -268,6 +401,12 @@ def _run_update_memory(args):
             "error": "改记忆要传 memory_id、old_text（列出来的旧原文）、"
             "new_text（新说法），缺了没法改。",
         }
+    # 判断 c 号：执行前再验一次统一守卫（确认卡建好后库可能变了，
+    # 防卡上的条目在确认前被改掉/删掉）。precheck 已经验过一次，
+    # 这里是第二道；只有守卫放行、且 target_id 就是要改的这条才动手。
+    anchor_error, _augment = _check_update_anchor(args)
+    if anchor_error:
+        return {"ok": False, "data": None, "error": anchor_error}
     try:
         owned = {
             item["id"]: item
@@ -486,6 +625,8 @@ def register_memory_tools():
             "改一条长期记忆里的说法。先调 list_memories 列出全部，找到要改的"
             "那条，把 memory_id、old_text（列出来的旧原文，一字不差地抄）、"
             "new_text（新说法）一起传来；旧原文对不上库里的就不改。"
+            "程序会先核对：挑的这条原文和 old_text 完全一致才建确认卡，"
+            "对不上、多条候选挑的不是唯一精确的那条时直接拒绝、不建卡；"
             "改之前会先弹确认卡，BOOS 点了确认才执行，取消了就不改。"
             "返回 {memory_id, old_text, new_text}。"
         ),
@@ -509,6 +650,11 @@ def register_memory_tools():
                     "minLength": 1,
                     "maxLength": 1000,
                 },
+                "_anchor_match": {
+                    "type": "string",
+                    "description": "程序算好的匹配结果，确认卡上显示用；模型不用填",
+                    "maxLength": 500,
+                },
             },
             "required": ["memory_id", "old_text", "new_text"],
         },
@@ -521,6 +667,7 @@ def register_memory_tools():
         func=_run_update_memory,
         replay_safe=False,
         side_effect_free=False,
+        precheck=_check_update_anchor,
     )
     _register_one(
         name="delete_memory",

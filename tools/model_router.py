@@ -123,6 +123,19 @@ def _classify_heuristic(text):
     return "easy", "日常问题"
 
 
+def needs_reasoning(text):
+    """最后回答那轮要不要深想（提速 2 号的分档信号）。
+
+    hard（多步推理、跨东西比较、写代码/调试、意思复杂）→ 要深想；
+    easy（日常）→ 不用深想，最后回答那轮跳过思考（a 档）或只轻改写（b 档）。
+    注意：这只是分类器的信号——50/54 号日期冲突是运行时的信号，
+    循环里另外算，两者任一成立都走深想（c 档）。
+    返回 True（要深想）/ False（不用）。
+    """
+    difficulty, _reason = classify(text)
+    return difficulty == "hard"
+
+
 def _classify_with_model(text):
     """模型分类（扩展点，还没实现）。
 

@@ -220,7 +220,7 @@ def test_55_loop_adds_habit_via_tool_and_replies_recorded(tmp_path):
             return dict(self.script.pop(0))
 
         def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                          thinking=None):
+                          thinking=None, model=None, max_tokens=None):
             return {"text": "最终回答", "usage": None, "cost_usd": 0.001, "model": self.model}
 
     provider = ScriptedProvider([

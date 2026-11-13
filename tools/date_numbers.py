@@ -444,6 +444,129 @@ def is_market_data_question(question):
     return False
 
 
+# ---------- 判断 (b) 号：动态数字事实（双源印证） ----------
+
+# 动态数字事实 = 一个数配上日期/时间，且这个数每天会变（不是用户说的
+# 稳定数）。问的是这类数时，要两个独立来源印证才敢当事实用。
+# 类别（判断 b 号）：
+#   行情（收盘/价格/指数）：纳指、标普、道指、沪深、上证、恒生、黄金、原油。
+#   天气/气温：天气、气温、温度、降雨、湿度。
+#   汇率：汇率、美元兑、欧元兑、日元兑。
+#   比赛比分：比分、比赛结果。
+#   利率：利率、加息、降息。
+#   空气质量：空气质量、AQI、PM2.5。
+# 用户说的稳定数（“我每天定投 5 块”“我每月预算 5 美元”）不是动态数字
+# 事实——那是他的决定/偏好，不用双源印证，也不进这里。
+_DYNAMIC_NUMERIC_KEYWORDS = (
+    # 行情（复用行情实体 + 数据词）。
+    "收盘", "收盘价", "点位", "涨幅", "跌幅", "开盘", "最高", "最低",
+    "纳指", "纳斯达克", "标普", "道指", "道琼斯", "沪深", "上证", "恒生",
+    "黄金", "金价", "原油", "油价",
+    # 天气/气温。
+    "气温", "温度", "多少度", "降雨", "湿度",
+    # 汇率。
+    "汇率", "美元兑", "欧元兑", "日元兑",
+    # 比赛比分。
+    "比分",
+    # 利率。
+    "利率", "加息", "降息",
+    # 空气质量。
+    "空气质量", "AQI", "PM2.5", "PM10",
+)
+
+
+def is_dynamic_numeric_question(question):
+    """这是不是在问一个动态数字事实（判断 b 号）？
+
+    动态数字事实 = 一个数配上日期/时间，且这个数每天会变。
+    问的是这类数时，要两个独立来源印证才敢当事实用（双源印证）。
+    用户说的稳定数（定投金额、预算）不是——那是他的决定/偏好，
+    不用印证。定投算钱（“一共多少钱”）也不算，那是算数，不是查数。
+    """
+    text = (question or "")
+    if not text.strip():
+        return False
+    # 定投算钱、预算：算数，不是查动态数。
+    if "一共多少钱" in text or "一共多少" in text:
+        return False
+    lowered = text.lower()
+    if not any(keyword in lowered for keyword in _DYNAMIC_NUMERIC_KEYWORDS):
+        return False
+    # 行情：走 51 号的口径（实体 + 日期才算问数）。
+    if is_market_data_question(question):
+        return True
+    # 天气/汇率/比分/利率/空气质量：问的就是当天的数（每天会变），
+    # 有没有写明日期都算——没写日期就是问今天/现在。
+    # 注意：“今天天气怎么样”不算——那是泛问天气，不是要数；
+    # 要数得写明气温/温度/多少度/降雨/湿度这些词。
+    for keyword in (
+        "气温", "温度", "多少度", "降雨", "湿度",
+        "汇率", "美元兑", "欧元兑", "日元兑",
+        "比分", "利率", "加息", "降息",
+        "空气质量", "AQI", "PM2.5", "PM10",
+    ):
+        if keyword in lowered:
+            return True
+    return False
+
+
+def dynamic_numeric_fact_kind(text):
+    """动态数字事实的类别（判断 b 号，定 expires_at 用）：
+    "market"（行情，24 小时或下一个交易日）、"weather"（天气，12 小时）、
+    "other"（其他，24 小时）。不是动态数字事实时返回 None。
+    问题和事实原文都能传（“纳指收盘多少”是问题，“纳指收盘 25466.19”
+    是事实，类别判断用的都是实体词）。"""
+    if not (is_dynamic_numeric_question(text) or is_dynamic_numeric_fact(text)):
+        return None
+    lowered = (text or "").lower()
+    if any(
+        keyword in lowered
+        for keyword in ("气温", "温度", "多少度", "降雨", "湿度", "空气质量", "AQI", "PM2.5", "PM10")
+    ) or re.search(r"\d+\s*(?:度|°c|摄氏度)", lowered):
+        return "weather"
+    return "market" if is_market_data_question(text) else "other"
+
+
+def is_dynamic_numeric_fact(text):
+    """这句话是不是一个动态数字事实（判断 b 号，记忆入库门禁）？
+
+    动态数字事实 = 一个数配上日期/时间，且这个数每天会变（行情收盘、
+    气温、汇率、比分、利率、空气质量）。入库时要双源印证才敢当稳定
+    事实用；没印证的只记成未核实、可信度封顶 0.35。
+    用户说的稳定数（定投金额、预算、某天花了多少钱）不是——那是他的
+    决定/自己的花销，不用双源印证。判断方法：先看有没有配上日期的数
+    （没日期的数直接不是），再看有没有动态实体词（行情/天气/汇率/
+    比分/利率/空气质量）或气温写法（数字 + 度/°C）。
+    """
+    if not (text or "").strip():
+        return False
+    lowered = text.lower()
+    # 有没有配上日期：显式日期（11 月 11 日）由 extract_dated_numbers 配；
+    # 相对日期（今天/昨天）它不认，这里单独认。
+    dated = [
+        entry for entry in extract_dated_numbers(text)
+        if entry.get("date") is not None
+    ]
+    has_date = bool(dated) or any(
+        word in lowered
+        for word in ("今天", "昨天", "前天", "明天", "大前天", "后天", "昨晚", "今晚")
+    )
+    if not has_date:
+        return False
+    # 气温写法：数字 + 度/°C（“广州今天 26 度”）——这种数小，
+    # _NUMBER_RE（只认带逗号的大数/百分比）抓不到，单独认。
+    if re.search(r"\d+(?:\.\d+)?\s*(?:度|°c|摄氏度)", lowered):
+        return True
+    # 行情/汇率/比分/利率/空气质量：实体词 + 配上日期的数。
+    # 没有实体词就不是动态数字事实，只是用户自己的数（定投金额、
+    # 预算、某天花了多少钱）。
+    if not any(keyword in lowered for keyword in _DYNAMIC_NUMERIC_KEYWORDS):
+        return False
+    if dated:
+        return True
+    return bool(extract_numbers(text))
+
+
 def _search_date_covers(entry, requested_date):
     """一条搜索记录的日期对得上要问的那天吗？
     date_range 起止同一天就是那天；或查询词文本里直接写了那天
@@ -558,3 +681,136 @@ def find_date_mismatches(reply, dated_numbers, requested_date):
             }
         )
     return mismatches, unverified
+
+
+# ---------- 追问补全（2026-11-13：上下文接日期） ----------
+
+# “标普呢”接在“道指11.10”后面问，意思就是“标普的 11.10”——
+# 但当时的解析只看本句：本句没日期，51 号门禁不开，模型直接说
+# 不知道，还反问“要不要联网查”。根因是追问没继承上文的日期/实体。
+# 治本：在门禁前面加一层“追问补全”，只补行情实体和日期，不改
+# 门禁本身的逻辑；补全后的问题再走正常流程（门禁、校验都认它）。
+# 保守起见，只有同时满足下面三条才补：
+#   1. 本句缺日期或缺实体（两个都有时不用补）；
+#   2. 本句像追问（短 + 带追问词，或光秃秃一个实体）；
+#   3. 最近 1–2 轮用户问话里有缺的那块（行情问题才算）。
+# 补全格式按 BOOS 自己的说法：“标普的 11.10”（实体 + 的 + M.D），
+# 下游解析（resolve_requested_date / extract_market_entity /
+# is_market_data_question）都认这个格式。
+# 不补的情形：本句有明确的相对日期（今天/昨天）——那是它自己的日期，
+# 不是上文的；上文也没有日期/实体；本句不是追问（比如完整的新问题）。
+
+_FOLLOW_UP_TAIL_MARKERS = ("怎么样", "如何", "怎样", "呢", "吗")
+_FOLLOW_UP_HEAD_MARKERS = ("那", "那么", "然后", "还有", "另外")
+
+
+def _looks_like_follow_up(question):
+    """这句像不像追问（短 + 带追问词，或光秃秃一个实体）？
+    长句子不算——“纳指昨天涨还是跌”这种自己带齐信息的不是追问。"""
+    text = (question or "").strip()
+    if not text or len(text) > 15:
+        return False
+    if any(text.startswith(head) for head in _FOLLOW_UP_HEAD_MARKERS):
+        return True
+    if any(marker in text for marker in _FOLLOW_UP_TAIL_MARKERS):
+        return True
+    key, _label = extract_market_entity(text)
+    return key is not None and len(text) <= 6
+
+
+def _follow_up_tail(question):
+    """追问里要保留的问法尾巴：怎么样/如何/怎样，或“涨了吗/跌了吗”
+    这种涨跌问法；光秃秃的“呢/吗”只是语气词，不保留。
+    返回要接在补全问题后面的尾巴（带前面的空格），没有返回 ""。"""
+    text = (question or "").strip()
+    for marker in ("怎么样", "如何", "怎样"):
+        if marker in text:
+            return f" {marker}"
+    lowered = text.lower()
+    for word in ("涨", "跌"):
+        index = lowered.find(word)
+        if index != -1 and "吗" in text[index:]:
+            return f" {text[index:].strip()}"
+    return ""
+
+
+def _leftover_after_markers_and_dates(text, today):
+    """去掉日期和追问词后，问题里还剩什么实质内容。
+    缺实体时只有剩空了才敢补上文的实体——“比特币呢”剩个“比特币”，
+    绝不能补成上文的道指；“11.10 怎么样”剩空，才能补。"""
+    stripped = text or ""
+    for mention in parse_date_mentions(text or "", default_year=today.year):
+        start, end = mention["start"], mention["end"]
+        stripped = stripped[:start] + " " * (end - start) + stripped[end:]
+    for word in (
+        "大前天", "前天", "昨天", "昨日", "今天", "今日", "明天", "明日", "后天",
+        "怎么样", "如何", "怎样", "呢", "吗", "那", "那么", "然后", "还有", "另外",
+    ):
+        stripped = stripped.replace(word, "")
+    return re.sub(r"[\s，,。？?！!、：:；;]+", "", stripped)
+
+
+def complete_follow_up_question(question, history, today=None):
+    """追问补全：当前问题缺日期/实体、又像追问时，从最近 1–2 轮
+    用户问话里把缺的那块补上（只补行情实体和日期，别的不碰）。
+    返回补全后的问题；不用补时原样返回。
+    history 是之前的对话消息列表（user/assistant），只看 user 的；
+    today 不传时按上海时间算今天。
+    例子（today=2026-11-12，上轮问过“道指11.10”）：
+      “标普呢” → “标普的 11.10”；
+      “那道指呢” → “道指的 11.10”；
+      “11.10 怎么样” → “道指的 11.10 怎么样”；
+      “呢” → “道指的 11.10”。"""
+    text = (question or "").strip()
+    if not text:
+        return question
+    if today is None:
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    entity_key, _label = extract_market_entity(text)
+    asked_date = resolve_requested_date(text, today)
+    if entity_key is not None and asked_date is not None:
+        return question
+    if not _looks_like_follow_up(text):
+        return question
+    # 最近 1–2 轮用户问话里找日期和实体（离现在越近越优先）：
+    # 先找同一轮里两个都有的，再分开找最近的日期、最近的实体。
+    user_turns = [
+        msg.get("content") or ""
+        for msg in reversed(history or [])
+        if isinstance(msg, dict)
+        and msg.get("role") == "user"
+        and isinstance(msg.get("content"), str)
+    ][:2]
+    prev_date = None
+    prev_entity_key = None
+    prev_entity_label = None
+    for prev in user_turns:
+        prev_asked = resolve_requested_date(prev, today)
+        prev_key, prev_label = extract_market_entity(prev)
+        if prev_date is None and prev_asked is not None:
+            prev_date = prev_asked
+        if prev_entity_key is None and prev_key is not None:
+            prev_entity_key, prev_entity_label = prev_key, prev_label
+        if prev_date is not None and prev_entity_key is not None:
+            break
+    if asked_date is None and prev_date is None:
+        return question
+    if entity_key is None and prev_entity_key is None:
+        return question
+    # 缺实体时，先看本句除了日期和追问词还剩什么：剩了实质内容
+    # （比如“比特币”），说明问的是别的东西，别拿上文的实体顶上。
+    if entity_key is None and _leftover_after_markers_and_dates(text, today):
+        return question
+    # 缺哪块补哪块：实体用中文名（“标普”“道指”），日期用 M.D（“11.10”）。
+    if entity_key is None:
+        _key, entity_label = prev_entity_key, prev_entity_label
+    else:
+        _key, entity_label = extract_market_entity(text)
+    if asked_date is None:
+        filled_date = prev_date
+    else:
+        filled_date = asked_date
+    tail = _follow_up_tail(text)
+    return f"{entity_label}的 {filled_date.month}.{filled_date.day}{tail}"

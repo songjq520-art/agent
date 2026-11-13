@@ -21,6 +21,7 @@
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
@@ -29,6 +30,7 @@ import requests
 from tools.date_numbers import (
     english_market_close_query,
     extract_dated_numbers,
+    extract_numbers,
     parse_date_mentions,
 )
 from tools.errors import QuotaExhausted, ToolError
@@ -40,6 +42,12 @@ PARALLEL_MCP_URL = "https://mcp.parallel.ai/mcp"
 
 _DEFAULT_TIMEOUT = 30
 _SNIPPET_MAX_CHARS = 1000
+# 提速 4 号（2026-11-13，BOOS 批准）：正文摘要 extract 的长度和条数——
+#   前 2–3 条结果带 extract（正文里挑出来的 400–800 字），让模型
+#   少跑一轮“再去读正文”；摘要（snippet）还是照旧，不动。
+_EXTRACT_MIN_CHARS = 400
+_EXTRACT_MAX_CHARS = 800
+_EXTRACT_TOP_RESULTS = 3
 # 中文及相关字符区（含 CJK 标点、全角形式）：用来判断一段文字是不是中文。
 _CJK_RE = re.compile(r"[\u2e80-\ua4cf\uff00-\uffef]")
 # 一段连续的 Latin-1 字符（0x80–0xFF）：双重编码的 UTF-8 字节读出来就是这个样子。
@@ -83,21 +91,34 @@ def _repair_mojibake(text):
 
 @dataclass
 class SearchResult:
-    """一条搜索结果：标题、来源链接、摘要、发布时间（有就留，没有就空）。"""
+    """一条搜索结果：标题、来源链接、摘要、发布时间（有就留，没有就空）。
+    extract（提速 4 号）：正文里挑出来的摘要（400–800 字），
+    优先含日期/数字/关键事实的段落；只有前 2–3 条结果带它，
+    其余的为空字符串。"""
 
     title: str
     url: str
     snippet: str = ""
     published_at: str = None
     score: float = None
+    extract: str = ""
 
     def to_dict(self):
         # 50/54 号：每条结果带 dated_numbers（数字-日期对照，只留配上日期的；
         # 没配上日期的数不放进来，模型就知道“这个数没日期，别当某天的数用”。
-        # 注意：这里只看标题 + 摘要里的文字日期，绝不拿 published_at 当数的日期。）
+        # 注意：这里只看标题 + 摘要 + extract 里的文字日期，绝不拿 published_at 当数的日期。）
+        # 判断 (b) 号：value（数值）和 kind（价格/百分比/点位）也留着，
+        # 双源印证要拿它比两个来源的数对不对得上。
         dated = [
-            {"number": item["number"], "date": item["date"]}
-            for item in extract_dated_numbers(f"{self.title}. {self.snippet}")
+            {
+                "number": item["number"],
+                "value": item["value"],
+                "kind": item["kind"],
+                "date": item["date"],
+            }
+            for item in extract_dated_numbers(
+                f"{self.title}. {self.snippet}. {self.extract}"
+            )
             if item["date"] is not None
         ]
         return {
@@ -106,6 +127,7 @@ class SearchResult:
             "snippet": self.snippet,
             "published_at": self.published_at,
             "score": self.score,
+            "extract": self.extract,
             "dated_numbers": dated,
         }
 
@@ -151,6 +173,52 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _make_extract(body):
+    """从正文里挑一段摘要（提速 4 号）：优先要含日期/数字/关键事实的段落，
+    凑够 400–800 字。段落按换行切；含日期或数字的段落先取（按原文顺序），
+    凑不够 400 字时再按原文顺序补别的段落；正文太短时有几字算几字。
+    正文为空时返回 ""。"""
+    text = (body or "").strip()
+    if not text:
+        return ""
+    paragraphs = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
+    if not paragraphs:
+        return text[:_EXTRACT_MAX_CHARS]
+
+    def _informative(paragraph):
+        """这段有没有日期或数字（信息密度高，优先要）。"""
+        if parse_date_mentions(paragraph):
+            return True
+        if extract_numbers(paragraph):
+            return True
+        return False
+
+    chosen = set()
+    total = 0
+    # 先取含日期/数字的段落（原文顺序）。
+    for index, paragraph in enumerate(paragraphs):
+        if total >= _EXTRACT_MAX_CHARS:
+            break
+        if _informative(paragraph):
+            chosen.add(index)
+            total += len(paragraph)
+    # 凑不够 400 字时，按原文顺序补别的段落。
+    if total < _EXTRACT_MIN_CHARS:
+        for index, paragraph in enumerate(paragraphs):
+            if total >= _EXTRACT_MAX_CHARS:
+                break
+            if index in chosen:
+                continue
+            chosen.add(index)
+            total += len(paragraph)
+    if not chosen:
+        return text[:_EXTRACT_MAX_CHARS]
+    # 按原文顺序拼。
+    return " ".join(paragraphs[index] for index in sorted(chosen))[
+        :_EXTRACT_MAX_CHARS
+    ]
+
+
 def _normalize_results(items):
     """把各家形状不一的结果条目归一化成 SearchResult 列表。
 
@@ -174,6 +242,15 @@ def _normalize_results(items):
         published_at = (
             item.get("published_at") or item.get("publish_date") or item.get("publishedDate")
         )
+        # 提速 4 号：前 2–3 条结果带 extract（正文里挑出来的摘要）。
+        # 正文用 content / text（没给时用 snippet 本身）；只给前
+        # _EXTRACT_TOP_RESULTS 条，省 token。
+        body = item.get("content") or item.get("text") or snippet
+        extract = (
+            _make_extract(_repair_mojibake(str(body)))
+            if len(out) < _EXTRACT_TOP_RESULTS and body
+            else ""
+        )
         out.append(
             SearchResult(
                 title=_repair_mojibake(item.get("title") or url),
@@ -181,6 +258,7 @@ def _normalize_results(items):
                 snippet=_repair_mojibake(str(snippet))[:_SNIPPET_MAX_CHARS],
                 published_at=published_at,
                 score=item.get("score"),
+                extract=extract,
             )
         )
     return out
@@ -342,6 +420,13 @@ class ParallelMCPClient:
         self._initialized = False
         self._next_id = 0
         self._session_id = None
+        self._lock = threading.RLock()
+        # 提速 1 号：同一轮里多条搜索并行跑时，两个线程可能同时走到
+        # Parallel MCP——_next_id、_session_id、_initialized 都是
+        # 共享的可变状态，不加锁会撞号、丢会话。RLock 串行化每一次
+        # JSON-RPC 调用（initialize 里调 _rpc 要重入，所以用 RLock）；
+        # Tavily / AnySearch 是纯 HTTP、无共享可变状态，不用锁，
+        # 仍可并行。
 
     def _headers(self):
         headers = {
@@ -432,35 +517,42 @@ class ParallelMCPClient:
         return response
 
     def _rpc(self, method, params=None):
-        self._next_id += 1
-        payload = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-        parsed = self._parse_response(self._post(payload))
-        if isinstance(parsed, dict) and "error" in parsed:
-            error = parsed["error"]
-            raise ToolError(
-                f"Parallel MCP 报错：{error.get('message', error)}"
-            )
-        return parsed.get("result") if isinstance(parsed, dict) else None
+        # 提速 1 号：整段上锁——id 分配、发请求、读会话号必须原子，
+        # 不然两个并行搜索会拿到同一个 id 或互相覆盖会话。
+        with self._lock:
+            self._next_id += 1
+            payload = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
+            if params is not None:
+                payload["params"] = params
+            parsed = self._parse_response(self._post(payload))
+            if isinstance(parsed, dict) and "error" in parsed:
+                error = parsed["error"]
+                raise ToolError(
+                    f"Parallel MCP 报错：{error.get('message', error)}"
+                )
+            return parsed.get("result") if isinstance(parsed, dict) else None
 
     def initialize(self):
         """握手一次：initialize + notifications/initialized，之后复用。"""
-        if self._initialized:
-            return
-        self._rpc(
-            "initialize",
-            {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "twelve-tools", "version": "0.1.0"},
-            },
-        )
-        try:
-            self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        except ToolError:
-            pass  # 通知发出去就行，回不回无所谓
-        self._initialized = True
+        # 提速 1 号：整段上锁（RLock，里面调 _rpc 会重入）——
+        # _initialized 的“查了没有再握手”必须原子，不然两个线程
+        # 会各握手一次，第二个覆盖第一个的会话号。
+        with self._lock:
+            if self._initialized:
+                return
+            self._rpc(
+                "initialize",
+                {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "twelve-tools", "version": "0.1.0"},
+                },
+            )
+            try:
+                self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            except ToolError:
+                pass  # 通知发出去就行，回不回无所谓
+            self._initialized = True
 
     def call_tool(self, name, arguments):
         """调一个 MCP 工具，返回它的文本内容（拼成一段）。"""
@@ -571,6 +663,181 @@ def _domain_of(url):
         return urlparse(url).netloc.lower()
     except Exception:
         return ""
+
+
+# ---------- 判断 (b) 号：双源印证 ----------
+
+# 权威来源白名单：官方交易所、政府气象局、央行——一家就能验证
+#（可信度上限 0.85），不用等第二家。注意：这里是注册域名
+#（finance.yahoo.com 和 yahoo.com 都是 yahoo.com，不算两家）。
+# 2026-11-13（BOOS 定：行情搜索要权威报道）：再加主流财经数据商——
+# 雅虎财经、英为财情、MarketWatch、CNBC、路透、彭博、华尔街日报、
+# 金融时报、晨星、巴伦周刊、东方财富、新浪财经、中国证券网、
+# 证券时报、财联社、同花顺。行情收盘数一家权威来源就能验证
+#（0.85 上限）；这些站的天气/汇率页同样可靠，不另设白名单。
+AUTHORITATIVE_DOMAINS = frozenset(
+    {
+        # 官方交易所。
+        "nasdaq.com", "nyse.com", "spglobal.com", "dowjones.com",
+        "sse.com.cn", "szse.cn", "hkex.com.hk",
+        # 政府气象局。
+        "weather.gov", "weather.com.cn", "metoffice.gov.uk", "bom.gov.au",
+        # 央行/官方汇率。
+        "federalreserve.gov", "ecb.europa.eu", "boj.or.jp", "pbc.gov.cn",
+        # 主流财经数据商（行情）。
+        "yahoo.com", "investing.com", "marketwatch.com", "cnbc.com",
+        "reuters.com", "bloomberg.com", "wsj.com", "ft.com",
+        "morningstar.com", "barrons.com",
+        "eastmoney.com", "sina.com.cn", "cnstock.com", "stcn.com",
+        "cls.cn", "10jqka.com.cn",
+    }
+)
+
+# 行情黑名单（2026-11-13，BOOS 定）：这些站不是股票/指数收盘的
+# 权威来源——绝不能只凭它们一家就把数当收盘价给出去。
+# 主要是币圈交易所的新闻（Gate 那篇把 11 月 10 日的收盘写成
+# 11 月 11 日的，就是这类来源）。注册域名比对，和白名单同口径。
+MARKET_DENYLIST_DOMAINS = frozenset(
+    {
+        "gate.com", "binance.com", "coinbase.com", "okx.com",
+        "kraken.com", "bitfinex.com", "huobi.com", "bybit.com",
+        "kucoin.com", "gemini.com", "bitstamp.net", "bitget.com",
+        "mexc.com",
+    }
+)
+
+# 两段式公共后缀（注册域名要取最后三段，比如 news.co.uk 的注册域名是
+# news.co.uk，不是 co.uk；com.cn 同理）。
+_TWO_PART_SUFFIXES = frozenset(
+    {
+        "co.uk", "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+        "co.jp", "com.au", "co.kr", "com.br", "com.hk", "com.tw",
+        "com.sg", "co.in", "com.mx", "co.nz",
+    }
+)
+
+
+def registrable_domain(url):
+    """一个 URL 的注册域名（判断 b 号：独立来源按注册域名算）。
+    finance.yahoo.com 和 yahoo.com 都是 yahoo.com——不算两家；
+    cnn.com 和 reuters.com 是两家。www. 前缀去掉。"""
+    host = _domain_of(url or "")
+    if host.startswith("www."):
+        host = host[4:]
+    parts = [part for part in host.split(".") if part]
+    if len(parts) <= 2:
+        return host
+    if ".".join(parts[-2:]) in _TWO_PART_SUFFIXES and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def is_authoritative_domain(domain):
+    """这个注册域名是不是权威来源（判断 b 号白名单）？"""
+    return (domain or "").lower() in AUTHORITATIVE_DOMAINS
+
+
+def is_market_denylisted_domain(domain):
+    """这个注册域名是不是行情黑名单（2026-11-13）？
+    黑名单站不是股票/指数收盘的权威来源，绝不能只凭它一家
+    就把数当收盘价给出去。"""
+    return (domain or "").lower() in MARKET_DENYLIST_DOMAINS
+
+
+def market_source_tier(domain):
+    """行情来源档位（2026-11-13，权威报道优先）：
+    0 = 权威财经来源（白名单里的交易所/财经数据商），
+    1 = 普通来源（既不权威也不在黑名单），
+    2 = 黑名单来源（币圈交易所等）。排序用：权威在前，黑名单在后。"""
+    domain = (domain or "").lower()
+    if domain in AUTHORITATIVE_DOMAINS:
+        return 0
+    if domain in MARKET_DENYLIST_DOMAINS:
+        return 2
+    return 1
+
+
+def check_numeric_consensus(results, date_iso, tolerance=0.01):
+    """双源印证（判断 b 号）：给定一组搜索结果（to_dict 后的 dict，
+    含 url + dated_numbers）和目标日期，判断两个独立来源的数对不对得上。
+
+    只认 date == date_iso 且配上日期的数（50/54 的日期-数字配对已经
+    算好了）；同一注册域名的多个结果算一家（finance.yahoo.com 和
+    yahoo.com 不算两家）。数按 kind 分组（收盘价和涨跌幅不混着比），
+    同 kind 里两个独立来源的数在 tolerance 内对得上才算印证。
+    收盘价 tolerance 默认 0.01（精确到小数点后两位）；气温传 1.0
+    （±1°C 算对得上）。
+
+    返回 {"consensus": bool, "value": str|None, "kind": str|None,
+    "sources": [domain, ...], "source_count": int,
+    "by_kind": {kind: {"consensus": bool, "value": ..., "sources": [...]}},
+    "date": date_iso}。
+    consensus 为真时 value 是两个来源都认的数（字符串，原样）；为假时
+    value 是 None（别拿单家的数当事实用）。
+    """
+    by_kind = {}
+    for result in results or []:
+        domain = registrable_domain((result or {}).get("url") or "")
+        if not domain:
+            continue
+        for entry in (result or {}).get("dated_numbers") or []:
+            if (entry or {}).get("date") != date_iso:
+                continue
+            kind = (entry or {}).get("kind") or "price"
+            value = (entry or {}).get("value")
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            by_kind.setdefault(kind, {}).setdefault(domain, number)
+    verdicts = {}
+    for kind, per_domain in by_kind.items():
+        domains = sorted(per_domain)
+        agreed_value = None
+        agreed_sources = []
+        # 找“最多独立来源认的那个数”：每个数当一回候选，数它有多少家
+        # 在 tolerance 内认它；两家以上认同一个数才算印证。
+        for candidate_domain in domains:
+            candidate = per_domain[candidate_domain]
+            supporters = [
+                domain
+                for domain in domains
+                if abs(per_domain[domain] - candidate) <= tolerance
+            ]
+            if len(supporters) >= 2 and len(supporters) > len(agreed_sources):
+                agreed_sources = supporters
+                agreed_value = candidate
+        if agreed_value is not None:
+            verdicts[kind] = {
+                "consensus": True,
+                "value": f"{agreed_value:.2f}",
+                "sources": agreed_sources,
+                "source_count": len(agreed_sources),
+            }
+        else:
+            verdicts[kind] = {
+                "consensus": False,
+                "value": None,
+                "sources": domains,
+                "source_count": len(domains),
+            }
+    # 主结论认收盘价（price）那组——行情问题最关心收盘价；
+    # 没收盘价时认数最多的那组。
+    main_kind = "price" if "price" in verdicts else None
+    if main_kind is None and verdicts:
+        main_kind = max(verdicts, key=lambda k: verdicts[k]["source_count"])
+    main = verdicts.get(main_kind) if main_kind else None
+    return {
+        "consensus": bool(main and main["consensus"]),
+        "value": main["value"] if main else None,
+        "kind": main_kind,
+        "sources": main["sources"] if main else [],
+        "source_count": main["source_count"] if main else 0,
+        "by_kind": verdicts,
+        "date": date_iso,
+    }
 
 
 def _parse_date(value):
