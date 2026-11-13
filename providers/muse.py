@@ -114,7 +114,7 @@ class MuseProvider:
             # 直接发送完整消息历史（本轮及之前所有轮次），不只发最新问题。
             "messages": messages,
             # max_completion_tokens（最大输出 Token 数）：实际生效的输出上限，
-            # 与调用前预估用的 MAX_OUTPUT_TOKENS 是同一个值（2048），
+            # 与调用前预估用的 MAX_OUTPUT_TOKENS 是同一个值（4096），
             # 所以预估里的输出量不是凭空假设。
             "max_completion_tokens": MAX_OUTPUT_TOKENS,
         }

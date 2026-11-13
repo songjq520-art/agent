@@ -162,7 +162,8 @@ def test_tier1_needs_confirmation():
         ["pip", "install", "requests"],
         ["python", "-m", "pip", "install", "requests"],
         ["python", "-c", "print('hi')"],
-        ["python", "-m", "pytest", "tests/", "-q"],
+        # 注意：python -m pytest 不在这里——它是跑测试（白名单里的日常命令），
+        # 不是现拼代码，见 test_tier0_auto_allowed。
         ["python", "-m", "http.server"],
         ["node", "-e", "console.log(1)"],
         ["ruby", "-e", "puts 1"],
@@ -188,12 +189,51 @@ def test_tier0_auto_allowed():
         ["python", "script.py"],
         ["node", "server.js"],
         ["pytest", "tests/", "-q"],
+        # python -m pytest 也是跑测试（白名单）：-m 在这里不是内联代码，
+        # 测试文件写进去的时候已经要过一次确认，和跑写好的脚本一样。
+        ["python", "-m", "pytest", "tests/", "-q"],
         ["git", "status"],
         ["git", "log", "--oneline"],
         ["git", "diff"],
         ["ls", "-la"],
     ]
     for argv in cases:
+        tier, reason = classify_command(argv)
+        assert tier == 0, (argv, tier, reason)
+
+
+def test_whitelist_default_asks_first():
+    """5 号（BOOS 2026-11-12 定）：白名单 + 有风险的先问 BOOS。
+    前面几关都没拦住的命令，不再默认放行——只放行清单上的日常命令，
+    不在清单上的先问 BOOS（Tier 1），硬禁的还是 Tier 2。
+    白名单外的日常操作（推代码、拉代码、转格式、开编辑器）都要先问，
+    不是因为它们危险，是因为它们不在清单上、BOOS 没点头放行。
+    """
+    ask_first = [
+        ["git", "push"],
+        ["git", "pull"],
+        ["ffmpeg", "-i", "a.mp4", "b.mp4"],
+        ["C:\\Windows\\System32\\notepad.exe", "a.txt"],
+        ["7z", "x", "a.zip"],
+    ]
+    for argv in ask_first:
+        tier, reason = classify_command(argv)
+        assert tier == 1, (argv, tier, reason)
+        # 前面几关都没拦住，最后是白名单默认拦下来的，理由要写明白。
+        assert "白名单" in reason, (argv, reason)
+    # 别的 Tier 1 规则先拦住的也一样要问（理由是那条规则的，不是白名单的）。
+    for argv in [["python", "-m", "pip", "list"]]:
+        tier, reason = classify_command(argv)
+        assert tier == 1, (argv, tier, reason)
+    # 白名单里的照样 Tier 0（全路径/后缀也不误伤）。
+    allowed = [
+        ["C:\\Program Files\\Git\\bin\\git.exe", "status"],
+        ["C:\\tools\\python.exe", "script.py"],
+        ["C:\\tools\\python.exe", "-m", "pytest", "tests/", "-q"],
+        ["git", "--version"],
+        ["node", "--version"],
+    ]
+    for argv in allowed:
         tier, reason = classify_command(argv)
         assert tier == 0, (argv, tier, reason)
 
@@ -378,7 +418,8 @@ def test_tier1_full_path_needs_confirmation():
         ["C:\\Windows\\System32\\curl.exe", "http://example.com/f.zip", "-o", "f.zip"],
         ["C:\\tools\\pip.exe", "install", "requests"],
         ["C:\\tools\\python.exe", "-c", "print(1)"],
-        ["C:\\tools\\python.exe", "-m", "pytest", "tests/", "-q"],
+        # 注意：python.exe -m pytest 不在这里——它是跑测试（白名单），
+        # 全路径也一样放行，见 test_whitelist_default_asks_first。
         ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
          "-Command", "Get-ChildItem"],
     ]
@@ -392,7 +433,9 @@ def test_tier0_full_path_still_allowed():
     cases = [
         ["C:\\Program Files\\Git\\bin\\git.exe", "status"],
         ["C:\\tools\\python.exe", "script.py"],
-        ["C:\\Windows\\System32\\notepad.exe", "a.txt"],
+        # 注意：notepad.exe 不在这里——它不在白名单上（图形编辑器，
+        # 不是日常命令），按 5 号的规矩先问 BOOS，见
+        # test_whitelist_default_asks_first。
     ]
     for argv in cases:
         tier, reason = classify_command(argv)

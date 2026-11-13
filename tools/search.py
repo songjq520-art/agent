@@ -21,11 +21,18 @@
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import requests
 
+from tools.date_numbers import (
+    english_market_close_query,
+    extract_dated_numbers,
+    extract_numbers,
+    parse_date_mentions,
+)
 from tools.errors import QuotaExhausted, ToolError
 
 ANYSEARCH_API_URL = "https://api.anysearch.com/v1/search"
@@ -35,6 +42,12 @@ PARALLEL_MCP_URL = "https://mcp.parallel.ai/mcp"
 
 _DEFAULT_TIMEOUT = 30
 _SNIPPET_MAX_CHARS = 1000
+# 提速 4 号（2026-11-13，BOOS 批准）：正文摘要 extract 的长度和条数——
+#   前 2–3 条结果带 extract（正文里挑出来的 400–800 字），让模型
+#   少跑一轮“再去读正文”；摘要（snippet）还是照旧，不动。
+_EXTRACT_MIN_CHARS = 400
+_EXTRACT_MAX_CHARS = 800
+_EXTRACT_TOP_RESULTS = 3
 # 中文及相关字符区（含 CJK 标点、全角形式）：用来判断一段文字是不是中文。
 _CJK_RE = re.compile(r"[\u2e80-\ua4cf\uff00-\uffef]")
 # 一段连续的 Latin-1 字符（0x80–0xFF）：双重编码的 UTF-8 字节读出来就是这个样子。
@@ -78,21 +91,44 @@ def _repair_mojibake(text):
 
 @dataclass
 class SearchResult:
-    """一条搜索结果：标题、来源链接、摘要、发布时间（有就留，没有就空）。"""
+    """一条搜索结果：标题、来源链接、摘要、发布时间（有就留，没有就空）。
+    extract（提速 4 号）：正文里挑出来的摘要（400–800 字），
+    优先含日期/数字/关键事实的段落；只有前 2–3 条结果带它，
+    其余的为空字符串。"""
 
     title: str
     url: str
     snippet: str = ""
     published_at: str = None
     score: float = None
+    extract: str = ""
 
     def to_dict(self):
+        # 50/54 号：每条结果带 dated_numbers（数字-日期对照，只留配上日期的；
+        # 没配上日期的数不放进来，模型就知道“这个数没日期，别当某天的数用”。
+        # 注意：这里只看标题 + 摘要 + extract 里的文字日期，绝不拿 published_at 当数的日期。）
+        # 判断 (b) 号：value（数值）和 kind（价格/百分比/点位）也留着，
+        # 双源印证要拿它比两个来源的数对不对得上。
+        dated = [
+            {
+                "number": item["number"],
+                "value": item["value"],
+                "kind": item["kind"],
+                "date": item["date"],
+            }
+            for item in extract_dated_numbers(
+                f"{self.title}. {self.snippet}. {self.extract}"
+            )
+            if item["date"] is not None
+        ]
         return {
             "title": self.title,
             "url": self.url,
             "snippet": self.snippet,
             "published_at": self.published_at,
             "score": self.score,
+            "extract": self.extract,
+            "dated_numbers": dated,
         }
 
 
@@ -109,6 +145,13 @@ class SearchOutcome:
     attempts: list = field(default_factory=list)
     quality: dict = field(default_factory=dict)
     fetched_at: str = ""
+    # 48 号：实际发出去的查询词（走 AnySearch 翻成英文时是英文那份，
+    # 不是模型写的中文原文；没翻译时就等于 query）。界面上显示它，
+    # BOOS 才看得到“到底拿什么词去搜的”。
+    executed_query: str = ""
+    # 28 号：按日期范围过滤的情况（{"start", "end", "dropped", "undated"}），
+    # 没给日期范围时是空字典。
+    date_range: dict = field(default_factory=dict)
 
     def to_dict(self):
         return {
@@ -121,11 +164,59 @@ class SearchOutcome:
             "attempts": self.attempts,
             "quality": self.quality,
             "fetched_at": self.fetched_at,
+            "executed_query": self.executed_query or self.query,
+            "date_range": self.date_range,
         }
 
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _make_extract(body):
+    """从正文里挑一段摘要（提速 4 号）：优先要含日期/数字/关键事实的段落，
+    凑够 400–800 字。段落按换行切；含日期或数字的段落先取（按原文顺序），
+    凑不够 400 字时再按原文顺序补别的段落；正文太短时有几字算几字。
+    正文为空时返回 ""。"""
+    text = (body or "").strip()
+    if not text:
+        return ""
+    paragraphs = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
+    if not paragraphs:
+        return text[:_EXTRACT_MAX_CHARS]
+
+    def _informative(paragraph):
+        """这段有没有日期或数字（信息密度高，优先要）。"""
+        if parse_date_mentions(paragraph):
+            return True
+        if extract_numbers(paragraph):
+            return True
+        return False
+
+    chosen = set()
+    total = 0
+    # 先取含日期/数字的段落（原文顺序）。
+    for index, paragraph in enumerate(paragraphs):
+        if total >= _EXTRACT_MAX_CHARS:
+            break
+        if _informative(paragraph):
+            chosen.add(index)
+            total += len(paragraph)
+    # 凑不够 400 字时，按原文顺序补别的段落。
+    if total < _EXTRACT_MIN_CHARS:
+        for index, paragraph in enumerate(paragraphs):
+            if total >= _EXTRACT_MAX_CHARS:
+                break
+            if index in chosen:
+                continue
+            chosen.add(index)
+            total += len(paragraph)
+    if not chosen:
+        return text[:_EXTRACT_MAX_CHARS]
+    # 按原文顺序拼。
+    return " ".join(paragraphs[index] for index in sorted(chosen))[
+        :_EXTRACT_MAX_CHARS
+    ]
 
 
 def _normalize_results(items):
@@ -151,6 +242,15 @@ def _normalize_results(items):
         published_at = (
             item.get("published_at") or item.get("publish_date") or item.get("publishedDate")
         )
+        # 提速 4 号：前 2–3 条结果带 extract（正文里挑出来的摘要）。
+        # 正文用 content / text（没给时用 snippet 本身）；只给前
+        # _EXTRACT_TOP_RESULTS 条，省 token。
+        body = item.get("content") or item.get("text") or snippet
+        extract = (
+            _make_extract(_repair_mojibake(str(body)))
+            if len(out) < _EXTRACT_TOP_RESULTS and body
+            else ""
+        )
         out.append(
             SearchResult(
                 title=_repair_mojibake(item.get("title") or url),
@@ -158,6 +258,7 @@ def _normalize_results(items):
                 snippet=_repair_mojibake(str(snippet))[:_SNIPPET_MAX_CHARS],
                 published_at=published_at,
                 score=item.get("score"),
+                extract=extract,
             )
         )
     return out
@@ -319,6 +420,13 @@ class ParallelMCPClient:
         self._initialized = False
         self._next_id = 0
         self._session_id = None
+        self._lock = threading.RLock()
+        # 提速 1 号：同一轮里多条搜索并行跑时，两个线程可能同时走到
+        # Parallel MCP——_next_id、_session_id、_initialized 都是
+        # 共享的可变状态，不加锁会撞号、丢会话。RLock 串行化每一次
+        # JSON-RPC 调用（initialize 里调 _rpc 要重入，所以用 RLock）；
+        # Tavily / AnySearch 是纯 HTTP、无共享可变状态，不用锁，
+        # 仍可并行。
 
     def _headers(self):
         headers = {
@@ -409,35 +517,42 @@ class ParallelMCPClient:
         return response
 
     def _rpc(self, method, params=None):
-        self._next_id += 1
-        payload = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-        parsed = self._parse_response(self._post(payload))
-        if isinstance(parsed, dict) and "error" in parsed:
-            error = parsed["error"]
-            raise ToolError(
-                f"Parallel MCP 报错：{error.get('message', error)}"
-            )
-        return parsed.get("result") if isinstance(parsed, dict) else None
+        # 提速 1 号：整段上锁——id 分配、发请求、读会话号必须原子，
+        # 不然两个并行搜索会拿到同一个 id 或互相覆盖会话。
+        with self._lock:
+            self._next_id += 1
+            payload = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
+            if params is not None:
+                payload["params"] = params
+            parsed = self._parse_response(self._post(payload))
+            if isinstance(parsed, dict) and "error" in parsed:
+                error = parsed["error"]
+                raise ToolError(
+                    f"Parallel MCP 报错：{error.get('message', error)}"
+                )
+            return parsed.get("result") if isinstance(parsed, dict) else None
 
     def initialize(self):
         """握手一次：initialize + notifications/initialized，之后复用。"""
-        if self._initialized:
-            return
-        self._rpc(
-            "initialize",
-            {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "twelve-tools", "version": "0.1.0"},
-            },
-        )
-        try:
-            self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        except ToolError:
-            pass  # 通知发出去就行，回不回无所谓
-        self._initialized = True
+        # 提速 1 号：整段上锁（RLock，里面调 _rpc 会重入）——
+        # _initialized 的“查了没有再握手”必须原子，不然两个线程
+        # 会各握手一次，第二个覆盖第一个的会话号。
+        with self._lock:
+            if self._initialized:
+                return
+            self._rpc(
+                "initialize",
+                {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "twelve-tools", "version": "0.1.0"},
+                },
+            )
+            try:
+                self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            except ToolError:
+                pass  # 通知发出去就行，回不回无所谓
+            self._initialized = True
 
     def call_tool(self, name, arguments):
         """调一个 MCP 工具，返回它的文本内容（拼成一段）。"""
@@ -550,6 +665,181 @@ def _domain_of(url):
         return ""
 
 
+# ---------- 判断 (b) 号：双源印证 ----------
+
+# 权威来源白名单：官方交易所、政府气象局、央行——一家就能验证
+#（可信度上限 0.85），不用等第二家。注意：这里是注册域名
+#（finance.yahoo.com 和 yahoo.com 都是 yahoo.com，不算两家）。
+# 2026-11-13（BOOS 定：行情搜索要权威报道）：再加主流财经数据商——
+# 雅虎财经、英为财情、MarketWatch、CNBC、路透、彭博、华尔街日报、
+# 金融时报、晨星、巴伦周刊、东方财富、新浪财经、中国证券网、
+# 证券时报、财联社、同花顺。行情收盘数一家权威来源就能验证
+#（0.85 上限）；这些站的天气/汇率页同样可靠，不另设白名单。
+AUTHORITATIVE_DOMAINS = frozenset(
+    {
+        # 官方交易所。
+        "nasdaq.com", "nyse.com", "spglobal.com", "dowjones.com",
+        "sse.com.cn", "szse.cn", "hkex.com.hk",
+        # 政府气象局。
+        "weather.gov", "weather.com.cn", "metoffice.gov.uk", "bom.gov.au",
+        # 央行/官方汇率。
+        "federalreserve.gov", "ecb.europa.eu", "boj.or.jp", "pbc.gov.cn",
+        # 主流财经数据商（行情）。
+        "yahoo.com", "investing.com", "marketwatch.com", "cnbc.com",
+        "reuters.com", "bloomberg.com", "wsj.com", "ft.com",
+        "morningstar.com", "barrons.com",
+        "eastmoney.com", "sina.com.cn", "cnstock.com", "stcn.com",
+        "cls.cn", "10jqka.com.cn",
+    }
+)
+
+# 行情黑名单（2026-11-13，BOOS 定）：这些站不是股票/指数收盘的
+# 权威来源——绝不能只凭它们一家就把数当收盘价给出去。
+# 主要是币圈交易所的新闻（Gate 那篇把 11 月 10 日的收盘写成
+# 11 月 11 日的，就是这类来源）。注册域名比对，和白名单同口径。
+MARKET_DENYLIST_DOMAINS = frozenset(
+    {
+        "gate.com", "binance.com", "coinbase.com", "okx.com",
+        "kraken.com", "bitfinex.com", "huobi.com", "bybit.com",
+        "kucoin.com", "gemini.com", "bitstamp.net", "bitget.com",
+        "mexc.com",
+    }
+)
+
+# 两段式公共后缀（注册域名要取最后三段，比如 news.co.uk 的注册域名是
+# news.co.uk，不是 co.uk；com.cn 同理）。
+_TWO_PART_SUFFIXES = frozenset(
+    {
+        "co.uk", "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+        "co.jp", "com.au", "co.kr", "com.br", "com.hk", "com.tw",
+        "com.sg", "co.in", "com.mx", "co.nz",
+    }
+)
+
+
+def registrable_domain(url):
+    """一个 URL 的注册域名（判断 b 号：独立来源按注册域名算）。
+    finance.yahoo.com 和 yahoo.com 都是 yahoo.com——不算两家；
+    cnn.com 和 reuters.com 是两家。www. 前缀去掉。"""
+    host = _domain_of(url or "")
+    if host.startswith("www."):
+        host = host[4:]
+    parts = [part for part in host.split(".") if part]
+    if len(parts) <= 2:
+        return host
+    if ".".join(parts[-2:]) in _TWO_PART_SUFFIXES and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def is_authoritative_domain(domain):
+    """这个注册域名是不是权威来源（判断 b 号白名单）？"""
+    return (domain or "").lower() in AUTHORITATIVE_DOMAINS
+
+
+def is_market_denylisted_domain(domain):
+    """这个注册域名是不是行情黑名单（2026-11-13）？
+    黑名单站不是股票/指数收盘的权威来源，绝不能只凭它一家
+    就把数当收盘价给出去。"""
+    return (domain or "").lower() in MARKET_DENYLIST_DOMAINS
+
+
+def market_source_tier(domain):
+    """行情来源档位（2026-11-13，权威报道优先）：
+    0 = 权威财经来源（白名单里的交易所/财经数据商），
+    1 = 普通来源（既不权威也不在黑名单），
+    2 = 黑名单来源（币圈交易所等）。排序用：权威在前，黑名单在后。"""
+    domain = (domain or "").lower()
+    if domain in AUTHORITATIVE_DOMAINS:
+        return 0
+    if domain in MARKET_DENYLIST_DOMAINS:
+        return 2
+    return 1
+
+
+def check_numeric_consensus(results, date_iso, tolerance=0.01):
+    """双源印证（判断 b 号）：给定一组搜索结果（to_dict 后的 dict，
+    含 url + dated_numbers）和目标日期，判断两个独立来源的数对不对得上。
+
+    只认 date == date_iso 且配上日期的数（50/54 的日期-数字配对已经
+    算好了）；同一注册域名的多个结果算一家（finance.yahoo.com 和
+    yahoo.com 不算两家）。数按 kind 分组（收盘价和涨跌幅不混着比），
+    同 kind 里两个独立来源的数在 tolerance 内对得上才算印证。
+    收盘价 tolerance 默认 0.01（精确到小数点后两位）；气温传 1.0
+    （±1°C 算对得上）。
+
+    返回 {"consensus": bool, "value": str|None, "kind": str|None,
+    "sources": [domain, ...], "source_count": int,
+    "by_kind": {kind: {"consensus": bool, "value": ..., "sources": [...]}},
+    "date": date_iso}。
+    consensus 为真时 value 是两个来源都认的数（字符串，原样）；为假时
+    value 是 None（别拿单家的数当事实用）。
+    """
+    by_kind = {}
+    for result in results or []:
+        domain = registrable_domain((result or {}).get("url") or "")
+        if not domain:
+            continue
+        for entry in (result or {}).get("dated_numbers") or []:
+            if (entry or {}).get("date") != date_iso:
+                continue
+            kind = (entry or {}).get("kind") or "price"
+            value = (entry or {}).get("value")
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            by_kind.setdefault(kind, {}).setdefault(domain, number)
+    verdicts = {}
+    for kind, per_domain in by_kind.items():
+        domains = sorted(per_domain)
+        agreed_value = None
+        agreed_sources = []
+        # 找“最多独立来源认的那个数”：每个数当一回候选，数它有多少家
+        # 在 tolerance 内认它；两家以上认同一个数才算印证。
+        for candidate_domain in domains:
+            candidate = per_domain[candidate_domain]
+            supporters = [
+                domain
+                for domain in domains
+                if abs(per_domain[domain] - candidate) <= tolerance
+            ]
+            if len(supporters) >= 2 and len(supporters) > len(agreed_sources):
+                agreed_sources = supporters
+                agreed_value = candidate
+        if agreed_value is not None:
+            verdicts[kind] = {
+                "consensus": True,
+                "value": f"{agreed_value:.2f}",
+                "sources": agreed_sources,
+                "source_count": len(agreed_sources),
+            }
+        else:
+            verdicts[kind] = {
+                "consensus": False,
+                "value": None,
+                "sources": domains,
+                "source_count": len(domains),
+            }
+    # 主结论认收盘价（price）那组——行情问题最关心收盘价；
+    # 没收盘价时认数最多的那组。
+    main_kind = "price" if "price" in verdicts else None
+    if main_kind is None and verdicts:
+        main_kind = max(verdicts, key=lambda k: verdicts[k]["source_count"])
+    main = verdicts.get(main_kind) if main_kind else None
+    return {
+        "consensus": bool(main and main["consensus"]),
+        "value": main["value"] if main else None,
+        "kind": main_kind,
+        "sources": main["sources"] if main else [],
+        "source_count": main["source_count"] if main else 0,
+        "by_kind": verdicts,
+        "date": date_iso,
+    }
+
+
 def _parse_date(value):
     """把发布时间解析成日期（ISO / YYYY-MM-DD 都认），解析不了返回 None。"""
     if not value:
@@ -581,6 +871,51 @@ def _is_stale(published_at, days=30):
     return (_date.today() - parsed).days > days
 
 
+def _parse_date_range(date_range):
+    """把 date_range 参数解析成 (开始日期, 结束日期)，都是 date 对象。
+
+    认 {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}；只给一边时另一边
+    就等于那一边（只查当天）；开始晚于结束、格式不对、不是字典时
+    返回 None——调用方按“没给日期范围”处理，不静默用错范围查。
+    """
+    if not isinstance(date_range, dict):
+        return None
+    start = _parse_date(date_range.get("start"))
+    end = _parse_date(date_range.get("end"))
+    if start is None and end is None:
+        return None
+    if start is None:
+        start = end
+    if end is None:
+        end = start
+    if start > end:
+        return None
+    return start, end
+
+
+def _apply_date_range(results, start, end):
+    """按日期范围过滤结果：返回 (留下的结果, 掉出去的条数, 没带时间的条数)。
+
+    28 号：搜回来的数分属不同日期时，只留要的那几天的——带发布时间的，
+    日期在 [start, end] 里才留；没带时间、或时间解析不出来的，留着：
+    没法按日期判断就别硬丢，丢了可能把对的结果也丢了，数量记下来、
+    让模型知道这几条是没时间信息的（回答时标明“没带时间”）。
+    """
+    kept = []
+    dropped = 0
+    undated = 0
+    for result in results or []:
+        parsed = _parse_date(result.published_at)
+        if parsed is None:
+            undated += 1
+            kept.append(result)
+        elif start <= parsed <= end:
+            kept.append(result)
+        else:
+            dropped += 1
+    return kept, dropped, undated
+
+
 def _quality_notes(results, corroborated_domains):
     """结果质量检查（GPT 的建议）：来源、时间（新旧）、多源印证，写成人话。"""
     notes = []
@@ -604,6 +939,51 @@ def _quality_notes(results, corroborated_domains):
         if stale:
             notes.append(f"其中 {len(stale)} 条是 30 天以前的，可能过时了")
     return notes
+
+
+def _outcome_has_close_candidate(outcome, day_iso):
+    """这一批结果里有没有可能是收盘价的数：plain number（kind=price，
+    不是百分比）且配上了要的那天的日期。百分比不算——财联社“跌幅达
+    0.9%”配上了 2026-11-10，但那是盘中跌幅，不是收盘价；2025 年表里
+    的数配的是 2025 年的日期，也不算。"""
+    for result in (outcome.results or []):
+        for item in extract_dated_numbers(f"{result.title}. {result.snippet}"):
+            if item.get("kind") == "price" and item.get("date") == day_iso:
+                return True
+    return False
+
+
+def _outcome_has_undated_price_for_day(outcome, day_iso):
+    """这一批结果里有没有没配上日期的 plain number，同时整条结果提到了
+    要的那天（日期在标题里、数在正文里这种——句内配对够不着，但整条
+    结果就是讲那天的，比如美联社“Tuesday 11/10/2026”标题 + 正文里的
+    7,520.93）。重试的接受条件用这个：模型自己会读正文判断哪个数是
+    收盘价，重试只要把像样的 raw 材料带回来就行。"""
+    day = date.fromisoformat(day_iso)
+    for result in (outcome.results or []):
+        if _result_rank_for_day(result, day_iso) == 1:
+            return True
+    return False
+
+
+def _result_rank_for_day(result, day_iso):
+    """一条结果对要的那天的有用程度（51 号排序用）：0 = 有配上那天的
+    plain number（收盘价候选）；1 = 有没配上日期的 plain number、同时
+    整条结果提到了那天（日期在标题里、数在正文里）；2 = 其他。
+    排序时 0 在前、1 其次，2 垫底。"""
+    text = f"{result.title}. {result.snippet}"
+    dated = extract_dated_numbers(text)
+    if any(
+        item.get("kind") == "price" and item.get("date") == day_iso
+        for item in dated
+    ):
+        return 0
+    day = date.fromisoformat(day_iso)
+    if any(m["date"] == day for m in parse_date_mentions(text)) and any(
+        item.get("kind") == "price" and item.get("date") is None for item in dated
+    ):
+        return 1
+    return 2
 
 
 class SearchService:
@@ -682,14 +1062,23 @@ class SearchService:
             for name, provider in self.providers.items()
         ]
 
-    def search(self, query, kind="normal", max_results=5, cross_check=False, force_provider=None):
+    def search(self, query, kind="normal", max_results=5, cross_check=False, force_provider=None, date_range=None):
         """搜一次。kind 是 normal（普通查询）或 structured（结构化信息）；
         force_provider 直接指定只用某一个服务（备选链路测试用）；
-        cross_check 为真时，再用搭档服务的结果互相印证。"""
+        cross_check 为真时，再用搭档服务的结果互相印证。
+        date_range 是 {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}（28 号）：
+        结果按 published_at 过滤到这几天——带时间的只留范围内的，没带时间
+        的留着（没法按日期判断）；一家服务过滤后没结果就顺着链路切下一家，
+        都没结果时报错里写明是日期过滤掉的，让模型放宽范围或去掉它再查。"""
         if kind not in _CHAINS:
             raise ToolError(f"未知的搜索类型：{kind}（只认 normal / structured）")
         if not (query or "").strip():
             raise ToolError("查询不能为空")
+        # 28 号：日期范围先解析好（格式不对按没给处理，不静默用错范围查）。
+        parsed_range = _parse_date_range(date_range)
+        range_start = parsed_range[0] if parsed_range else None
+        range_end = parsed_range[1] if parsed_range else None
+        date_filter_stats = {"dropped": 0, "undated": 0}
         if force_provider is not None:
             if force_provider not in self.providers:
                 raise ToolError(f"未知的搜索服务：{force_provider}")
@@ -728,8 +1117,29 @@ class SearchService:
                     {"provider": name, "status": "empty", "reason": "这个服务没找到结果"}
                 )
                 continue
+            # 28 号：按日期范围过滤——一家服务过滤后没结果就切下一家，
+            # 别拿着别的日子的数当答案。没带时间的留着，数量记下来。
+            if range_start is not None:
+                kept, dropped, undated = _apply_date_range(
+                    candidate.results, range_start, range_end
+                )
+                if not kept:
+                    attempts.append(
+                        {
+                            "provider": name,
+                            "status": "empty",
+                            "reason": f"按日期过滤（{range_start} 至 {range_end}）后没有结果",
+                            "date_filtered": True,
+                        }
+                    )
+                    continue
+                candidate.results = kept
+                date_filter_stats["dropped"] += dropped
+                date_filter_stats["undated"] += undated
             outcome = candidate
             outcome.query = query
+            # 48 号：实际发出去的查询词（翻成英文时是英文那份）。
+            outcome.executed_query = send_query
             attempt = {"provider": name, "status": "ok"}
             if send_query != query:
                 attempt["translated_query"] = send_query
@@ -755,7 +1165,17 @@ class SearchService:
                 status = "failed"
             elif attempted:
                 tried = "、".join(a["provider"] for a in attempted)
-                error = f"试过的服务都没找到结果（{tried}）"
+                if any(a.get("date_filtered") for a in attempted):
+                    # 28 号：不是没搜到，是日期过滤把结果都滤掉了——
+                    # 报错里写明，让模型放宽范围或去掉 date_range 再查，
+                    # 别让它以为“没这个东西”就说不知道。
+                    error = (
+                        f"按日期过滤（{range_start} 至 {range_end}）后没有结果："
+                        "搜到了，但都不是这几天的——"
+                        "可以放宽日期范围或去掉 date_range 再查"
+                    )
+                else:
+                    error = f"试过的服务都没找到结果（{tried}）"
                 status = "no_results"
             else:
                 skipped = "；".join(
@@ -780,6 +1200,71 @@ class SearchService:
                 quality={"results": 0, "with_url": 0, "notes": [error]},
                 fetched_at=_now_iso(),
             )
+        # 51 号实测（2026-11-12）：Tavily 中文查询召回差——“标普500指数
+        # 11月10日 收盘”只搜回一则盘中快讯（0.9% 是百分比，不是收盘价）
+        # 和一张 2025 年的表，没有 2026-11-10 的收盘数；同一问题翻成英文
+        # 一次就搜到美联社的收盘数（7,520.93）。链路只在“没结果”时才切
+        # 备选，“有结果、但没有要的那天的收盘价”就停了，模型只能说没查到。
+        # 所以：带单日 date_range 且结果里一个收盘价候选都没有时，翻成英文
+        # 整条链重跑一次；重跑后有了收盘价候选（配上那天的 plain number，
+        # 或整条结果讲那天、数没配上日期）就用重跑的，还是没有就留第一份
+        #（别把已有的结果弄丢）。只重试一次——翻出来的查询不再含中文，
+        # 不会再触发。
+        # 英文查询优先用程序拼的（行情问题：实体英文名 + close + 日期，
+        # 确定的、不花钱）：模型翻译器对短词组不稳，实测“纳斯达克指数 收盘”
+        # 翻回来还是中文，重试就触发不了；非行情问题才走模型翻译器。
+        if (
+            range_start is not None
+            and range_start == range_end
+            and _contains_cjk(query)
+            and not _outcome_has_close_candidate(outcome, range_start.isoformat())
+        ):
+            retry_query = english_market_close_query(query, range_start)
+            if retry_query is None and self.translator is not None:
+                translated = None
+                try:
+                    translated = self.translator(query, "en")
+                except Exception:
+                    translated = None
+                if (
+                    translated
+                    and translated.strip()
+                    and translated.strip() != query.strip()
+                    and not _contains_cjk(translated)
+                ):
+                    retry_query = translated.strip()
+            if retry_query:
+                retry = self.search(
+                    retry_query,
+                    kind=kind,
+                    max_results=max_results,
+                    cross_check=cross_check,
+                    force_provider=force_provider,
+                    date_range=date_range,
+                )
+                if retry.status == "ok" and (
+                    _outcome_has_close_candidate(retry, range_start.isoformat())
+                    or _outcome_has_undated_price_for_day(
+                        retry, range_start.isoformat()
+                    )
+                ):
+                    attempts.append(
+                        {
+                            "provider": retry.provider,
+                            "status": "ok",
+                            "reason": "中文查询没有要的那天的收盘价，翻成英文重搜后找到",
+                        }
+                    )
+                    outcome = retry
+        # 51 号实测（2026-11-12）：道指 11.10 那轮，第一轮搜回来的结果里
+        # 本来就有 2026-11-10 的收盘数（英为财情历史表：收 52,231.89），
+        # 但排在维基百科那条巨型摘要后面，工具结果 4000 字截断把它截掉了，
+        # 模型根本没看到、只能说没查到。所以：带单日 date_range 时，把
+        # 有那天收盘价候选的结果排前面（稳定排序，只提顺序、不丢结果），
+        # 其次是整条结果讲那天、数没配上日期的，让模型先看到能用的数。
+        if range_start is not None and range_start == range_end:
+            day_iso = range_start.isoformat()
+            outcome.results.sort(key=lambda r: _result_rank_for_day(r, day_iso))
         if not outcome.fetched_at:
             outcome.fetched_at = _now_iso()
         outcome.attempts = attempts
@@ -798,6 +1283,15 @@ class SearchService:
                     partner_query = self._send_query_for(partner_name, query)
                     partner_outcome = partner.search(partner_query, max_results=max_results)
                     if partner_outcome.status == "ok":
+                        # 28 号：搭档的结果也要按日期过滤（搭档那路没过滤），
+                        # 过滤完再合并、再算互相印证——印证只算范围内的来源。
+                        if range_start is not None:
+                            filtered, dropped, undated = _apply_date_range(
+                                partner_outcome.results, range_start, range_end
+                            )
+                            partner_outcome.results = filtered
+                            date_filter_stats["dropped"] += dropped
+                            date_filter_stats["undated"] += undated
                         seen_urls = {r.url for r in outcome.results}
                         merged = list(outcome.results)
                         new_results = []
@@ -835,6 +1329,21 @@ class SearchService:
             "translated_back": translated_back,
             "notes": _quality_notes(outcome.results, corroborated),
         }
+        # 28 号：日期过滤的情况记进结果里（模型看得到、界面也看得到），
+        # 告诉模型哪些去掉了、哪些没带时间——回答时标明每组数是哪天的。
+        if range_start is not None:
+            outcome.date_range = {
+                "start": str(range_start),
+                "end": str(range_end),
+                "dropped": date_filter_stats["dropped"],
+                "undated": date_filter_stats["undated"],
+            }
+            note = f"已按日期过滤到 {range_start} 至 {range_end}"
+            if date_filter_stats["dropped"]:
+                note += f"，去掉了 {date_filter_stats['dropped']} 条其他日期的结果"
+            if date_filter_stats["undated"]:
+                note += f"，{date_filter_stats['undated']} 条没带时间（没法按日期判断，留着）"
+            outcome.quality["notes"].append(note)
         if translated_back:
             outcome.quality["notes"].append(
                 "查询先翻成英文再搜（AnySearch 中文不准），标题和摘要已翻回中文"

@@ -271,10 +271,13 @@ def test_add_turn_empty_messages_does_nothing(tmp_path):
     assert store._memory.add_calls == []
 
 
-def test_add_turn_failure_returns_empty_dict(tmp_path):
-    """add 失败时返回 {} 不抛异常：存记忆失败不能把已经拿到的聊天回答搞崩。
+def test_add_turn_failure_returns_flagged_dict(tmp_path):
+    """add 失败时不抛异常，也不悄悄返回 {}（52 号）：失败要标出来
+    （extraction_failed），原消息留在 failed_messages 里等下轮重试，
+    存记忆失败不能把已经拿到的聊天回答搞崩。
 
-    Plan C：失败发生在提交时（本轮先待定），所以 flush_pending() 返回 {}。"""
+    Plan C：失败发生在提交时（本轮先待定），所以 flush_pending() 返回
+    带失败标记的字典。"""
     memory = FakeMemory()
 
     def _boom(messages, user_id=None, infer=True):
@@ -289,7 +292,10 @@ def test_add_turn_failure_returns_empty_dict(tmp_path):
     )
     result = store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
     assert result.get("pending") is True
-    assert store.flush_pending() == {}
+    flushed = store.flush_pending()
+    assert flushed.get("extraction_failed") is True
+    assert flushed.get("extraction_reason") == "mem0_add_failed"
+    assert flushed.get("failed_messages") == ["我喜欢喝咖啡。"]
 
 
 def test_add_turn_concurrent_writes_do_not_crash(tmp_path):

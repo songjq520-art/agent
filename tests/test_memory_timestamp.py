@@ -457,8 +457,15 @@ def test_slot_rename_keeps_old_text_and_orders_by_timestamp(tmp_path):
 
 
 def test_backfill_marks_old_memories_honestly(tmp_path):
-    """没时间戳的老记忆补一次：时间戳补上了，标明是后补的，
-    文本不动、来源不升级（没确认的还是没确认）。"""
+    """33 号改过的回填：真缺时间的老记忆不补、也不乱标来源。
+
+    mem0 2.2.1 的 update() 会保留 payload 原有的 created_at，缺了就是
+    None，传什么都写不进去——所以这种记忆补不了，返回 0、来源也不标
+    成 "backfilled"（没补上时间还标“后补的”是假话）。面板上照实显示
+    未知时间。实际上写入口都带时间、mem0 的 add 缺了也会自己补一个，
+    真缺时间的情况本就不该出现；回填现在只负责“顶层有时间就跳过”，
+    不再每次启动把所有记忆的来源都改写成 backfilled。
+    """
     store = make_fake_store(tmp_path)
     store._memory.add(
         [{"role": "user", "content": "我喜欢看纪录片。"}],
@@ -466,16 +473,16 @@ def test_backfill_marks_old_memories_honestly(tmp_path):
         infer=False,
         metadata=None,
     )
-    assert store.backfill_timestamps() == 1
+    assert store.backfill_timestamps() == 0
     items = store.get_all()
     assert len(items) == 1
     assert items[0]["text"] == "我喜欢看纪录片。"
     meta = items[0]["metadata"]
-    assert meta["created_at"]
-    assert meta["created_at_source"] == "backfilled"
+    assert meta["created_at"] is None
+    assert meta["created_at_source"] is None
     assert meta["source"] == "unconfirmed"
     assert meta["confirmed"] is False
-    # 幂等：补过的不会再补。
+    # 幂等：再调一次还是 0，不反复改写。
     assert store.backfill_timestamps() == 0
 
 
@@ -513,11 +520,9 @@ def test_backfilled_loses_to_written():
 
 
 def test_backfilled_memories_have_no_order(tmp_path):
-    """补完时间的两条老记忆，排序键一样：后补的先后是假的，不能拿来判。
-
-    补的时候明明给了越来越新的时间和递增的序号，但排新旧时一律
-    按没时间算——键撞上，真打架时就问 BOOS。
-    """
+    """真缺时间的两条老记忆，排序键一样：都没时间，键撞上，
+    真打架时就问 BOOS（后补时间的先后是假的，不能拿来判——
+    见 test_backfilled_memories_tie_and_ask，那里直接测排序键）。"""
     store = make_fake_store(tmp_path)
     store._memory.add(
         [{"role": "user", "content": "我喜欢看纪录片。"}],
@@ -531,11 +536,11 @@ def test_backfilled_memories_have_no_order(tmp_path):
         infer=False,
         metadata=None,
     )
-    assert store.backfill_timestamps() == 2
+    assert store.backfill_timestamps() == 0
     items = store.get_all()
     assert len(items) == 2
     assert all(
-        item["metadata"]["created_at_source"] == "backfilled" for item in items
+        item["metadata"]["created_at"] is None for item in items
     )
     keys = [_memory_order_key(item["metadata"]) for item in items]
     assert keys[0] == keys[1]

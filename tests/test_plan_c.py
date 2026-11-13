@@ -156,7 +156,8 @@ def test_seeded_name_and_soul_recall_in_fresh_conversation(tmp_path):
     seeded_again = store.ensure_identity_memories()
     assert seeded_again["agent_name"]["status"] == "unchanged"
     assert seeded_again["soul"]["status"] == "unchanged"
-    assert len(store._memory.all_texts()) == 2
+    # 17 号：种子现在是 3 条——名字 + SOUL + 电脑配置，第二次启动不重复种。
+    assert len(store._memory.all_texts()) == 3
 
 
 def test_chat_naming_stores_user_confirmed_name(tmp_path):
@@ -191,7 +192,14 @@ def test_seed_does_not_overwrite_chat_renamed_name(tmp_path):
     assert "十三" in " ".join(store._memory.all_texts())
     seeded = store.ensure_identity_memories()
     assert seeded["agent_name"]["status"] == "unchanged"
-    assert not any("十二" in text for text in store._memory.all_texts())
+    # 17 号：电脑配置种子文本里也有“十二”（十二的工作区），所以只查
+    # 名字槽位——名字槽位里不能有“十二”，改名后的“十三”才算保住了。
+    name_items = [
+        item
+        for item in store.get_all()
+        if (item.get("metadata") or {}).get("slot") == "agent_name"
+    ]
+    assert not any("十二" in item["text"] for item in name_items)
 
 
 def test_identity_seed_texts_are_the_confirmed_ones():
@@ -394,7 +402,8 @@ def test_seed_marks_legacy_unmarked_name(tmp_path):
     seeded = store.ensure_identity_memories()
     assert seeded["agent_name"]["status"] == "unchanged"
     items = store.get_all()
-    assert len(items) == 2  # 名字（旧的）+ SOUL（新种的），没重复
+    # 17 号：3 条——名字（旧的）+ SOUL（新种的）+ 电脑配置（新种的），没重复
+    assert len(items) == 3
     name_item = [i for i in items if "十二" in i["text"]][0]
     assert name_item["metadata"]["slot"] == "agent_name"
     assert name_item["text"] == "Agent 的名字是十二，你叫十二"
@@ -405,7 +414,14 @@ def test_seed_marks_legacy_unmarked_name(tmp_path):
     renamed = [i for i in store.get_all() if "十三" in i["text"]]
     assert len(renamed) == 1
     assert renamed[0]["id"] == legacy_id
-    assert not any("十二" in t for t in store._memory.all_texts())
+    # 17 号：电脑配置种子文本里也有“十二”（十二的工作区），所以只查
+    # 名字槽位——名字改成十三之后，名字槽位里不能再有“十二”。
+    name_items = [
+        item
+        for item in store.get_all()
+        if (item.get("metadata") or {}).get("slot") == "agent_name"
+    ]
+    assert not any("十二" in item["text"] for item in name_items)
 
 
 def test_rename_updates_legacy_unmarked_user_name(tmp_path):
@@ -448,8 +464,15 @@ def test_correction_of_name_keeps_slot(tmp_path):
     ]
     # 纠错改过的那条是“你叫十三。”（不是“Agent 的名字是…”句式），
     # 但槽位还在，upsert 按槽位找到它、原地改回十二，不并存。
-    assert len([t for t in store._memory.all_texts() if "十二" in t]) == 1
-    assert len([t for t in store._memory.all_texts() if "十三" in t]) == 0
+    # 17 号：电脑配置种子文本里也有“十二”（十二的工作区），所以
+    # “十二/十三出现几次”只数名字槽位里的，不数全库。
+    name_items = [
+        item
+        for item in store.get_all()
+        if (item.get("metadata") or {}).get("slot") == "agent_name"
+    ]
+    assert len([i for i in name_items if "十二" in i["text"]]) == 1
+    assert len([i for i in name_items if "十三" in i["text"]]) == 0
     assert len(name_texts) <= 1
 
 
@@ -477,3 +500,24 @@ def test_flush_pending_commits_last_turn(tmp_path):
     assert [item["memory"] for item in result.get("results", [])] == ["我喜欢喝咖啡"]
     assert store.flush_pending() == {}
     assert store._memory.all_texts() == ["我喜欢喝咖啡"]
+
+
+def test_retraction_natural_phrasing_not_extracted_later(tmp_path):
+    """34 号：自然说法的撤回（“其实也不是很喜欢吃”）——模型判撤回后，
+    被撤回的那条不进库，撤回句本身也不能在后面被提取成一条新记忆。
+    （实测 2026-11-12 08:58：撤回句被存成了第二条记忆。）"""
+    store = make_fake_store(tmp_path)
+    # 这里只测“判撤回之后”的程序行为，判本身靠模型——真判由实测验。
+    store._judge_retraction_intent = lambda *a, **k: True
+    result = store.add_turn([{"role": "user", "content": "我喜欢吃鸡杂面。"}])
+    assert result.get("pending") is True
+    result = store.add_turn([{"role": "user", "content": "其实也不是很喜欢吃。"}])
+    assert result.get("retracted") is True
+    # 被撤回的那条没进库。
+    assert not any("鸡杂面" in t for t in store._memory.all_texts())
+    # 再来一轮普通对话、再 flush：撤回句不能借此回来。
+    store.add_turn([{"role": "user", "content": "今天天气真好。"}])
+    store.flush_pending()
+    texts = store._memory.all_texts()
+    assert not any("不是很喜欢吃" in t for t in texts)
+    assert not any("鸡杂面" in t for t in texts)

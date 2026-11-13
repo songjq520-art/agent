@@ -422,8 +422,10 @@ def test_web_ask_returns_correction_field(monkeypatch, tmp_path):
 
 
 def test_web_ask_without_correction_has_no_correction_field(monkeypatch, tmp_path):
-    """网页入口：普通聊天时 ask() 的返回里没有 "correction" 键
-    （原来的五个键原样返回，不多不少）。"""
+    """网页入口：普通聊天时 ask() 的返回里没有 "correction" 键。
+    第 0 步地基后返回是六个键：原来的五个 + timings_ms（本轮各截耗时）；
+    没有 correction 键（普通聊天没纠错），timings_ms 里是本轮量到的两截
+    （ask 的搜记忆 + 收尾的存记忆，假 run_question 不带计时）。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     store = make_fake_store(tmp_path)
     state = ChatState(budget_tracker=tracker, mem0_store=store)
@@ -441,13 +443,13 @@ def test_web_ask_without_correction_has_no_correction_field(monkeypatch, tmp_pat
 
     monkeypatch.setattr("web.server.run_question", _fake_run_question)
     result = state.ask("今天天气真好。")
-    assert result == {
-        "reply": "假回答",
-        "model": "deepseek-flash",
-        "mode": "real",
-        "cost_usd": 0.0001,
-        "usage": {"total_tokens": 10},
-    }
+    assert result["reply"] == "假回答"
+    assert result["model"] == "deepseek-flash"
+    assert result["mode"] == "real"
+    assert result["cost_usd"] == 0.0001
+    assert result["usage"] == {"total_tokens": 10}
+    assert "correction" not in result
+    assert set(result["timings_ms"]) == {"memory_search_ms", "memory_save_ms"}
 
 
 # ---------- 9. 纠错判断：模型按意思 + 对话上下文裁决（2026-11-09 修正轮） ----------
@@ -527,6 +529,21 @@ def _judge_prompt(calls):
         if (msg or {}).get("role") == "user":
             return (msg or {}).get("content") or ""
     return ""
+
+
+def _correction_judge_calls(judge_calls):
+    """只挑出纠错判的调用（42 号规则提炼是另一路调用，不算在这里）。
+
+    judge_calls 是 _install_fake_judge 记的 (args, kwargs) 列表；纠错判的
+    系统提示是“你是记忆纠错的判断助手”，规则提炼的是“纠正规则的提炼助手”。
+    纠正成功后 42 号会再调一次模型提炼规则，所以数“纠错判调了几次”
+    时必须过滤，不然每个成功纠正的测试都会多算一次。
+    """
+    return [
+        call
+        for call in judge_calls
+        if "记忆纠错的判断助手" in str(call)
+    ]
 
 
 def _pick_in_context(prompt):
@@ -691,8 +708,16 @@ def test_same_topic_correction_judge_uses_context(tmp_path):
         "我喜欢看科幻电影。",
         "我喜欢看纪录片。",
     ]
-    # 模型判被调了一次（第 1 层没了，不再“不调模型直接定”）。
-    assert len(judge_calls) == 1
+    # 纠错判被调了一次（第 1 层没了，不再“不调模型直接定”）。
+    # 注意：只数纠错判（系统提示是“记忆纠错的判断助手”）——纠正成功后
+    # 42 号还会再调一次模型提炼规则（系统提示是“纠正规则的提炼助手”），
+    # 那是另一回事，不算在这里。
+    correction_judge_calls = [
+        call
+        for call in judge_calls
+        if "记忆纠错的判断助手" in str(call)
+    ]
+    assert len(correction_judge_calls) == 1
 
 
 def test_judge_unsure_asks_user_then_resolves(tmp_path):
@@ -726,8 +751,9 @@ def test_judge_unsure_asks_user_then_resolves(tmp_path):
         "我喜欢看科幻电影。",
         "我喜欢看纪录片。",
     ]
-    # 挑中后走原文对上的路，不用再请模型判断。
-    assert len(judge_calls) == 2
+    # 挑中后走原文对上的路，不用再请模型判断（纠错判还是两次；
+    # 纠正成功后 42 号提炼规则又调了一次模型，那是另一路，不算在这里）。
+    assert len(_correction_judge_calls(judge_calls)) == 2
 
 
 def test_judge_failure_falls_back_to_asking_user(tmp_path):
@@ -771,7 +797,8 @@ def test_judge_not_called_for_single_candidate(tmp_path):
     judge_calls = _install_fake_judge(store, choice="none")
     result = _correct_to_documentary(store)
     assert result["correction"]["status"] == "updated"
-    assert judge_calls == []
+    # 纠错判一次没调（42 号提炼规则会调一次模型，那是另一路，不算在这里）。
+    assert _correction_judge_calls(judge_calls) == []
     assert [item["text"] for item in store.get_all()] == ["我喜欢看纪录片。"]
 
 
@@ -917,8 +944,10 @@ def test_judge_called_with_single_in_context(tmp_path):
         "我现在喜欢用 Go 写代码。",
     ]
     # 第 1 层没了，模型判必须被调一次（1000 上限）。
-    assert len(judge_calls) == 1
-    assert judge_calls[0][1]["max_tokens"] == 1000
+    # 只数纠错判——纠正成功后 42 号提炼规则又调了一次模型，不算在这里。
+    correction_calls = _correction_judge_calls(judge_calls)
+    assert len(correction_calls) == 1
+    assert correction_calls[0][1]["max_tokens"] == 1000
 
 
 def test_judge_called_with_zero_in_context(tmp_path):
@@ -930,8 +959,10 @@ def test_judge_called_with_zero_in_context(tmp_path):
     assert result["correction"]["status"] == "updated"
     assert result["correction"]["layer"] == "judge"
     assert result["correction"]["memory_id"] == scifi_id
-    assert len(judge_calls) == 1
-    assert judge_calls[0][1]["max_tokens"] == 1000
+    # 只数纠错判——纠正成功后 42 号提炼规则又调了一次模型，不算在这里。
+    correction_calls = _correction_judge_calls(judge_calls)
+    assert len(correction_calls) == 1
+    assert correction_calls[0][1]["max_tokens"] == 1000
 
 
 def test_judge_called_with_two_in_context(tmp_path):
@@ -945,7 +976,8 @@ def test_judge_called_with_two_in_context(tmp_path):
     assert result["correction"]["status"] == "updated"
     assert result["correction"]["layer"] == "judge"
     assert result["correction"]["memory_id"] == scifi_id
-    assert len(judge_calls) == 1
+    # 只数纠错判——纠正成功后 42 号提炼规则又调了一次模型，不算在这里。
+    assert len(_correction_judge_calls(judge_calls)) == 1
 
 
 def test_judge_truncation_retries_once_at_2000(tmp_path):
@@ -964,12 +996,14 @@ def test_judge_truncation_retries_once_at_2000(tmp_path):
         "我喜欢看纪录片。",
         "我现在喜欢用 Go 写代码。",
     ]
-    assert len(judge_calls) == 2
-    assert judge_calls[0][1]["max_tokens"] == 1000
-    assert judge_calls[1][1]["max_tokens"] == 2000
+    # 只数纠错判——纠正成功后 42 号提炼规则又调了一次模型，不算在这里。
+    correction_calls = _correction_judge_calls(judge_calls)
+    assert len(correction_calls) == 2
+    assert correction_calls[0][1]["max_tokens"] == 1000
+    assert correction_calls[1][1]["max_tokens"] == 2000
     # 重试用的是同一个提示。
-    messages_0 = judge_calls[0][1]["messages"]
-    messages_1 = judge_calls[1][1]["messages"]
+    messages_0 = correction_calls[0][1]["messages"]
+    messages_1 = correction_calls[1][1]["messages"]
     assert messages_0 == messages_1
 
 
@@ -986,9 +1020,11 @@ def test_judge_similar_none_retries_and_picks(tmp_path):
     assert result["correction"]["status"] == "updated"
     assert result["correction"]["layer"] == "judge"
     assert result["correction"]["memory_id"] == scifi_id
-    assert len(judge_calls) == 2
-    assert judge_calls[0][1]["max_tokens"] == 1000
-    assert judge_calls[1][1]["max_tokens"] == 2000
+    # 只数纠错判——纠正成功后 42 号提炼规则又调了一次模型，不算在这里。
+    correction_calls = _correction_judge_calls(judge_calls)
+    assert len(correction_calls) == 2
+    assert correction_calls[0][1]["max_tokens"] == 1000
+    assert correction_calls[1][1]["max_tokens"] == 2000
 
 
 def test_judge_unrelated_none_does_not_retry(tmp_path):

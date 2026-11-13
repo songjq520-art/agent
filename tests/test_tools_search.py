@@ -963,3 +963,406 @@ def test_translator_cross_check_partner_anysearch_gets_translated_query():
     # 搭档新并进来的结果翻回了中文
     assert outcome.results[1].title == "广州晴"
     assert outcome.quality["translated_back"] is True
+
+
+# ---------- 28 号：date_range 按 published_at 过滤 ----------
+
+
+def _dated_outcome(query, provider, dated):
+    """dated：[(标题, published_at 或 None)]，造一条带时间的结果集。"""
+    return SearchOutcome(
+        query=query,
+        provider=provider,
+        status="ok",
+        results=[
+            SearchResult(title=title, url=f"https://example.com/{i}", snippet=f"s{i}", published_at=published)
+            for i, (title, published) in enumerate(dated)
+        ],
+    )
+
+
+def test_date_range_keeps_in_range_drops_out_of_range():
+    # 28 号：11 月 10 日那天的只留 11 月 10 日的，11 月 9 日的去掉，
+    # 没带时间的留着（没法按日期判断），数量记在 outcome.date_range 里。
+    tavily = FakeProvider(
+        "tavily",
+        [_dated_outcome("q", "tavily", [
+            ("纳指 25065.88", "2026-11-10"),
+            ("纳指 25253.14", "2026-11-09"),
+            ("纳指收盘", None),
+        ])],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-10", "end": "2026-11-10"})
+    assert outcome.status == "ok"
+    titles = [r.title for r in outcome.results]
+    assert titles == ["纳指 25065.88", "纳指收盘"]
+    assert outcome.date_range["dropped"] == 1
+    assert outcome.date_range["undated"] == 1
+    assert outcome.date_range["start"] == "2026-11-10"
+
+
+def test_date_range_empty_falls_through_to_next_provider():
+    # 一家服务过滤后没结果就顺着链路切下一家，别拿别的日子的数当答案。
+    tavily = FakeProvider(
+        "tavily",
+        [_dated_outcome("q", "tavily", [("纳指 25253.14", "2026-11-09")])],
+    )
+    parallel = FakeProvider(
+        "parallel",
+        [_dated_outcome("q", "parallel", [("纳指 25065.88", "2026-11-10")])],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=parallel,
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-10", "end": "2026-11-10"})
+    assert outcome.status == "ok"
+    assert outcome.provider == "parallel"
+    assert [r.title for r in outcome.results] == ["纳指 25065.88"]
+    assert outcome.attempts[0]["status"] == "empty"
+    assert outcome.attempts[0]["date_filtered"] is True
+
+
+def test_date_range_all_filtered_reports_date_filter():
+    # 都没结果时报错里写明是日期过滤掉的，让模型放宽范围或去掉它再查。
+    tavily = FakeProvider(
+        "tavily",
+        [_dated_outcome("q", "tavily", [("纳指 25253.14", "2026-11-09")])],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-10", "end": "2026-11-10"})
+    assert outcome.status == "no_results"
+    assert "按日期过滤" in (outcome.error or "")
+    assert "放宽日期范围" in (outcome.error or "")
+
+
+def test_date_range_bad_input_ignored():
+    # 格式不对（开始比结束晚、日期写错）按没给处理，不静默用错范围查。
+    tavily = FakeProvider(
+        "tavily",
+        [
+            _dated_outcome("q", "tavily", [("纳指 25065.88", "2026-11-10")]),
+            _dated_outcome("q", "tavily", [("纳指 25065.88", "2026-11-10")]),
+        ],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", []),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", []),
+    )
+    outcome = service.search("q", date_range={"start": "2026-11-11", "end": "2026-11-10"})
+    assert outcome.status == "ok"
+    assert len(outcome.results) == 1
+    outcome2 = service.search("q", date_range={"start": "不是日期", "end": "2026-11-10"})
+    assert outcome2.status == "ok"
+    assert len(outcome2.results) == 1
+
+
+# ---------- 51 号实测：中文查询没有要的那天的收盘价时，翻成英文重搜 ----------
+
+# 夹具就是 2026-11-12 冒烟实测里真实出现过的三条结果（Tavily 中文查询
+# “标普500指数 11月10日 收盘”搜回来的）：财联社只有盘中跌幅（百分比，
+# 不是收盘价）、雅虎那张是 2025 年的表；英文查询一次就搜到美联社的
+# 收盘数（标题里带 11/10/2026，正文里的 7,520.93 没配上日期）。
+_CLS_LIKE = SearchResult(
+    title="财联社11月10日电，标普500指数跌幅达0.9%，触及日内低点。",
+    url="https://m.cls.cn/detail/2530767",
+    snippet="财联社11月10日电，标普500指数跌幅达0.9%，触及日内低点。",
+    published_at="2026-11-10",
+)
+_YAHOO_LIKE = SearchResult(
+    title="標普500指數 (^GSPC) 歷史數據 - Yahoo 財經",
+    url="https://hk.finance.yahoo.com/quote/%5EGSPC/history",
+    snippet="| 2025年11月11日 | 6,815.64 | 6,855.13 | 6,806.87 | 6,846.61 |"
+    " | 2025年11月10日 | 6,785.36 | 6,841.32 | 6,770.56 | 6,832.43 |",
+)
+_AP_LIKE = SearchResult(
+    title="How major US stock indexes fared Tuesday 11/10/2026",
+    url="https://www.kare11.com/article/syndication/associatedpress/how-major-us-stock-indexes-fared-tuesday-11102026/616-4df3bb95-8333-42f4-b765-66adcca04669",
+    snippet="On Tuesday:\n\nThe S&P 500 fell 29.01 points, or 0.4%, to 7,520.93.\n\n"
+    "The Dow Jones Industrial Average fell 157.86 points, or 0.3%, to 52,231.89.",
+    published_at="2026-11-10",
+)
+_DIRECT_CLOSE = SearchResult(
+    title="标普500指数 11月10日 收盘",
+    url="https://example.com/sp500-1110",
+    snippet="2026年11月10日，标普500指数收于7,520.93点。",
+    published_at="2026-11-10",
+)
+_DAY_1110 = {"start": "2026-11-10", "end": "2026-11-10"}
+
+
+def _retry_translator(calls):
+    def translate(text, target):
+        calls.append((text, target))
+        if target == "en":
+            return "S&P 500 close November 10 2026"
+        return text
+
+    return translate
+
+
+def test_retry_english_when_no_close_candidate():
+    """51 号实测：中文查询搜回来的只有百分比和 2025 年的数，没有
+    2026-11-10 的收盘价——程序拼出英文查询（S&P 500 close November 10
+    2026）重搜，美联社那篇（标题带日期、正文里有没配上日期的 7,520.93）
+    就成了赢家。翻译器这轮没被调（行情问题不用模型翻）。"""
+    tavily = FakeProvider(
+        "tavily",
+        [
+            ok_outcome("q", "tavily", []),
+            ok_outcome("q", "tavily", []),
+        ],
+    )
+    # 假服务按剧本返回整份结果：第一轮财联社 + 雅虎，第二轮美联社。
+    tavily._script = [
+        SearchOutcome(
+            query="q", provider="tavily", status="ok",
+            results=[_CLS_LIKE, _YAHOO_LIKE],
+        ),
+        SearchOutcome(
+            query="q", provider="tavily", status="ok", results=[_AP_LIKE]
+        ),
+    ]
+    parallel = FakeProvider("parallel", [], available=False)
+    anysearch = FakeProvider("anysearch", [], available=False)
+    calls = []
+    service = SearchService(
+        anysearch=anysearch, tavily=tavily, parallel=parallel,
+        translator=_retry_translator(calls),
+    )
+    outcome = service.search(
+        "标普500指数 11月10日 收盘", date_range=_DAY_1110
+    )
+    assert outcome.status == "ok"
+    assert outcome.results[0].title.startswith("How major US stock indexes")
+    assert "7,520.93" in outcome.results[0].snippet
+    # 行情问题走程序拼的英文查询，翻译器没被调；Tavily 两次调用分别是
+    # 中文查询和拼出来的英文查询。
+    assert calls == []
+    assert tavily.calls == [
+        "标普500指数 11月10日 收盘",
+        "S&P 500 close November 10 2026",
+    ]
+    assert any(
+        a.get("reason", "").startswith("中文查询没有要的那天的收盘价")
+        for a in outcome.attempts
+    )
+
+
+def test_retry_uses_translator_for_non_market_query():
+    """非行情问题拼不出英文查询，才走模型翻译器：翻译器翻出的英文查询
+    重搜后找到了要的那天的数，就用重搜的。（特斯拉不在行情实体表里，
+    所以走翻译器；重试结果里的数用带逗号的价格形状——模块只认这种数，
+    “26 度”这种裸整数本来就不是数。）"""
+    tesla_first = SearchResult(
+        title="特斯拉股价今日大涨",
+        url="https://example.com/tesla",
+        snippet="特斯拉股价今日大涨 5%，市场情绪高涨。",
+        published_at="2026-11-10",
+    )
+    tesla_retry = SearchResult(
+        title="Tesla stock price November 10 2026",
+        url="https://example.com/tesla-en",
+        snippet="Tesla shares closed at 1,485.32 on November 10, 2026.",
+        published_at="2026-11-10",
+    )
+    tavily = FakeProvider(
+        "tavily",
+        [
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[tesla_first],
+            ),
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[tesla_retry],
+            ),
+        ],
+    )
+    calls = []
+
+    def tesla_translator(text, target):
+        calls.append((text, target))
+        if target == "en":
+            return "Tesla stock price November 10 2026"
+        return text
+
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", [], available=False),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", [], available=False),
+        translator=tesla_translator,
+    )
+    outcome = service.search("特斯拉股价 11月10日", date_range=_DAY_1110)
+    assert outcome.status == "ok"
+    assert outcome.results[0].title == "Tesla stock price November 10 2026"
+    assert calls == [("特斯拉股价 11月10日", "en")]
+    assert tavily.calls == ["特斯拉股价 11月10日", "Tesla stock price November 10 2026"]
+
+
+def test_no_retry_when_close_candidate_present():
+    """第一轮就有配上那天的收盘价（7,520.93 和 2026年11月10日在同一句），
+    不重试、不翻译。"""
+    tavily = FakeProvider(
+        "tavily",
+        [
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[_DIRECT_CLOSE],
+            )
+        ],
+    )
+    calls = []
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", [], available=False),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", [], available=False),
+        translator=_retry_translator(calls),
+    )
+    outcome = service.search(
+        "标普500指数 11月10日 收盘", date_range=_DAY_1110
+    )
+    assert outcome.status == "ok"
+    assert outcome.results[0].title == "标普500指数 11月10日 收盘"
+    assert calls == []
+    assert len(tavily.calls) == 1
+
+
+def test_no_retry_without_translator_for_non_market():
+    """没配翻译器、又不是行情问题（拼不出英文查询）时不重试（也不崩）：
+    第一轮的结果原样返回。行情问题不用翻译器也能重试（程序拼查询），
+    见 test_retry_english_when_no_close_candidate。"""
+    tavily = FakeProvider(
+        "tavily",
+        [
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[
+                    SearchResult(
+                        title="广州天气",
+                        url="https://example.com/weather",
+                        snippet="广州今日多云，气温 26 度。",
+                        published_at="2026-11-10",
+                    )
+                ],
+            )
+        ],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", [], available=False),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", [], available=False),
+    )
+    outcome = service.search("广州天气 11月10日", date_range=_DAY_1110)
+    assert outcome.status == "ok"
+    assert len(outcome.results) == 1
+    assert len(tavily.calls) == 1
+
+
+def test_no_retry_for_english_query():
+    """英文查询本来就不用翻：第一轮没有收盘价候选也不重试。"""
+    tavily = FakeProvider(
+        "tavily",
+        [
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[_CLS_LIKE, _YAHOO_LIKE],
+            )
+        ],
+    )
+    calls = []
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", [], available=False),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", [], available=False),
+        translator=_retry_translator(calls),
+    )
+    outcome = service.search(
+        "S&P 500 close November 10 2026", date_range=_DAY_1110
+    )
+    assert outcome.status == "ok"
+    assert calls == []
+    assert len(tavily.calls) == 1
+
+
+def test_retry_keeps_first_when_retry_finds_nothing():
+    """重搜后还是没有收盘价候选：留第一份结果，别把已有的弄丢。"""
+    tavily = FakeProvider(
+        "tavily",
+        [
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[_CLS_LIKE, _YAHOO_LIKE],
+            ),
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[_CLS_LIKE],
+            ),
+        ],
+    )
+    calls = []
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", [], available=False),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", [], available=False),
+        translator=_retry_translator(calls),
+    )
+    outcome = service.search(
+        "标普500指数 11月10日 收盘", date_range=_DAY_1110
+    )
+    assert outcome.status == "ok"
+    assert len(outcome.results) == 2
+    assert outcome.results[0].title.startswith("财联社")
+    assert calls == []  # 行情问题走程序拼的英文查询，翻译器没被调
+    assert len(tavily.calls) == 2
+
+
+def test_search_sorts_close_candidate_first():
+    """51 号实测：道指 11.10 那轮，第一轮结果里本来就有 2026-11-10 的
+    收盘数（历史表），但排在维基百科巨型摘要后面、被截断截掉了，模型
+    没看到。带单日 date_range 时，有那天收盘价候选的结果排前面。"""
+    wiki_like = SearchResult(
+        title="道琼斯工业平均指数 - 维基百科",
+        url="https://zh.wikipedia.org/dow",
+        snippet="历史最高点数：51,369.13点，于2026年6月2日出现。"
+        "历史最高收市点数：51,308.46点，于2026年6月2日出现。",
+        published_at="2026-11-10",
+    )
+    history_like = SearchResult(
+        title="道琼斯指数历史数据：指数历史行情，走势图_英为财情",
+        url="https://cn.investing.com/indices/us-30-historical-data",
+        snippet="2026年11月10日，开盘 52,163.21，最高 52,316.89，"
+        "最低 51,977.08，收盘 52,231.89。",
+        published_at="2026-11-10",
+    )
+    tavily = FakeProvider(
+        "tavily",
+        [
+            SearchOutcome(
+                query="q", provider="tavily", status="ok",
+                results=[wiki_like, history_like],
+            )
+        ],
+    )
+    service = SearchService(
+        anysearch=FakeProvider("anysearch", [], available=False),
+        tavily=tavily,
+        parallel=FakeProvider("parallel", [], available=False),
+    )
+    outcome = service.search("道琼斯指数 收盘 点数", date_range=_DAY_1110)
+    assert outcome.status == "ok"
+    assert outcome.results[0].title.startswith("道琼斯指数历史数据")
+    assert "52,231.89" in outcome.results[0].snippet
+    # 没丢结果，只是换了顺序。
+    assert len(outcome.results) == 2

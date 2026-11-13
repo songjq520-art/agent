@@ -49,6 +49,17 @@ class FakeMem0Store:
         self.memories = list(memories or [])
         self.saved_turns = []
         self.noted_context = []
+        # 25 号直存记下来的（每项 {"text", "source"}），供测试核对
+        # “记住”有没有立刻存、记的来源对不对。
+        self.direct_stored = []
+
+    def add_memory_text(self, text, source="user"):
+        """25 号直存：记下来，放进 memories 里让下一轮 search() 能找到
+        （和真实库“存完下一句就能查到”一致），返回非空表示存成了。"""
+        self.direct_stored.append({"text": text, "source": source})
+        if text not in self.memories:
+            self.memories.append(text)
+        return {"results": [{"id": f"d{len(self.direct_stored)}", "memory": text, "event": "ADD"}]}
 
     def search(self, query, top_k=5):
         """返回固定的记忆列表（每项和真实 Mem0Store.search() 的格式一致）。"""
@@ -61,6 +72,12 @@ class FakeMem0Store:
         """记下收到的消息（复制一份，免得调用方之后改了历史影响核对）。"""
         self.saved_turns.append(list(messages))
         return {}
+
+    def save_turn(self, messages, turn_id=None):
+        """26 号后台存：假 store 不模拟后台线程，直接走 add_turn 当场存
+        （和真实库“纠错/撤回走同步”的那条路一致），返回 add_turn 的结果。
+        这样 web 层“回答后存了本轮对话”的核对（saved_turns）不用改。"""
+        return self.add_turn(messages)
 
     def note_context(self, memories):
         """记下本轮检索到的记忆 id（和真实 Mem0Store.note_context 一致，
@@ -364,6 +381,38 @@ def test_ask_with_mem0_but_no_results_asks_plainly(tmp_path, monkeypatch):
     assert seen["prompt"] == "今天天气怎么样？"
     assert len(mem0_store.saved_turns) == 1
     assert mem0_store.saved_turns[0] == state.messages
+
+
+def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatch):
+    """25 号：网页说“记住……”要立刻直存（不用等下一轮），收尾跳过
+    add_turn（别让提取再存一条推断版）；下一句问起来就能查到。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    mem0_store = FakeMem0Store(memories=[])
+    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    seen = {}
+
+    def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["prompt"] = prompt
+        return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _capturing_fake)
+    result = state.ask("记住，我喜欢喝冰美式")
+    assert result["mode"] == "real"
+    assert result["reply"] == "假回答"
+    # 直存了：内容是“记住”后面的文字，来源是 user（已确认）。
+    assert mem0_store.direct_stored == [
+        {"text": "我喜欢喝冰美式", "source": "user"}
+    ]
+    # 直存那轮不调 add_turn（已经在库里了，再提取会重复存）。
+    assert len(mem0_store.saved_turns) == 0
+    # 直存的记忆在当轮搜记忆时就已经能找到，发给模型的提示块里有它。
+    assert "我喜欢喝冰美式" in seen["prompt"]
+    # 下一句马上问，搜到的记忆块里有这条（不用等一轮）。
+    result = state.ask("你记不记得我喜欢喝什么")
+    assert result["mode"] == "real"
+    assert "我喜欢喝冰美式" in seen["prompt"]
+    # 普通那轮照常走 add_turn（只跳过“记住”那轮）。
+    assert len(mem0_store.saved_turns) == 1
 
 
 def test_proposals_endpoint_is_gone(running_server):
@@ -1395,3 +1444,53 @@ def test_page_chat_bubble_uses_markdown_renderer():
     )
     assert "bubble.innerHTML = renderMarkdown(text)" in html
     assert "function renderMarkdown" in html
+
+
+# ---------- 第 4 批界面：35 号排队、36 号倒序+返回按钮、39 号宽面板、40 号后台总结 ----------
+# 页面 JS 没有浏览器跑不了，只做静态检查（关键结构和文案在页面源码里）
+# + node 语法检查（见 test_page_script_syntax_is_valid）。行为本身
+# （排队真不丢、点新对话真不卡）靠 BOOS 在本地浏览器里点一遍。
+
+
+def _read_page_html():
+    return (Path(__file__).resolve().parent.parent / "web" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_page_send_queue_keeps_input_when_busy():
+    """35 号：忙的时候输入不丢——排队结构在，排队文案在，忙完接着发。"""
+    html = _read_page_html()
+    assert "const sendQueue = []" in html
+    assert "sendQueue.push({ text, wrap })" in html
+    assert "排队中，忙完就发" in html
+    assert "已排队 ' + sendQueue.length + ' 条，忙完就发" in html
+    assert "sendQueue.shift()" in html
+    assert "async function _sendNow(text, shownWrap)" in html
+
+
+def test_page_memories_newest_first_and_back_button_bottom():
+    """36 号：记忆列表新的在前（按 created_at 倒序），返回按钮上下各一个。"""
+    html = _read_page_html()
+    assert "return tb - ta;" in html
+    assert 'id="backToChat"' in html
+    assert 'id="backToChatBottom"' in html
+    assert "← 返回对话" in html
+
+
+def test_page_memories_panel_wider_than_chat():
+    """39 号：记忆面板比对话宽、布局分开——面板 1100px，对话 860px。"""
+    html = _read_page_html()
+    assert "max-width: 1100px" in html
+    assert "max-width: 860px" in html
+
+
+def test_page_new_chat_opens_immediately_and_summarizes_in_background():
+    """40 号：点新对话立刻开新的（先清聊天区、显示“已开始新对话”），
+    总结放后台跑（pollClosedSummary 轮询，等好了再补摘要卡片），
+    重复点不重复开（newChatResetting 防重入）。"""
+    html = _read_page_html()
+    assert "let newChatResetting = false" in html
+    assert "已开始新对话" in html
+    assert "async function pollClosedSummary(closedId, triesLeft, anchorWrap)" in html
+    assert "pollClosedSummary(data.closed_id, 30, startedWrap)" in html

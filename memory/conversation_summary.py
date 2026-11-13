@@ -135,14 +135,26 @@ def estimate_messages_tokens(messages):
 
 
 def format_turns(turns):
-    """把一轮轮消息排成给模型看的对话记录（BOOS 说的话标 BOOS，回答标十二）。"""
+    """把一轮轮消息排成给模型看的对话记录（BOOS 说的话标 BOOS，回答标十二）。
+
+    每轮前面标“第 N 轮”：一轮是一问一答（一条 BOOS 消息 + 后面跟的
+    十二回答），37 号防混轮用——摘要要按轮次对齐、每轮只写自己的事，
+    模型得先看得出哪句是哪轮的。连续两条 BOOS 消息各算新的一轮；
+    开头没有 BOOS 消息的十二回答算进第 1 轮。
+    """
     lines = []
+    round_no = 0
     for msg in turns or []:
         role = (msg or {}).get("role")
         content = (msg or {}).get("content") or ""
         if role == "user":
+            round_no += 1
+            lines.append(f"第 {round_no} 轮")
             lines.append(f"BOOS：{content}")
         elif role == "assistant":
+            if round_no == 0:
+                round_no = 1
+                lines.append(f"第 {round_no} 轮")
             lines.append(f"十二：{content}")
         else:
             lines.append(content)
@@ -178,11 +190,17 @@ def build_summary_prompt(turns, previous_summary=None):
         "- 保留关键信息：聊了什么话题、BOOS 说了什么重要的事、做了什么决定、"
         "提到的人名/地名/数字/待办；",
         "- 只写对话里有的内容，不要编造，不要加自己的推测；",
+        "- 按时间顺序写，先聊的先写，后聊的后写；",
+        "- 每轮只写那轮自己的事，别把一轮的事算到另一轮里"
+        "（对话记录里标了第几轮）；",
+        "- 同一件事只写一次，别重复；",
+        "- 不确定的写不知道，别猜、别补；",
         "- 摘要是给以后翻看用的，写清楚、别写空话。",
     ]
     if previous_summary:
         parts.append(
-            "下面是这段对话之前的摘要，请把新内容合并进去，仍保持在 500 字以内：\n"
+            "下面是这段对话之前的摘要，请把新内容合并进去，仍保持在 500 字以内，"
+            "同一件事别重复写两遍，不确定的写不知道：\n"
             f"{_redact_sensitive(previous_summary)}"
         )
     parts.append("对话记录：\n" + format_turns(_redacted_turns(turns)))
@@ -517,6 +535,21 @@ class ConversationSummaryStore:
             "turns_summarized": rec.get("turns_summarized") or 0,
         }
 
+    def current_record(self):
+        """正在聊的那条记录（id、标题、摘要），没有时返回 None。
+
+        41 号当前对话恢复用：只拿正在聊的这一条，不回落到列表最新那条
+        （刚开新对话时，列表最新是上一段对话，不能当成当前对话）。
+        """
+        record = getattr(self, "_current_record", None)
+        if record is None:
+            return None
+        return {
+            "id": record.get("id"),
+            "title": record.get("title") or "新对话",
+            "summary": record.get("summary") or "",
+        }
+
     def begin_conversation(self):
         """开始一段新对话：正在聊的换成一条空记录（不进列表，等第一轮再记）。
 
@@ -631,7 +664,7 @@ class ConversationSummaryStore:
         self.save()
         return True
 
-    def flush(self, messages):
+    def flush(self, messages, record_id=None, summary_text=None):
         """对话结束时把剩下的历史总结进摘要、存硬盘。
 
         总结的是调用方手里剩下的全部消息（压缩后留下的最近几轮，
@@ -641,17 +674,33 @@ class ConversationSummaryStore:
         可能已经有一份梗概），合并时模型会去重，摘要只是梗概、
         轻微重复不影响用；但同一份消息绝不会被 flush 两遍
         （指纹拦着）。
+        参数 record_id（40 号：后台总结上一段时用）：总结进哪条记录，
+        传了就按 id 找那条旧记录写，不碰正在聊的那条——点“新对话”后
+        上一段在后台总结，不能写串到新对话里；id 对不上时返回 False，
+        不写进别的记录里。不传时总结进正在聊的那条（老行为）。
+        参数 summary_text（40 号）：已经算好的摘要（后台线程调模型算的），
+        传了就直接用它写，不再调一次模型；不传时现场调 summarizer。
         """
-        if self.summarizer is None:
-            return False
         if not messages:
             return False
         fingerprint = self._fingerprint(messages)
-        if fingerprint == self._last_flush_fingerprint:
+        if record_id is None and fingerprint == self._last_flush_fingerprint:
             # 同一份消息已经总结过一次了，不再总结第二遍。
             return False
-        record = self._ensure_current()
-        new_summary = self.summarizer(list(messages), record.get("summary") or None)
+        if record_id is not None:
+            record = self._find_record(record_id)
+            if record is None:
+                # 旧记录找不到了（比如被 20 条上限挤掉）：不写进别的记录里。
+                return False
+        else:
+            record = self._ensure_current()
+        if summary_text is None:
+            if self.summarizer is None:
+                return False
+            new_summary = self.summarizer(list(messages), record.get("summary") or None)
+        else:
+            # 后台已经算好的摘要：直接用，不再调模型。
+            new_summary = summary_text
         if not (new_summary or "").strip():
             return False
         record["summary"] = _truncate_summary(new_summary.strip())
@@ -663,6 +712,7 @@ class ConversationSummaryStore:
             record["title"] = _make_title(messages, record.get("summary"))
         record["recent"] = _copy_messages(messages[-self.keep_last_rounds * 2 :])
         self._ensure_current_in_list(record)
-        self._last_flush_fingerprint = fingerprint
+        if record_id is None:
+            self._last_flush_fingerprint = fingerprint
         self.save()
         return True

@@ -129,11 +129,13 @@ BUDGET_WARN_RATIO = 1.0  # 到预算 100%（$5）时才提醒，永不自动停�
 # 汇率会动，这里只是一个显示用的换算数，不参与美元记账；汇率明显变了就改这里。
 USD_CNY_RATE = 6.67
 # TOOL_BUDGET_CAP_CNY：$5 工具预算按上面汇率换算的人民币数（显示用）。
-# MAX_OUTPUT_TOKENS（输出上限，单位 Token）：一次回答最多输出 2048 Token。
+# MAX_OUTPUT_TOKENS（输出上限，单位 Token）：一次回答最多输出 4096 Token。
+# 2026-11-13 从 2048 放到 4096（BOOS 批准，原则同步改）：长回答、长代码
+# 不再被拦腰截断；平时短回答用不上这个上限，多花的钱只在长回答上。
 # 这个值既是调用前费用预估用的输出量，也是请求里实际传给 API 的
-# max_tokens 上限；输出成本上限 = 2048/1e6*4.25 美元。
+# max_tokens 上限；输出成本上限 = 4096/1e6*4.25 美元。
 # 注意：预估仍是粗略估算，不能保证单次请求绝对不超支。
-MAX_OUTPUT_TOKENS = 2048
+MAX_OUTPUT_TOKENS = 4096
 # 提醒：这是 Agent 自身的限制，不代表服务商账单的绝对上限，
 #       还要关注各模型官方后台的消费情况（Muse 看 Meta 后台，DeepSeek 看 DeepSeek 后台）。
 
@@ -575,7 +577,7 @@ class BudgetTracker:
         （新规矩：到 $5 提醒，永不自动停）。
 
         预估方法：输入 Token 用 estimate_input_tokens() 估算；
-        输出按 MAX_OUTPUT_TOKENS（2048 Token）估算，这个值同时是请求里
+        输出按 MAX_OUTPUT_TOKENS（4096 Token）估算，这个值同时是请求里
         实际传给 API 的 max_tokens 上限，所以输出量不再是
         凭空假设；缓存按 0 算（最保守，即全部输入按普通价算）。
         参数 provider：按哪个模型的价格估算；model：DeepSeek 时可指定

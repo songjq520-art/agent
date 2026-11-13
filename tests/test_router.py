@@ -514,19 +514,19 @@ def test_chinese_prompt_estimate_not_underestimated(tmp_path):
     assert tracker.estimate_input_tokens(long_chinese) == 15000
     assert tracker.estimate_input_tokens(long_chinese) >= 10000
     assert tracker.estimate_input_tokens(long_chinese) > 2500  # 旧算法的值
-    # 新预估成本 = 15000/1e6*1.25 + 2048/1e6*4.25 = 0.027454 美元，
+    # 新预估成本 = 15000/1e6*1.25 + 4096/1e6*4.25 = 0.036158 美元，
     # 旧算法成本 = 2500/1e6*1.25 + 512/1e6*4.25 = 0.005301 美元。
-    assert tracker.estimate_cost(long_chinese) == pytest.approx(0.027454)
+    assert tracker.estimate_cost(long_chinese) == pytest.approx(0.036158)
     assert tracker.estimate_cost(long_chinese) > 0.005301
     # 短中文 prompt 的预估仍在 $5 预算内，能通过预估检查。
     assert tracker.estimate_input_tokens("你好") == 3  # 2 个汉字 * 1.5
     assert tracker.can_afford_estimated("你好") is True
-    assert MAX_OUTPUT_TOKENS == 2048
+    assert MAX_OUTPUT_TOKENS == 4096
 
 
 def test_max_output_tokens_is_sent_in_request(tmp_path):
-    """输出上限实际生效：调 chat() 时，请求体里必须带 max_completion_tokens=2048，
-    而不是只在预估里假设 2048、实际请求不限输出。"""
+    """输出上限实际生效：调 chat() 时，请求体里必须带 max_completion_tokens=4096，
+    而不是只在预估里假设 4096、实际请求不限输出。"""
     fake_response = Mock()
     fake_response.json.return_value = {
         "choices": [{"message": {"content": "你好"}}],
@@ -540,7 +540,7 @@ def test_max_output_tokens_is_sent_in_request(tmp_path):
         mock_post.assert_called_once()
     assert result["text"] == "你好"
     sent_payload = mock_post.call_args.kwargs["json"]
-    assert sent_payload["max_completion_tokens"] == 2048
+    assert sent_payload["max_completion_tokens"] == 4096
     assert sent_payload["model"] == "muse-spark-1.3"
 
 

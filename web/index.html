@@ -148,6 +148,9 @@
   .bubble ul { margin: 4px 0; padding-left: 20px; }
   .bubble li { margin-bottom: 2px; }
   .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  /* 回答下面“搜了什么”那行小字（48 号）：灰色小字，和 meta 一个风格，
+     只写查询词，不渲染 Markdown。 */
+  .search-note { font-size: 12px; color: var(--muted); margin-top: 4px; }
   .msg.typing .bubble { color: var(--muted); font-style: italic; }
   .welcome {
     text-align: center; color: var(--muted);
@@ -186,10 +189,13 @@
   .hint { max-width: 860px; margin: 8px auto 0; font-size: 11px; color: var(--muted); text-align: center; }
 
   /* ---------- 长期记忆面板 ---------- */
+  /* 39 号：面板和对话别挤同一列——对话列是 860px，面板单独加宽到 1100px，
+     打开时聊天区藏起来，面板自己占一列宽屏展示；长的记忆不截断，
+     卡片上下堆着看全。 */
   .memories {
     flex: 1; overflow-y: auto;
     padding: 18px;
-    max-width: 860px; width: 100%; margin: 0 auto;
+    max-width: 1100px; width: 100%; margin: 0 auto;
   }
   .memories-head {
     display: flex; align-items: flex-start; justify-content: space-between;
@@ -297,6 +303,27 @@
   .approval-actions { display: flex; gap: 8px; margin-top: 10px; }
   .approval-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
 
+  /* ---------- 卡住的任务（12 号） ---------- */
+  /* 重启/关机后没交代的任务（结果未知 / 已暂停），显示在聊天区顶部：
+     每条是原话 + 状态 + 续跑 / 作废两个按钮。样式和确认卡保持一致
+     （白底、细边框、左边一条竖线）。这个盒子不是 .msg，新对话清空
+     （只删 .msg）时它留着，直到任务续跑完或作废了才消失。 */
+  .unresolved {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn, #d97706);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    font-size: 14px; line-height: 1.7;
+    word-break: break-word;
+  }
+  .unresolved-title { font-weight: 700; margin-bottom: 6px; }
+  .unresolved-row { margin: 8px 0; }
+  .unresolved-goal { font-weight: 700; }
+  .unresolved-hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .unresolved-actions { display: flex; gap: 8px; margin-top: 6px; }
+
   /* ---------- 等你点头的横幅 ---------- */
   /* 有没点的确认卡时，聊天区顶部显示这一句，点一下滚到那张卡。
      平时藏起来（hidden），有卡时才显示；卡点完了、过期了就再藏起来。
@@ -396,6 +423,8 @@
       <div id="memoriesList"></div>
       <div class="memories-sub" style="margin-top:16px">保护记录：记忆写入时如果保护失败了（比如快照读不出来、旧记忆没恢复回来），会记在这里，不会悄悄跳过。没有记录就是没出过事。</div>
       <div id="protectionEventsList"></div>
+      <!-- 36 号：返回按钮上下各放一个——看完最下面那条记忆不用翻回顶上就能回去。 -->
+      <div style="margin-top:16px"><button class="btn" id="backToChatBottom">← 返回对话</button></div>
     </div>
 
     <div class="composer" id="composer">
@@ -495,22 +524,92 @@
     }
   }
 
+  // 35 号：排队——忙的时候输入不丢，进队列等着；先发的先答、后发的依次答。
+  // 队列里存 {text, wrap}：wrap 是排队时先显示出来的用户气泡（带“排队中”
+  // 小字），轮到它发时把小字去掉、接着跑，不用再画一遍气泡，顺序不串。
+  const sendQueue = [];
+  const hintEl = document.querySelector('.hint');
+  const hintText = hintEl ? hintEl.textContent : '';
+
+  function updateQueueHint() {
+    if (!hintEl) return;
+    hintEl.textContent = sendQueue.length
+      ? ('已排队 ' + sendQueue.length + ' 条，忙完就发')
+      : hintText;
+  }
+
+  // 48 号：回答下面多一行“搜了什么”，让 BOOS 看到实际查询词。
+  // executed_query 是实际发出去的那份（走 AnySearch 翻成英文时是英文），
+  // 和模型写的中文原文不一样时两份都写；一样时只写一份。
+  function appendSearchNote(wrap, searches) {
+    const list = (searches || []).filter((s) => s && (s.query || s.executed_query));
+    if (!list.length || !wrap) return;
+    const note = document.createElement('div');
+    note.className = 'search-note';
+    note.textContent = '🔍 搜了：' + list.map((s) => {
+      const q = s.query || '';
+      const ex = s.executed_query || '';
+      return ex && ex !== q ? (q + '（实际发出：' + ex + '）') : (q || ex);
+    }).join('；');
+    wrap.appendChild(note);
+  }
+
   // send(presetText)：发一条消息。平时从输入框取值；
   // 纠错候选按钮点“选第 N 条”时，直接传 "第 N 条" 发出去，
   // 走同一条 /api/chat，后端按待确认的纠错把它认成“挑候选”
   // （见 memory/mem0_store.py 的 _parse_pending_selection）。
   async function send(presetText) {
+    // 只认字符串 presetText：点发送按钮时浏览器会传一个鼠标事件对象，
+    // 不是字符串就当没传、读输入框——44 号就是这个事件对象把按钮弄坏的。
+    if (typeof presetText !== 'string') presetText = undefined;
     const text = (presetText !== undefined ? presetText : inputEl.value).trim();
-    if (!text || busy) return;
-    busy = true;
-    sendBtn.disabled = true;
+    if (!text) return;
     if (presetText === undefined) {
       inputEl.value = '';
       inputEl.style.height = 'auto';
     }
-    addMsg('user', text);
+    if (busy) {
+      // 35 号：忙的时候不丢，先显示气泡（带“排队中”小字）、再排队等着；
+      // 输入框已经清空了，可以接着打下一句。
+      const wrap = addMsg('user', text, '排队中，忙完就发');
+      sendQueue.push({ text, wrap });
+      updateQueueHint();
+      return;
+    }
+    busy = true;
+    sendBtn.disabled = true;
+    try {
+      await _sendNow(text, null);
+      while (sendQueue.length) {
+        const next = sendQueue.shift();
+        updateQueueHint();
+        await _sendNow(next.text, next.wrap);
+      }
+    } finally {
+      busy = false;
+      sendBtn.disabled = false;
+      inputEl.focus();
+      updateQueueHint();
+    }
+  }
+
+  // 真正发一轮：调 /api/chat、显示回答。排队里轮到的那句也走这里。
+  // shownWrap 是排队时先显示出来的用户气泡：有它就不用再画一遍，
+  // 只把“排队中”小字去掉；没有（直接发的）就照常画气泡。
+  async function _sendNow(text, shownWrap) {
+    if (shownWrap) {
+      const meta = shownWrap.querySelector('.meta');
+      if (meta) meta.remove();
+    } else {
+      addMsg('user', text);
+    }
     const typing = addMsg('ai', '正在想…');
     typing.classList.add('typing');
+    // 12 号：进度——发出去后每 1.5 秒问一次正在跑的任务，
+    // 有进度就把“正在想…”换成它在干嘛（第几轮、在用什么工具）。
+    // 回答一到就停，不再轮询。
+    const typingBubble = typing.querySelector('.bubble');
+    const progressTimer = setInterval(() => pollProgress(typingBubble), 1500);
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -531,7 +630,9 @@
         const cost = data.cost_usd === null || data.cost_usd === undefined
           ? '成本未知'
           : ('本次 $' + Number(data.cost_usd).toFixed(6));
-        addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+        const aiWrap = addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+        // 48 号：本轮搜过时，回答下面多一行“搜了什么”。
+        if (data.searches) appendSearchNote(aiWrap, data.searches);
         // 本轮是聊天纠错时，后端在返回里多带一个 "correction" 键：
         // 改好了、要挑一条、还是改失败了，都在这里告诉 BOOS；
         // 没这个键时页面和原来一模一样。
@@ -541,12 +642,28 @@
       typing.remove();
       addMsg('ai', '出错了：连不上服务，请确认服务还在运行。');
     }
-    busy = false;
-    sendBtn.disabled = false;
-    inputEl.focus();
+    clearInterval(progressTimer);
     refreshStatus();
     refreshRecent();  // 发完一轮，最近列表里出现/更新这段对话（标题取第一句）。
     refreshPendingApprovals();  // 顺便把没点的确认卡找回来（刷新页面后也一样）。
+    refreshUnresolvedTasks();  // 顺便把没交代的任务找回来（跑完的就不列了）。
+  }
+
+  // 12 号：进度轮询——问一次 /api/tasks/active，正在跑的任务有进度
+  // 就把“正在想…”那行换成它在干嘛；没任务、没进度、气泡已经没了时
+  // 什么都不做，下次再试。读不到也不报错、不拦聊天。
+  async function pollProgress(typingBubble) {
+    if (!typingBubble || !typingBubble.isConnected) return;
+    try {
+      const res = await fetch('/api/tasks/active');
+      const data = await res.json();
+      const tasks = (data && data.tasks) || [];
+      const first = tasks[0];
+      const detail = first && first.progress && first.progress.detail;
+      if (detail && typingBubble.isConnected) typingBubble.textContent = detail;
+    } catch (e) {
+      // 读不到进度也不拦聊天，下次轮询再试。
+    }
   }
 
   // ---------- 聊天里的纠错提示 ----------
@@ -683,7 +800,9 @@
       const cost = data.cost_usd === null || data.cost_usd === undefined
         ? '成本未知'
         : ('本次 $' + Number(data.cost_usd).toFixed(6));
-      addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+      const aiWrap = addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+      // 48 号：本轮搜过时，回答下面多一行“搜了什么”。
+      if (data.searches) appendSearchNote(aiWrap, data.searches);
       if (data.correction) renderCorrection(data.correction);
     } catch (e) {
       box.classList.add('err');
@@ -710,7 +829,150 @@
     }
   }
 
-  sendBtn.addEventListener('click', send);
+  // ---------- 当前对话恢复（41 号） ----------
+  // 页面加载时先拉当前对话：有内容就接着显示（摘要卡片 + 全文消息），
+  // 不用去“最近”里找；没有（刚启动、刚开新对话还没说话）就留空白欢迎页。
+  async function refreshCurrentConversation() {
+    try {
+      const res = await fetch('/api/conversations/current');
+      const data = await res.json();
+      const messages = (data && data.messages) || [];
+      if (!messages.length) return;
+      currentConvId = data.id || null;
+      showChatPanel();
+      chatEl.querySelectorAll('.msg').forEach((node) => node.remove());
+      const summaryCard = renderSummaryCard(data.summary);
+      if (summaryCard) chatEl.appendChild(summaryCard);
+      messages.forEach((m) => {
+        addMsg(m.role === 'user' ? 'user' : 'ai', m.content || '');
+      });
+      if (data.transcript_status && data.transcript_status !== 'full') {
+        addMsg('ai', '这段对话的全文已按保留期转成摘要，上面只显示摘要和最近几轮。');
+      }
+      addMsg('ai', '已恢复当前对话《' + (data.title || '新对话') + '》，接着聊吧。');
+      refreshRecent();
+    } catch (e) {
+      // 当前对话读不到也不拦聊天，空白欢迎页照常用。
+    }
+  }
+
+  // ---------- 卡住的任务（12 号） ----------
+  // 重启/关机后没交代的任务（结果未知 / 已暂停），显示在聊天区顶部：
+  // 每条是原话 + 状态 + 续跑 / 作废两个按钮。盒子不是 .msg，
+  // 新对话清空（只删 .msg）时它留着，直到任务续跑完或作废了才消失。
+  const unresolvedStatusLabel = { UNKNOWN: '结果未知', PAUSED: '已暂停' };
+  // 每条工具调用的状态说法（GPT 第一轮审查 P1 第 4 条）：
+  // 执行过了结果丢了的和结果已保存的要分得清清楚楚。
+  const unresolvedToolStatusLabel = {
+    ok: '已执行（结果已保存）',
+    failed: '执行失败（结果已保存）',
+    timeout: '超时（结果未知）',
+    executing: '执行中（结果未知）',
+    waiting_approval: '等确认（还没执行）',
+    rejected: '被拦下（没执行）',
+    invalid_args: '参数不对（没执行）',
+  };
+
+  async function refreshUnresolvedTasks() {
+    try {
+      const res = await fetch('/api/tasks/unresolved');
+      const data = await res.json();
+      const tasks = (data && data.tasks) || [];
+      const old = document.getElementById('unresolvedBox');
+      if (old) old.remove();
+      if (!tasks.length) return;
+      const box = el('div', 'unresolved');
+      box.id = 'unresolvedBox';
+      box.appendChild(el('div', 'unresolved-title', '有 ' + tasks.length + ' 个任务没交代（重启/关机时停下的），续跑还是作废，你定：'));
+      tasks.forEach((task) => {
+        const row = el('div', 'unresolved-row');
+        row.appendChild(el('div', 'unresolved-goal',
+          '“' + (task.goal || task.task_id || '') + '”——' +
+          (unresolvedStatusLabel[task.status] || task.status || '')));
+        if (task.reason) {
+          row.appendChild(el('div', 'unresolved-hint', task.reason));
+        }
+        if (task.tool_calls && task.tool_calls.length) {
+          const summary = task.tool_calls.map((c) =>
+            (c.tool || '工具') + ' ' +
+            (unresolvedToolStatusLabel[c.status] || c.status || '')
+          ).join('；');
+          row.appendChild(el('div', 'unresolved-hint', '工具：' + summary));
+        }
+        const actions = el('div', 'unresolved-actions');
+        actions.appendChild(smallBtn('续跑', 'primary', () => {
+          row.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+          resumeTask(task, row);
+        }));
+        actions.appendChild(smallBtn('作废', '', () => {
+          row.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+          discardTask(task, row);
+        }));
+        row.appendChild(actions);
+        box.appendChild(row);
+      });
+      chatEl.insertBefore(box, chatEl.firstChild);
+    } catch (e) {
+      // 读不到没交代的任务也不拦聊天，下次发消息时再试。
+    }
+  }
+
+  async function resumeTask(task, row) {
+    try {
+      const res = await fetch('/api/tasks/' + encodeURIComponent(task.task_id) + '/resume', {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        row.appendChild(el('div', 'unresolved-hint', '没续跑成：' + (data.error || ('HTTP ' + res.status))));
+        row.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+        return;
+      }
+      if (data.mode === 'waiting_approval' && data.needs_approval) {
+        row.appendChild(el('div', 'unresolved-hint', '续跑了，又停在下一张确认卡上了。'));
+        renderApproval(data.needs_approval);
+      } else {
+        const cost = data.cost_usd === null || data.cost_usd === undefined
+          ? '成本未知'
+          : ('本次 $' + Number(data.cost_usd).toFixed(6));
+        const aiWrap = addMsg('ai', data.reply, (data.model || '') + ' · ' + cost);
+        // 48 号：本轮搜过时，回答下面多一行“搜了什么”。
+        if (data.searches) appendSearchNote(aiWrap, data.searches);
+        if (data.correction) renderCorrection(data.correction);
+        row.appendChild(el('div', 'unresolved-hint', '续跑完了。'));
+      }
+      row.querySelectorAll('button').forEach((b) => { b.remove(); });
+    } catch (e) {
+      row.appendChild(el('div', 'unresolved-hint', '出错了：连不上服务，请确认服务还在运行。'));
+      row.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+    }
+    refreshStatus();
+    refreshRecent();
+    refreshPendingApprovals();
+    refreshUnresolvedTasks();
+  }
+
+  async function discardTask(task, row) {
+    try {
+      const res = await fetch('/api/tasks/' + encodeURIComponent(task.task_id) + '/discard', {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        row.appendChild(el('div', 'unresolved-hint', '没作废成：' + (data.error || ('HTTP ' + res.status))));
+        row.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+        return;
+      }
+      row.appendChild(el('div', 'unresolved-hint', '已作废。'));
+      row.querySelectorAll('button').forEach((b) => { b.remove(); });
+    } catch (e) {
+      row.appendChild(el('div', 'unresolved-hint', '出错了：连不上服务，请确认服务还在运行。'));
+      row.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+    }
+    refreshUnresolvedTasks();
+  }
+
+  sendBtn.addEventListener('click', () => send());
   inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
@@ -800,7 +1062,15 @@
         return;
       }
       setMemoriesMsg('共 ' + memories.length + ' 条记忆。');
-      memories.forEach((mem) => memoriesListEl.appendChild(renderMemoryItem(mem)));
+      // 36 号：按形成时间倒序，新的在最上面；没时间的排最后。
+      // 后端返回的顺序不保证（mem0 的 list 按 created_at 升序），这里按
+      // created_at 自己排一遍，新的在前才对。
+      const sorted = memories.slice().sort((a, b) => {
+        const ta = Date.parse(((a.metadata || {}).created_at) || '') || 0;
+        const tb = Date.parse(((b.metadata || {}).created_at) || '') || 0;
+        return tb - ta;
+      });
+      sorted.forEach((mem) => memoriesListEl.appendChild(renderMemoryItem(mem)));
     } catch (e) {
       setMemoriesMsg('加载失败：连不上服务，请确认服务还在运行。', true);
     }
@@ -1009,6 +1279,8 @@
 
   document.getElementById('memoriesBtn').addEventListener('click', showMemoriesPanel);
   document.getElementById('backToChat').addEventListener('click', showChatPanel);
+  // 36 号：底下的返回按钮和顶上那一个一样，点一下回对话。
+  document.getElementById('backToChatBottom').addEventListener('click', showChatPanel);
 
   // ---------- 聊天顶部的摘要卡片 ----------
   // 点开一段旧对话 / 开新对话时，顶部显示“之前聊过：”+ 存下来的
@@ -1104,9 +1376,19 @@
   }
 
   // ---------- 原来的聊天逻辑 ----------
+  // 40 号：点新对话立刻开新的——先清聊天区、显示“已开始新对话”，
+  // 不等 /api/reset 回来；上一段的总结在后台做，好了再轮询回来、
+  // 在顶部补一张摘要卡片（新对话里还没发过消息时才补）。
+  // reset 请求在路上时再点也不重复开（newChatResetting）。
+  let newChatResetting = false;
   document.getElementById('newChat').addEventListener('click', async () => {
-    if (busy) return;
+    if (busy || newChatResetting) return;
+    newChatResetting = true;
     showChatPanel();  // 正在看记忆时点了新对话：先回到聊天，再清空。
+    chatEl.querySelectorAll('.msg').forEach((el) => el.remove());
+    currentConvId = null;
+    const startedWrap = addMsg('ai', '已开始新对话，之前的对话已总结保存了，左边“最近”里能找回。');
+    refreshRecent();
     let data = null;
     try {
       const res = await fetch('/api/reset', { method: 'POST' });
@@ -1114,15 +1396,41 @@
     } catch (e) {
       data = null;  // reset 没回包也不拦开新对话：卡片不显示就是了。
     }
-    chatEl.querySelectorAll('.msg').forEach((el) => el.remove());
-    currentConvId = null;
-    // 新对话读回了上一段的摘要时，顶部显示同样的摘要卡片，
-    // 让 BOOS 一眼看出这段对话接的是哪段；没有摘要时不显示。
-    const summaryCard = renderSummaryCard(data && data.summary);
-    if (summaryCard) chatEl.appendChild(summaryCard);
-    addMsg('ai', '已开始新对话，之前的对话已总结保存了，左边“最近”里能找回。');
-    refreshRecent();
+    newChatResetting = false;
+    // 后台总结好了再补摘要卡片：每 2 秒问一次那段对话，最多问 30 次；
+    // 新对话里已经发过消息了就不补（卡片只属于刚开新对话那一刻）。
+    if (data && data.summarizing && data.closed_id) {
+      pollClosedSummary(data.closed_id, 30, startedWrap);
+    }
   });
+
+  // 40 号：轮询刚结束那段对话的摘要——后台总结好了（summary 非空），
+  // 就在“已开始新对话”那句前面补一张摘要卡片；新对话里已经发过
+  // 消息了、或问了 30 次还没好，就不补了（摘要还在“最近”里能看）。
+  async function pollClosedSummary(closedId, triesLeft, anchorWrap) {
+    if (!closedId || triesLeft <= 0) return;
+    if (chatEl.querySelectorAll('.msg.user').length) return;
+    try {
+      const res = await fetch('/api/conversations/' + encodeURIComponent(closedId));
+      const data = await res.json();
+      if (res.ok && data && (data.summary || '').trim()) {
+        if (!chatEl.querySelectorAll('.msg.user').length) {
+          const card = renderSummaryCard(data.summary);
+          if (card) {
+            if (anchorWrap && anchorWrap.isConnected) {
+              chatEl.insertBefore(card, anchorWrap);
+            } else {
+              chatEl.insertBefore(card, chatEl.firstChild);
+            }
+          }
+        }
+        return;
+      }
+    } catch (e) {
+      // 读不到就下次再试，不拦聊天。
+    }
+    setTimeout(() => pollClosedSummary(closedId, triesLeft - 1, anchorWrap), 2000);
+  }
 
   // 侧边栏显示当前实际地址（端口改了也能对上，不用在 HTML 里写死地址）。
   document.getElementById('origin').textContent = window.location.origin;
@@ -1130,6 +1438,8 @@
   refreshStatus();
   refreshRecent();
   refreshPendingApprovals();  // 打开页面时把没点的确认卡找回来。
+  refreshCurrentConversation();  // 41 号：刷新后回到当前对话。
+  refreshUnresolvedTasks();  // 12 号：没交代的任务入口。
   inputEl.focus();
 </script>
 </body>
