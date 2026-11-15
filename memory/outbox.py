@@ -187,6 +187,19 @@ class MemoryOutbox:
                 )
                 if attempt < self._SAVE_RETRIES:
                     time.sleep(self._SAVE_RETRY_DELAY)
+        # 存成了先删盘、再减轮数（2026-11-15 修的竞态）：原来先把
+        # _pending 减到 0，flush 一看是 0 就回来了，可删盘文件那步
+        # 还在后面半步；Windows 上删得慢一点，调用方马上查就撞上
+        # 文件还在（test_57 在笔记本上两回都这么挂）。先删盘再减数，
+        # flush 回来时文件一定已经没了。删失败只记日志（_drop_pending
+        # 内部已处理），不拦减数、不拦回执。
+        if outcome is not None:
+            _failed = bool(
+                (outcome or {}).get("extraction_failed")
+                or (outcome or {}).get("protection_failed")
+            )
+            if not _failed:
+                self._drop_pending(turn_id)
         with self._pending_lock:
             self._pending -= 1
         with self._outcomes_lock:
@@ -203,6 +216,7 @@ class MemoryOutbox:
                 # add_turn 的返回里带 extraction_failed / protection_failed
                 # 时，是上一轮的提交没写成——那几句带着下一轮重试，
                 # 这轮记 failed（不是丢了，是“这次没写成、等重试”）。
+                # 这种也不删盘文件：下次启动还能捞回来重存。
                 failed = bool(
                     (outcome or {}).get("extraction_failed")
                     or (outcome or {}).get("protection_failed")
@@ -211,9 +225,6 @@ class MemoryOutbox:
                     "status": "failed" if failed else "committed",
                     "result": outcome,
                 }
-                if not failed:
-                    # 存成了，删掉落盘文件（57 号）。
-                    self._drop_pending(turn_id)
 
     def _drain(self):
         """后台线程主循环：按顺序取一轮、存一轮。"""

@@ -135,6 +135,18 @@ DEFAULT_USER_ID = "boos"  # 单用户 Agent，记忆都归 BOOS
 # _memory_block）和模型自己判断。阈值是个可调的常量，观测后可以再改。
 RETRIEVAL_THRESHOLD = 0.4
 
+# FETCH_ALL_TOP_K（“取全库”时传给 mem0 get_all 的 top_k）：
+# mem0 2.2.1 的 get_all 默认 top_k=20，不传就只返回前 20 条——
+# 2026-11-15 上午就是这么把库“看少”的：火锅、冒菜一直在库里，
+# 直查只返回前 20 条，看着像没存进去；去重时快照也只看到前 20 条，
+# 刚存的那条看不见，又被重复存了一遍。凡是要“全部记忆”的地方
+# （快照、去重、守卫核对、按 id 找原始 metadata、补时间戳、
+# 关键词补充）都必须走 _fetch_all_raw()，不许再裸调 get_all。
+# 现在库里 30 多条，1000 留足余量；真到 1000 那天再改这个数。
+# （mem0 内部按 top_k*4 从向量库取，1000 就是取 4000 条，个人库没压力；
+# 遥测已关，top_k ≥ 50 的 mem0 提示也不会打出来。）
+FETCH_ALL_TOP_K = 1000
+
 # KEYWORD_MIN_WEIGHT（关键词补充信号的最低权重）：语义检索之外，
 # 再用 v1 那套中文两字窗口关键词做补充。权重 = 匹配到的关键词长度之和，
 # ≥ 2 才算命中（至少一个两字关键词）。补充信号只排在语义结果后面，
@@ -2466,7 +2478,7 @@ class Mem0Store:
             try:
                 keywords = _extract_keywords(query)
                 if keywords:
-                    all_items = self._memory.get_all(filters={"user_id": self.user_id})
+                    all_items = self._fetch_all_raw()
                     for item in (all_items or {}).get("results", []):
                         if len(results) >= top_k:
                             break
@@ -2522,6 +2534,18 @@ class Mem0Store:
         except Exception:
             logger.warning("记对话上下文失败：本次上下文未记录。", exc_info=True)
 
+    def _fetch_all_raw(self):
+        """取全库原始记录（mem0 get_all 的返回口径）。
+
+        唯一允许裸调 self._memory.get_all 的地方：top_k 必须传
+        FETCH_ALL_TOP_K。mem0 默认只给前 20 条，漏了后半个库，
+        去重、守卫、找 metadata 全都会错（2026-11-15 上午的教训：
+        库里 33 条，直查只看到前 20 条）。
+        """
+        return self._memory.get_all(
+            filters={"user_id": self.user_id}, top_k=FETCH_ALL_TOP_K
+        )
+
     def _snapshot_all(self):
         """拍一张库快照（提取前、恢复核对时用）。
 
@@ -2531,7 +2555,7 @@ class Mem0Store:
         分不出来就没法失败关闭（快照读不出来还往里写，就是没保护
         硬写，见 _extract_and_save_turn）。
         """
-        raw = self._memory.get_all(filters={"user_id": self.user_id})
+        raw = self._fetch_all_raw()
         out = []
         for item in (raw or {}).get("results", []):
             text = item.get("memory") or ""
@@ -3759,7 +3783,7 @@ class Mem0Store:
         if not before_items:
             return {"verified": True, "restored": 0, "failed_ids": []}
         try:
-            raw = self._memory.get_all(filters={"user_id": self.user_id})
+            raw = self._fetch_all_raw()
         except Exception:
             logger.warning("覆盖守卫：核对快照时读库失败，本次不恢复。", exc_info=True)
             return {"verified": False, "restored": 0, "failed_ids": []}
@@ -4161,7 +4185,7 @@ class Mem0Store:
         if not memory_id:
             return None
         try:
-            raw = self._memory.get_all(filters={"user_id": self.user_id})
+            raw = self._fetch_all_raw()
         except Exception:
             return None
         for item in (raw or {}).get("results", []):
@@ -4776,7 +4800,7 @@ class Mem0Store:
         """
         with _WRITE_LOCK:
             try:
-                raw = self._memory.get_all(filters={"user_id": self.user_id})
+                raw = self._fetch_all_raw()
             except Exception:
                 logger.warning("补时间戳：读记忆库失败，本次不补。", exc_info=True)
                 return -1

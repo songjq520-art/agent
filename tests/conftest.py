@@ -196,9 +196,12 @@ class FakeMemory:
             scored.sort(key=lambda entry: entry["score"], reverse=True)
             return {"results": scored[:top_k]}
 
-    def get_all(self, filters=None):
+    def get_all(self, filters=None, top_k=None):
         """返回全部已存记忆（id + 文本 + metadata）。
 
+        top_k 对齐真实 mem0 2.2.1：不传（None）默认只给前 20 条，
+        传了就按传的数截断——适配层取全库必须传 FETCH_ALL_TOP_K
+        （2026-11-15 上午的教训：裸调 get_all 只看到前 20 条）。
         get_all_failures 里排着结果时，先按顺序拿一个：None 表示
         这次正常返回，异常对象表示这次抛出来（模拟库读不出来）。
         队空了就正常返回。
@@ -208,16 +211,19 @@ class FakeMemory:
                 outcome = self.get_all_failures.pop(0)
                 if outcome is not None:
                     raise outcome
-            return {
-                "results": [
-                    {
-                        "id": item["id"],
-                        "memory": item["memory"],
-                        "metadata": dict(item["metadata"]) if item.get("metadata") else None,
-                    }
-                    for item in self._items
-                ]
-            }
+            results = [
+                {
+                    "id": item["id"],
+                    "memory": item["memory"],
+                    "metadata": dict(item["metadata"]) if item.get("metadata") else None,
+                }
+                for item in self._items
+            ]
+            if top_k is None:
+                results = results[:20]
+            else:
+                results = results[:top_k]
+            return {"results": results}
 
     def update(self, memory_id, text=None, metadata=None):
         """改一条记忆的文本（和/或 metadata），保留同一 id。

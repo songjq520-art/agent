@@ -44,8 +44,8 @@ class PromotingFakeMemory(FakeMemory):
         raw = super().search(query, filters=filters, top_k=top_k)
         return {"results": [self._promote(it) for it in raw.get("results", [])]}
 
-    def get_all(self, filters=None):
-        raw = super().get_all(filters=filters)
+    def get_all(self, filters=None, top_k=None):
+        raw = super().get_all(filters=filters, top_k=top_k)
         return {"results": [self._promote(it) for it in raw.get("results", [])]}
 
     def update(self, memory_id, text=None, metadata=None):

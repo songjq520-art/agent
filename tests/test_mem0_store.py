@@ -17,6 +17,7 @@ from memory.mem0_store import (
     CUSTOM_INSTRUCTIONS,
     EMBEDDING_DIMS,
     EMBEDDING_MODEL,
+    FETCH_ALL_TOP_K,
     FIRST_MEMORIES,
     MEM0_VERSION,
     RETRIEVAL_THRESHOLD,
@@ -656,3 +657,36 @@ def test_custom_instructions_mentions_key_rules():
     assert "conditionals" in CUSTOM_INSTRUCTIONS
     assert "hypotheticals" in CUSTOM_INSTRUCTIONS
     assert "small talk" in CUSTOM_INSTRUCTIONS
+
+
+# ---------- 取全库必须传大 top_k（2026-11-15 上午的教训） ----------
+
+
+class _DefaultTopKMemory(FakeMemory):
+    """模拟真实 mem0 2.2.1 的 get_all 默认行为：不传 top_k 只给前 20 条。
+
+    2026-11-15 上午：快照裸调 get_all，库里 33 条只看到前 20 条，
+    火锅、冒菜看着像没存进去；去重也因此看不见刚存的那条，又重复存了一遍。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.seen_top_k = []
+
+    def get_all(self, filters=None, top_k=None):
+        self.seen_top_k.append(top_k)
+        return super().get_all(filters=filters, top_k=top_k)
+
+
+def test_snapshot_all_fetches_beyond_mem0_default_top_k(tmp_path):
+    """库里超过 20 条时，快照也要全拿回来，不许被 mem0 默认 top_k=20 截断。"""
+    memory = _DefaultTopKMemory()
+    for i in range(25):
+        memory.add([{"role": "user", "content": f"我喜欢吃菜{i}。"}], infer=False)
+    store = make_fake_store(tmp_path, memory=memory)
+    items = store.get_all(include_sensitive=True)
+    assert len(items) == 25
+    assert [item["text"] for item in items] == [f"我喜欢吃菜{i}。" for i in range(25)]
+    # 适配层取全库必须传大 top_k，而不是靠默认。
+    assert memory.seen_top_k and memory.seen_top_k[-1] == FETCH_ALL_TOP_K
+    assert FETCH_ALL_TOP_K > 20
