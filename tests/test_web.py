@@ -52,6 +52,9 @@ class FakeMem0Store:
         # 25 号直存记下来的（每项 {"text", "source"}），供测试核对
         # “记住”有没有立刻存、记的来源对不对。
         self.direct_stored = []
+        # 第二步衰减：每次 search() 有没有要求强化（reinforce=True），
+        # 供测试核对“真把记忆用上了才强化”的接线。
+        self.reinforce_calls = []
 
     def add_memory_text(self, text, source="user"):
         """25 号直存：记下来，放进 memories 里让下一轮 search() 能找到
@@ -61,8 +64,10 @@ class FakeMem0Store:
             self.memories.append(text)
         return {"results": [{"id": f"d{len(self.direct_stored)}", "memory": text, "event": "ADD"}]}
 
-    def search(self, query, top_k=5):
-        """返回固定的记忆列表（每项和真实 Mem0Store.search() 的格式一致）。"""
+    def search(self, query, top_k=5, reinforce=False):
+        """返回固定的记忆列表（每项和真实 Mem0Store.search() 的格式一致）。
+        reinforce 跟真实签名对齐（默认 False），只记下来、不真写回。"""
+        self.reinforce_calls.append(bool(reinforce))
         return [
             {"id": f"m{i}", "text": text, "score": 0.9, "source": "semantic"}
             for i, text in enumerate(self.memories[:top_k])
@@ -362,6 +367,8 @@ def test_ask_with_mem0_injects_memory_and_saves_turn(tmp_path, monkeypatch):
     assert mem0_store.saved_turns[0] == state.messages
     # 提问前记了一次上下文：搜到的那条记忆的 id（纠错时当“在聊什么”的提示）。
     assert mem0_store.noted_context == ["m0"]
+    # 第二步衰减：提问前那次检索要求了强化（记忆真拼进问题里了）。
+    assert mem0_store.reinforce_calls == [True]
 
 
 def test_ask_with_mem0_but_no_results_asks_plainly(tmp_path, monkeypatch):
@@ -413,6 +420,8 @@ def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatc
     assert "我喜欢喝冰美式" in seen["prompt"]
     # 普通那轮照常走 add_turn（只跳过“记住”那轮）。
     assert len(mem0_store.saved_turns) == 1
+    # 第二步衰减：两轮提问前的检索都要求了强化。
+    assert mem0_store.reinforce_calls == [True, True]
 
 
 def test_proposals_endpoint_is_gone(running_server):
