@@ -23,6 +23,7 @@
 
 import contextvars
 
+from memory.money_slots import extract_core_slots
 from tools.tool_registry import get_tool, register_tool
 
 # 绑定的记忆库：用 ContextVar 存，不用模块全局字典——每个任务
@@ -96,22 +97,94 @@ def _norm_anchor_text(text):
     return (text or "").strip().strip("。！？；，、.!?;, \t\n")
 
 
-def _find_anchor_matches(store, anchor):
-    """库里哪些记忆的原文含有 anchor（归一化后子串比对）。
-    返回 [(id, text)]，按库里的顺序排。anchor 为空时返回 []。"""
+# ---------- 上下文衔接修复（2026-11-15）：删/找记忆不只按字面找 ----------
+# 背景：上午删定投那次，anchor 是固定事实“万家纳指”时，库里“每天定投
+# 5 块”那两条未确认的原文里没有这四个字，子串找不着——十二按字面认不
+# 出它们就是同一个万家纳指。修法：已命中的那条当桥，数字相同、内容词
+# 重合的也算候选（同一槽位扩展），确认卡上会注明这条不是字面命中。
+# 态度词表和 memory/money_slots.py 里 _slot_values_conflict 的保持一致。
+_SLOT_POSITIVE = ("喜欢", "爱吃", "爱喝", "想要", "要吃", "要喝")
+_SLOT_NEGATIVE = ("过敏", "讨厌", "不喜欢", "不吃", "不能吃", "不喝", "不要")
+
+
+def _slot_attitude_conflict(a_text, b_text):
+    """两条记忆是不是同一槽位、态度相反（喜欢 vs 讨厌……）。
+
+    只看态度词，不看数字——数字由 _same_slot 的“共有一个数字”把关。
+    不直接用 _slot_values_conflict：它把“数字集合不同”也算冲突，
+    会把带基金代码（0194442）的同一笔定投拦掉。
+    """
+    a_lower = (a_text or "").lower()
+    b_lower = (b_text or "").lower()
+    a_pos = any(word in a_lower for word in _SLOT_POSITIVE)
+    a_neg = any(word in a_lower for word in _SLOT_NEGATIVE)
+    b_pos = any(word in b_lower for word in _SLOT_POSITIVE)
+    b_neg = any(word in b_lower for word in _SLOT_NEGATIVE)
+    return (a_pos and b_neg) or (a_neg and b_pos)
+
+
+def _same_slot(a_slots, b_slots):
+    """两条记忆是不是同一槽位：共有一个数字 + 一个内容词。
+
+    数字必须相同（“每天喝 2 杯”不会扩到“每天喝 3 杯”），内容词重合
+    才能算（“每月预算 5 美元”不会扩到“每天定投 5 块”——数字都是 5，
+    但没有共同内容词）。
+    """
+    a_nums = {slot for slot in a_slots if slot.startswith("num:")}
+    b_nums = {slot for slot in b_slots if slot.startswith("num:")}
+    a_words = {slot for slot in a_slots if slot.startswith("word:")}
+    b_words = {slot for slot in b_slots if slot.startswith("word:")}
+    return bool(a_nums & b_nums) and bool(a_words & b_words)
+
+
+def _find_anchor_matches(store, anchor, expand=True):
+    """库里哪些记忆和 anchor 相关（归一化后子串比对 + 同一槽位扩展）。
+
+    返回 [(id, text)]，直接命中的在前、同一槽位扩展的在后，各按库里的
+    顺序排。anchor 为空时返回 []。
+    扩展（2026-11-15 上下文衔接修复）：只按字面找，会漏掉“同一件事、
+    换了说法”的记忆——比如 anchor 是“万家纳指”时，库里“每天定投 5 块”
+    那两条未确认的原文里没有这四个字，子串找不着，但它们和已命中的
+    “每天定投 5 块钱买万家纳指”是同一笔定投。所以已命中的那条当桥：
+    数字相同、内容词重合、态度不相反的，也算候选。
+    57 号那次拉面不会被扩进来——它和鸡杂面没有共同数字。
+    expand=False 时只做字面命中（update 走这条：old_text 就是旧原文，
+    字面命中就够了，扩展的候选进不了 update 的精确核对）。
+    """
     norm = _norm_anchor_text(anchor)
     if not norm:
         return []
-    out = []
     try:
         items = store.get_all(include_sensitive=True) or []
     except Exception:
         return []
+    direct = []
+    direct_ids = set()
     for item in items:
         text = (item or {}).get("text") or ""
         if norm in _norm_anchor_text(text):
-            out.append(((item or {}).get("id") or "", text))
-    return out
+            mid = (item or {}).get("id") or ""
+            direct.append((mid, text))
+            direct_ids.add(mid)
+    if not expand:
+        return direct
+    expanded = []
+    expanded_ids = set()
+    for _did, dtext in direct:
+        dslots = extract_core_slots(dtext)
+        for item in items:
+            mid = (item or {}).get("id") or ""
+            if mid in direct_ids or mid in expanded_ids:
+                continue
+            text = (item or {}).get("text") or ""
+            if not text:
+                continue
+            if _slot_attitude_conflict(text, dtext):
+                continue
+            if _same_slot(extract_core_slots(text), dslots):
+                expanded.append((mid, text))
+                expanded_ids.add(mid)
+    return direct + expanded
 
 
 def guard_memory_target(action, memory_id, anchor_text, candidates):
@@ -174,8 +247,14 @@ def guard_memory_target(action, memory_id, anchor_text, candidates):
             "target_id": None, "needs_user": True, "choices": cand,
         }
     if action == "delete":
+        picked_text = picked[1]
+        if norm_anchor in _norm_anchor_text(picked_text):
+            reason = "挑的这条原文里含目标。"
+        else:
+            # 同一槽位扩展进来的候选：原文里没有目标，别谎称“含目标”。
+            reason = "挑的这条是按同一槽位找出来的（原文里没有目标）。"
         return {
-            "ok": True, "reason": "挑的这条原文里含目标。",
+            "ok": True, "reason": reason,
             "target_id": picked[0], "needs_user": False, "choices": cand,
         }
     # update：anchor 就是旧原文，要求精确一致。
@@ -227,6 +306,7 @@ def _check_delete_anchor(args):
             "（比如“鸡杂面”），没写没法核对。",
             None,
         )
+    norm_anchor = _norm_anchor_text(anchor)
     matches = _find_anchor_matches(store, anchor)
     guard = guard_memory_target("delete", memory_id, anchor, matches)
     if not guard["ok"]:
@@ -253,9 +333,23 @@ def _check_delete_anchor(args):
             "请先列出全部记忆，照原文再删。",
             None,
         )
-    note = f"程序已核对：anchor“{anchor}”对得上“{picked_text}”"
-    if len(matches) > 1:
-        note += f"（库里还有 {len(matches) - 1} 条提到“{anchor}”的记忆，确认删的是这一条。）"
+    if norm_anchor in _norm_anchor_text(picked_text):
+        note = f"程序已核对：anchor“{anchor}”对得上“{picked_text}”"
+        if len(matches) > 1:
+            note += f"（库里还有 {len(matches) - 1} 条提到“{anchor}”的记忆，确认删的是这一条。）"
+    else:
+        # 同一槽位扩展进来的候选：卡上必须说明它不是字面命中，
+        # 不然 BOOS 以为这条原文里有目标。
+        note = (
+            f"程序已核对：这条原文里没有“{anchor}”，是按同一槽位"
+            f"（数字相同、关键词重合）从已命中的记忆找出来的"
+            f"“{picked_text}”，确认删的是这一条。"
+        )
+        direct_count = sum(
+            1 for _i, t in matches if norm_anchor in _norm_anchor_text(t)
+        )
+        if direct_count:
+            note += f"（库里还有 {direct_count} 条原文含“{anchor}”的记忆。）"
     return None, {"_anchor_match": note}
 
 
@@ -277,7 +371,7 @@ def _check_update_anchor(args):
             "改记忆要写 old_text：列出来的旧原文，没写没法核对。",
             None,
         )
-    matches = _find_anchor_matches(store, old_text)
+    matches = _find_anchor_matches(store, old_text, expand=False)
     guard = guard_memory_target("update", memory_id, old_text, matches)
     if not guard["ok"]:
         if not matches:

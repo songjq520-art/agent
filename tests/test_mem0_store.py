@@ -79,6 +79,9 @@ def _store_with_fixed_search(tmp_path, fixed_results, seed_texts=()):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
 
 
@@ -119,6 +122,9 @@ def test_search_threshold_is_configurable(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
         threshold=0.3,
     )
     found = store.search("你记得我叫什么吗？")
@@ -145,6 +151,9 @@ def test_search_keyword_rescue_for_proper_noun(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     found = store.search("圆通是做什么的？")
     assert len(found) == 1
@@ -167,6 +176,9 @@ def test_search_keyword_supplement_goes_after_semantic(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     found = store.search("我叫什么？在圆通工作的是谁？")
     assert [item["source"] for item in found] == ["semantic", "keyword"]
@@ -204,6 +216,9 @@ def test_search_error_returns_what_was_got(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     found = store.search("圆通是做什么的？")
     assert len(found) == 1 and "圆通" in found[0]["text"]
@@ -223,6 +238,9 @@ def test_search_both_steps_fail_returns_empty(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     assert store.search("你好") == []
 
@@ -290,6 +308,9 @@ def test_add_turn_failure_returns_flagged_dict(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     result = store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
     assert result.get("pending") is True
@@ -360,6 +381,9 @@ def test_add_memory_text_failure_returns_empty_dict(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     assert store.add_memory_text("我喜欢喝咖啡。") == {}
 
@@ -390,6 +414,9 @@ def test_get_all_failure_returns_empty_list(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     assert store.get_all() == []
 
@@ -418,6 +445,9 @@ def test_history_failure_returns_empty_list(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     assert store.history("fake-1") == []
     good_store = make_fake_store(tmp_path)

@@ -103,6 +103,172 @@ from pathlib import Path
 
 from memory.outbox import MemoryOutbox
 
+# （拆分，2026-11-13：纯函数按功能拆进 memory/ 下的小模块，这里只做
+#  re-export——行为不变，测试和调用方继续从本模块 import，一切照旧。）
+from memory.timeutil import (
+    _today,
+    _now_iso,
+    _next_write_seq,
+    _NOW_LOCK,
+    _NOW_LAST,
+    _WRITE_SEQ_LOCK,
+    _WRITE_SEQ,
+)
+from memory.money_slots import (
+    _extract_money_metadata,
+    _known_money,
+    _money_slot_relation,
+    _normalize_money_metadata,
+    _flatten_money,
+    extract_core_slots,
+    _slot_values_conflict,
+    _MONEY_CURRENCIES,
+    _MONEY_PERIODS,
+    _MONEY_AMOUNT_RE,
+    _MONEY_SYMBOL_AMOUNT_RE,
+    _MONEY_PERIOD_WORDS,
+    _MONEY_BUY_TARGET_RE,
+    _MONEY_DCA_TARGET_RE,
+    _MONEY_DCA_AMOUNT_TARGET_RE,
+    _MONEY_DCA_AMOUNT_TARGET_NO_DE_RE,
+    _MONEY_NON_TARGET_LEADS,
+    _MONEY_FLAT_KEYS,
+    _MONEY_UNSET,
+    _SLOT_STOPWORDS,
+    _SLOT_RELATIVE_DATES,
+    _SLOT_DATE_RE,
+    SLOT_AGENT_NAME,
+    SLOT_USER_NAME,
+    SLOT_SOUL,
+    SLOT_COMPUTER,
+    KNOWN_SLOTS,
+    AGENT_NAME_VALUE,
+    AGENT_NAME_TEXT,
+    AGENT_SOUL_TEXT,
+    COMPUTER_VALUE,
+    COMPUTER_TEXT,
+)
+from memory.provenance import (
+    _provenance,
+    _normalize_metadata,
+    _credibility_rank,
+    _is_core_memory,
+    _parse_created_at,
+    _memory_order_key,
+    _resolve_conflict,
+    _carry_protection_fields,
+    SOURCE_USER,
+    SOURCE_INFERRED,
+    SOURCE_UNCONFIRMED,
+    CONFIDENCE_USER,
+    CONFIDENCE_INFERRED,
+    CREDIBILITY_CONFIRMED,
+    CREDIBILITY_USER,
+    CREDIBILITY_INFERRED,
+    CREDIBILITY_UNCONFIRMED,
+    CREATED_AT_SOURCES,
+    _PROTECTION_RESULT_KEYS,
+)
+from memory.redaction import (
+    _id18_check_ok,
+    _luhn_ok,
+    _redact_sensitive,
+    _contains_sensitive,
+    _meaningful_after_redaction,
+    _normalize_memory_text,
+    _find_duplicate_memory,
+    _REDACTED,
+    _PRIVATE_KEY_RE,
+    _JWT_RE,
+    _KNOWN_KEY_RES,
+    _ID18_RE,
+    _ID15_RE,
+    _CARD_CANDIDATE_RE,
+    _SECRET_LABELS,
+    _LABELED_SECRET_RE,
+    _GENERIC_TOKEN_RE,
+    _ID18_WEIGHTS,
+    _ID18_CHECK_CHARS,
+    _MEANINGLESS_RES,
+)
+from memory.keywords import (
+    _extract_keywords,
+    _keyword_weight,
+    _cosine_similarity,
+    _STOPWORDS,
+    _CJK_RE,
+)
+from memory.correction_text import (
+    _detect_correction,
+    _latest_user_content,
+    _strip_correction_sentences,
+    _detect_correction_fragment,
+    _is_bare_retraction,
+    _detect_identity_statement,
+    _parse_chinese_number,
+    _is_joke_or_exaggeration,
+    _filter_extraction_messages,
+    _correction_result,
+    _parse_pending_selection,
+    _parse_judge_choice,
+    _CORRECTION_PHRASES,
+    _CORRECTION_SEPARATORS,
+    _BUDUI_BOUNDARY,
+    _CHINESE_NUMERALS,
+    _FRAGMENT_MAX_LEN,
+    _VAGUE_FRAGMENT_VALUES,
+    _RETRACTION_SIGNALS,
+    _RETRACTION_TRAILING_PUNCT,
+    _CONDITIONAL_LEADS,
+    _JOKE_MARKERS,
+    _JOKE_AGE_LIMIT,
+    _JOKE_HEIGHT_LIMIT_M,
+    _CN_DIGITS,
+    _CN_UNITS,
+    _AGE_RE,
+    _HEIGHT_RE,
+    _IDENTITY_USER_TRIGGERS,
+    _IDENTITY_AGENT_TRIGGERS,
+    _IDENTITY_VALUE_MAX_LEN,
+    _IDENTITY_TRAILING_PARTICLES,
+    _IDENTITY_QUESTION_SUFFIXES,
+)
+from memory.versioning import (
+    _read_version_file,
+    _write_version_file,
+    _check_version_file,
+    CUSTOM_INSTRUCTIONS_VERSION,
+)
+# （整合，2026-11-13：账本 / 衰减 / 关系 / 备份四个新模块。
+# 衰减的名字直接引进来重导出——tests/test_memory_decay.py 从这里
+# import 它们；账本、关系、备份用模块名前缀调，避免和 Mem0Store
+# 的同名方法撞上。）
+from memory import backup as _backup
+from memory import ledger as _ledger
+from memory import relations as _relations
+from memory.decay import (
+    DECAY_DELETE_BACKUP_PREFIX,
+    DECAY_DELETE_IDLE_DAYS,
+    DECAY_DORMANT_IDLE_DAYS,
+    DECAY_DORMANT_WEIGHT,
+    DECAY_HALF_LIFE_DAYS,
+    DECAY_KIND_EPISODIC,
+    DECAY_KIND_STABLE,
+    DECAY_PROMOTION_DAYS,
+    DECAY_STATE_DORMANT,
+    DECAY_STATE_VERBATIM,
+    DECAY_WEIGHT_FLOOR,
+    _decay_day,
+    _decay_idle_days,
+    _decay_iso,
+    _decay_now_dt,
+    classify_decay_kind,
+    decay_should_delete,
+    decay_should_go_dormant,
+    decay_weight,
+    promotion_reached,
+)
+
 logger = logging.getLogger("agent")
 
 # ---------- 遥测开关（必须在 import mem0 之前设置） ----------
@@ -293,12 +459,6 @@ RETRACTION_CANDIDATE_MARKERS = (
 # （id、原文、元数据、撤回时间），不放别的。
 RETRACTED_TRASH_FILENAME = "retracted_memories.json"
 
-# CUSTOM_INSTRUCTIONS_VERSION（自定义提取规则的版本号）：
-# 规则文本改了就改这个版本号，方便以后追踪“哪版规则存的记忆”。
-# 2026-11-09 改到第二版：加了“价值判断”（只存值得长期记的）和
-# “不存未确认/不存别人的事/不存没被认可的 AI 观点”（见下文第 9–12 条）。
-# 2026-11-09 Plan C 改到第三版：加第 13 条（玩笑/夸张/不可能的说法不存）。
-CUSTOM_INSTRUCTIONS_VERSION = "2026-11-09-plan-c"
 
 # CUSTOM_INSTRUCTIONS（自定义提取规则，BOOS 定的，最高优先级）：
 # 原文照抄试跑验证过的版本（~/workspace/mem0-spike/spike_common.py）。
@@ -402,48 +562,8 @@ _OUTDATED_BUDGET_TEXT = "每月预算 5 美元，4 美元提醒，5 美元停。
 _WRITE_LOCK = threading.RLock()
 
 
-def _today():
-    """今天的日期，格式 YYYY-MM-DD。"""
-    return date.today().isoformat()
 
 
-# ---------- 来源元数据（provenance） ----------
-# 每条记忆存进 mem0 时带的 metadata（见文件头“来源”一节）：
-#   source：记忆从哪来。"user"——BOOS 亲口说的/让记住的/亲口纠正的；
-#           "inferred"——DeepSeek 从对话里提取的（用户明确说过的话，
-#           但 BOOS 没逐条确认过那个写法）。
-#   created_at：记忆形成的时间（UTC 的 ISO 时间串，微秒级、严格单调递增，
-#           固定 6 位小数、带 Z——见 _now_iso）。
-#   write_seq：同一批写进去的序号（进程内严格递增，和 created_at 一起
-#           排新旧，见 _memory_order_key）。
-#   created_at_source：这个时间是哪来的——"written"（这次写进去的）、
-#           "backfilled"（老记忆后补的，见 backfill_timestamps）、
-#           "migrated"（迁移时沿用的旧日期，见 migrate_from_v1）。
-#   confidence：可信度 0–1。BOOS 亲口说的记 1.0；提取的记 0.7——
-#           不是因为提取得不准，而是因为“模型提的”本身就比“用户
-#           亲口确认的”低一档；模型用它来判断这条记忆有多可信。
-#   user_confirmed：BOOS 是否逐条确认过。只在 source="user" 时为 True。
-#           注意：提取的记忆哪怕存下来了，也绝不会因为“存下来了”就
-#           自动变成已确认——source 还是 "inferred"，user_confirmed
-#           还是 False；只有 BOOS 亲口说/纠正/让记住，才是已确认。
-#   衰减字段（第二步，2026-11-13）：decay_kind（stable 稳定事实 /
-#           episodic 一次性经历）、importance（high/normal/low，重要性
-#           和用得多不多分开算）、last_used_at（最后一次用上的时间，
-#           写时就是现在）、decay_seen_days（不同天被提到的天数，写时
-#           记 1）、decay_last_seen_day（上次被提到的日期 YYYY-MM-DD）、
-#           decay_state（verbatim 原话 / dormant 沉底——30 天没人找
-#           只打标，原话和向量文本都不动）、
-#           decay_delete_due（月扫标的“满半年没人找、等 BOOS 亲口说删”，
-#           只做标记，不直接删）。Chroma 只接受标量值，所以这些全是字符串 /
-#           数字 / 布尔，没有字典和列表。
-# 没有 metadata 的旧记忆（2026-11-09 之前存的）：取回时一律按
-# "unconfirmed" 处理（见 _normalize_metadata），绝不默认已确认。
-
-SOURCE_USER = "user"
-SOURCE_INFERRED = "inferred"
-SOURCE_UNCONFIRMED = "unconfirmed"
-CONFIDENCE_USER = 1.0
-CONFIDENCE_INFERRED = 0.7
 
 # 判断 (b) 号：动态数字事实的核实可信度上限。
 #   未核实（没两个独立来源印证）：0.35——不进稳定事实层，须确认才用。
@@ -455,2014 +575,135 @@ VERIFICATION_CAP_VERIFIED = 0.75
 VERIFICATION_CAP_AUTHORITATIVE = 0.85
 VERIFICATION_EXPIRY_HOURS = {"market": 24, "weather": 12, "other": 24}
 
-# 可信度分级（覆盖规则用，见 _resolve_conflict）：
-#   3 = BOOS 亲口确认的（source=user 且 user_confirmed=True）；
-#   2 = 来源是 user、但没逐条确认（旧数据损坏/写坏了才有，正常写不到）；
-#   1 = 模型从对话里提取的（inferred）；
-#   0 = 没来源信息的旧记忆（unconfirmed）。
-# 时间戳决定新旧，可信度决定有没有资格覆盖：级别低的新记忆不能
-# 直接覆盖级别高的旧事实。
-CREDIBILITY_CONFIRMED = 3
-CREDIBILITY_USER = 2
-CREDIBILITY_INFERRED = 1
-CREDIBILITY_UNCONFIRMED = 0
-
-# created_at 的合法来源（见 _provenance 的 created_at_source 参数）。
-CREATED_AT_SOURCES = ("written", "backfilled", "migrated")
-
-# _NOW_LOCK / _NOW_LAST：保证 _now_iso() 发出的时间戳严格递增。
-# 秒级精度时，两轮对话同一秒写进去，created_at 一撞就分不出新旧——
-# 和 conversation_summary 的 _now_iso 修过的是同一类问题（PR #13，
-# BOOS 笔记本上跑全套时撞上过一次）。这里不能直接 import 那边
-# （conversation_summary 反过来 import 本模块的 _redact_sensitive，
-# 循环了），所以同一套算法、各自一份状态，各管各的域。
-# 每次发值时如果新值 <= 上一次发的值，就在上一次的值上加 1 微秒再发。
-# 时钟往回调也不会乱：每次只比上一次大 1 微秒，墙上时间追上来就恢复正常。
-# 写记忆是多线程的（网页服务），读-改-写上锁，别让两个线程同时拿到同一个值。
-_NOW_LOCK = threading.Lock()
-_NOW_LAST = None
-
-
-def _now_iso():
-    """现在的时间，UTC 的 ISO 时间串（固定 6 位微秒，带 Z），供 metadata 用。
-
-    小数部分固定 6 位：isoformat() 默认会省略微秒为 0 时的小数点，
-    '...T03:00:00Z' 按字符串排会比 '...T03:00:00.000001Z' 大——
-    字符串顺序就和时间顺序反了。固定 6 位后，字符串顺序就是时间顺序。
-    """
-    global _NOW_LAST
-    now = datetime.now(timezone.utc)
-    with _NOW_LOCK:
-        if _NOW_LAST is not None and now <= _NOW_LAST:
-            now = _NOW_LAST + timedelta(microseconds=1)
-        _NOW_LAST = now
-    return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
-
-
-# _WRITE_SEQ_LOCK / _WRITE_SEQ：同一批写进去的序号（进程内严格递增）。
-# 同一批写进去的几条记忆，时间戳也可能撞在同一微秒——单调 +1 微秒能
-# 分开绝大多数，但序号是更稳的第二道：同一批里每条各拿一个号，先后
-# 一目了然。序号只管同一进程里的先后，跨进程重启从 0 再来——新旧判断
-# 先看 created_at，序号只是平局时的决胜（见 _memory_order_key）。
-# 真正的写操作本来就串在 _WRITE_LOCK 里，这里这把锁只是兜底。
-_WRITE_SEQ_LOCK = threading.Lock()
-_WRITE_SEQ = 0
-
-
-def _next_write_seq():
-    """下一条写入序号（进程内严格递增）。"""
-    global _WRITE_SEQ
-    with _WRITE_SEQ_LOCK:
-        _WRITE_SEQ += 1
-        return _WRITE_SEQ
-
-
-# ---------- 金额结构化字段（27 号） ----------
-# 背景：BOOS 的两笔钱——每月 5 美元工具预算、每天定投 5 块买万家纳指——
-# 数字都是 5，模型只看文字经常揉成一笔。修法：金额类记忆存的时候，
-# 把金额、币种、周期、对象拆成结构化字段贴在 metadata 上（money），
-# 回答时 _memory_block（main.py）把字段标在每条记忆后面，模型一眼
-# 分得清两笔钱；提示词那句“两笔钱没关系”只当兜底（没字段的老记忆用）。
-# 只做金额类、不全量：别的记忆不贴字段，不动现有结构。
-# 提取是确定性正则、不调模型、不花钱；一条记忆里有两笔钱时只取第一笔
-# （两笔钱 normally 各是一条记忆，混在一条里的极少，真混了就靠兜底句）。
-
-_MONEY_CURRENCIES = ("CNY", "USD")
-_MONEY_PERIODS = ("day", "week", "month", "year", "once")
-# 金额：数字 + 单位（块/元/人民币/¥ 是元，美元/美金/刀/$ 是美元），
-# 万是乘数（1 万块 = 10000 元）；$ / ¥ 也可以写在数字前面（$5）。
-_MONEY_AMOUNT_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(万)?\s*(块|元|人民币|美元|美金|刀|\$|＄|¥)"
-)
-_MONEY_SYMBOL_AMOUNT_RE = re.compile(r"(\$|＄|¥)\s*(\d+(?:\.\d+)?)")
-_MONEY_PERIOD_WORDS = (
-    ("每天", "day"), ("每日", "day"),
-    ("每周", "week"), ("每星期", "week"), ("每个星期", "week"),
-    ("每月", "month"), ("每个月", "month"),
-    ("每年", "year"), ("每一年", "year"),
-    ("一次", "once"), ("一次性", "once"),
-)
-# 对象：买/定投后面的名词（“买万家纳指”→“万家纳指”）；“投”后面常跟
-# 数字（“投 5 块”），数字开头的不算对象；“预算”出现就是工具预算。
-# “定投”后面跟“是/的/了”时是名词用法（“我的定投是每天 5 块”），
-# 不算对象——先找“买”，再找后面直接跟名词的“定投”。
-_MONEY_BUY_TARGET_RE = re.compile(r"买\s*([^\s，。,、；;：:！!？?]{1,12})")
-_MONEY_DCA_TARGET_RE = re.compile(
-    r"定投\s*([^是的了\s，。,、；;：:！!？?][^\s，。,、；;：:！!？?]{0,11})"
-)
-# 56 号：定投金额后面的“的+目标”（“每天定投5刀的沪深300”→“沪深300”）——
-# 金额夹在“定投”和“的”中间时，上面那条会抠出“5刀的沪深300”又因数字
-# 开头被丢掉；这条直接认“定投<金额>的<目标>”。
-_MONEY_DCA_AMOUNT_TARGET_RE = re.compile(
-    r"定投\s*\d+(?:\.\d+)?\s*(?:万)?\s*(?:块|元|人民币|美元|美金|刀|\$|＄|¥)?\s*的\s*([^\s，。,、；;：:！!？?]{1,12})"
-)
-# 56 号补（2026-11-12 实测）：定投金额后面直接跟目标、没有“的”也没有
-# “买”——模型复述时常把“的”丢了（“每天定投5美元沪深300”→“沪深300”），
-# 上面三条都认不出来，target 存成 None，53 号的槽位比对就认不出是同一
-# 对象、同值重复的定投就漏进来了。这条认“定投<金额><目标>”。
-_MONEY_DCA_AMOUNT_TARGET_NO_DE_RE = re.compile(
-    r"定投\s*\d+(?:\.\d+)?\s*(?:万)?\s*(?:块|元|人民币|美元|美金|刀|\$|＄|¥)?\s*([^是的了钱块元美刀\$＄¥\s，。,、；;：:！!？?][^\s，。,、；;：:！!？?]{0,11})"
-)
-# 上面那条抠出来的目标如果是时间/状语开头（“到年底”“从今天起”“以后”
-# 这类），不算目标——宁可 target 为空（53 号走兜底），也别把时间当对象。
-_MONEY_NON_TARGET_LEADS = (
-    "到", "从", "以后", "之前", "开始", "结束", "为止",
-    "每天", "每月", "每年", "每周", "一次",
-)
-
-
-def _extract_money_metadata(text):
-    """从一条记忆文本里抠金额结构化字段（27 号）。
-
-    返回 {"amount", "currency", "period", "target"}，没金额返回 None。
-    amount 是 int（整数）或 float；currency 是 "CNY"（元）或 "USD"（美元）；
-    period 是 "day"/"week"/"month"/"year"/"once"，没写周期就是 None；
-    target 是对象（比如“万家纳指”“工具预算”），没写就是 None。
-    纯正则，不调模型；抠不出来（写法太怪）就返回 None，不猜。
-    “刀”就是美元（56 号：BOOS 说“5刀”就是 5 美元）。
-    """
-    if not isinstance(text, str) or not text.strip():
-        return None
-    amount = None
-    currency = None
-    match = _MONEY_AMOUNT_RE.search(text)
-    if match:
-        num, wan, unit = match.groups()
-        amount = float(num)
-        if wan:
-            amount *= 10000
-        if amount == int(amount):
-            amount = int(amount)
-        currency = "USD" if unit in ("美元", "美金", "刀", "$", "＄") else "CNY"
-    else:
-        symbol_match = _MONEY_SYMBOL_AMOUNT_RE.search(text)
-        if symbol_match:
-            symbol, num = symbol_match.groups()
-            amount = float(num)
-            if amount == int(amount):
-                amount = int(amount)
-            currency = "USD" if symbol in ("$", "＄") else "CNY"
-    if amount is None:
-        return None
-    period = None
-    for word, code in _MONEY_PERIOD_WORDS:
-        if word in text:
-            period = code
-            break
-    target = None
-    if "预算" in text:
-        target = "工具预算"
-    else:
-        buy_match = _MONEY_BUY_TARGET_RE.search(text)
-        if buy_match:
-            candidate = buy_match.group(1).lstrip("的")
-            if candidate and not candidate[0].isdigit():
-                target = candidate
-        if target is None:
-            # 56 号：先认“定投<金额>的<目标>”，再认“定投<金额><目标>”
-            #（没有“的”的，模型复述常丢“的”），最后认“定投<名词>”。
-            dca_amount_match = _MONEY_DCA_AMOUNT_TARGET_RE.search(text)
-            if dca_amount_match:
-                candidate = dca_amount_match.group(1)
-                if candidate and not candidate[0].isdigit():
-                    target = candidate
-        if target is None:
-            dca_no_de_match = _MONEY_DCA_AMOUNT_TARGET_NO_DE_RE.search(text)
-            if dca_no_de_match:
-                candidate = dca_no_de_match.group(1)
-                if (
-                    candidate
-                    and not candidate[0].isdigit()
-                    and not candidate.startswith(_MONEY_NON_TARGET_LEADS)
-                ):
-                    target = candidate
-        if target is None:
-            dca_match = _MONEY_DCA_TARGET_RE.search(text)
-            if dca_match:
-                candidate = dca_match.group(1)
-                if (
-                    candidate
-                    and not candidate[0].isdigit()
-                    # 56 号补：时间/状语开头（“定投到年底”里的“到年底”）
-                    # 不是目标，和上面那条同一个拦截。
-                    and not candidate.startswith(_MONEY_NON_TARGET_LEADS)
-                ):
-                    target = candidate
-    return {
-        "amount": amount,
-        "currency": currency,
-        "period": period,
-        "target": target,
-    }
-
-
-def _known_money(item):
-    """一条已有记忆的金额字段（53 号）：metadata 里的 money 字典优先，
-    没有就从文本里现抠（快照/老数据可能没贴字段）。"""
-    money = _normalize_money_metadata(((item or {}).get("metadata") or {}).get("money"))
-    if money is not None:
-        return money
-    return _extract_money_metadata((item or {}).get("text") or "")
-
-
-def _money_slot_relation(new_money, known_money):
-    """53 号：两条金额记忆的槽位关系。
-    - 任一边没金额字段 → None（不归槽位管，走老路：向量+模型判）。
-    - 对象不明（任一边 target 为空）→ None（没法归槽位，不猜）。
-    - （对象，周期）不同 → "different"（同主题不同槽位，分别保留，
-      别拿去给模型判重复——向量相似度分不开“万家纳指”和“沪深300”）。
-    - （对象，周期）相同：金额+币种相同 → "duplicate"（重复，不存新的）；
-      不同 → "supersede"（同槽位新值，旧条更新成新说法）。
-    """
-    if not new_money or not known_money:
-        return None
-    new_target = new_money.get("target")
-    known_target = known_money.get("target")
-    if not new_target or not known_target:
-        return None
-    if new_target != known_target or new_money.get("period") != known_money.get("period"):
-        return "different"
-    if (
-        new_money.get("amount") == known_money.get("amount")
-        and new_money.get("currency") == known_money.get("currency")
-    ):
-        return "duplicate"
-    return "supersede"
-
-
-def _normalize_money_metadata(raw):
-    """校验 money 字段的形状（读回来时用，见 _normalize_metadata）。
-
-    形状不对（比如旧数据、手写坏了）返回 None，不猜、不将就——
-    字段是辅助，文本本身还在，丢了字段最多走兜底句。
-    接受两种形状：字典形 {"amount", "currency", "period", "target"}
-    （代码里传来传去的形状）和扁平形 {"money_amount", ...}
-    （真正存进 Chroma 的形状，见 _flatten_money）。
-    """
-    if not isinstance(raw, dict):
-        return None
-    amount = raw.get("amount", raw.get("money_amount"))
-    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-        return None
-    currency = raw.get("currency", raw.get("money_currency"))
-    if currency not in _MONEY_CURRENCIES:
-        return None
-    period = raw.get("period", raw.get("money_period"))
-    if period is not None and period not in _MONEY_PERIODS:
-        return None
-    target = raw.get("target", raw.get("money_target"))
-    if target is not None and (not isinstance(target, str) or not target):
-        return None
-    return {
-        "amount": amount,
-        "currency": currency,
-        "period": period,
-        "target": target,
-    }
-
-
-# Chroma（BOOS 笔记本和这里用的向量库）只接受标量 metadata 值
-# （str/int/float/bool/list/None），dict 值会直接炸掉整条 add/update——
-# 27 号第一版把 money 存成一个 dict，真调时 add_memory_text 在 Chroma
-# 那层就 ValueError，金额记忆根本没存进去（第 4 批真调抓到的）。
-# 所以 money 存成四个扁平标量字段，读回来（_normalize_metadata）
-# 再拼回字典形。字段名都带 money_ 前缀，别和别的字段撞上。
-_MONEY_FLAT_KEYS = ("money_amount", "money_currency", "money_period", "money_target")
-
-
-def _flatten_money(money):
-    """把 money 字典展平成 Chroma 能存的四个标量字段。
-
-    money 是 None 时四个字段都显式给 None——纠正时新说法没金额，
-    旧的金额字段要清掉（mem0 的 update 是合并，不传就留着旧值）。
-    形状不对时当 None 处理（清掉），不把坏形状往库里写。
-    """
-    flat = dict.fromkeys(_MONEY_FLAT_KEYS)
-    clean = _normalize_money_metadata(money)
-    if clean is not None:
-        flat["money_amount"] = clean["amount"]
-        flat["money_currency"] = clean["currency"]
-        flat["money_period"] = clean["period"]
-        flat["money_target"] = clean["target"]
-    return flat
-
-
-# _MONEY_UNSET：_provenance 的 money 参数没传——不碰 money 字段。
-# 传 None 是“显式清掉”（纠正时新说法没金额，旧的金额字段不能留着）。
-_MONEY_UNSET = object()
-
-
-def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
-                created_at_source="written", is_rule=False, money=_MONEY_UNSET,
-                verification_status=None, requires_confirmation=False,
-                expires_at=None, conflict_for_review=False, needs_review=False):
-    """拼一份来源元数据（存记忆时传给 mem0.add 的 metadata 参数）。
-
-    source 不是 "user" 时一律按 "inferred" 存（调用方传错也不让它
-    进库）；user_confirmed 只在 source="user" 时才可能是 True。
-    slot（Plan C）：身份/称呼类记忆的槽位名（agent_name/user_name/
-    soul），只认 KNOWN_SLOTS 里的，其他值不进库——同槽位只留一条，
-    新值盖旧值时靠它找旧记忆。
-    is_rule（第 3 批 42 号）：纠正后总结的通用规则（比如“定投只在交易日
-    扣款”）才记 True——检索时优先捞出来，回答同类问题先套用规则再算。
-    created_at 不传时取新鲜的单调时间（_now_iso）；传了就用传的
-    （迁移沿用旧日期、纠错回滚恢复旧时间时用）。created_at_source
-    说明这个时间是哪来的，只认 CREATED_AT_SOURCES 里的三个值，
-    传错了按 "written" 算——时间来源不能靠猜，必须是明确的。
-    money（27 号）：金额结构化字段（_extract_money_metadata 的结果）；
-    没传（_MONEY_UNSET）就不碰 money 字段；传 None 是显式清掉
-    （纠正时新说法没金额，旧的金额字段不能留着）；传了字典就校验后
-    展平成四个标量字段存（见 _flatten_money，Chroma 不接受 dict 值）。
-    verification_status / requires_confirmation / expires_at（判断 b 号）：
-    动态数字事实的核实状态——"verified"（两个独立来源对得上，或一家
-    权威来源）或 "unverified"（没印证）；未核实的可信度封顶 0.35，
-    须确认（requires_confirmation=True）才当稳定事实用；expires_at
-    是这条数的有效期（行情 24 小时、天气 12 小时），过期了要重查，
-    不能再当事实引用。只认 "verified"/"unverified"，别的不要。
-    conflict_for_review / needs_review（判断 a 号）：按意思去重的裁决
-    标记——conflict_for_review 是槽位值冲突（同一件事、说法对着干，
-    比如喜欢吃鸡杂面 vs 对鸡杂面过敏），留着让 BOOS 看；
-    needs_review 是模型裁决把握不够（confidence <0.80 或判失败），
-    等兜底清理时再看。都是 True 才写进 metadata。
-    每次调都新拿一个 write_seq（同一批里的先后靠它分）。
-    """
-    source = SOURCE_USER if source == SOURCE_USER else SOURCE_INFERRED
-    if created_at_source not in CREATED_AT_SOURCES:
-        created_at_source = "written"
-    metadata = {
-        "source": source,
-        "created_at": created_at or _now_iso(),
-        "created_at_source": created_at_source,
-        "write_seq": _next_write_seq(),
-        "confidence": confidence,
-        "user_confirmed": bool(user_confirmed) and source == SOURCE_USER,
-    }
-    # 第二步衰减：新记忆自带衰减字段（见文件头的 DECAY 常量注释）。
-    # kind 按“核心 / BOOS 亲口说的 / 模型提取的”分，不猜关键词——
-    # 核心（已确认、带槽位、规则）记 stable；BOOS 亲口说的稳定事实/
-    # 偏好 / 决定也记 stable；模型提取的记 episodic（一次性经历多半
-    # 在这里），反复出现 3 次不同天再晋升。last_used_at 记这次写的
-    # 时间（写就是一次“用上”；迁移/恢复沿用旧 created_at 时，last_used
-    # 还是现在——刚写回来的记忆不算“很久没用”）。
-    _decay_core = (
-        (source == SOURCE_USER and bool(user_confirmed))
-        or slot in KNOWN_SLOTS
-        or bool(is_rule)
-    )
-    metadata["decay_kind"] = classify_decay_kind(
-        source, _decay_core, bool(is_rule)
-    )
-    metadata["importance"] = "high" if _decay_core else "normal"
-    metadata["last_used_at"] = _now_iso()
-    metadata["decay_seen_days"] = 1
-    metadata["decay_last_seen_day"] = datetime.now(timezone.utc).date().isoformat()
-    metadata["decay_state"] = DECAY_STATE_VERBATIM
-    if slot in KNOWN_SLOTS:
-        metadata["slot"] = slot
-    if is_rule:
-        metadata["is_rule"] = True
-    if verification_status in ("verified", "unverified"):
-        metadata["verification_status"] = verification_status
-    if requires_confirmation:
-        metadata["requires_confirmation"] = True
-    if isinstance(expires_at, str) and expires_at:
-        metadata["expires_at"] = expires_at
-    if conflict_for_review:
-        metadata["conflict_for_review"] = True
-    if needs_review:
-        metadata["needs_review"] = True
-    if money is not _MONEY_UNSET:
-        # None 也存：把旧的金额字段清掉（纠正时新说法没金额就清掉，
-        # 不然“每天投 5 块”改成“我不投了”，5 块的字段还贴在上面）。
-        # 展平成四个标量字段存（见 _flatten_money）：Chroma 不接受
-        # dict 值的 metadata，存 dict 会炸掉整条写入。
-        metadata.update(_flatten_money(money))
-    return metadata
-
-
-def _normalize_metadata(raw, item=None):
-    """把 mem0 返回的 metadata 规整成统一形状（检索时用）。
-
-    规整规则（安全降级，宁可信度低、不可误认）：
-    - raw 不是字典、或缺 source、或 source 不是 user/inferred，
-      一律按 "unconfirmed" 处理（旧记忆、新旧版本混用、损坏数据
-      都走这条路）；
-    - user_confirmed 只有明确是 True（布尔值）才算确认，写成
-      "yes"/1 这类非布尔值不算——确认必须是明确的，不能靠猜；
-    - confidence 不是 0–1 之间的数字时记成 None（不知道就是不知道）；
-    - created_at 不是字符串时记成 None；
-    - write_seq 不是整数时记成 None；created_at_source 不是三个合法值
-      时记成 None；pending_confirmation 只有明确是 True（布尔值）
-      才算待确认——这三样也一样，不能靠猜；
-    - slot 不是 KNOWN_SLOTS 里的已知槽位时记成 None（旧记忆、新旧
-      版本混用、损坏数据都走这条路——槽位只认这三个，别的都不认）。
-    - money（27 号）：金额结构化字段，形状不对就记 None（见
-      _normalize_money_metadata），不猜。
-    created_at 的第二来源（33 号）：mem0 2.2.1 读回来时把 created_at
-    提到条目的顶层（get/get_all/search 的返回里，created_at 是
-    MemoryItem 的顶层字段），同时从返回的 metadata 里剔掉——所以
-    只看 metadata 永远找不到时间，面板上 14 条全是“未知时间”。
-    根因不在写的那头：写的时候 _provenance 每条都带了显式时间，
-    mem0 存的时候也留着（add 时缺了它自己还会补一个）。修法：调
-    用方把整条 item 也传进来（item 参数），metadata 里没有时再到
-    顶层找——metadata 里的优先，顶层是兜底。没传 item 时只看 metadata，
-    行为和以前一样。
-    返回：{"source", "created_at", "created_at_source", "write_seq",
-           "confidence", "user_confirmed", "confirmed", "slot",
-           "pending_confirmation", "is_rule", "money",
-           "decay_kind", "importance", "last_used_at", "decay_seen_days",
-           "decay_last_seen_day", "decay_state", "decay_delete_due",
-           "superseded"}，其中 confirmed
-    就是 user_confirmed（取了个短名字，方便调用方判断“能不能当作事实用”）。
-    衰减字段（第二步）：只认合法值，别的按缺失处理；老记忆没有这些
-    字段时走派生默认值（见 return 前的派生段）——不猜、不抬可信度。
-    """
-    source = SOURCE_UNCONFIRMED
-    created_at = None
-    created_at_source = None
-    write_seq = None
-    confidence = None
-    user_confirmed = False
-    slot = None
-    pending_confirmation = False
-    is_rule = False
-    money = None
-    verification_status = None
-    requires_confirmation = False
-    expires_at = None
-    conflict_for_review = False
-    needs_review = False
-    evidence = None
-    if isinstance(raw, dict):
-        raw_source = raw.get("source")
-        if raw_source in (SOURCE_USER, SOURCE_INFERRED):
-            source = raw_source
-        raw_created = raw.get("created_at")
-        if isinstance(raw_created, str) and raw_created:
-            created_at = raw_created
-        raw_created_source = raw.get("created_at_source")
-        if raw_created_source in CREATED_AT_SOURCES:
-            created_at_source = raw_created_source
-        raw_seq = raw.get("write_seq")
-        if isinstance(raw_seq, int) and not isinstance(raw_seq, bool):
-            write_seq = raw_seq
-        raw_conf = raw.get("confidence")
-        if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool):
-            if 0 <= raw_conf <= 1:
-                confidence = float(raw_conf)
-        user_confirmed = raw.get("user_confirmed") is True and source == SOURCE_USER
-        raw_slot = raw.get("slot")
-        if raw_slot in KNOWN_SLOTS:
-            slot = raw_slot
-        pending_confirmation = raw.get("pending_confirmation") is True
-        # is_rule 只有明确是 True（布尔值）才算规则，写成 "yes"/1 不算——
-        # 规则要在检索时优先捞出来，不能靠猜。
-        is_rule = raw.get("is_rule") is True
-        # 27 号：money 字典形（旧数据/代码里传的）或扁平形（真正存在
-        # Chroma 里的四个 money_* 字段）都认，拼回字典形给调用方。
-        money = _normalize_money_metadata(raw.get("money"))
-        if money is None:
-            money = _normalize_money_metadata(raw)
-        # 判断 (b) 号：动态数字事实的核实状态——只认
-        # "verified"/"unverified"，别的不要；requires_confirmation
-        # 只有明确是 True（布尔值）才算；expires_at 只认非空字符串。
-        raw_verification = raw.get("verification_status")
-        if raw_verification in ("verified", "unverified"):
-            verification_status = raw_verification
-        requires_confirmation = raw.get("requires_confirmation") is True
-        raw_expires = raw.get("expires_at")
-        if isinstance(raw_expires, str) and raw_expires:
-            expires_at = raw_expires
-        # 判断 (a) 号：裁决标记——只有明确是 True（布尔值）才算。
-        conflict_for_review = raw.get("conflict_for_review") is True
-        needs_review = raw.get("needs_review") is True
-        # 判断 (a) 号：重复证据（JSON 字符串，原样透传，调用方自己解析）。
-        raw_evidence = raw.get("evidence")
-        if isinstance(raw_evidence, str) and raw_evidence:
-            evidence = raw_evidence
-    if created_at is None and isinstance(item, dict):
-        # 33 号兜底：mem0 把 created_at 提到条目顶层了，metadata 里没有
-        # 就到顶层找。顶层的时间就是 payload 里存的那个，不是现编的。
-        top_created = item.get("created_at")
-        if isinstance(top_created, str) and top_created:
-            created_at = top_created
-    # 第二步衰减：decay_* 字段只认合法值（字符串/数字/布尔要对得上号），
-    # 别的按缺失处理。派生默认值（老记忆没有衰减字段时）：
-    #   - last_used_at 没有就用 created_at（写时就是最后一次用上）；
-    #     两个都没有的老记忆不衰减（记 None，decay_weight 按 1.0 算——
-    #     宁可不沉，不错沉）；
-    #   - kind 没有就按核心/非核心派生（核心 stable，其余 episodic）；
-    #   - importance 没有就按核心 high、其余 normal。
-    decay_kind = None
-    importance = None
-    last_used_at = None
-    decay_seen_days = None
-    decay_last_seen_day = None
-    decay_state = DECAY_STATE_VERBATIM
-    decay_delete_due = False
-    superseded = False
-    if isinstance(raw, dict):
-        raw_kind = raw.get("decay_kind")
-        if raw_kind in (DECAY_KIND_STABLE, DECAY_KIND_EPISODIC):
-            decay_kind = raw_kind
-        raw_importance = raw.get("importance")
-        if raw_importance in ("high", "normal", "low"):
-            importance = raw_importance
-        raw_last_used = raw.get("last_used_at")
-        if isinstance(raw_last_used, str) and raw_last_used:
-            last_used_at = raw_last_used
-        raw_seen = raw.get("decay_seen_days")
-        if isinstance(raw_seen, int) and not isinstance(raw_seen, bool) and raw_seen >= 0:
-            decay_seen_days = raw_seen
-        raw_seen_day = raw.get("decay_last_seen_day")
-        if isinstance(raw_seen_day, str) and re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}", raw_seen_day
-        ):
-            decay_last_seen_day = raw_seen_day
-        raw_state = raw.get("decay_state")
-        if raw_state in (DECAY_STATE_VERBATIM, DECAY_STATE_DORMANT):
-            decay_state = raw_state
-        elif raw_state == "summarized":
-            # 旧版（未合进 main 的衰减分支）写过的摘要态：那版没上过真库，
-            # 这里只是兜底——摘要态的文本就是原话的短版，按沉底态认，
-            # 照常能搜到、被用上回到原话态。
-            decay_state = DECAY_STATE_DORMANT
-        decay_delete_due = raw.get("decay_delete_due") is True
-        superseded = raw.get("superseded") is True
-    if last_used_at is None:
-        last_used_at = created_at
-    _decay_core_derived = bool(user_confirmed) or slot is not None or bool(is_rule)
-    if decay_kind is None:
-        decay_kind = DECAY_KIND_STABLE if _decay_core_derived else DECAY_KIND_EPISODIC
-    if importance is None:
-        importance = "high" if _decay_core_derived else "normal"
-    return {
-        "source": source,
-        "created_at": created_at,
-        "created_at_source": created_at_source,
-        "write_seq": write_seq,
-        "confidence": confidence,
-        "user_confirmed": user_confirmed,
-        "confirmed": user_confirmed,
-        "slot": slot,
-        "pending_confirmation": pending_confirmation,
-        "is_rule": is_rule,
-        "money": money,
-        "verification_status": verification_status,
-        "requires_confirmation": requires_confirmation,
-        "expires_at": expires_at,
-        "conflict_for_review": conflict_for_review,
-        "needs_review": needs_review,
-        "evidence": evidence,
-        "decay_kind": decay_kind,
-        "importance": importance,
-        "last_used_at": last_used_at,
-        "decay_seen_days": decay_seen_days,
-        "decay_last_seen_day": decay_last_seen_day,
-        "decay_state": decay_state,
-        "decay_delete_due": decay_delete_due,
-        "superseded": superseded,
-    }
-
-
-# ---------- 时间戳 + 覆盖规则（第一步，2026-11-10） ----------
-# 规则（BOOS 定的）：时间戳决定新旧，来源可信度决定有没有资格覆盖。
-# 同级里新的胜出，旧的标“被取代”但原话留着；低可信度的新记忆不能
-# 直接覆盖高可信度的旧事实——新记忆挂起来“待确认”，只有真用上时
-# 才问 BOOS；时间戳相同或缺失、真分不出先后的，问 BOOS；核心记忆
-# 钉住不动，模型推断一律不能顶掉。
-# 这几个函数都是纯函数（只“判”，不动库），调用方见 _resolve_conflict
-# 的注释——它不管两条记忆是不是同一件事，“是不是同一件事”由调用方
-# 按各自的证据定（槽位相同、BOOS 亲口指的、提取后守卫的关键词邻居）。
-
-
-def _credibility_rank(metadata):
-    """一条记忆的可信度级别（覆盖规则用，见 _resolve_conflict）。
-
-    只看规整过的 metadata：confirmed（user 且逐条确认）最高；
-    source=user 但没确认次之；inferred 再次；没来源信息的最低。
-    raw 和规整过的都能传——里面先过一遍 _normalize_metadata，
-    所以两种形状结果一样。
-    """
-    meta = _normalize_metadata(metadata)
-    if meta["confirmed"]:
-        return CREDIBILITY_CONFIRMED
-    if meta["source"] == SOURCE_USER:
-        return CREDIBILITY_USER
-    if meta["source"] == SOURCE_INFERRED:
-        return CREDIBILITY_INFERRED
-    return CREDIBILITY_UNCONFIRMED
-
-
-def _is_core_memory(metadata):
-    """是不是核心记忆（第一步的口径）。
-
-    核心记忆 = 原四类（名字、SOUL、你的决定、钱的规矩）+ 安全权限 +
-    项目基础决策。第一步里先按“用户已确认”来认：名字/SOUL 有槽位
-    标记，其余几类都是 BOOS 亲口确认过的记忆（记住/纠正/迁移都记
-    source=user、user_confirmed=True）；对话里随口说的决定是提取的
-    （inferred），要等 BOOS 逐条确认才算核心——这是 Plan C 已有的
-    区分，第一步不改它。以后做衰减/删除时，这里换成正式的
-    “类别/重要性”字段（见下面“以后留的位置”）。
-    raw 和规整过的都能传。
-    """
-    meta = _normalize_metadata(metadata)
-    return bool(meta["confirmed"]) or meta["slot"] in KNOWN_SLOTS
-
-
-def _parse_created_at(value):
-    """把 created_at 字符串解析成带时区的 datetime，解析不出返回 None。
-
-    认三种写法：新版微秒 + Z（"2026-11-10T12:00:00.000001Z"）、
-    旧版秒级 +00:00（"2026-11-09T10:00:00+00:00"）、迁移带来的
-    纯日期（"2026-11-07"，算当天 0 点）。没时区的当 UTC。
-    """
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    try:
-        if len(text) == 10:
-            parsed = datetime.strptime(text, "%Y-%m-%d")
-            return parsed.replace(tzinfo=timezone.utc)
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def _memory_order_key(metadata):
-    """一条记忆的新旧排序键：(形成时间, 写入序号)。
-
-    没时间戳的按最早算：缺时间戳的都是时间戳功能上线之前存的，
-    一定比新写的旧——这是时间线本身，不是猜；序号缺失按 -1 算。
-    后补的时间戳也按没时间算：backfill 补时间时是按库里随手排的
-    顺序给的“现在时间”，根本不知道历史上谁先谁后——那个先后是
-    假的，不能拿来判新旧。两条后补的排出来键一样，_resolve_conflict
-    就会走“分不出先后、问 BOOS”那条；后补的对新写的，新写的赢，
-    因为后补的本来就是功能上线前的老记忆，本来就比新写的旧。
-    迁移沿用的旧日期（migrated）是旧数据里的真日期，照常用。
-    raw 和规整过的都能传。
-    """
-    meta = _normalize_metadata(metadata)
-    if meta.get("created_at_source") == "backfilled":
-        return (datetime.min.replace(tzinfo=timezone.utc), -1)
-    when = _parse_created_at(meta.get("created_at"))
-    if when is None:
-        when = datetime.min.replace(tzinfo=timezone.utc)
-    seq = meta.get("write_seq")
-    if not isinstance(seq, int) or isinstance(seq, bool):
-        seq = -1
-    return (when, seq)
-
-
-def _resolve_conflict(old_metadata, new_metadata):
-    """新旧两条记忆打架时，时间戳 + 可信度怎么判（纯函数，不动库）。
-
-    判法：
-    - 两条都没有时间戳、或时间戳 + 序号全撞：真分不出先后，问 BOOS。
-      （只有一边缺时间戳不问：缺的那条一定是时间戳功能上线之前存的，
-      一定比新写的旧——这是时间线本身，不是猜。后补的时间戳在排序
-      时按没时间算（见 _memory_order_key），所以两条后补的也走问 BOOS。）
-    - 新的可信度比旧的低：旧的赢，新记忆挂起来“待确认”（pending_new），
-      不覆盖——时间戳再新也没用，新旧管不了覆盖资格。
-    - 新的可信度比旧的高：新的胜出，旧的标“被取代”（supersede_old）。
-    - 同级：新的胜出，旧的标“被取代”；但新记忆比旧的还早（迟到的
-      旧写入）时不覆盖，旧的留着（keep_old）。
-    - 核心记忆钉住不动：核心记忆都是用户已确认的（见 _is_core_memory），
-      可信度最高，模型推断（最低档）永远判成 pending_new——上面
-      “新低旧高”那条已经盖住了，这里不用再单列。
-    返回 {"winner": "old" | "new" | "ask",
-           "action": "supersede_old" | "pending_new" | "keep_old" | "ask",
-           "reason": 给人看的一句话}。
-    注意：这个函数只“判”，不“认”——它不管两条记忆是不是同一件事。
-    “是不是同一件事”由调用方按各自的证据定：同槽位就是同一件事
-    （_upsert_slot_memory）；纠正是 BOOS 亲口指的（correct_memory）；
-    提取后守卫只凭关键词重合找“同一话题”的邻居（_apply_coverage_guard），
-    所以同级的新胜出在那里不自动标被取代——关键词重合分不出
-    “同一条事实的新版本”还是“同一话题的不同事实”（“喜欢喝咖啡”
-    和“喜欢喝拿铁”能同时是真的），宁可不标，不标错。等以后有模型判
-    “同一事实”时，再把 supersede_old 接到提取后守卫上。
-    """
-    old = _normalize_metadata(old_metadata)
-    new = _normalize_metadata(new_metadata)
-    old_rank = _credibility_rank(old)
-    new_rank = _credibility_rank(new)
-    old_key = _memory_order_key(old)
-    new_key = _memory_order_key(new)
-    if old.get("created_at") is None and new.get("created_at") is None:
-        return {
-            "winner": "ask",
-            "action": "ask",
-            "reason": "两条记忆都没有时间戳，分不出先后，请 BOOS 定。",
-        }
-    if old_key == new_key:
-        return {
-            "winner": "ask",
-            "action": "ask",
-            "reason": "两条记忆时间戳和序号都一样，分不出先后，请 BOOS 定。",
-        }
-    if new_rank < old_rank:
-        return {
-            "winner": "old",
-            "action": "pending_new",
-            "reason": "新记忆可信度比旧的低，不能直接覆盖，挂起来待确认。",
-        }
-    if new_rank > old_rank:
-        return {
-            "winner": "new",
-            "action": "supersede_old",
-            "reason": "新记忆可信度比旧的高，新的胜出，旧的标被取代。",
-        }
-    if new_key > old_key:
-        return {
-            "winner": "new",
-            "action": "supersede_old",
-            "reason": "同一级别，新的胜出，旧的标被取代。",
-        }
-    return {
-        "winner": "old",
-        "action": "keep_old",
-        "reason": "同一级别，但新记忆比旧的还早，不覆盖。",
-    }
-
-
-# ---------- 第二步衰减（连续衰减，2026-11-13） ----------
-# 下面全是纯函数（只算、不读库、不写库），调用方见 Mem0Store 里
-# 的 reinforce_memories / _record_decay_occurrence / sweep_monthly /
-# delete_due_memories。定稿口径见文件头的 DECAY 常量注释。
-#   - "importance"（重要性，high/normal/low）：和用得多不多分开算——
-#     低频不等于低价值（原则②）；衰减速度看 importance 所在的 kind，
-#     不看调用次数。钉住的核心记忆 importance=high、衰减是零。
-#   - "superseded"（被取代标记，bool）：同级新胜出时旧记忆标上，原话保留；
-#     第一步里只有 _resolve_conflict 会判，真正标上去要等模型能判断
-#     “同一条事实”时再接（见 _resolve_conflict 注释）。
-#   - 真删前检查（原则③）：删之前查三样——是不是核心记忆、是不是
-#     BOOS 明确让记的、有没有别的记忆连着它；有一条不满足就继续
-#     归档、不删。delete_due_memories 只删满 180 天没人找、且不是
-#     核心的那几条，删前先写备份（见 delete_due_memories）。
-
-
-def _decay_now_dt(now=None):
-    """把 now 规整成带时区的 datetime：不传就是现在（UTC）；
-    传 datetime 就用它（没时区的当 UTC）；传 ISO 时间串就解析，
-    解析不出也当现在——衰减算的是“多久没用”，拿不准就按“刚用过”
-    算（宁可不沉，不错沉）。"""
-    if isinstance(now, datetime):
-        if now.tzinfo is None:
-            return now.replace(tzinfo=timezone.utc)
-        return now
-    if isinstance(now, str) and now.strip():
-        parsed = _parse_created_at(now)
-        if parsed is not None:
-            return parsed
-    return datetime.now(timezone.utc)
-
-
-def _decay_day(value):
-    """取一个时间（datetime / ISO 串 / None）的 UTC 日期 YYYY-MM-DD；
-    取不出返回 None（不猜今天——拿不准就当这一天没数过）。
-    出现次数按“不同日期”数，就靠它。"""
-    if isinstance(value, datetime):
-        parsed = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        return parsed.date().isoformat()
-    if isinstance(value, str) and value.strip():
-        parsed = _parse_created_at(value)
-        if parsed is not None:
-            return parsed.date().isoformat()
-    return None
-
-
-def _decay_iso(moment):
-    """把 datetime 格式化成 _now_iso 同款的 ISO 串（6 位微秒，带 Z）。"""
-    parsed = _decay_now_dt(moment)
-    return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
-
-
-def classify_decay_kind(source, is_core, is_rule):
-    """新记忆写进库时定它的衰减档位（stable / episodic）。
-
-    核心（名字、SOUL、决定、钱的规矩、安全权限、项目基础决策）和
-    规则记 stable；BOOS 亲口说的稳定事实/偏好/决定也记 stable；
-    模型提取的记 episodic（一次性经历多半在这里）。不猜关键词——
-    档位只看来源和核心标记，猜错档位顶多是沉得快一点或慢一点，
-    不会把记忆弄丢（月扫只压摘要、不直接删，删还要再等半年）。"""
-    if is_core or is_rule:
-        return DECAY_KIND_STABLE
-    if source == SOURCE_USER:
-        return DECAY_KIND_STABLE
-    return DECAY_KIND_EPISODIC
-
-
-def _decay_idle_days(last_used_at, now=None):
-    """从最后一次用上到 now，闲了多少天（小数天数，负数按 0 算）；
-    last_used_at 没有（没时间的老记忆）返回 None——算不出闲了多久，
-    就当它没闲过（宁可不沉，不错沉）。"""
-    if not isinstance(last_used_at, str) or not last_used_at:
-        return None
-    last = _parse_created_at(last_used_at)
-    if last is None:
-        return None
-    delta = (_decay_now_dt(now) - last).total_seconds() / 86400.0
-    return max(0.0, delta)
-
-
-def decay_weight(kind, last_used_at, now=None, is_core=False):
-    """一条记忆现在的权重（0.10–1.0）：指数衰减，
-    weight = 0.5 ** (闲置天数 / 半衰期)，下限 0.10。
-    核心记忆恒为 1.0（钉住不动，衰减是零，不是慢）；没时间的老记忆
-    也按 1.0 算（算不出闲了多久，就当它没闲过）。
-    权重只管排位、不管对错，更不管“能不能搜到”——检索资格只看
-    原始语义分（见 search），权重再低也不会让记忆搜不到（坑 1）。"""
-    if is_core:
-        return 1.0
-    idle = _decay_idle_days(last_used_at, now)
-    if idle is None:
-        return 1.0
-    half_life = DECAY_HALF_LIFE_DAYS.get(kind, DECAY_HALF_LIFE_DAYS[DECAY_KIND_EPISODIC])
-    weight = 0.5 ** (idle / half_life)
-    return max(DECAY_WEIGHT_FLOOR, min(1.0, weight))
-
-
-def promotion_reached(seen_days):
-    """一次性经历在不同天出现够 3 次没有——够了就晋升成稳定事实。
-    seen_days 不是整数、或没数过时按没够算。"""
-    return (
-        isinstance(seen_days, int)
-        and not isinstance(seen_days, bool)
-        and seen_days >= DECAY_PROMOTION_DAYS
-    )
-
-
-def decay_should_go_dormant(kind, last_used_at, now=None, is_core=False):
-    """这条记忆该标沉底了吗：30 天没人找，且权重已经掉到 0.30 下面。
-    核心记忆永远不标；没时间的老记忆不标（闲了多久都算不出来）。
-    只判“该不该打标”，标了也只是打标——原话和文本都不动（见
-    sweep_monthly）。"""
-    if is_core:
-        return False
-    idle = _decay_idle_days(last_used_at, now)
-    if idle is None or idle < DECAY_DORMANT_IDLE_DAYS:
-        return False
-    return decay_weight(kind, last_used_at, now, is_core=False) < DECAY_DORMANT_WEIGHT
-
-
-def decay_should_delete(last_used_at, now=None, is_core=False):
-    """这条记忆该标待删了吗：从最后一次用上算起满 180 天还没人找。
-    核心记忆永远不标；没时间的老记忆不标。只判“该不该打待删标记”，
-    不管删——删是 delete_due_memories 的事，要 BOOS 点头才删。"""
-    if is_core:
-        return False
-    idle = _decay_idle_days(last_used_at, now)
-    if idle is None:
-        return False
-    return idle >= DECAY_DELETE_IDLE_DAYS
-
-
-# ---------- 关键词补充信号（从 v1 main.py 搬过来，只做补充用） ----------
-# v1 的关键词检索很小、已测过，留作第二路信号：语义检索漏掉的
-# 精确关键词（比如“圆通”“Kimi”这种专有名词），靠它兜底。
-# 注意：它只是补充，排在语义结果后面；主召回仍是 mem0 的语义检索。
-
-_STOPWORDS = frozenset(
-    [
-        "怎么",
-        "什么",
-        "多少",
-        "这个",
-        "那个",
-        "一下",
-        "可以",
-        "一个",
-        "为什么",
-        "怎么办",
-        "是不是",
-        "有没有",
-        "请问",
-        "谢谢",
-        "the",
-        "is",
-        "are",
-        "do",
-        "does",
-        "can",
-        "could",
-        "please",
-        "tell",
-    ]
-)
-
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-
-
-def _extract_keywords(prompt, min_len=2):
-    """把问题拆成关键词：按空白和标点分词；含中文的长词再拆成两字窗口。
-
-    中文词常是两个字（“预算”“对话”），只按标点分会把“我的预算是多少”
-    当成一个词，搜不到记忆；所以含中文的长词要拆成两字窗口才能命中。
-    英文长词整词搜，不拆两字母（两字母片段噪音太大）。
-    停用词（_STOPWORDS）直接去掉，不参与检索，减少误撞。
-    返回去重后的关键词列表（保持出现顺序）。
-    """
-    parts = re.split(r"[^\w]+", prompt or "")
-    keywords = []
-    for part in parts:
-        part = part.strip()
-        if len(part) < min_len:
-            continue
-        keywords.append(part)
-        if len(part) > min_len and _CJK_RE.search(part):
-            for i in range(len(part) - 1):
-                keywords.append(part[i : i + 2])
-    seen = set()
-    out = []
-    for word in keywords:
-        if word not in seen:
-            seen.add(word)
-            if word.lower() in _STOPWORDS:
-                continue
-            out.append(word)
-    return out
-
-
-def _keyword_weight(text, keywords):
-    """给一段记忆文本打关键词权重（供补充信号用）。
-
-    权重 = 匹配到的关键词长度之和：匹配的关键词越长、越多，权重越高。
-    返回 (权重, 匹配到的关键词列表)。
-    """
-    lower = (text or "").lower()
-    matched = [kw for kw in keywords if kw.lower() in lower]
-    return sum(len(kw) for kw in matched), matched
-
-
-# ---------- 敏感信息过滤（隐私三层过滤：存前脱敏 / 用时拦截 / 导出排除） ----------
-# 为什么要有这一层：记忆里可能出现密码、API Key、身份证号、银行卡号——
-# 这些东西一旦进了记忆，有三条路会往外漏：提取时发给 DeepSeek、
-# 使用时拼进发给模型的问题、导出/迁移时被整批读出来。
-# 所以过滤做在三个地方（见 Mem0Store 里各方法的注释），日志里也绝不
-# 出现原文。注意：脱敏是按正则模式匹配的，不是万无一失——没见过的
-# 密钥格式、中间带空格的多词密码可能漏网；这层是“减少泄露面”，
-# 不是“保证绝不泄露”；真的密钥还是不要往对话里发。
-
-# _REDACTED（脱敏占位符）：秘密被替换成的文字。占位符本身不含任何
-# 原文信息，提取器看到它也不会把它当成事实存下来。
-_REDACTED = "【已隐藏敏感信息】"
-
-# _PRIVATE_KEY_RE（私钥块）：-----BEGIN ... PRIVATE KEY----- 整块都是秘密，
-# 整块替换，不留一行。
-_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-    re.DOTALL,
-)
-
-# _JWT_RE（JWT 令牌）：eyJ 开头的三段式（header.payload.signature）。
-_JWT_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-)
-
-# _KNOWN_KEY_RES（已知密钥格式，不带标签也认得）：
-# OpenAI/Anthropic 风格的 sk-、GitHub 的 ghp_/gho_/github_pat_、
-# AWS 的 AKIA、Google 的 AIza、Slack 的 xox、HuggingFace 的 hf_。
-# 前面的 (?<![A-Za-z0-9...]) 是为了不把长单词里的一段误当成密钥
-# （比如 task-abcdef... 里的 "sk-..."）。
-_KNOWN_KEY_RES = [
-    re.compile(r"(?<![A-Za-z0-9-])sk-(?:ant|proj)-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9-])sk-[A-Za-z0-9]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}"),
-    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}"),
-    re.compile(r"(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{20,}"),
-]
-
-# _ID18_RE（18 位身份证号）：6 位地区 + 8 位生日 + 3 位顺序 + 1 位校验。
-# 只认生日像生日的（19/20 年开头、月份 01–12、日期 01–31），
-# 再加校验位验算（见 _id18_check_ok），避免把 18 位订单号误伤。
-# 注意不用 \b：身份证号前面常直接跟中文（“身份证号是11010...”），
-# 中文和数字之间没有 \b；改用“前后不能是数字”来定界。
-_ID18_RE = re.compile(
-    r"(?<![0-9])\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9])"
-)
-# _ID15_RE（15 位老身份证号）：6 位地区 + 6 位生日（YYMMDD）+ 3 位顺序。
-_ID15_RE = re.compile(
-    r"(?<![0-9])\d{6}\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}(?![0-9])"
-)
-# _CARD_CANDIDATE_RE（银行卡号候选）：13–19 位数字，中间可带空格或短横。
-# 光长度不够，还要过 Luhn 校验（见 _luhn_ok）才算，避免把手机号、
-# 订单号这种长数字串误伤。
-_CARD_CANDIDATE_RE = re.compile(r"(?<![0-9])\d(?:[ -]?\d){12,18}(?![0-9])")
-
-# _SECRET_LABELS（带标签的秘密）：中文/英文里“某某是/为/：秘密”的说法。
-# 标签后面跟的才是秘密值，只替换值、保留标签和前面的正常内容，
-# 这样“喜欢喝咖啡，密码是 xxx”脱敏后还剩“喜欢喝咖啡”这句有用的。
-# 值至少 3 个字符（“密码是多少”这种问句里的“多少”只有 2 个字，不会误伤），
-# 遇到空格、逗号、句号就停（值里带空格的多词密码脱不干净，是已知局限，
-# 见文件头“实话”）。
-_SECRET_LABELS = (
-    r"密码|口令|passwd|password|pwd",
-    r"api[_ -]?key|api[_ -]?密钥|密钥|秘钥",
-    r"secret|token|令牌|access[_ -]?key|auth[_ -]?token",
-    r"身份证(?:号)?|银行卡号|信用卡号|卡号",
-)
-_LABELED_SECRET_RE = re.compile(
-    r"(?:"
-    + "|".join(_SECRET_LABELS)
-    + r")\s*(?:是|为|is|=|:|：)\s*([^\s，,、；;。！？\n]{3,})",
-    re.IGNORECASE,
-)
-
-# _GENERIC_TOKEN_RE（没见过的长令牌）：32 位以上、同时含大小写字母和
-# 数字的连续字符串（字母数字 _ -），大概率是某种 token/key。
-# 要求混搭（纯小写十六进制的 git hash 不算、纯数字不算），且前面不能是
-# / . : 或字母数字（网址、路径里的长段不算，避免把链接误伤）。
-_GENERIC_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_/.:-])"
-    r"(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\d)"
-    r"[A-Za-z0-9_-]{32,}"
-)
-
-_ID18_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
-_ID18_CHECK_CHARS = "10X98765432"
-
-
-def _id18_check_ok(number):
-    """验算 18 位身份证号的校验位（GB 11643 加权求和取模）。"""
-    if len(number) != 18:
-        return False
-    total = sum(int(digit) * weight for digit, weight in zip(number[:17], _ID18_WEIGHTS))
-    return _ID18_CHECK_CHARS[total % 11] == number[17].upper()
-
-
-def _luhn_ok(number):
-    """Luhn 校验（银行卡号用的校验算法）：从右往左隔位翻倍、减 9，
-    各位相加能被 10 整除就是合法卡号。"""
-    digits = [int(ch) for ch in number if ch.isdigit()]
-    if not 13 <= len(digits) <= 19:
-        return False
-    total = 0
-    for i, digit in enumerate(reversed(digits)):
-        if i % 2 == 1:
-            digit *= 2
-            if digit > 9:
-                digit -= 9
-        total += digit
-    return total % 10 == 0
-
-
-def _redact_sensitive(text):
-    """把一段文本里的敏感信息替换成占位符（只换秘密本身，保留其他内容）。
-
-    顺序有讲究：先换整块/定格式的（私钥块、JWT、已知密钥格式、
-    身份证号、银行卡号），再换带标签的（“密码是 xxx”——标签值里
-    也可能是一串卡号，先换卡号能把带空格的卡号整段换掉），
-    最后换没见过的长令牌。没有敏感信息时原样返回。
-    注意：这个函数绝不能记日志、绝不能把原文写进任何地方——
-    它处理的就是不能外泄的东西。
-    """
-    if not isinstance(text, str) or not text:
-        return text
-    redacted = _PRIVATE_KEY_RE.sub(_REDACTED, text)
-    redacted = _JWT_RE.sub(_REDACTED, redacted)
-    for pattern in _KNOWN_KEY_RES:
-        redacted = pattern.sub(_REDACTED, redacted)
-    redacted = _ID18_RE.sub(
-        lambda m: _REDACTED if _id18_check_ok(m.group(0)) else m.group(0), redacted
-    )
-    redacted = _ID15_RE.sub(_REDACTED, redacted)
-    redacted = _CARD_CANDIDATE_RE.sub(
-        lambda m: _REDACTED if _luhn_ok(m.group(0)) else m.group(0), redacted
-    )
-    redacted = _LABELED_SECRET_RE.sub(
-        lambda m: m.group(0)[: m.start(1) - m.start(0)] + _REDACTED, redacted
-    )
-    redacted = _GENERIC_TOKEN_RE.sub(_REDACTED, redacted)
-    return redacted
-
-
-def _contains_sensitive(text):
-    """一段文本里是否含有敏感信息（按上面的模式判断）。"""
-    if not isinstance(text, str) or not text:
-        return False
-    return _redact_sensitive(text) != text
-
-
-# _MEANINGLESS_RES（脱敏后判断“还剩不剩有用的内容”时去掉的东西）：
-# 占位符、标签词（密码/密钥/……）、虚词和标点都不算内容——
-# “我的密码是 xxx”脱敏后只剩“我的密码是”，这不叫“有用的记忆”，
-# 不值得存；“我喜欢喝咖啡，我的密码是 xxx”脱敏后还剩“喜欢喝咖啡”，
-# 这才叫有用的记忆，要留下来。注意这三个正则只用来判断“还剩不剩”，
-# 不用来改要存的文本。
-_MEANINGLESS_RES = [
-    re.compile(re.escape(_REDACTED)),
-    re.compile(
-        "|".join(_SECRET_LABELS),
-        re.IGNORECASE,
-    ),
-    re.compile(r"[我的为有在和与了呢吗是：:，,、；;。！？\s]+"),
-]
-
-
-def _meaningful_after_redaction(text):
-    """脱敏后的文本里还剩不剩有用的内容（去掉占位符、标签词、虚词后
-    还有东西才算有）。纯秘密（“我的密码是 xxx”）脱敏后什么都不剩，
-    返回 False，调用方直接不存；混合内容（“喜欢喝咖啡，密码是 xxx”）
-    还剩“喜欢喝咖啡”，返回 True，调用方存脱敏后的版本。"""
-    if not isinstance(text, str):
-        return False
-    rest = text
-    for pattern in _MEANINGLESS_RES:
-        rest = pattern.sub("", rest)
-    return bool(rest.strip())
-
-
-def _normalize_memory_text(text):
-    """把一条记忆文本规整成可比的形状（供直接存入的去重用）：
-    全角转半角（Ａ→A）、去所有空白、去末尾句末标点、英文转小写。
-    “我每天晚上都读半小时书。”和“我每天晚上都读半小时书”
-    （只差一个句号）算同一条，不重复存。"""
-    if not isinstance(text, str):
-        return ""
-    normalized = unicodedata.normalize("NFKC", text)
-    normalized = re.sub(r"\s+", "", normalized)
-    normalized = normalized.rstrip("。！？；，、.!?;,")
-    return normalized.lower()
-
-
-def _find_duplicate_memory(text, existing_items):
-    """在已有记忆里找和 text 相同（或只差标点/空白/大小写）的那条，
-    找到返回那一项（{"id", "text"}），找不到返回 None。"""
-    normalized = _normalize_memory_text(text)
-    if not normalized:
-        return None
-    for item in existing_items or []:
-        if _normalize_memory_text(item.get("text") or "") == normalized:
-            return item
-    return None
-
-
-# 判断 (a) 号：核心槽位（轻量，不请模型）。
-# 实体/数字/日期/动作词/类别词——两条记忆有没有共同槽位，
-# 决定它值不值得送模型判“是不是同一件事”。
-# 做法（纯程序，便宜）：
-#   数字：\d+（带小数也认）；
-#   日期：显式日期文本（11 月 11 日 / 2026-11-11），
-#         相对日期（今天/昨天）也算；
-#   内容词：中文没空格，取去停用词后的相邻二字当词
-#         （“鸡杂面”出“鸡杂”“杂面”，“喜欢吃”出“喜欢”“欢吃”——
-#         同一件事换说法时，至少有一两个二字词能对上）。
-# 返回一组槽位 token（"num:5"、"date:11 月 11 日"、"word:鸡杂"），
-# 调用方拿两组求交集：有交集 = 有共同槽位。
-_SLOT_STOPWORDS = frozenset(
-    "的了是在和我你他她它这那有个不没也都就还把被给让对从到为以及或但若如果因为所以虽然然而可是于是然后接着"
-)
-_SLOT_RELATIVE_DATES = ("今天", "昨天", "前天", "明天", "大前天", "后天", "昨晚", "今晚")
-_SLOT_DATE_RE = re.compile(
-    r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?"
-    r"|\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?"
-    r"|\d{4}-\d{2}-\d{2}"
-)
-
-
-def extract_core_slots(text):
-    """一条记忆文本的核心槽位（判断 a 号）。
-    返回 set（"num:..." / "date:..." / "word:..."）。
-    空文本返回空 set。"""
-    slots = set()
-    if not isinstance(text, str) or not text.strip():
-        return slots
-    lowered = text.lower()
-    for match in re.finditer(r"\d(?:\d|,\d)*(?:\.\d+)?", lowered):
-        slots.add(f"num:{match.group(0)}")
-    for match in _SLOT_DATE_RE.finditer(text):
-        slots.add(f"date:{match.group(0)}")
-    for word in _SLOT_RELATIVE_DATES:
-        if word in lowered:
-            slots.add(f"date:{word}")
-    cleaned = "".join(ch for ch in lowered if ch not in _SLOT_STOPWORDS and ch.strip())
-    for i in range(len(cleaned) - 1):
-        bigram = cleaned[i:i + 2]
-        if len(bigram) == 2:
-            slots.add(f"word:{bigram}")
-    return slots
-
-
-def _slot_values_conflict(new_text, old_text):
-    """两条记忆是不是槽位值冲突（判断 a 号，硬合并线用）：
-    同一个槽位（比如都提“鸡杂面”），值却对着干（一个说喜欢吃、
-    一个说过敏）——这种不能直接算重复，得请模型判或留着让 BOOS 看。
-    做法（启发式，宁严勿松）：两边有共同内容词，且一边带肯定动作词
-    （喜欢/爱/爱吃/要），另一边带否定/排斥动作词（过敏/讨厌/不喜欢/
-    不吃/不能吃/不要），就当冲突。没把握时返回 False（不拦硬合并，
-    模型判那道关还在）。
-    """
-    new_lower = (new_text or "").lower()
-    old_lower = (old_text or "").lower()
-    new_slots = extract_core_slots(new_text)
-    old_slots = extract_core_slots(old_text)
-    shared_words = {
-        slot for slot in (new_slots & old_slots) if slot.startswith("word:")
-    }
-    if not shared_words:
-        return False
-    positive = ("喜欢", "爱吃", "爱喝", "想要", "要吃", "要喝")
-    negative = ("过敏", "讨厌", "不喜欢", "不吃", "不能吃", "不喝", "不要")
-    new_pos = any(word in new_lower for word in positive)
-    new_neg = any(word in new_lower for word in negative)
-    old_pos = any(word in old_lower for word in positive)
-    old_neg = any(word in old_lower for word in negative)
-    if (new_pos and old_neg) or (new_neg and old_pos):
-        return True
-    # 57 号：宾语不同也是槽位值冲突——只对偏好句（喜欢/爱吃/爱喝）用：
-    # “BOOS 爱吃冒菜”vs“BOOS 爱吃拉面”，都是肯定偏好、没数字，旧检查
-    # 认不出冲突，硬合并线会把两条不同事实并成一条。做法：把两边的泛词
-    # 都去掉，剩下实义词再比——冒菜 vs 拉面剩下不同，冲突；“喜欢喝冰美式”
-    # vs“喜欢冰美式”剩下都是冰美式，不冲突，照常合并。
-    # 注意：只在两边都是偏好句时才比——“助手叫十二”vs“你的名字是十二”
-    # 这种换句式的身份陈述，泛词去掉后剩下的也不同，但它是同一件事，
-    # 不能拦，留给模型判。
-    _PREF = ("喜欢", "爱吃", "爱喝")
-    if any(w in (new_text or "") for w in _PREF) and any(
-        w in (old_text or "") for w in _PREF
-    ):
-        _FILLER = (
-            "BOOS", "我", "你", "他", "她", "它", "这", "那", "有", "个", "不",
-            "没", "也", "都", "就", "还", "把", "被", "给", "让", "对", "从",
-            "到", "为", "以及", "或", "但", "若", "如果", "因为", "所以", "虽然",
-            "然而", "可是", "于是", "然后", "接着", "喜欢", "爱吃", "爱喝",
-            "喝", "吃", "想", "要", "的", "了", "是", "在", "和", "助手", "叫",
-            "名字", "你的", "我的",
-        )
-        def _core_text(t):
-            s = t or ""
-            for w in _FILLER:
-                s = s.replace(w, "")
-            # 数字里的逗号是格式，不是内容：“25,466.19”和“25466.19”是同一个数。
-            s = s.replace(",", "")
-            return s.strip(" 。，、")
-        new_core = _core_text(new_text)
-        old_core = _core_text(old_text)
-        if new_core and old_core and new_core != old_core:
-            return True
-    # 数字不同也是槽位值冲突（“每天喝 2 杯咖啡”vs“每天喝 3 杯咖啡”——
-    # 同一话题、数不同，不是同一件事）。去掉逗号后比数值，
-    # 25,466.19 和 25466.19 是同一个数，不算冲突。
-    def _num_values(slots):
-        values = set()
-        for slot in slots:
-            if not slot.startswith("num:"):
-                continue
-            raw = slot[4:].replace(",", "")
-            try:
-                values.add(float(raw))
-            except ValueError:
-                values.add(raw)
-        return values
-
-    new_nums = _num_values(new_slots)
-    old_nums = _num_values(old_slots)
-    if new_nums and old_nums and new_nums != old_nums:
-        return True
-    return False
-
-
-
-# ---------- 聊天纠错的意图识别（供 Mem0Store.add_turn 用） ----------
-# 只认明确的纠错说法，宁可漏认、不要误认——普通聊天绝不能触发纠错。
-# “我不是”要特别小心：“我不是很确定”只是犹豫，不是纠错；所以
-# “我不是”后面必须跟一个替换说法（“而是/其实是/，新说法”），
-# 否则不触发（见 _detect_correction）。
-
-# _CORRECTION_PHRASES（纠错说法）：只认这五个明确的说法。
-_CORRECTION_PHRASES = ("你记错了", "不对", "纠正一下", "其实是", "我不是")
-
-# _CORRECTION_SEPARATORS（纠错说法前面能跟的分隔符）：纠错说法必须在
-# 句首，或在句号/逗号/换行之后——比如“我喜欢科幻电影。不对，我喜欢
-# 纪录片。”这种一句里先肯定后纠正的也认；但“我觉得不对劲”里的
-# “不对”前面是“得”，不是分隔符，不认。
-_CORRECTION_SEPARATORS = set("。！？；\n，、： ")
-
-# _BUDUI_BOUNDARY（“不对”后面能跟的字）：“不对”后面必须是个边界，
-# 不然可能是“不对劲/不对头”这种词的一部分——“不对劲，我先走了”
-# 不是纠错。标点、语气词（啊/呀/哦/呢/吧）、人称（我/你/他/这/那）
-# 都算边界；其他汉字（劲/头/味/路……）不算。
-_BUDUI_BOUNDARY = set("，。：、；！？\n \t啊呀哦呢吧我你他她它这那是")
-
-# _CHINESE_NUMERALS（挑候选时认的中文数字）：“第 1 条”里的 1 是阿拉伯
-# 数字，“第一个”里的“一”是中文数字，都认。
-_CHINESE_NUMERALS = {
-    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
-}
-
-
-def _detect_correction(text):
-    """从一句话里认出“纠错意图 + 新说法”。
-
-    返回 {"phrase": 触发的说法, "fact": 新说法}，不是纠错时返回 None。
-    认法（保守，只认明确的）：
-    - 说法必须在句首，或在句号/逗号/换行等分隔符之后；
-    - “不对”后面必须是个边界（标点/语气词/人称），排除“不对劲”这种词；
-    - 新说法 = 说法后面那一句的话（到第一个句号为止），同一轮里
-      后面的句子是别的内容，不算进新说法里；
-    - “我不是 X，Y”这种否定句式：Y 才是新说法——先看“而是/其实是”，
-      没有就取第一个逗号后面的；两个都没有（比如“我不是很确定”）
-      就不是纠错，返回 None；
-    - 新说法太短（只剩一个字或空）不算纠错，走正常保存。
-    例子：
-    - “不对，我喜欢看纪录片。”→ fact “我喜欢看纪录片。”
-    - “你记错了，我喜欢用 Go 写代码”→ fact “我喜欢用 Go 写代码”
-    - “我不是喜欢科幻电影，我喜欢纪录片。”→ fact “我喜欢纪录片。”
-    - “我不是很确定”→ None（只是犹豫，没有替换说法）
-    - “我觉得不对劲”→ None（“不对”是词的一部分）
-    """
-    if not isinstance(text, str):
-        return None
-    text = text.strip()
-    if not text:
-        return None
-    best = None  # (出现位置, 说法)：多个说法同时出现时取最早的。
-    for phrase in _CORRECTION_PHRASES:
-        start = 0
-        while True:
-            idx = text.find(phrase, start)
-            if idx < 0:
-                break
-            start = idx + 1
-            if idx != 0 and text[idx - 1] not in _CORRECTION_SEPARATORS:
-                continue
-            if phrase == "不对":
-                after = text[idx + len(phrase):idx + len(phrase) + 1]
-                if after and after not in _BUDUI_BOUNDARY:
-                    continue
-            if best is None or idx < best[0]:
-                best = (idx, phrase)
-            break  # 同一个说法只取第一次出现。
-    if best is None:
-        return None
-    idx, phrase = best
-    fact = text[idx + len(phrase):].lstrip("，,：:、；; \t")
-    if phrase == "我不是":
-        # 否定句式：新说法在“而是/其实是”后面，或在第一个逗号后面。
-        for marker in ("而是", "其实是"):
-            pos = fact.find(marker)
-            if pos >= 0:
-                fact = fact[pos + len(marker):].lstrip("，,：:、；; \t")
-                break
-        else:
-            comma = fact.find("，")
-            if comma < 0:
-                comma = fact.find(",")
-            if comma >= 0:
-                fact = fact[comma + 1:].lstrip(" \t")
-            else:
-                return None
-    fact = fact.strip()
-    # 新说法只取纠错说法所在的那一句——同一轮里后面的句子是别的内容，
-    # 不该被纠正的新文本吞进去（2 号：不然“我喜欢喝咖啡”会被存进
-    # 名字记忆里，后面待定区提交时又存一条，重复且文本被污染）。
-    term = re.search(r"[。！？\n]", fact)
-    if term:
-        fact = fact[:term.end()].strip()
-    # 新说法太短（去掉句末标点只剩一个字、或空）不算纠错，走正常保存。
-    if len(fact.rstrip("。！？；，、.!?;,")) < 2:
-        return None
-    return {"phrase": phrase, "fact": fact}
-
-
-def _latest_user_content(messages):
-    """取消息列表里最后一条 user 消息的内容（本轮用户刚说的那句）。
-
-    add_turn 收到的可能是最近几轮的消息（CLI/网页都只带最近 6 条），
-    纠错只看最新那句——以前轮次的纠错在它那轮已经处理过了。
-    没有 user 消息时返回 ""。
-    """
-    for message in reversed(messages or []):
-        if (message or {}).get("role") == "user":
-            return (message or {}).get("content") or ""
-    return ""
-
-
-def _strip_correction_sentences(latest_user):
-    """去掉纠错句，留非纠正部分（Plan C 2 号）。
-
-    一句一句看：含纠错说法的那句，只留说法前面的部分（有实质内容
-    才留，比如“我喜欢喝咖啡，你记错了，我叫小宋”里留“我喜欢喝咖啡”），
-    说法后面的新说法已由 correct_memory 处理，不再重复存；
-    没有纠错说法的句子原样留。
-    返回剩下的句子列表，没有剩下时返回 []。
-    """
-    kept = []
-    for sentence in re.split(r"[。！？\n]+", latest_user or ""):
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        detected = _detect_correction(sentence)
-        if detected is None:
-            kept.append(sentence)
-            continue
-        before = sentence[:sentence.find(detected["phrase"])].strip()
-        before = before.strip("，,：:、；; \t")
-        if len(before) >= 2:
-            kept.append(before)
-    return kept
-
-
-# 碎片纠正：纠正新说法是个碎片（不完整的一句）时，先补成整句再改。
-_FRAGMENT_MAX_LEN = 12  # 碎片一般很短，超过这个长度就当完整的一句处理
-# 含糊指代：值本身没有内容（“那个”“这个”“它”），补不出来，直接走老路。
-_VAGUE_FRAGMENT_VALUES = (
-    "那个", "这个", "它", "他", "她", "那", "这",
-    "那个东西", "这个东西", "那东西", "这东西",
-)
-
-
-def _detect_correction_fragment(text):
-    """认出纠错新说法是不是个“碎片”（不完整的一句）。
-
-    碎片 = “是 + 值”（“是绿色”）或光秃秃一个短语（“绿色”“喜欢绿色”）。
-    返回碎片里的“值”（“绿色”），不是碎片时返回 None。
-    完整的一句（“我喜欢绿色。”）有主语，不算碎片。
-    """
-    if not isinstance(text, str):
-        return None
-    s = text.strip().rstrip("。！？；，、.!?;,").strip()
-    if not s or len(s) > _FRAGMENT_MAX_LEN:
-        return None
-    if s.startswith("是"):
-        value = s[1:].strip("，,：:、；; \t")
-        return value or None
-    # 光秃秃一个短语：不以主语开头——“绿色”“喜欢绿色”。
-    if s[0] in ("我", "你", "他", "她", "它", "这", "那"):
-        return None
-    return s
-
-
-# ---------- Plan C：记忆信任修复（2026-11-09，BOOS 批准动手） ----------
-# 问题：十二不敢信 BOOS 亲口说的名字和 SOUL.md——新对话里问名字，
-# 它说“未经逐条确认的信息”、SOUL.md“没有任何记录”。根因是确认
-# 模型太严，连用户亲口说的都不敢信。治本办法（三闸门 + 待定区 +
-# 冲突兜底），落地顺序见 add_turn / _commit_pending_turn：
-#   闸门 1（话语类型过滤）：假设句、玩笑夸张不存（见
-#     _filter_extraction_messages + CUSTOM_INSTRUCTIONS 第 13 条）；
-#   闸门 2（槽位分级）：名字/称呼/重要偏好是 BOOS 亲口说的，代码
-#     直接标 user_explicit（source="user"、user_confirmed=True、
-#     confidence=1.0），来源由代码定、不由模型定（见
-#     _detect_identity_statement + _upsert_slot_memory）；
-#   闸门 3（待定区 + 冲突检查）：新记忆先在内存里待一轮对话，
-#     下一轮不撤回才真正存入；“不不不”这类撤回信号直接丢掉待定
-#     的那轮，沉默（没有下一轮）则待定区清空、不存；同槽位新值
-#     来时原地 UPDATE，不并存（mem0 本身是 ADD-only，冲突处理
-#     必须在应用层做，见 _upsert_slot_memory）。
-# 记忆面板只做事后修正兜底，不当确认入口。
-
-# 槽位（slot）：身份/称呼类记忆在 metadata 里带的槽位名，
-# 同槽位只留一条（新值盖旧值）。KNOWN_SLOTS 之外的 slot 一律不认。
-SLOT_AGENT_NAME = "agent_name"  # Agent 自己的名字（十二）
-SLOT_USER_NAME = "user_name"  # BOOS 希望被怎么称呼
-SLOT_SOUL = "soul"  # Agent 的人格（灵魂，SOUL.md）
-SLOT_COMPUTER = "computer"  # BOOS 的电脑配置（17 号种子）
-KNOWN_SLOTS = frozenset([SLOT_AGENT_NAME, SLOT_USER_NAME, SLOT_SOUL, SLOT_COMPUTER])
-
-# 身份种子（Plan C 种进长期记忆的两条“已确认”记忆）：
-# 名字是 BOOS 2026-11-08 亲口定的、2026-11-09 亲口告诉十二的；
-# SOUL.md 是 BOOS 逐条定的十条原则。种子只在“没有时”才加，
-# 绝不覆盖已有的槽位值（比如 BOOS 以后在聊天里改了名字，
-# 下次启动不能把名字改回去）。
-AGENT_NAME_VALUE = "十二"
-# 种子文本里特意留了“你叫十二”：_detect_identity_statement 要能从
-# 这句里认出 agent_name=十二——以后 BOOS 在聊天里再说“你叫十二”，
-# upsert 比对旧值对得上，才不会误判成改名、把“是十一的弟弟”盖掉。
-AGENT_NAME_TEXT = "Agent 的名字是十二，你叫十二，是十一的弟弟。"
-AGENT_SOUL_TEXT = (
-    "Agent 的人格（灵魂）写在 SOUL.md 里：十条原则——"
-    "真诚帮忙不装样子、有主见、自己先想办法再问、重要的事先问、"
-    "亦师亦友、温暖不冷淡、记住并不断学习、诚实绝不编造、有原则、"
-    "BOOS 明确要求无条件服从时就服从。"
-)
-
-# 电脑配置种子（17 号：BOOS 的电脑配置也种进长期记忆当已确认，
-# 评审技术方案、回答“我的电脑能不能跑这个”时先拿这条当依据）。
-# 配置以 BOOS 2026-11-06 发来的系统信息为准：Windows 11 Home 23H2、
-# ASUS Vivobook K3402ZA、i5-12500H、16GB 内存、Python 3.12.10、
-# Git、VS Code；仓库在 D:\代码\agent，文件工具的工作区围栏是
-# D:\代码\十二的工作区。硬盘容量截图里没显示，不要编，就不写。
-# 和身份种子一样，只在“没有时”才加，绝不覆盖已有值。
-COMPUTER_VALUE = "windows-pc"
-COMPUTER_TEXT = (
-    "BOOS 的电脑配置：Windows 11 Home 23H2，ASUS Vivobook K3402ZA，"
-    "i5-12500H，16GB 内存，Python 3.12.10，Git，VS Code。"
-    "仓库在 D:\\代码\\agent，文件工具的工作区围栏是 D:\\代码\\十二的工作区。"
-)
-
-# _RETRACTION_SIGNALS（撤回信号）：整句只有这些词（加句末标点）时，
-# 意思是“刚说的那句撤回、不记了”——直接丢掉待定区里的上一轮，
-# 不存、不问。只认“整句只有信号”：“不对，我喜欢看纪录片。”这种
-# 带替换内容的不是撤回，走纠错。没有“没有”——光秃秃的“没有”常常
-# 是在回答助手刚问的问题（“你喜欢喝茶吗？”“没有。”），不是撤回
-# 上一句，误杀会丢掉刚说的重要事实。
-_RETRACTION_SIGNALS = frozenset(
-    [
-        "不不不",
-        "不对不对",
-        "不不",
-        "不对",
-        "不是",
-        "算了",
-        "别记",
-        "别记了",
-        "不要记",
-        "不要记了",
-        "不记了",
-        "别存",
-        "不要存",
-        "错了",
-        "说错了",
-        "收回",
-        "撤回",
-    ]
-)
-_RETRACTION_TRAILING_PUNCT = "。！？.!?~～ \t\n"
-
-# 条件句开头：不是既定事实，提取时整句去掉（和 FakeMemory 认同一套）。
-_CONDITIONAL_LEADS = ("如果", "假设", "假如", "要是", "万一")
-
-# 玩笑标记：句里出现这些词，这句就是在开玩笑/说着玩，不是既定事实
-# （Plan C 闸门 1 的代码兜底；提示词第 13 条仍在，模型判断是第一道，
-# 这里是第二道——模型哪天没拦住，代码拦）。
-# 写法收紧：只认带明确标记的说法——“我喜欢开玩笑”这种真偏好不带
-# 这些标记，不会被误拦。
-_JOKE_MARKERS = (
-    "开玩笑的", "开玩笑呢", "开玩笑了", "我开玩笑", "只是开玩笑",
-    "开个玩笑", "逗你玩", "闹着玩", "说着玩", "别当真",
-    "瞎说的", "胡说的",
-)
-
-# 明显不可能的数字（只认这两类最稳的，其余交给模型判断）：
-# - 年龄超过 120 岁（人类最长寿 122 岁，留一点余量）；
-# - 身高超过 3 米（人类最高 2.72 米）。
-_JOKE_AGE_LIMIT = 120
-_JOKE_HEIGHT_LIMIT_M = 3.0
-_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-              "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
-_CN_UNITS = {"十": 10, "百": 100, "千": 1000}
-_AGE_RE = re.compile(r"([一二三四五六七八九十百千两\d]+)\s*岁")
-# 身高只认两种写法：“身高 3.5 米”“我 3.5 米高”——“我 100 米跑”
-# 这种跑步距离不认（“米”后面没有“高”，也不是“身高”开头）。
-_HEIGHT_RE = re.compile(
-    r"(?:身高\s*([一二三四五六七八九十百千两\d]+(?:\.\d+)?)\s*米"
-    r"|我\s*([一二三四五六七八九十百千两\d]+(?:\.\d+)?)\s*米高)"
-)
-
-# 身份陈述的触发词：按“先 user、后 agent”试——“你叫我小宋”里的
-# “你叫”是叫“我”，不是在给 Agent 起名；每组内按触发词从长到短试。
-_IDENTITY_USER_TRIGGERS = ("我的名字是", "我的名字叫", "你叫我", "叫我", "我叫")
-_IDENTITY_AGENT_TRIGGERS = ("以后你叫", "现在你叫", "你的名字是", "你的名字叫", "你叫", "助手叫", "助手的名字是", "助手的名字叫")
-_IDENTITY_VALUE_MAX_LEN = 12  # 名字值最多 12 字
-_IDENTITY_TRAILING_PARTICLES = "了啊呀呢吧哦嘛呗啦喽哈"  # 名字末尾的语气词，去掉
-# 问句尾巴：值以这些结尾时整句是问句（“你叫十三好不好”是在问，
-# 不是在起名），不当身份陈述认。
-_IDENTITY_QUESTION_SUFFIXES = ("好不好", "行不行", "可以吗", "好吗")
-
-
-def _is_bare_retraction(text):
-    """整句只有撤回信号时返回 True（Plan C 待定区撤回）。
-
-    “不不不。”“不对。”“算了。”这种——只有信号加句末标点。
-    “不对，我喜欢看纪录片。”带替换内容，不是撤回，返回 False。
-    """
-    if not isinstance(text, str):
-        return False
-    stripped = text.strip().strip(_RETRACTION_TRAILING_PUNCT).strip()
-    return stripped in _RETRACTION_SIGNALS
-
-
-def _detect_identity_statement(sentence):
-    """从一句话里认出“身份/称呼陈述句”（Plan C 闸门 2，代码定、不是模型定）。
-
-    只认陈述句：带“什么/吗/?”的一律不认（“你叫什么？”是提问，
-    不是在告诉名字）。认到返回 {"slot", "value", "text"}：
-    - agent_name（十二的名字）：“你叫十二”“以后你叫十二了”
-      → text "Agent 的名字是十二，你叫十二"（带“你叫”二字，
-      离线关键词召回问“你叫什么”时也能找着）；
-    - user_name（BOOS 的称呼）：“我叫小宋”→ 原句存（去句末标点）；
-      “叫我小宋”/“你叫我小宋”→ "我叫小宋，请称呼我小宋"。
-    名字值最多 12 字，末尾的语气词（了/啊/呀/呢/吧/哦/嘛/呗/啦/喽/哈）去掉；
-    值以“好不好/行不行/可以吗/好吗”结尾时整句是问句，返回 None。
-    认不到返回 None。
-    """
-    if not isinstance(sentence, str):
-        return None
-    text = sentence.strip().strip("。！？；，、.!?;,")
-    if not text:
-        return None
-    if any(q in text for q in ("什么", "吗", "？", "?")):
-        return None
-    if any(marker in text for marker in _JOKE_MARKERS):
-        # 玩笑里的起名不当真（“开玩笑的，你叫十三”不是在改名）。
-        return None
-    for triggers, slot in (
-        (_IDENTITY_USER_TRIGGERS, SLOT_USER_NAME),
-        (_IDENTITY_AGENT_TRIGGERS, SLOT_AGENT_NAME),
-    ):
-        for trigger in triggers:
-            idx = text.find(trigger)
-            if idx < 0:
-                continue
-            rest = text[idx + len(trigger):]
-            # 值到第一个标点为止。
-            value = re.split(r"[，。！？、；;,\s]", rest, maxsplit=1)[0].strip()
-            value = value.rstrip(_IDENTITY_TRAILING_PARTICLES)
-            # 问句尾巴：整句是在问“这样叫好不好”，不是在起名。
-            if any(value.endswith(suffix) for suffix in _IDENTITY_QUESTION_SUFFIXES):
-                return None
-            if not value or len(value) > _IDENTITY_VALUE_MAX_LEN:
-                continue
-            if slot == SLOT_USER_NAME:
-                if trigger in ("叫我", "你叫我"):
-                    canonical = f"我叫{value}，请称呼我{value}"
-                else:
-                    canonical = text  # “我叫小宋”这类原句直接存
-            else:
-                canonical = f"Agent 的名字是{value}，你叫{value}"
-            return {"slot": slot, "value": value, "text": canonical}
-    return None
-
-
-def _parse_chinese_number(text):
-    """把“十/百/千”组合的中文数字转成整数（只做年龄、身高这点小事）。
-
-    一百五十 → 150，二十 → 20，一千二百三十四 → 1234。
-    认不出来（混了阿拉伯数字、带“点”这种）返回 None，不猜。
-    """
-    if not text or not all(ch in _CN_DIGITS or ch in _CN_UNITS for ch in text):
-        return None
-    total = 0
-    current = 0
-    seen_unit = False
-    for ch in text:
-        if ch in _CN_DIGITS:
-            current = _CN_DIGITS[ch]
-        else:
-            unit = _CN_UNITS[ch]
-            if current == 0:
-                current = 1  # “十”就是 10，“百”就是 100
-            total += current * unit
-            current = 0
-            seen_unit = True
-    total += current
-    if not seen_unit and total == 0:
-        return None
-    return total
-
-
-def _is_joke_or_exaggeration(sentence):
-    """Plan C 闸门 1 的代码兜底：明显是玩笑/夸张的句子返回 True。
-
-    只认最稳的三类，其余交给提示词第 13 条（模型判断）：
-    - 句里带明确玩笑标记（开玩笑的/逗你玩/闹着玩/说着玩/别当真/
-      瞎说的/胡说的）——整句当玩笑处理，连着的真话也一起去掉，
-      宁可漏记一句（用户会再说），不把玩笑存成事实；
-    - 年龄超过 120 岁（阿拉伯数字或中文数字，如 150 岁/一百五十岁）；
-    - 身高超过 3 米（身高 3.5 米/我 3.5 米高）。
-    “我一百岁了”（100 岁）、“姚明 2.26 米”这种没超线的正常话不拦。
-    """
-    if not isinstance(sentence, str) or not sentence:
-        return False
-    if any(marker in sentence for marker in _JOKE_MARKERS):
-        return True
-    age_match = _AGE_RE.search(sentence)
-    if age_match:
-        raw = age_match.group(1)
-        age = int(raw) if raw.isdigit() else _parse_chinese_number(raw)
-        if age is not None and age > _JOKE_AGE_LIMIT:
-            return True
-    height_match = _HEIGHT_RE.search(sentence)
-    if height_match:
-        raw = height_match.group(1) or height_match.group(2)
-        if raw is None:
-            return False
-        if "." in raw:
-            try:
-                height = float(raw)
-            except ValueError:
-                height = None
-        elif raw.isdigit():
-            height = float(raw)
-        else:
-            parsed = _parse_chinese_number(raw)
-            height = float(parsed) if parsed is not None else None
-        if height is not None and height > _JOKE_HEIGHT_LIMIT_M:
-            return True
-    return False
-
-
-def _filter_extraction_messages(messages):
-    """Plan C 闸门 1：从待提交的对话里去掉不该进提取的东西，
-    返回过滤后的消息列表（assistant 的话原样透传，只当提取上下文）。
-
-    去掉三类 user 句子：
-    - 条件/假设句开头的（如果/假设/假如/要是/万一）——不是既定事实；
-    - 身份/称呼陈述句——身份事实只走确定性的槽位路径
-      （_upsert_slot_memory），不经过模型提取，避免同一事实存两份；
-    - 玩笑/夸张句（_is_joke_or_exaggeration）——明确玩笑标记、
-      年龄超 120 岁、身高超 3 米；其余玩笑仍靠提示词第 13 条拦。
-    一条 user 消息里句子全被去掉时，整条消息不要了。
-    """
-    kept = []
-    for message in messages or []:
-        role = (message or {}).get("role")
-        content = (message or {}).get("content") or ""
-        if role != "user":
-            if role == "assistant":
-                kept.append({"role": "assistant", "content": content})
-            continue
-        sentences = re.split(r"[。！？\n]+", content)
-        kept_sentences = []
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            if sentence.startswith(_CONDITIONAL_LEADS):
-                continue
-            if _detect_identity_statement(sentence) is not None:
-                continue
-            if _is_joke_or_exaggeration(sentence):
-                continue
-            kept_sentences.append(sentence)
-        if kept_sentences:
-            kept.append(
-                {"role": "user", "content": "。".join(kept_sentences) + "。"}
-            )
-    return kept
-
-
-def _correction_result(outcome):
-    """把 correct_memory 的返回收成调用方好用的样子（只留必要字段）。
-
-    {"status", "memory_id", "old_text", "new_text",
-     "candidates": [{"id", "text"}]（ambiguous 时给调用方展示用）,
-     "reason": 没改成的原因（给人看的）,
-     "layer": 哪一层定的（exact/single/judge/judge_blocked/ask/none，
-     见 correct_memory）,
-     "resolution": 这次纠正的结果（updated/judge_blocked/ask/
-     not_found/unchanged/failed，见 correct_memory）,
-     "audit": 审计信息（picked_id/judge_reason/old_new_similarity/
-     candidate_scores/context_ids，见 correct_memory）}。
-    """
-    outcome = outcome or {}
-    return {
-        "status": outcome.get("status"),
-        "memory_id": outcome.get("memory_id"),
-        "old_text": outcome.get("old_text"),
-        "new_text": outcome.get("new_text"),
-        "candidates": [
-            {"id": (c or {}).get("id"), "text": (c or {}).get("text")}
-            for c in (outcome.get("candidates") or [])
-        ],
-        "reason": outcome.get("reason") or "",
-        "layer": outcome.get("layer") or "none",
-        "resolution": outcome.get("resolution") or "failed",
-        "audit": outcome.get("audit") or {},
-    }
-
-
-def _parse_pending_selection(text, candidates):
-    """用户回“第 1 条/第一个/1”或直接引用某条候选原文时，认出他指的是哪条。
-
-    返回挑中的候选（{"id", "text"}），认不出时返回 None——认不出
-    就当放弃这次纠错（add_turn 会清掉待确认、不再问），绝不猜一条。
-    认法（按明确程度从高到低）：
-    - “第 1 条 / 第1条 / 第一个 / 1”：数字指明第几条；
-    - 直接引用候选原文：某条候选里连续 4 个字出现在用户的话里，
-      且只有这一条对得上（两条都对得上时不猜，返回 None）。
-      比如候选是“我喜欢看科幻电影”，用户说“科幻电影那条”——
-      “科幻电影”这 4 个字只在这一条里，就认它。
-    """
-    if not isinstance(text, str) or not candidates:
-        return None
-    stripped = text.strip()
-    match = re.search(r"第\s*(\d+)\s*条", stripped)
-    if match:
-        n = int(match.group(1))
-        return candidates[n - 1] if 1 <= n <= len(candidates) else None
-    match = re.search(r"第\s*([一二三四五六七八九十])\s*个", stripped)
-    if match:
-        n = _CHINESE_NUMERALS[match.group(1)]
-        return candidates[n - 1] if 1 <= n <= len(candidates) else None
-    if re.fullmatch(r"\d+", stripped):
-        n = int(stripped)
-        return candidates[n - 1] if 1 <= n <= len(candidates) else None
-    # 直接引用原文：候选里连续 4 个字出现在用户的话里，且只有一条对得上。
-    norm_text = _normalize_memory_text(stripped)
-    matched = []
-    for cand in candidates:
-        norm_cand = _normalize_memory_text((cand or {}).get("text") or "")
-        if len(norm_cand) < 4:
-            continue
-        windows = {norm_cand[i:i + 4] for i in range(len(norm_cand) - 3)}
-        if any(window in norm_text for window in windows):
-            matched.append(cand)
-    if len(matched) == 1:
-        return matched[0]
-    return None
-
-
-def _parse_judge_choice(content, candidates):
-    """从 DeepSeek 纠错判断的返回里抠出它选的候选 id（供 _judge_correction 用）。
-
-    认三种写法：{"choice": "<候选 id>"}（标准）、{"choice": "none"}
-    （分不清/没有冲突的）、直接写 id 本身（或第几条的数字序号）。
-    返回 (id 或 None, reason)：
-    - 选中的 id 时 reason 是 None；
-    - choice 是 none 时 reason 是 "similar"（两条都像、分不开）或
-      "unrelated"（哪个都不像、没关系），取自返回里的 "reason" 字段；
-      reason 缺失或认不出时默认 "similar"——重试一次是安全的，
-      最坏也只是多调一次然后问 BOOS。
-    分不清、格式不对、选的 id 不在候选里时 id 都是 None，调用方
-    走问 BOOS 的流程，绝不猜。模型有时会在 JSON 外面包一层
-    ```json 围栏，先剥掉再解析。
-    """
-    if not isinstance(content, str) or not content.strip():
-        return None, "similar"
-    text = content.strip()
-    # 去掉 ```json ... ``` 这种围栏（模型有时会包一层）。
-    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
-    ids = {(c or {}).get("id") for c in candidates or []}
-    choice = None
-    reason = None
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            choice = data.get("choice")
-            reason = data.get("reason")
-        elif isinstance(data, (str, int)) and not isinstance(data, bool):
-            # 整段就是答案本身（比如直接写了个 id，或写了个数字序号）。
-            choice = data
-    except ValueError:
-        # 不是 JSON：整段就是它写的答案（比如直接写了个 id）。
-        choice = text
-    if isinstance(reason, str):
-        reason = reason.strip().lower()
-        if reason not in ("similar", "unrelated"):
-            reason = None
-    else:
-        reason = None
-    if isinstance(choice, int) and not isinstance(choice, bool):
-        # 数字序号也认（1 → 第 1 条）。
-        if 1 <= choice <= len(candidates or []):
-            return (candidates[choice - 1] or {}).get("id"), None
-        return None, "similar"
-    if not isinstance(choice, str):
-        return None, "similar"
-    choice = choice.strip().strip("\"'")
-    if choice.lower() in ("none", "unclear", "不知道", "分不清", ""):
-        return None, reason or "similar"
-    if choice in ids:
-        return choice, None
-    if choice.isdigit():
-        n = int(choice)
-        if 1 <= n <= len(candidates or []):
-            return (candidates[n - 1] or {}).get("id"), None
-    return None, "similar"
-
-
-def _cosine_similarity(vec_a, vec_b):
-    """两个向量的余弦相似度（纠错安全网用，纯函数）。
-
-    返回 -1 到 1 之间：1 是同一方向、0 是无关、-1 是相反。
-    任一向量是空的或零向量时返回 0.0（没法比，就当中立）。
-    自己做归一化，不依赖 embedding 模型有没有归一化过。
-    """
-    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
-        return 0.0
-    dot = sum(float(x) * float(y) for x, y in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(float(x) * float(x) for x in vec_a))
-    norm_b = math.sqrt(sum(float(y) * float(y) for y in vec_b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-# ---------- 版本文件（embedding 模型 + 维度记录） ----------
-# 换 embedding 模型必须全量重嵌：维度不同时 Chroma 直接报硬错，
-# 旧库不能混用。所以每次建库时，把用的模型名、维度、mem0 版本
-# 写进版本文件；启动时先对一下，对不上就拒绝启动、不悄悄混用，
-# 让用户走重嵌迁移（tools/reembed_memories.py），而不是等 Chroma 报错。
-
-def _read_version_file(version_path):
-    """读版本文件，读不到或格式不对时返回 None（当作“没有版本记录”）。"""
-    try:
-        data = json.loads(Path(version_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
-
-
-def _write_version_file(version_path, embedding_model, embedding_dims, mem0_version):
-    """写版本文件：模型名、维度、mem0 版本、写入日期。"""
-    path = Path(version_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "embedding_model": embedding_model,
-                "embedding_dims": embedding_dims,
-                "mem0_version": mem0_version,
-                "custom_instructions_version": CUSTOM_INSTRUCTIONS_VERSION,
-                "updated": _today(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
-def _check_version_file(version_path, chroma_path, embedding_model, embedding_dims, mem0_version):
-    """校验版本文件与当前配置是否一致。
-
-    规则：
-    - 版本文件不存在、且 Chroma 目录也不存在或为空：全新库，写版本文件，通过。
-    - 版本文件不存在、但 Chroma 目录里已有数据：来历不明的旧库，拒绝启动
-      （不知道它是用哪个模型嵌的，混用会坏数据）。
-    - 版本文件存在、模型名或维度或 mem0 版本对不上：拒绝启动，提示走重嵌迁移。
-    - 对得上：通过。
-    拒绝时抛 RuntimeError，信息里写清楚原因和该怎么做。
-    """
-    version_path = Path(version_path)
-    chroma_path = Path(chroma_path)
-    recorded = _read_version_file(version_path)
-    chroma_has_data = chroma_path.exists() and any(chroma_path.iterdir())
-    if recorded is None:
-        if chroma_has_data:
-            raise RuntimeError(
-                "记忆库版本不明：Chroma 目录里已有数据，但没有版本文件，"
-                "不知道它是用哪个 embedding 模型建的，不能直接混用。"
-                "请先备份 memory/，再用 tools/reembed_memories.py 重嵌，"
-                "或删掉 memory/mem0_chroma 后重新迁移。"
-            )
-        _write_version_file(version_path, embedding_model, embedding_dims, mem0_version)
-        return
-    if (
-        recorded.get("embedding_model") != embedding_model
-        or recorded.get("embedding_dims") != embedding_dims
-        or recorded.get("mem0_version") != mem0_version
-    ):
-        raise RuntimeError(
-            "记忆库版本不匹配：记录的是 "
-            f"{recorded.get('embedding_model')}（{recorded.get('embedding_dims')} 维，"
-            f"mem0 {recorded.get('mem0_version')}），当前配置是 "
-            f"{embedding_model}（{embedding_dims} 维，mem0 {mem0_version}）。"
-            "换 embedding 模型必须全量重嵌，不能直接混用。"
-            "请用 tools/reembed_memories.py 重嵌，或删掉 memory/mem0_chroma 后重新迁移。"
-        )
-
-
-# 保护失败时结果里附带的列表字段：没恢复回来的旧记忆 id、回滚删不掉
-# 的新记忆 id 和原文。保护信息要经过守卫 → 提交 → add_turn 三层往上传，
-# 以前每层手写一个键一个键地传，加个字段就得改三处，漏一处就半路丢了
-# （回滚残留的原文就是这么丢的：守卫算出来了，只进了保护事件，没进
-# 返回结果）。现在三层都调 _carry_protection_fields，以后再加字段只改
-# 下面这个元组一行。
-_PROTECTION_RESULT_KEYS = (
-    "failed_ids",
-    "rollback_leftover_ids",
-    "rollback_leftover_texts",
-)
-
-
-def _carry_protection_fields(src, dst):
-    """把保护失败的字段从一个结果字典带到另一个。
-
-    只在源字典标了 protection_failed 时才带；没标时什么都不动。
-    只填空、不覆盖：目标字典里已经有 protection_failed 时，目标
-    那份是更新鲜的（比如纠错返回路里，本轮自己的提取也失败了），
-    原样留着、一个键都不盖——上一轮的只在目标没有时才补。不能按
-    键一个一个填：上一轮的 failed_ids、残留 id/原文都是上一轮那次
-    失败的，单拎几个键填进本轮的失败里会串味（比如原因写着快照
-    失败，failed_ids 却是上一轮没恢复回来的旧记忆）。
-    失败标记和原因照原样带（原因即使是 None 也带，和以前手写时
-    一样）；三个列表字段只在非空时带，空的就不写进结果——返回的
-    样子不变，同样的顶层键，调用方（web 面板、命令行）不用动。
-    """
-    src = src or {}
-    if not src.get("protection_failed"):
-        return
-    if dst.get("protection_failed"):
-        return
-    dst["protection_failed"] = True
-    dst["protection_reason"] = src.get("protection_reason")
-    for key in _PROTECTION_RESULT_KEYS:
-        value = src.get(key)
-        if value:
-            dst[key] = value
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class Mem0Store:
@@ -2488,6 +729,9 @@ class Mem0Store:
         history_db_path=None,
         version_path=None,
         protection_events_path=None,
+        ledger_path=None,
+        snapshot_path=None,
+        backup_dir=None,
         user_id=DEFAULT_USER_ID,
         budget_tracker=None,
         threshold=RETRIEVAL_THRESHOLD,
@@ -2513,6 +757,29 @@ class Mem0Store:
             if protection_events_path
             else project_root / "memory" / "protection-events.jsonl"
         )
+        # 事件账本（最终方案，2026-11-13）：memory_events.jsonl 是家，
+        # mem0 只是可丢弃的索引。先写账本、再写索引；账本写不进去，
+        # 索引那步也别写。快照（一年压一次）和备份（带校验、真恢复）
+        # 也都放 memory/ 下，gitignore 覆盖，不进仓库。
+        self.ledger_path = (
+            Path(ledger_path)
+            if ledger_path
+            else project_root / "memory" / "memory_events.jsonl"
+        )
+        self.snapshot_path = (
+            Path(snapshot_path)
+            if snapshot_path
+            else project_root / "memory" / "memory_events_snapshot.json"
+        )
+        self.backup_dir = (
+            Path(backup_dir)
+            if backup_dir
+            else project_root / "memory" / "backups"
+        )
+        # _ledger_lock：账本追加的锁——序号是“读最后一行 + 1”算出来的，
+        # 两个线程同时追加会编出同一个号；追加那一下串起来，别的写操作
+        # 不走这把锁（写记忆本来就串在 _WRITE_LOCK 里）。
+        self._ledger_lock = threading.Lock()
         self.user_id = user_id
         self.budget_tracker = budget_tracker
         self.threshold = threshold
@@ -2663,15 +930,16 @@ class Mem0Store:
 
     # ---------- 检索（提问前） ----------
 
-    def search(self, query, top_k=5, reinforce=False):
+    def search(self, query, top_k=5, reinforce=False, include_history=False):
         """搜和问题相关的记忆（语义检索 + 关键词补充信号）。
 
         返回：记忆列表，每项为 {"id", "text", "score", "source",
-        "metadata", "confirmed", "decay_weight"}，source 是 "semantic"（语义）或
-        "keyword"（关键词补充），metadata 是规整过的来源信息
-        （见 _normalize_metadata），confirmed 是“BOOS 是否逐条确认过”
-        （只有 source="user" 的记忆才可能是 True），decay_weight 是
-        这条记忆现在的衰减权重（0.10–1.0，核心记忆恒为 1.0）。
+        "metadata", "confirmed", "decay_weight", "is_history"}，source 是
+        "semantic"（语义）、"keyword"（关键词补充）或 "ledger"（账本兜底），
+        metadata 是规整过的来源信息（见 _normalize_metadata），confirmed
+        是“BOOS 是否逐条确认过”（只有 source="user" 的记忆才可能是 True），
+        decay_weight 是这条记忆现在的衰减权重（0.10–1.0，核心记忆恒为 1.0），
+        is_history 是不是“以前的”（被取代/睡着的，默认不返回，见下）。
         注意：search 不按来源过滤——提取的（inferred）记忆和未确认的
         旧记忆也会返回，调用方（main.py 的 _memory_block）按来源决定
         怎么用：已确认的才能当作事实，未确认的不能当作事实。
@@ -2688,6 +956,14 @@ class Mem0Store:
         没返回的候选一条也不抬。内部检索（纠错找候选、守卫找邻居）
         一律不传，绝不能把“找候选”也算成“用上了”（好几个纠错测试
         都断言了“检索不写回”，见 tests/test_mem0_correction.py）。
+        投影过滤（最终方案，2026-11-13）：检索回来之后再过筛子——
+        被取代的、删了的默认不给（is_history=False 的才是当前记忆）；
+        问“以前”时传 include_history=True 才放出来，并标
+        is_history=True（“这是以前的”）。睡着的不屏蔽：它是衰减的
+        标签，不是“不是当前了”（见 ledger.py project_and_filter）。
+        账本是空的（刚启用、还没记过）时筛子不过滤，行为和以前一模一样。
+        账本兜底：当前结果不够 top_k 时，翻账本原话按关键词找，
+        补在后面（source="ledger"，score 是关键词权重，不是语义分）。
         流程：
         1. mem0 语义检索（top_k 条），只留分数 ≥ 阈值（默认 0.4）的。
            分数不够的直接丢掉，不注入——宁可不带记忆，也别把看着像的
@@ -2794,17 +1070,128 @@ class Mem0Store:
             key=lambda item: item.get("decay_weight") or 0,
             reverse=True,
         )
+        # 投影过滤之前先把这一批的 key 都记下来：被筛掉的（睡着的、
+        # 被取代的、删了的）原话，兜底那步也不许再从账本里捞回来——
+        # 筛子刚扔掉的，兜底不能再捡回来当现况（账本兜底只补“索引
+        # 里丢了”的，不补“筛子判了旧的”）。
+        pre_filter_keys = {
+            _ledger.ledger_event_key(
+                item.get("text") or "",
+                (item.get("metadata") or {}).get("created_at"),
+            )
+            for item in results
+        }
+        ledger_state = self.ledger_state()
+        # 投影过滤：被取代的、睡着的默认不给；问“以前”才放出来。
+        results = _ledger.project_and_filter(
+            results, ledger_state, include_history=include_history
+        )
+        # 账本兜底：当前结果不够时，翻账本原话按关键词找，补在后面。
+        # 只补“当前”的原话：账本里标了 superseded / deleted 的 key
+        # 不当现况（除非问的就是以前，include_history=True 时才放
+        # 出来，并标清它是什么状态）；睡着的（dormant）是当前记忆，
+        # 照常补（见 project_and_filter）。兜底项没有 mem0 id
+        # （id=None）：它只是档案里的原话，拿来回答问题可以，拿去
+        # update / 纠错 / 打标记不行——内部流程认 id 的地方要跳过它
+        # （见 _find_slot_memories_by_text、_find_correction_candidates）。
+        if len(results) < top_k:
+            try:
+                events, _info = _ledger.read_events(self.ledger_path)
+                seen_keys = {
+                    _ledger.ledger_event_key(
+                        item.get("text") or "",
+                        (item.get("metadata") or {}).get("created_at"),
+                    )
+                    for item in results
+                } | pre_filter_keys
+                key_states = ledger_state.get("key_states") or {}
+                for hit in _ledger.find_in_ledger(
+                    events, query, top_k=top_k - len(results), exclude_keys=seen_keys
+                ):
+                    text = hit.get("text") or ""
+                    if not text or text in seen_texts:
+                        continue
+                    hit_state = key_states.get(hit.get("key"))
+                    if not include_history and hit_state in (
+                        _ledger.LEDGER_STATE_SUPERSEDED,
+                        _ledger.LEDGER_STATE_DELETED,
+                    ):
+                        continue
+                    if _contains_sensitive(text):
+                        skipped_sensitive += 1
+                        continue
+                    meta = _normalize_metadata(hit.get("meta") or {})
+                    results.append(
+                        {
+                            "id": None,
+                            "text": text,
+                            "score": hit.get("score"),
+                            "source": "ledger",
+                            "metadata": meta,
+                            "confirmed": meta["confirmed"],
+                            "decay_weight": 1.0,
+                            "is_history": True,
+                            "history_state": hit_state or "ledger",
+                            "ledger_key": hit.get("key"),
+                        }
+                    )
+                    seen_texts.add(text)
+            except Exception:
+                logger.warning("账本兜底检索失败：本次只用索引里的结果。", exc_info=True)
         if reinforce and results:
-            # 真正用上了才强化：只强化返回的这几条，没返回的候选不动。
+            # 真正用上了才强化：只强化返回的、不是历史的那几条——
+            # 历史记忆被翻出来看看不算“用上了”，不能把它唤醒回原话态。
             # 写回失败也不拦聊天——记忆本身还在，只是这次没刷新时间。
             try:
                 self.reinforce_memories(
-                    [item.get("id") for item in results if item.get("id")],
+                    [
+                        item.get("id")
+                        for item in results
+                        if item.get("id") and not item.get("is_history")
+                    ],
                     now=now_dt,
                 )
             except Exception:
                 logger.warning("检索强化写回失败：记忆本身还在。", exc_info=True)
         return results
+
+    def search_history(self, query, top_k=5):
+        """直接翻账本找“以前”的记忆（问“以前想去哪”这类问题时调）。
+
+        不走 mem0 索引：翻账本原话按关键词找，返回的都是历史记忆
+        （is_history=True，source="ledger"，score 是关键词权重）。
+        账本里没有、或关键词一个没命中时返回空列表，不抛异常。
+        """
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+            key_states = (self.ledger_state().get("key_states") or {})
+            out = []
+            for hit in _ledger.find_in_ledger(events, query, top_k=top_k):
+                text = hit.get("text") or ""
+                if not text or _contains_sensitive(text):
+                    continue
+                meta = _normalize_metadata(hit.get("meta") or {})
+                out.append(
+                    {
+                        "id": None,
+                        "text": text,
+                        "score": hit.get("score"),
+                        "source": "ledger",
+                        "metadata": meta,
+                        "confirmed": meta["confirmed"],
+                        "decay_weight": 1.0,
+                        "is_history": True,
+                        # 历史也要分清状态：被取代的、睡着的、删了的，
+                        # 问“以前”时都该给，但得标清它是什么状态。
+                        "history_state": key_states.get(hit.get("key"))
+                        or "ledger",
+                        "ledger_key": hit.get("key"),
+                    }
+                )
+            return out
+        except Exception:
+            logger.warning("翻账本找历史失败。", exc_info=True)
+            return []
 
     def note_context(self, memories):
         """记下本轮提问时检索到的记忆 id（最近对话上下文）。
@@ -2957,6 +1344,310 @@ class Mem0Store:
         except Exception:
             logger.warning("读保护事件失败。", exc_info=True)
             return []
+
+    # ---------- 账本（事件账本：只追加、不修改，原话逐字存） ----------
+    # 账本是家、mem0 只是索引（最终方案，2026-11-13）：先写账本、再写
+    # 索引；索引坏了从账本重建；筛子在检索回来之后过滤。下面这几个
+    # 帮手只管“记账本 / 读账本状态”，不管业务判断——判断在调用方。
+
+    def _ledger_append(self, event_type, **fields):
+        """往账本记一笔（只追加，写完 + 刷盘才算数）。
+
+        写失败只记日志、返回 None，不抛异常——账本是第二道防线，
+        不能因为账本写不进去就把聊天搞崩；但“先写账本再写索引”的
+        那一步不用这个，用 _ledger_append_or_raise（账本写不进去，
+        索引那步也别写）。
+        """
+        try:
+            return _ledger.append_event(
+                self.ledger_path,
+                {"type": event_type, **fields},
+                lock=self._ledger_lock,
+            )
+        except Exception:
+            logger.warning("账本记一笔失败：%s。", event_type, exc_info=True)
+            return None
+
+    def _ledger_append_or_raise(self, event_type, seq=None, **fields):
+        """往账本记一笔，写失败就抛——先写账本再写索引，账本写不进去，
+        索引那步也别写（add_memory_text 用这个；写记忆失败返回 {}，
+        不抛到聊天里，见 _add_text_with_metadata 的约定）。
+        seq 只有恢复时才传（按备份里的原序号写回来）。"""
+        return _ledger.append_event(
+            self.ledger_path,
+            {"type": event_type, **fields},
+            lock=self._ledger_lock,
+            seq=seq,
+        )
+
+    def ledger_state(self):
+        """当前账本折叠出的状态（快照打底 + 快照之后的新事件）。
+
+        账本读坏了返回空状态、不抛异常——筛子没状态就不过滤，
+        检索照常跑，绝不能因为账本读不出来就搜不到记忆。"""
+        try:
+            return _ledger.load_ledger_state(self.ledger_path, self.snapshot_path)
+        except Exception:
+            logger.warning("读账本状态失败：本次检索不过滤。", exc_info=True)
+            return {
+                "by_id": {},
+                "adds": [],
+                "relations": [],
+                "key_states": {},
+                "id_to_key": {},
+                "seq_max": 0,
+                "snapshot_seq": None,
+            }
+
+    def ledger_verify(self):
+        """查账本：序号缺没缺、最后一行写没写完、有没有坏行
+        （见 memory/ledger.py verify_ledger）。"""
+        return _ledger.verify_ledger(self.ledger_path)
+
+    def ledger_repair(self):
+        """修账本：扔掉末尾写一半的残行（见 memory/ledger.py repair_ledger）。"""
+        return _ledger.repair_ledger(self.ledger_path)
+
+    def relate_memories(self, memory_id, related_id, relation, note=""):
+        """记一条记忆关系（只留四种：取代 / 补充 / 冲突 / 关联）。
+
+        关系存在账本里（relate 事件），不另建表。relation 不在四种
+        里时抛 ValueError——账本里不许出现没名没姓的关系。
+        返回记好的事件，写失败返回 None。"""
+        if relation not in _relations.RELATION_TYPES:
+            raise ValueError(f"记忆关系不对：{relation!r}。")
+        return self._ledger_append(
+            _ledger.LEDGER_EVENT_RELATE,
+            memory_id=memory_id,
+            related_id=related_id,
+            relation=relation,
+            note=note or "",
+        )
+
+    def reconcile_ledger_index(self):
+        """启动对序号补缺：账本里有、索引里没有的，按账本重建索引。
+
+        对账按 key 认（原话 + created_at 的哈希，见 ledger_event_key）：
+        账本里有、索引里没有的 key，就是“账本写了、索引没写上”（写
+        索引那步崩了、或索引坏过），按账本里的原话 + metadata 原样
+        写回索引。索引里有、账本里没有的不动（提取路径的老记忆本来
+        就没有账本记录，不算缺）。返回 {"reconciled", "missing",
+        "failed"}。读账本失败时返回 reconciled=0，不抛异常——对账
+        是启动时的兜底，不能因为对不上就把服务搞崩。
+        注意：重建写回走 _add_text_with_metadata，含敏感信息的原文
+        会被用时拦截那道防线再删掉（和正常写入同一道防线），这种
+        记在 failed 里，不算“补上了”。
+        """
+        try:
+            state = self.ledger_state()
+            adds = state.get("adds") or []
+            if not adds:
+                return {"reconciled": 0, "missing": [], "failed": []}
+            # 只补“当前”的原话：账本里标了 superseded / deleted 的
+            # 不补——纠正过的旧说法、删了的，补回索引就是复活（原地
+            # 纠正后重启会把错的那句再存一条；删了的重启又回来）。
+            # 睡着的（dormant）照常补：它丢了只是索引坏了，补回来时
+            # 按账本里的原 metadata（last_used_at 还是旧的），下次
+            # 月扫还会把它标回 dormant，不会“洗白”成常用记忆。
+            # 没标过的（老事件）默认当 current。
+            key_states = state.get("key_states") or {}
+            adds = [
+                entry
+                for entry in adds
+                if key_states.get(entry.get("key"))
+                not in (
+                    _ledger.LEDGER_STATE_SUPERSEDED,
+                    _ledger.LEDGER_STATE_DELETED,
+                )
+            ]
+            existing_keys = set()
+            for item in self.get_all(include_sensitive=True):
+                meta = (item or {}).get("metadata") or {}
+                existing_keys.add(
+                    _ledger.ledger_event_key(
+                        item.get("text") or "", meta.get("created_at")
+                    )
+                )
+            missing = [
+                entry for entry in adds if entry.get("key") not in existing_keys
+            ]
+            reconciled = []
+            failed = []
+            for entry in missing:
+                text = entry.get("text") or ""
+                meta = dict(entry.get("meta") or {})
+                if not text:
+                    failed.append(
+                        {"key": entry.get("key"), "reason": "账本里这条没原话"}
+                    )
+                    continue
+                try:
+                    result = self._add_text_with_metadata(text, meta)
+                    if result and (result.get("results") or []):
+                        reconciled.append(entry.get("key"))
+                    else:
+                        failed.append(
+                            {"key": entry.get("key"), "reason": "写索引没返回结果"}
+                        )
+                except Exception as exc:
+                    failed.append({"key": entry.get("key"), "reason": str(exc)})
+            return {
+                "reconciled": len(reconciled),
+                "missing": [entry.get("key") for entry in missing],
+                "failed": failed,
+            }
+        except Exception:
+            logger.warning("账本对账失败：本次不对索引补缺。", exc_info=True)
+            return {
+                "reconciled": 0,
+                "missing": [],
+                "failed": [{"reason": "对账读账本失败"}],
+            }
+
+    def backup_memories(self, backup_dir=None):
+        """备份：账本全部事件 + 索引全部记忆（原话 + 原始 metadata）+
+        快照（压过账本才有），带校验和。返回 {"backup_path", "counts",
+        "snapshot_error"}；写失败抛 OSError。备份是显式操作，不在
+        启动时自动跑——写备份之前要先想清楚放哪、留几份。
+        快照读坏了时备份照常写，但结果里带 snapshot_error，验备份
+        时会判不过（缺了快照的备份是不完整的，不能当“能恢复”来认）。"""
+        events, _info = _ledger.read_events(self.ledger_path)
+        items = []
+        for item in self.get_all(include_sensitive=True):
+            items.append(
+                {
+                    "id": item.get("id"),
+                    "text": item.get("text") or "",
+                    "metadata": self._raw_metadata_for(item.get("id")) or {},
+                }
+            )
+        snapshot = None
+        snapshot_error = None
+        try:
+            snapshot = _ledger.read_snapshot(self.snapshot_path)
+        except ValueError as exc:
+            snapshot_error = str(exc)
+            logger.warning("备份时快照读坏了：%s。", exc, exc_info=True)
+        backup = _backup.build_backup(
+            items, events, snapshot=snapshot, snapshot_error=snapshot_error
+        )
+        directory = Path(backup_dir) if backup_dir else self.backup_dir
+        path = directory / _backup.backup_filename()
+        _backup.write_backup(path, backup)
+        return {
+            "backup_path": str(path),
+            "counts": backup["counts"],
+            "snapshot_error": snapshot_error,
+        }
+
+    def verify_backup(self, backup_path):
+        """验一份备份（见 memory/backup.py verify_backup）。"""
+        return _backup.verify_backup(backup_path)
+
+    def restore_from_backup(self, backup_path):
+        """真恢复：先验备份，再把缺的东西补回来（不是回滚）。
+
+        验不过（文件读不出、条数对不上、校验和对不上、快照坏了）
+        就抛 ValueError，一个也不恢复。验过了：
+          1. 快照：备份里的快照比现有的新（或现有没有）才写回去；
+             现有的更新时不动（恢复是“补齐”，不是“回滚”）。
+          2. 账本事件：按原 seq 排好、缺的才追加（已有的跳过）；
+             snapshot 标记事件也按原 seq 写回去（快照的底子靠它认）。
+          3. 索引记忆：按 key 认，已有的跳过，缺的按备份里的原话 +
+             原始 metadata 原样写回（created_at、decay 字段都原样，
+             不重新编时间）。
+        含敏感信息的原文写回时会被用时拦截那道防线再删掉（和正常
+        写入同一道防线），记在 skipped 里。返回 {"restored_items",
+        "skipped_items", "restored_events", "skipped_events",
+        "snapshot_restored", "backup_path"}。
+        """
+        check = _backup.verify_backup(backup_path)
+        if not check["ok"]:
+            raise ValueError(
+                f"备份验不过，不恢复：{'; '.join(check['errors'])}。"
+            )
+        payload = _backup.read_backup(backup_path)
+        snapshot_restored = False
+        backup_snapshot = payload.get("snapshot")
+        if isinstance(backup_snapshot, dict):
+            current_snapshot = None
+            try:
+                current_snapshot = _ledger.read_snapshot(self.snapshot_path)
+            except ValueError:
+                current_snapshot = None
+            current_seq = (
+                current_snapshot.get("snapshot_seq")
+                if isinstance(current_snapshot, dict)
+                else None
+            )
+            backup_seq = backup_snapshot.get("snapshot_seq")
+            if current_seq is None or (
+                isinstance(backup_seq, int) and backup_seq > current_seq
+            ):
+                _ledger.write_snapshot_raw(self.snapshot_path, backup_snapshot)
+                snapshot_restored = True
+        existing_events, _info = _ledger.read_events(self.ledger_path)
+        existing_seqs = {
+            e.get("seq") for e in existing_events if isinstance(e.get("seq"), int)
+        }
+        restored_events = 0
+        skipped_events = 0
+        for event in sorted(
+            payload.get("ledger_events") or [],
+            key=lambda e: e.get("seq") if isinstance(e.get("seq"), int) else 0,
+        ):
+            seq = event.get("seq")
+            if seq in existing_seqs:
+                skipped_events += 1
+                continue
+            record = {k: v for k, v in event.items() if k != "seq"}
+            self._ledger_append_or_raise(event.get("type"), seq=seq, **record)
+            restored_events += 1
+        existing_keys = set()
+        for item in self.get_all(include_sensitive=True):
+            meta = (item or {}).get("metadata") or {}
+            existing_keys.add(
+                _ledger.ledger_event_key(
+                    item.get("text") or "", meta.get("created_at")
+                )
+            )
+        restored_items = []
+        skipped_items = []
+        for item in payload.get("items") or []:
+            text = (item or {}).get("text") or ""
+            meta = dict((item or {}).get("metadata") or {})
+            key = _ledger.ledger_event_key(text, meta.get("created_at"))
+            if key in existing_keys:
+                skipped_items.append({"id": item.get("id"), "reason": "索引里已有"})
+                continue
+            if not text:
+                skipped_items.append({"id": item.get("id"), "reason": "备份里这条没原话"})
+                continue
+            result = self._add_text_with_metadata(text, meta)
+            if result and (result.get("results") or []):
+                restored_items.append(
+                    ((result.get("results") or [{}])[0] or {}).get("id")
+                )
+                existing_keys.add(key)
+            else:
+                skipped_items.append(
+                    {"id": item.get("id"), "reason": "写索引没返回结果"}
+                )
+        return {
+            "restored_items": restored_items,
+            "skipped_items": skipped_items,
+            "restored_events": restored_events,
+            "skipped_events": skipped_events,
+            "snapshot_restored": snapshot_restored,
+            "backup_path": str(backup_path),
+        }
+
+    def compact_ledger(self):
+        """一年压缩一次：账本压成快照（原话都在快照里），账本截断
+        到只剩一行 snapshot 标记（见 memory/ledger.py compact_ledger）。
+        显式调用，不自动跑；压完就不用删了——快照就是档案，真删
+        记忆还是等 BOOS 亲口说，压缩本身不删任何记忆。"""
+        return _ledger.compact_ledger(self.ledger_path, self.snapshot_path)
 
     # ---------- 写入（回答后自动存 / 手动存） ----------
 
@@ -3124,7 +1815,57 @@ class Mem0Store:
         # 27 号：提取出的新记忆里带金额的，把结构化金额字段贴上。
         # 提取时 metadata 是整批共用的、不知道每条写了什么，只能事后
         # 按文本贴；放在去重之后（被删掉的就不用贴了）。
-        return self._attach_money_metadata(result)
+        result = self._attach_money_metadata(result)
+        # 提取路径补记账本：mem0 自己拆句，事前不知道文本，只能事后
+        # 对留下的新条补记 add 事件（UPDATE 的是同槽位新值，
+        # _supersede_money_memory 里已经记了 supersede，不重复记）。
+        self._ledger_extraction_adds(result, metadata)
+        return result
+
+    def _ledger_extraction_adds(self, result, batch_metadata):
+        """提取路径补记账本（见 _extract_and_save_turn）。
+
+        只记 event == "ADD" 的新条；同一批共用一份 metadata，
+        key 按“原话 + 这批的 created_at”算。同一条重复记时
+        （同一轮被提交两遍）按 key 去重，不记两遍。
+        记失败不拦路：记忆已经在索引里了，账本缺这一笔只是档案
+        不全，不丢事实。
+        """
+        try:
+            items = (result or {}).get("results") or []
+            if not items:
+                return
+            created_at = (batch_metadata or {}).get("created_at")
+            try:
+                state = self.ledger_state()
+                known_keys = {
+                    entry.get("key") for entry in state.get("adds") or []
+                }
+            except Exception:
+                known_keys = set()
+            for item in items:
+                if (item or {}).get("event") != "ADD":
+                    continue
+                text = (item or {}).get("memory") or ""
+                if not text:
+                    continue
+                key = _ledger.ledger_event_key(text, created_at)
+                if key in known_keys:
+                    continue
+                known_keys.add(key)
+                self._ledger_append(
+                    _ledger.LEDGER_EVENT_ADD,
+                    key=key,
+                    text=text,
+                    meta={
+                        "source": SOURCE_INFERRED,
+                        "confidence": CONFIDENCE_INFERRED,
+                        "user_confirmed": False,
+                        "created_at": created_at,
+                    },
+                )
+        except Exception:
+            logger.warning("提取补记账本失败：索引里的记忆还在。", exc_info=True)
 
     def _attach_money_metadata(self, results):
         """27 号：给提取出的新记忆贴金额结构化字段。
@@ -3329,6 +2070,11 @@ class Mem0Store:
             return []
         found = []
         for cand in candidates:
+            # 账本兜底项没有 mem0 id（id=None）：它只是档案里的原话，
+            # 不能拿去 update / 打标记——槽位逻辑要的是索引里真实的
+            # 那条，兜底的原话不算（索引里丢了它，对账会按账本重建）。
+            if (cand or {}).get("source") == "ledger":
+                continue
             text = (cand or {}).get("text") or ""
             if slot == SLOT_SOUL:
                 if "SOUL.md" in text and "十条原则" in text:
@@ -3493,8 +2239,12 @@ class Mem0Store:
                     "status": "updated",
                     "memory_id": near["id"],
                 }
+        # 种子是新记忆：记账本（best_effort——记失败不拦种子本身，
+        # 记忆本身还在索引里，只是账本里缺这一笔档案）。
         result = self._add_text_with_metadata(
-            text, _provenance(SOURCE_USER, CONFIDENCE_USER, True, slot=slot)
+            text,
+            _provenance(SOURCE_USER, CONFIDENCE_USER, True, slot=slot),
+            ledger_mode="best_effort",
         )
         results = (result or {}).get("results") or []
         if not results:
@@ -3558,8 +2308,12 @@ class Mem0Store:
                 "status": "unchanged",
                 "memory_id": duplicate["id"],
             }
+        # 同槽位新增是新记忆：记账本（best_effort——记失败不拦，
+        # 记忆本身还在索引里，只是账本里缺这一笔档案）。
         result = self._add_text_with_metadata(
-            text, _provenance(SOURCE_USER, CONFIDENCE_USER, True, slot=slot)
+            text,
+            _provenance(SOURCE_USER, CONFIDENCE_USER, True, slot=slot),
+            ledger_mode="best_effort",
         )
         results = (result or {}).get("results") or []
         if not results:
@@ -4470,6 +3224,26 @@ class Mem0Store:
         updated = dict(known_item)
         updated["text"] = new_text
         updated["metadata"] = metadata
+        # 账本记一笔取代：旧说法被新说法换掉了（原地更新，id 不变，
+        # 状态还是 current，旧话留在账本里——resolve_state 里同 id
+        # 的 supersede 只记 history，不标 superseded）。key 带上：
+        # 旧原话的 key 标 superseded（对账、兜底按 key 认旧话，不会
+        # 把旧说法当现况捞回来）；新原话的 key 标 current。
+        old_text = (known_item or {}).get("text") or ""
+        created_at = ((known_item or {}).get("metadata") or {}).get("created_at")
+        self._ledger_append(
+            _ledger.LEDGER_EVENT_SUPERSEDE,
+            memory_id=known_id,
+            supersedes_id=known_id,
+            old_text=old_text,
+            text=new_text,
+            key=_ledger.ledger_event_key(old_text, created_at),
+            current_key=_ledger.ledger_event_key(new_text, created_at),
+        )
+        # 新说法也要进档案：不然账本里只有旧金额那句的 add 事件，
+        # 对账重建、兜底都找不到新金额这句。记失败不拦路——更新
+        # 本身已经成功了，索引里的新说法还在。
+        self._ledger_record_add(new_text, metadata)
         return updated
 
     def _raw_metadata_for(self, memory_id):
@@ -4558,14 +3332,16 @@ class Mem0Store:
             return False
         return True
 
-    # ---------- 第二步衰减：原话备份、强化、月扫、到期删除 ----------
+    # ---------- 第二步衰减：强化、月扫、到期删除 ----------
     # 锁的规矩：下面这几个方法自己不拿 _WRITE_LOCK——_decay_touch /
     # _record_decay_occurrence 是从写流程里（add_memory_text、提取去重，
     # 它们已经拿着锁）调的，reinforce 是从读流程里（search）调的；
     # 只有 sweep_monthly 自己拿锁（它是显式维护操作，不在聊天流程里）。
     # 写回都走 _raw_metadata_for 拿原始整份 metadata 再改（见
     # _mark_memory_review 的注释：拿规整过的当整份传回，会把 evidence
-    # 这类字段弄丢）。
+    # 这类字段弄丢）。状态变化顺带记一笔账本（revive / promote /
+    # dormant）：账本是家，索引上的标记也要在账本里留痕，记账失败
+    # 不拦路（记忆本身的标记已经写回去了）。
 
     def _decay_touch(self, memory_id, now=None, record_occurrence=False):
         """用上了一条记忆：刷新 last_used_at，顺带把沉底态唤醒回原话态。
@@ -4617,6 +3393,10 @@ class Mem0Store:
         except Exception:
             logger.warning("衰减刷新写回失败：记忆本身还在。", exc_info=True)
             return {"ok": False, "restored": False, "promoted": False}
+        if restored:
+            self._ledger_append(_ledger.LEDGER_EVENT_REVIVE, memory_id=memory_id)
+        if promoted:
+            self._ledger_append(_ledger.LEDGER_EVENT_PROMOTE, memory_id=memory_id)
         return {"ok": True, "restored": restored, "promoted": promoted}
 
     def reinforce_memories(self, memory_ids, now=None):
@@ -4706,6 +3486,7 @@ class Mem0Store:
                         {"id": memory_id, "reason": "读原始 metadata 失败"}
                     )
                     continue
+                was_delete_due = bool(raw.get("decay_delete_due"))
                 if mark_dormant:
                     raw["decay_state"] = DECAY_STATE_DORMANT
                     raw["decay_dormant_at"] = _decay_iso(now_dt)
@@ -4718,6 +3499,25 @@ class Mem0Store:
                         {"id": memory_id, "reason": "打标写回失败"}
                     )
                     continue
+                # 账本记一笔睡着：刚睡着时记一次；已经睡着、这次待删
+                # 刚翻成 True 时也记一次（账本里的 delete_due 要跟上，
+                # 不然账本还以为这条只是睡着、没到待删）。已经睡着又
+                # 已经待删的就不重复记了——月扫每月跑一次，别刷屏。
+                # 注意：台账里的 dormant 列表只列“这次新睡着的”
+                # （mark_dormant），待删翻转的那条不进这个列表——它
+                # 早就睡着了，这次只是待删翻了个标记。
+                if mark_dormant or (mark_delete_due and not was_delete_due):
+                    # key 带上：这条原话标 dormant——兜底、筛子按 key 认，
+                    # 睡着的原话不会再从账本里被当现况捞回来；唤醒时
+                    # revive 再把它标回 current。
+                    self._ledger_append(
+                        _ledger.LEDGER_EVENT_DORMANT,
+                        memory_id=memory_id,
+                        delete_due=bool(mark_delete_due),
+                        key=_ledger.ledger_event_key(
+                            text, meta.get("created_at")
+                        ),
+                    )
                 if mark_dormant:
                     ledger["dormant"].append(
                         {
@@ -4930,6 +3730,15 @@ class Mem0Store:
                 # 槽位值冲突：不是重复，新条留着，标 conflict_for_review，
                 # 等 BOOS 看（比如喜欢吃鸡杂面 vs 对鸡杂面过敏）。
                 self._mark_memory_review(mem_id, conflict_for_review=True)
+                candidate = verdict.get("candidate") or {}
+                if candidate.get("id"):
+                    # 账本记一条冲突关系：两条都留着，谁也没顶掉谁。
+                    self.relate_memories(
+                        mem_id,
+                        candidate["id"],
+                        _relations.RELATION_CONFLICT,
+                        note="提取去重：同一件事、说法对着干，等 BOOS 定。",
+                    )
                 kept.append(item)
                 known.append({"id": mem_id, "text": mem_text})
                 continue
@@ -4955,7 +3764,52 @@ class Mem0Store:
             logger.warning("提取去重：%d 条重复记忆没删掉（仍在库里）。", len(survivors))
         return results
 
-    def _add_text_with_metadata(self, text, metadata):
+    def _ledger_record_add(self, text, metadata, or_raise=False):
+        """给一条新原话记 add 事件进账本（原话进档案）。
+
+        or_raise=True 时写失败就抛——“先写账本再写索引”的那一步
+        （add_memory_text）；否则写失败只记日志、不拦路（种子、
+        规则、纠正后的新说法这类“索引里已经有了”的补记）。
+        meta 只放标量字段（来源/置信度/是否确认/时间/写序号/槽位/
+        是否规则/衰减种类/重要性），和 add 事件的档案格式一致。
+        返回记好的事件，写失败返回 None（or_raise 时抛异常）。
+        """
+        meta = metadata or {}
+        if or_raise:
+            return self._ledger_append_or_raise(
+                _ledger.LEDGER_EVENT_ADD,
+                key=_ledger.ledger_event_key(text, meta.get("created_at")),
+                text=text,
+                meta={
+                    "source": meta.get("source"),
+                    "confidence": meta.get("confidence"),
+                    "user_confirmed": meta.get("user_confirmed"),
+                    "created_at": meta.get("created_at"),
+                    "write_seq": meta.get("write_seq"),
+                    "slot": meta.get("slot"),
+                    "is_rule": meta.get("is_rule", False),
+                    "decay_kind": meta.get("decay_kind"),
+                    "importance": meta.get("importance"),
+                },
+            )
+        return self._ledger_append(
+            _ledger.LEDGER_EVENT_ADD,
+            key=_ledger.ledger_event_key(text, meta.get("created_at")),
+            text=text,
+            meta={
+                "source": meta.get("source"),
+                "confidence": meta.get("confidence"),
+                "user_confirmed": meta.get("user_confirmed"),
+                "created_at": meta.get("created_at"),
+                "write_seq": meta.get("write_seq"),
+                "slot": meta.get("slot"),
+                "is_rule": meta.get("is_rule", False),
+                "decay_kind": meta.get("decay_kind"),
+                "importance": meta.get("importance"),
+            },
+        )
+
+    def _add_text_with_metadata(self, text, metadata, ledger_mode=None):
         """原文存一条记忆（infer=False），带上来源元数据。
 
         只做“调 mem0.add”这一件事：脱敏、去重由调用方先做好。
@@ -4965,7 +3819,19 @@ class Mem0Store:
         槽位 upsert 也走这里，和提取路径同一道防线。
         mem0 报错时记日志、返回 {}，不抛异常（存记忆失败不能把
         聊天搞崩，见 add_turn 的约定）。
+        ledger_mode：这次写要不要记账本——None 不记（从账本/备份/
+        回收站重建时，那条原话的账本记录已经有了，再记就重复）；
+        "best_effort" 记、记失败只记日志不拦路（种子、规则、迁移
+        这类新记忆）；"required" 先记账本、记失败就抛（add_memory_text：
+        账本写不进去，索引那步也别写）。
         """
+        if ledger_mode:
+            if ledger_mode == "required":
+                self._ledger_record_add(text, metadata, or_raise=True)
+            elif ledger_mode == "best_effort":
+                self._ledger_record_add(text, metadata)
+            else:
+                raise ValueError(f"ledger_mode 不对：{ledger_mode!r}。")
         try:
             result = self._mem0_add(
                 [{"role": "user", "content": text}],
@@ -5251,7 +4117,18 @@ class Mem0Store:
                 requires_confirmation=requires_confirmation,
                 expires_at=expires_at,
             )
-            return self._add_text_with_metadata(safe_text, metadata)
+            # 先写账本、再写索引（最终方案）：账本是家，mem0 只是索引。
+            # 账本写不进去时这次不写索引、返回 {}——写记忆失败不能把
+            # 聊天搞崩，但也不能让索引里多一条账本里没有的记忆
+            # （对账时认不出来）。记账本在 _add_text_with_metadata 里
+            # （ledger_mode="required"，记失败就抛、这里接住返回 {}）。
+            try:
+                return self._add_text_with_metadata(
+                    safe_text, metadata, ledger_mode="required"
+                )
+            except Exception:
+                logger.warning("账本先写失败：本次不写索引。", exc_info=True)
+                return {}
 
     # ---------- 迁移与种子 ----------
 
@@ -5315,6 +4192,8 @@ class Mem0Store:
             # 所以这里不走 add_memory_text，改走 _add_text_with_metadata。
             # 注意：直接调 mem0.add 之前，脱敏/去重上面已经做过了。）
             created_at = item.get("date") if isinstance(item.get("date"), str) else None
+            # 迁移进来的也是新记忆：记账本（best_effort），不然账本
+            # 里没有它们，对账重建、兜底都找不到这些老记忆。
             result = self._add_text_with_metadata(
                 text,
                 _provenance(
@@ -5324,6 +4203,7 @@ class Mem0Store:
                     created_at=created_at,
                     created_at_source="migrated",
                 ),
+                ledger_mode="best_effort",
             )
             if result and not result.get("duplicate"):
                 added += 1
@@ -6175,7 +5055,10 @@ class Mem0Store:
         metadata = _provenance(
             SOURCE_INFERRED, CONFIDENCE_INFERRED, False, is_rule=True
         )
-        result = self._add_text_with_metadata(rule, metadata)
+        # 规则也是新记忆：记账本（best_effort）。
+        result = self._add_text_with_metadata(
+            rule, metadata, ledger_mode="best_effort"
+        )
         items = (result or {}).get("results") or []
         if items:
             return (items[0] or {}).get("id")
@@ -6526,6 +5409,28 @@ class Mem0Store:
             # 提炼不出来（没有通用规则 / 模型判失败）时不存，纠正本身
             # 已经成功了，规则只是添头。
             rule_id = self._derive_and_store_rule(old_stored_text, safe_new)
+            # 账本记一笔取代：错的那句被正确的换掉了（原地替换，id 不变，
+            # 旧话留在账本里，以后翻账本还能找回“以前记错的那句”）。
+            # key 带上：旧原话的 key 标 superseded，新原话的 key 标
+            # current——对账、兜底按 key 认旧话，不会把错的那句复活。
+            # 注意：new_metadata 是新编的 created_at（纠正发生在现在），
+            # current_key 必须按新时间算，和下面补记的 add 事件是同一个 key。
+            old_created_at = (old_metadata or {}).get("created_at")
+            self._ledger_append(
+                _ledger.LEDGER_EVENT_SUPERSEDE,
+                memory_id=mem_id,
+                supersedes_id=mem_id,
+                old_text=old_stored_text,
+                text=safe_new,
+                key=_ledger.ledger_event_key(old_stored_text, old_created_at),
+                current_key=_ledger.ledger_event_key(
+                    safe_new, new_metadata.get("created_at")
+                ),
+            )
+            # 新说法也要进档案：不然账本里只有错的那句的 add 事件，
+            # 对账重建、兜底都找不到正确的这句。记失败不拦路——纠正
+            # 本身已经成功了，索引里的新说法还在。
+            self._ledger_record_add(safe_new, new_metadata)
             return {
                 "status": "updated",
                 "memory_id": mem_id,
@@ -6568,6 +5473,10 @@ class Mem0Store:
         except Exception:
             return {"ok": False, "reason": "校验时检索失败"}
         for hit in found:
+            # 历史项不算：账本天生留着旧原话（“以前记错的那句”），
+            # 它能翻出来是档案的功能，不是“旧文本还在索引里”。
+            if (hit or {}).get("is_history"):
+                continue
             if _normalize_memory_text(hit.get("text") or "") == _normalize_memory_text(old_text):
                 return {"ok": False, "reason": "旧文本还能检索到"}
         return {"ok": True, "reason": ""}
@@ -6819,6 +5728,11 @@ class Mem0Store:
         if old_text:
             try:
                 for hit in self.search(old_text, top_k=5):
+                    # 历史项不算：账本天生留着删掉的原话（删了什么、
+                    # 什么时候删的，账本里有数），它能翻出来是档案的
+                    # 功能，不是“向量里还留着”。
+                    if (hit or {}).get("is_history"):
+                        continue
                     if _normalize_memory_text(hit.get("text") or "") == _normalize_memory_text(old_text):
                         search_empty = False
                         break
@@ -6918,6 +5832,19 @@ class Mem0Store:
                 "已深度删除记忆：id=%s，history 清掉 %d 行。",
                 memory_id,
                 purge["rows_removed"],
+            )
+            # 账本记一笔删：深度删除是真删（向量 + history 都清了），
+            # 但账本里的原话留着——删了什么、什么时候删的，账本里有数，
+            # 以后翻账本还能找回“以前有过这条”。
+            # key 带上：这条原话标 deleted——兜底、对账按 key 认，
+            # 删了的原话不会再被当现况捞回来、也不会被对账复活。
+            self._ledger_append(
+                _ledger.LEDGER_EVENT_DELETE,
+                memory_id=memory_id,
+                key=_ledger.ledger_event_key(
+                    old_text,
+                    (owned[memory_id].get("metadata") or {}).get("created_at"),
+                ),
             )
             return True
 
@@ -7019,7 +5946,21 @@ class Mem0Store:
                 }
             except Exception:
                 return False
-            return memory_id not in after
+            deleted = memory_id not in after
+            if deleted:
+                # 账本记一笔删：软删除也是删（能恢复，但当前不在索引里了），
+                # 原话在回收站文件和账本里都留着，恢复时再记一笔 revive。
+                # key 带上：这条原话标 deleted——兜底、对账按 key 认，
+                # 删了的原话不会再被当现况捞回来、也不会被对账复活。
+                self._ledger_append(
+                    _ledger.LEDGER_EVENT_DELETE,
+                    memory_id=memory_id,
+                    key=_ledger.ledger_event_key(
+                        item.get("text") or "",
+                        (item.get("metadata") or {}).get("created_at"),
+                    ),
+                )
+            return deleted
 
     def restore_memory(self, memory_id):
         """从回收站恢复一条软删除的记忆（34 号）。
@@ -7060,6 +6001,22 @@ class Mem0Store:
             self._write_retracted_trash(
                 [e for e in trash if (e or {}).get("id") != memory_id]
             )
+            # 账本记一笔唤醒：恢复是重新存一条（新 id），旧 id 在账本里
+            # 还是 deleted——旧 id 不在索引里了，不影响筛子；新 id 是
+            # 当前的，记 revive 让账本知道这条记忆回来了。
+            new_id = ((result or {}).get("results") or [{}])[0].get("id")
+            if new_id:
+                # key 带上：恢复的这条原话标回 current——软删除时记的
+                # delete 把它的 key 标成 deleted 了，恢复要把它标回来，
+                # 不然兜底、对账还以为这条是删了的。
+                self._ledger_append(
+                    _ledger.LEDGER_EVENT_REVIVE,
+                    memory_id=new_id,
+                    key=_ledger.ledger_event_key(
+                        text, metadata.get("created_at")
+                    ),
+                    note=f"从回收站恢复，旧 id {memory_id}。",
+                )
             return True
 
     def list_retracted(self):
@@ -7103,12 +6060,22 @@ def create_mem0_store(budget_tracker=None, **kwargs):
     建不好的情况：没配 DEEPSEEK_API_KEY、mem0 没装、版本文件不匹配、
     Chroma 目录坏了。只记一条警告日志，不抛异常——记忆库出问题
     不能把聊天搞崩。
+
+    建好后顺手对一次账（reconcile_ledger_index）：账本里有、索引里
+    没有的，按账本重建索引——写索引那步崩了、或索引坏过，重启后
+    靠这一笔把记忆捞回来。对账本身不抛异常、只记日志：对不上也
+    不能把服务搞崩，索引里现有的记忆照常能用。
     """
     try:
-        return Mem0Store(budget_tracker=budget_tracker, **kwargs)
+        store = Mem0Store(budget_tracker=budget_tracker, **kwargs)
     except Exception as exc:
         logger.warning("mem0 记忆未启用：%s，本次不带记忆运行。", exc)
         return None
+    try:
+        store.reconcile_ledger_index()
+    except Exception:
+        logger.warning("启动对账失败：本次不对索引补缺。", exc_info=True)
+    return store
 
 
 def get_mem0_store(budget_tracker=None):

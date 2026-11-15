@@ -244,6 +244,9 @@ def _real_store(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
 
 

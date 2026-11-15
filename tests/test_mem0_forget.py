@@ -106,6 +106,9 @@ def test_restart_does_not_resurrect(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     assert [item["text"] for item in restarted.get_all()] == ["我喜欢喝咖啡。"]
     assert restarted.history(mem_id) == []
@@ -182,6 +185,9 @@ def test_delete_failure_reports_clear_state(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     mem_id = failing_store.get_all()[0]["id"]
     with pytest.raises(RuntimeError, match="向量没删掉"):
@@ -210,6 +216,9 @@ def test_history_purge_failure_reports_partial_state(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     mem_id = failing_store.get_all()[0]["id"]
     with pytest.raises(RuntimeError, match="删除了一半"):

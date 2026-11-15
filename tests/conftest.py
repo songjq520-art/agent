@@ -321,6 +321,12 @@ def make_fake_store(tmp_path=None, budget_tracker=None, threshold=0.4, memory=No
         history_db_path=base / "history.db",
         version_path=base / "mem0_versions.json",
         protection_events_path=base / "protection-events.jsonl",
+        # 账本也跟临时目录走：每个测试一份自己的账本，互不污染；
+        # 不传的话默认 memory/memory_events.jsonl，全套跑下来会把
+        # 各测试的事件全写进工作区同一个文件，检索兜底互相串味。
+        ledger_path=base / "memory_events.jsonl",
+        snapshot_path=base / "memory_events_snapshot.json",
+        backup_dir=base / "backups",
         budget_tracker=budget_tracker,
         threshold=threshold,
     )
