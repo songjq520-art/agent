@@ -210,16 +210,19 @@ def test_delete_one_of_duplicate_texts_passes_verification(tmp_path):
 
 def test_batch_delete_deletes_all_with_one_call(tmp_path):
     """批量删：一次调用删 3 条，火锅和无关的都还在；账本里 3 笔 delete 事件。
-    确认卡的备注里 3 条原文全列出来（点一次确认之前看得清删的是哪几条）。"""
+    确认卡的备注里 3 条原文全列出来（点一次确认之前看得清删的是哪几条）。
+    注意：这里不用“我爱吃冒菜。”当第二条——2026-11-16 拉面根子 3 修完后
+    它和“BOOS 爱吃冒菜。”归一化相同（剥掉“我/BOOS”主语），add 时会当
+    重复并掉，根本存不进去；用“配米饭”那句意思才不同。"""
     store = make_fake_store(tmp_path)
     _add(store, "BOOS 爱吃冒菜。")
-    _add(store, "我爱吃冒菜。")
+    _add(store, "我爱吃冒菜配米饭。")
     _add(store, "我爱的是冒菜，不是麻辣烫。")
     _add(store, "BOOS 爱吃火锅。")
     _add(store, "BOOS 爱吃拉面。")
     items = [
         {"memory_id": _mem_id(store, t), "text": t}
-        for t in ("BOOS 爱吃冒菜。", "我爱吃冒菜。", "我爱的是冒菜，不是麻辣烫。")
+        for t in ("BOOS 爱吃冒菜。", "我爱吃冒菜配米饭。", "我爱的是冒菜，不是麻辣烫。")
     ]
     with bound_memory_store(store):
         error, augment = _check_batch_delete_anchor(
@@ -228,7 +231,7 @@ def test_batch_delete_deletes_all_with_one_call(tmp_path):
         assert error is None
         note = (augment or {}).get("_anchor_match", "")
         assert "确认一次全删" in note
-        for t in ("BOOS 爱吃冒菜。", "我爱吃冒菜。", "我爱的是冒菜，不是麻辣烫。"):
+        for t in ("BOOS 爱吃冒菜。", "我爱吃冒菜配米饭。", "我爱的是冒菜，不是麻辣烫。"):
             assert t in note
         result = _run_delete_memories({"items": items, "anchor_text": "冒菜"})
         assert result["ok"] is True
@@ -243,16 +246,16 @@ def test_batch_delete_rejects_whole_batch_on_one_bad_item(tmp_path):
     验不过的条目绝不能混进这一批里。"""
     store = make_fake_store(tmp_path)
     _add(store, "BOOS 爱吃冒菜。")
-    _add(store, "我爱吃冒菜。")
+    _add(store, "我爱吃冒菜配米饭。")
     _add(store, "BOOS 爱吃火锅。")
     items = [
         {"memory_id": _mem_id(store, "BOOS 爱吃冒菜。"), "text": "BOOS 爱吃冒菜。"},
-        {"memory_id": _mem_id(store, "我爱吃冒菜。"), "text": "BOOS 爱吃拉面。"},
+        {"memory_id": _mem_id(store, "我爱吃冒菜配米饭。"), "text": "BOOS 爱吃拉面。"},
     ]
     with bound_memory_store(store):
         result = _run_delete_memories({"items": items, "anchor_text": "冒菜"})
         assert result["ok"] is False
-    assert _texts(store) == ["BOOS 爱吃冒菜。", "我爱吃冒菜。", "BOOS 爱吃火锅。"]
+    assert _texts(store) == ["BOOS 爱吃冒菜。", "我爱吃冒菜配米饭。", "BOOS 爱吃火锅。"]
     assert "delete" not in _ledger_types(store)
 
 
@@ -261,9 +264,9 @@ def test_batch_delete_partial_failure_reported_honestly(tmp_path):
     data 里删成的和没删成的两份清单都在，错误里写清哪条没删成。"""
     store = make_fake_store(tmp_path)
     _add(store, "BOOS 爱吃冒菜。")
-    _add(store, "我爱吃冒菜。")
+    _add(store, "我爱吃冒菜配米饭。")
     _add(store, "BOOS 爱吃火锅。")
-    bad_id = _mem_id(store, "我爱吃冒菜。")
+    bad_id = _mem_id(store, "我爱吃冒菜配米饭。")
     good_id = _mem_id(store, "BOOS 爱吃冒菜。")
     real_delete = store.delete_memory
 
@@ -275,7 +278,7 @@ def test_batch_delete_partial_failure_reported_honestly(tmp_path):
     store.delete_memory = _flaky
     items = [
         {"memory_id": good_id, "text": "BOOS 爱吃冒菜。"},
-        {"memory_id": bad_id, "text": "我爱吃冒菜。"},
+        {"memory_id": bad_id, "text": "我爱吃冒菜配米饭。"},
     ]
     try:
         with bound_memory_store(store):
@@ -287,9 +290,9 @@ def test_batch_delete_partial_failure_reported_honestly(tmp_path):
     assert result["data"]["deleted"][0]["memory_id"] == good_id
     assert len(result["data"]["failed"]) == 1
     assert result["data"]["failed"][0]["memory_id"] == bad_id
-    assert "我爱吃冒菜。" in result["error"]
+    assert "我爱吃冒菜配米饭。" in result["error"]
     assert "BOOS 爱吃冒菜。" not in _texts(store)
-    assert "我爱吃冒菜。" in _texts(store)
+    assert "我爱吃冒菜配米饭。" in _texts(store)
 
 
 # ---------- 问题 3 + 4b：循环提示词里的两条新规矩 ----------

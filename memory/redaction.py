@@ -186,13 +186,26 @@ def _normalize_memory_text(text):
     """把一条记忆文本规整成可比的形状（供直接存入的去重用）：
     全角转半角（Ａ→A）、去所有空白、去末尾句末标点、英文转小写。
     “我每天晚上都读半小时书。”和“我每天晚上都读半小时书”
-    （只差一个句号）算同一条，不重复存。"""
+    （只差一个句号）算同一条，不重复存。
+    2026-11-16 真机测试（拉面）：同一句话，显式记是第一人称
+    “我爱吃拉面。”，提取出来是第三人称“BOOS 爱吃拉面。”，只按
+    标点/空白/大小写规整还不一样，去重认不出来、存了两份。
+    所以再剥一层主语：开头的“我”（后面不跟“们/家/的”时）和
+    “BOOS”都去掉，只留事实本身，剥完为空的不剥。
+    “我们/我家/我的”不剥——主语不一样，不是同一句话；
+    “用户”也不剥——提取提示词写的是第三人称 BOOS，“用户”开头
+    的多半是摘要句，不是同一条事实的另一种说法。"""
     if not isinstance(text, str):
         return ""
     normalized = unicodedata.normalize("NFKC", text)
     normalized = re.sub(r"\s+", "", normalized)
     normalized = normalized.rstrip("。！？；，、.!?;,")
-    return normalized.lower()
+    normalized = normalized.lower()
+    if normalized.startswith("我") and len(normalized) > 1 and normalized[1] not in "们家的":
+        normalized = normalized[1:].lstrip("。！？；，、.!?;,")
+    elif normalized.startswith("boos") and len(normalized) > 4:
+        normalized = normalized[4:].lstrip("。！？；，、.!?;,")
+    return normalized
 
 def _find_duplicate_memory(text, existing_items):
     """在已有记忆里找和 text 相同（或只差标点/空白/大小写）的那条，

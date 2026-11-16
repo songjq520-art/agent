@@ -25,6 +25,7 @@
 import contextvars
 
 from memory.money_slots import extract_core_slots
+from memory.redaction import _normalize_memory_text
 from tools.tool_registry import get_tool, register_tool
 
 # 绑定的记忆库：用 ContextVar 存，不用模块全局字典——每个任务
@@ -186,6 +187,33 @@ def _find_anchor_matches(store, anchor, expand=True):
                 expanded.append((mid, text))
                 expanded_ids.add(mid)
     return direct + expanded
+
+
+def _live_copies_of_text(store, text, exclude_id=None):
+    """库里和 text 同一句话的活着的条目（[(id, text)]，不含 exclude_id）。
+
+    同一句话按归一化原文认——含“我/BOOS”主语差异（2026-11-16
+    拉面：显式记是“我爱吃拉面。”，提取出来是“BOOS 爱吃拉面。”，
+    去重没并掉，库里留了两份）。单条删除按文本删时，这几份要一起
+    删、卡上逐条列清，不能只删一个 id 就报“删掉了”。
+    读库失败返回 []（不拦路，单条该删的照删）。
+    """
+    norm = _normalize_memory_text(text or "")
+    if not norm:
+        return []
+    try:
+        items = store.get_all(include_sensitive=True) or []
+    except Exception:
+        return []
+    copies = []
+    for item in items:
+        mid = (item or {}).get("id") or ""
+        item_text = (item or {}).get("text") or ""
+        if not mid or mid == exclude_id or not item_text:
+            continue
+        if _normalize_memory_text(item_text) == norm:
+            copies.append((mid, item_text))
+    return copies
 
 
 def guard_memory_target(action, memory_id, anchor_text, candidates):
@@ -351,6 +379,17 @@ def _check_delete_anchor(args):
         )
         if direct_count:
             note += f"（库里还有 {direct_count} 条原文含“{anchor}”的记忆。）"
+    # 2026-11-16 拉面：同一句话可能存了多份（显式记 + 提取各一份），
+    # 卡上逐条列清、确认后一起删——不能只删一个 id 就报“删掉了”，
+    # 另一份还活着。副本按归一化原文认（含“我/BOOS”主语差异）。
+    copies = _live_copies_of_text(store, picked_text, exclude_id=guard["target_id"])
+    if copies:
+        shown = "；".join(t for _i, t in copies[:3])
+        more = f"（等共 {len(copies)} 条）" if len(copies) > 3 else ""
+        note += (
+            f"另外还有 {len(copies)} 条同一句话的副本：{shown}{more}"
+            "确认后会和这一条一起删掉。"
+        )
     return None, {"_anchor_match": note}
 
 
@@ -616,12 +655,33 @@ def _run_delete_memory(args):
             "data": None,
             "error": "这条记忆已经不在了（可能刚才已经删过）。",
         }
+    # 2026-11-16 拉面：同一句话可能存了多份（显式记 + 提取各一份），
+    # 只删一个 id 就报“删掉了”，另一份还活着。确认卡上列清的副本
+    # （_check_delete_anchor 里算好的），这里一起删掉、逐条报。
+    # 副本删失败不翻盘：主条已经删掉了，失败的副本单独列出来，
+    # 让模型告诉 BOOS、别谎称全删干净了。
+    extra_deleted = []
+    extra_failed = []
+    for other_id, other_text in _live_copies_of_text(
+        store, stored_text, exclude_id=memory_id
+    ):
+        try:
+            if store.delete_memory(other_id, approve=True):
+                extra_deleted.append(
+                    {"memory_id": other_id, "text": other_text}
+                )
+            else:
+                extra_failed.append({"memory_id": other_id, "text": other_text})
+        except Exception:  # noqa: BLE001 - 副本删失败单独报，不翻盘
+            extra_failed.append({"memory_id": other_id, "text": other_text})
     return {
         "ok": True,
         "data": {
             "memory_id": memory_id,
             "text": stored_text,
             "history_cleared": (scope or {}).get("history_count") or 0,
+            "extra_deleted": extra_deleted,
+            "extra_failed": extra_failed,
         },
         "error": None,
     }
@@ -727,10 +787,36 @@ def _run_revive_memory(args):
     except Exception as exc:  # noqa: BLE001 - 恢复失败也算执行失败
         return {"ok": False, "data": None, "error": f"恢复记忆失败：{exc}"}
     if revived is False:
+        # 2026-11-16 拉面：两种失败是两回事，别合成一句让模型猜——
+        # “已删里没有它”和“它已经在库里了”，模型该给 BOOS 不同的说法。
+        # 先看在不在库里（删完又被提取记回来的那条就是这种情况）：
+        # 在，就不用恢复；不在，再看已删里还有没有它。
+        live_text = entry_text or text.strip()
+        try:
+            live = any(
+                _normalize_memory_text((item or {}).get("text") or "")
+                == _normalize_memory_text(live_text)
+                for item in store.get_all(include_sensitive=True)
+            )
+        except Exception:
+            live = False
+        if live:
+            return {
+                "ok": False,
+                "data": None,
+                "error": f"这条记忆已经在库里了，不用恢复：“{live_text}”。",
+            }
+        scope_after = store.revive_scope(memory_id or None, text or None)
+        if not scope_after.get("found"):
+            return {
+                "ok": False,
+                "data": None,
+                "error": scope_after.get("reason") or "已删的记忆里没有这条，没恢复。",
+            }
         return {
             "ok": False,
             "data": None,
-            "error": "这条记忆恢复不了（已删里没有它，或它已经在库里了）。",
+            "error": "恢复失败：已删里有这条，但重新存进去时失败了，请再试一次。",
         }
     return {
         "ok": True,

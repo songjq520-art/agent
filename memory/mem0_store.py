@@ -108,6 +108,7 @@ from memory.outbox import MemoryOutbox
 from memory.timeutil import (
     _today,
     _now_iso,
+    _parse_created_at,
     _next_write_seq,
     _NOW_LOCK,
     _NOW_LAST,
@@ -834,6 +835,11 @@ class Mem0Store:
         # 待定区清空、不存（这是设计，不是丢数据：用户没给下一句，
         # 就当那句还没说定）。
         self._pending_turn = None
+        # _just_deleted_texts（本进程里刚删掉的原文）：{归一化原文: 删的时间戳}
+        # 2026-11-16 真机测试（拉面）：删完 10 秒，下一轮提交待定区时提取
+        # 又把同一条记回来了——账本是兜底，内存里这份是第一道（账本写失败
+        # 时也有据）。恢复/还原一条时把它清掉，删掉的才不会拦着以后重新说。
+        self._just_deleted_texts = {}
         # _committed_user_keys（已提交过的 user 消息指纹）：add_turn
         # 每次收到最近 6 条消息（约 3 轮），提交待定轮时只提没提交过
         # 的 user 消息——指纹是内容去掉首尾空白后的哈希，deque 最多
@@ -1777,7 +1783,7 @@ class Mem0Store:
             return None
         return {"correction": correction}
 
-    def _extract_and_save_turn(self, safe_messages):
+    def _extract_and_save_turn(self, safe_messages, extract_since=None):
         """正常提取保存（add_turn 的老路子，只做这一件事）。
 
         调 mem0.add 提取本轮对话、去重、存入；提取出的记忆里万一
@@ -1788,6 +1794,14 @@ class Mem0Store:
         把新记忆和自己/同一批的兄弟认成邻居）；快照还有第二个用处：
         万一 add 在里面动了旧记忆，守卫按快照原样恢复（见
         _restore_snapshot_memories）。
+        extract_since（2026-11-16 真机测试，拉面）：源轮次说话的
+        时间戳（待定区里那轮的 created_at）。提取出的原文如果在
+        extract_since 之后被删过，_drop_deleted_text_results 会把它
+        从库里清掉、不进账本——删完 10 秒提取又记回来，就是这么来的
+        （待定轮的提取跑在删除那轮的 add_turn 里，删除时库里还没它，
+        去重看不见它）。删在 extract_since 之前的是 BOOS 重新说起，
+        不拦。直接提取（纠错没找到时的那一处）不传 extract_since，
+        那一轮是当场纠错、没经过删除，不拦。
         失败关闭：快照是保护的前提——快照读不出来，就不知道旧记忆
         长什么样，写进去就是没保护硬写。所以快照先重试一次（很多
         时候就是抖一下，重试之间不睡、保持简单），还失败就不调
@@ -1840,6 +1854,11 @@ class Mem0Store:
         # 2026-11-16 真机测试（问题 4）：管记忆的动作复述成事实的，
         # 在这里拦掉——动作本身已经记在账本里了，不用再存一条。
         result = self._drop_management_action_results(result)
+        # 2026-11-16 真机测试（拉面，根子 1）：刚删的原文别再记回来。
+        # 放在去重和账本补记之前——去重看不见已删的（快照是删之后的），
+        # 账本补记只对留下的新条记，拦在这里就不会多一笔 add。
+        if extract_since is not None:
+            result = self._drop_deleted_text_results(result, extract_since)
         result = self._apply_coverage_guard(result, before, metadata)
         # 43 号价值关卡先走（一次判全场，低价值的先清掉），再 46 号去重
         # （对照面是提取前的库 + 本轮已留下的新记忆）。
@@ -1853,6 +1872,101 @@ class Mem0Store:
         # 对留下的新条补记 add 事件（UPDATE 的是同槽位新值，
         # _supersede_money_memory 里已经记了 supersede，不重复记）。
         self._ledger_extraction_adds(result, metadata)
+        return result
+
+    def _deleted_text_times(self, cutoff_epoch):
+        """cutoff 之后被删掉的原文（归一化原文 → 删的时间戳，epoch 秒）。
+
+        两处来源并在一起：
+        - 内存里刚删的（_just_deleted_texts）：账本写失败时也有据；
+        - 账本：按 key 折叠 add/delete/revive，取最后一次 delete 的
+          时间——revive 过的就不算删了，add 的原话用来认是哪条。
+        只认“删在源轮次说话之后”的：源轮次之前就删了的，是 BOOS
+        重新说起，不拦（2026-11-16 拉面：删 01:18:42、源轮次
+        01:18 之前，拦；周三重新说、周一删的，不拦）。
+        账本读不出来时只用内存那份，不抛异常——拦不住也别把提取搞崩。
+        """
+        out = {}
+        try:
+            cutoff = float(cutoff_epoch)
+        except (TypeError, ValueError):
+            return out
+        for norm, when in (self._just_deleted_texts or {}).items():
+            try:
+                when_f = float(when)
+            except (TypeError, ValueError):
+                continue
+            if when_f >= cutoff:
+                out[norm] = when_f
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            return out
+        key_text = {}
+        key_deleted_at = {}
+        for event in events or []:
+            etype = (event or {}).get("type")
+            key = (event or {}).get("key")
+            if not key:
+                continue
+            if etype == _ledger.LEDGER_EVENT_ADD:
+                key_text.setdefault(key, (event or {}).get("text") or "")
+            elif etype == _ledger.LEDGER_EVENT_DELETE:
+                parsed = _parse_created_at((event or {}).get("ts"))
+                if parsed is not None:
+                    key_deleted_at[key] = parsed.timestamp()
+            elif etype == _ledger.LEDGER_EVENT_REVIVE:
+                key_deleted_at.pop(key, None)
+        for key, when in key_deleted_at.items():
+            if when < cutoff:
+                continue
+            text = key_text.get(key) or ""
+            if not text:
+                continue
+            norm = _normalize_memory_text(text)
+            if norm and norm not in out:
+                out[norm] = when
+        return out
+
+    def _drop_deleted_text_results(self, result, cutoff_epoch):
+        """从提取结果里清掉刚删的原文（2026-11-16 真机测试，拉面）。
+
+        删掉的原文不再自己记回来，除非 BOOS 重新说起——重新说起
+        的轮次说话时间在删之后，cutoff 一过就不拦（见
+        _deleted_text_times）。删的办法和 _drop_sensitive_results /
+        _dedupe_extraction_results 同一套：先从向量库清掉、再读一遍
+        核对，清不掉的留着（results 里原样返回，调用方看得见），
+        清掉的记在 results["deleted_text_dropped"] 里。
+        放在账本补记之前调——拦在这里，账本就不会多一笔 add。
+        """
+        items = (result or {}).get("results") or []
+        if not items:
+            return result
+        deleted_after = self._deleted_text_times(cutoff_epoch)
+        if not deleted_after:
+            return result
+        dropped = []
+        kept = []
+        for item in items:
+            mem_text = (item or {}).get("memory") or ""
+            if mem_text and _normalize_memory_text(mem_text) in deleted_after:
+                dropped.append(item)
+            else:
+                kept.append(item)
+        if not dropped:
+            return result
+        survivors = self._rollback_new_memories(dropped)
+        survivor_ids = {(item or {}).get("id") for item in survivors}
+        actually_dropped = [
+            item for item in dropped if (item or {}).get("id") not in survivor_ids
+        ]
+        result["results"] = kept + survivors
+        result["deleted_text_dropped"] = len(actually_dropped)
+        if survivors:
+            logger.warning(
+                "提取复活拦截：%d 条刚删的记忆没清掉（仍在库里）。",
+                len(survivors),
+            )
         return result
 
     def _ledger_extraction_adds(self, result, batch_metadata):
@@ -1982,7 +2096,11 @@ class Mem0Store:
         extracted = {}
         filtered = _filter_extraction_messages(fresh)
         if filtered:
-            extracted = self._extract_and_save_turn(filtered)
+            # extract_since：待定轮说话的时间——这轮之后删掉的原文，
+            # 提取时拦掉，不再记回来（2026-11-16 拉面）。
+            extracted = self._extract_and_save_turn(
+                filtered, extract_since=pending.get("created_at")
+            )
             results = (extracted or {}).get("results") or []
             # 保护失败的标记要往上传：本轮没写成、或回滚过，调用方
             # （add_turn / 面板）得知道，不能只留在提取那一层。
@@ -2437,7 +2555,13 @@ class Mem0Store:
             detected = _detect_identity_statement(sentence)
             if detected is not None:
                 identity_items.append(detected)
-        self._pending_turn = {"messages": messages, "identity": identity_items}
+        # created_at：这轮话是什么时候说的——提取复活拦截的分水岭
+        # （2026-11-16 拉面）：删在这之后才拦，删在之前的是 BOOS 重新说起，不拦。
+        self._pending_turn = {
+            "messages": messages,
+            "identity": identity_items,
+            "created_at": datetime.now(timezone.utc).timestamp(),
+        }
 
     def add_turn(self, messages):
         """把本轮对话存进长期记忆（回答后调一次）。
@@ -2688,6 +2812,9 @@ class Mem0Store:
             self._pending_turn = {
                 "messages": pending_messages,
                 "identity": identity_items,
+                # created_at：本轮话是什么时候说的——提取复活拦截的分水岭
+                # （2026-11-16 拉面）：删在这之后才拦，删在之前的是 BOOS 重新说起，不拦。
+                "created_at": datetime.now(timezone.utc).timestamp(),
             }
             out = {
                 "pending": True,
@@ -3885,6 +4012,37 @@ class Mem0Store:
                 "importance": meta.get("importance"),
             },
         )
+
+    def _ledger_ensure_add(self, text, metadata, key):
+        """删之前先确认账本里有这条的 add 档案：没有就补记一笔
+        （2026-11-16 真机测试，拉面根子 2）。
+
+        账本落地之前存的老记忆没有 add 记录，删的时候只记了 delete，
+        _deleted_entries 认不出来——删了进不了已删列表、恢复不了。
+        补记的 key 和 delete 用的是同一个（text + mem0 metadata 的
+        created_at，ledger_event_key），删和记能对上；meta 用原条目
+        的那份，来源/确认状态/形成时间原样。已有 add 时什么都不做。
+        补记失败只记日志、不拦路——删本身还要继续，缺这一笔只是
+        恢复时还认不出来，和以前一样，不比以前差。
+        """
+        if not key or not (text or "").strip():
+            return
+        try:
+            state = self.ledger_state()
+        except Exception:
+            state = {}
+        key_states = (state or {}).get("key_states") or {}
+        if key in key_states:
+            return
+        if any(
+            (record or {}).get("key") == key
+            for record in (state or {}).get("adds") or []
+        ):
+            return
+        try:
+            self._ledger_record_add(text, metadata or {}, or_raise=False)
+        except Exception:
+            logger.warning("删前补记 add 失败：key=%s。", key, exc_info=True)
 
     def _add_text_with_metadata(self, text, metadata, ledger_mode=None):
         """原文存一条记忆（infer=False），带上来源元数据。
@@ -5922,14 +6080,30 @@ class Mem0Store:
             # 以后翻账本还能找回“以前有过这条”。
             # key 带上：这条原话标 deleted——兜底、对账按 key 认，
             # 删了的原话不会再被当现况捞回来、也不会被对账复活。
+            # 2026-11-16 真机测试（拉面根子 2）：先补记 add——账本落地
+            # 之前存的老记忆没有 add 记录，不补这一笔，删了进不了已删
+            # 列表、恢复不了。补记的 key 和下面这笔 delete 是同一个。
+            delete_key = _ledger.ledger_event_key(
+                old_text,
+                (owned[memory_id].get("metadata") or {}).get("created_at"),
+            )
+            self._ledger_ensure_add(
+                old_text,
+                owned[memory_id].get("metadata") or {},
+                delete_key,
+            )
             self._ledger_append(
                 _ledger.LEDGER_EVENT_DELETE,
                 memory_id=memory_id,
-                key=_ledger.ledger_event_key(
-                    old_text,
-                    (owned[memory_id].get("metadata") or {}).get("created_at"),
-                ),
+                key=delete_key,
             )
+            # 内存里也记一笔刚删（提取复活拦截的第一道，见
+            # _drop_deleted_text_results；账本是兜底）。
+            norm_old = _normalize_memory_text(old_text)
+            if norm_old:
+                self._just_deleted_texts[norm_old] = (
+                    datetime.now(timezone.utc).timestamp()
+                )
             return True
 
     # ---------- 34 号：撤回软删除（能恢复） ----------
@@ -6036,14 +6210,28 @@ class Mem0Store:
                 # 原话在回收站文件和账本里都留着，恢复时再记一笔 revive。
                 # key 带上：这条原话标 deleted——兜底、对账按 key 认，
                 # 删了的原话不会再被当现况捞回来、也不会被对账复活。
+                # 2026-11-16 真机测试（拉面根子 2）：先补记 add——没有
+                # add 记录的老记忆，不补这一笔，删了进不了已删列表。
+                delete_key = _ledger.ledger_event_key(
+                    item.get("text") or "",
+                    (item.get("metadata") or {}).get("created_at"),
+                )
+                self._ledger_ensure_add(
+                    item.get("text") or "",
+                    item.get("metadata") or {},
+                    delete_key,
+                )
                 self._ledger_append(
                     _ledger.LEDGER_EVENT_DELETE,
                     memory_id=memory_id,
-                    key=_ledger.ledger_event_key(
-                        item.get("text") or "",
-                        (item.get("metadata") or {}).get("created_at"),
-                    ),
+                    key=delete_key,
                 )
+                # 内存里也记一笔刚删（提取复活拦截的第一道）。
+                norm_item = _normalize_memory_text(item.get("text") or "")
+                if norm_item:
+                    self._just_deleted_texts[norm_item] = (
+                        datetime.now(timezone.utc).timestamp()
+                    )
             return deleted
 
     def restore_memory(self, memory_id):
@@ -6100,6 +6288,11 @@ class Mem0Store:
                         text, metadata.get("created_at")
                     ),
                     note=f"从回收站恢复，旧 id {memory_id}。",
+                )
+                # 内存里刚删的记录也清掉——这条回来了，以后重新说起
+                # 不再拦（2026-11-16 拉面）。
+                self._just_deleted_texts.pop(
+                    _normalize_memory_text(text), None
                 )
             return True
 
@@ -6347,6 +6540,11 @@ class Mem0Store:
                 note=f"从账本恢复，旧 id {entry.get('id')}。"
                 if entry.get("id")
                 else "从账本恢复。",
+            )
+            # 内存里刚删的记录也清掉——这条回来了，以后重新说起
+            # 不再拦（2026-11-16 拉面）。
+            self._just_deleted_texts.pop(
+                _normalize_memory_text(entry_text), None
             )
             return new_id
 
