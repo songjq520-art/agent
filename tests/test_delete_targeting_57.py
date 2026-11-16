@@ -373,3 +373,129 @@ def test_57_anchor_checked_again_at_execution(mem_store):
     assert second["ok"] is False
     assert "挑错了" in second["error"]
     assert "BOOS 爱吃拉面。" in _texts(mem_store)
+
+
+# ---------- 11-15 上下文衔接修复：anchor 是固定事实时，同一槽位也要找得到 ----------
+# 背景：上午清 53 号两条旧重复时，anchor 是固定事实“万家纳指”，库里
+# “每天定投 5 块”那两条未确认的原文里没有这四个字，子串找不着——十二
+# 按字面认不出它们就是同一个万家纳指，最后只能指着它自己列的那两条删。
+# 修法：_find_anchor_matches 在字面命中之外加一跳同一槽位扩展——已命中的
+# 那条当桥，数字相同、内容词重合、态度不相反的，也算候选；确认卡上注明
+# 这条不是字面命中。update 不走扩展（old_text 就是旧原文）。
+
+_DINGTOU_LIBRARY = [
+    "用户要求被称为BOOS。",
+    "是每天定投 5 块钱买万家纳指。基金代码0194442。",
+    "每月预算 5 美元，到 5 美元提醒，不自动停。",
+    "用户喜欢喝冰美式。",
+    "BOOS 喜欢吃鸡杂面。",
+    "BOOS 爱吃拉面。",
+    "每天定投 5 块。",
+    "我想每天定投 5 块。",
+]
+
+
+@pytest.fixture
+def dingtou_store(tmp_path):
+    """定投场景的假记忆库：已确认的万家纳指一条 + 两条未确认的“每天定投 5 块”。
+
+    另有每月 5 美元预算一条（数字也是 5，但没有共同内容词，不能被扩进来）
+    和鸡杂面/拉面两条（57 号对照：拉面不能被鸡杂面扩进来）。
+    """
+    store = make_fake_store(tmp_path)
+    for text in _DINGTOU_LIBRARY:
+        store.add_memory_text(text, source="user")
+    return store
+
+
+def test_anchor_slot_expansion_finds_unconfirmed_dingtou(dingtou_store):
+    """anchor“万家纳指”：已确认的那条字面命中，两条未确认的按同一槽位找出来。
+
+    每月 5 美元预算那条数字也是 5，但和定投没有共同内容词，不能被扩进来。
+    """
+    from tools.memory_tool import _find_anchor_matches
+
+    matches = _find_anchor_matches(dingtou_store, "万家纳指")
+    texts = [t for _i, t in matches]
+    assert "是每天定投 5 块钱买万家纳指。基金代码0194442。" in texts
+    assert "每天定投 5 块。" in texts
+    assert "我想每天定投 5 块。" in texts
+    assert "每月预算 5 美元，到 5 美元提醒，不自动停。" not in texts
+    # 字面命中的在前、扩展的在后。
+    assert texts[0] == "是每天定投 5 块钱买万家纳指。基金代码0194442。"
+
+
+def test_anchor_slot_expansion_delete_note_marks_expanded(dingtou_store):
+    """删未确认的那条：校验通过，卡上的备注必须说明它不是字面命中。"""
+    from tools.memory_tool import _check_delete_anchor
+
+    with bound_memory_store(dingtou_store):
+        error, augment = _check_delete_anchor(
+            {
+                "memory_id": _mem_id(dingtou_store, "每天定投 5 块。"),
+                "text": "每天定投 5 块。",
+                "anchor_text": "万家纳指",
+            }
+        )
+    assert error is None
+    note = (augment or {}).get("_anchor_match", "")
+    assert "同一槽位" in note
+    assert "原文里没有" in note
+    assert "每天定投 5 块。" in note
+
+
+def test_anchor_slot_expansion_delete_end_to_end(dingtou_store):
+    """上午那一幕走通：anchor“万家纳指”，删掉一条未确认的“每天定投 5 块”。"""
+    from tools.memory_tool import _run_delete_memory
+
+    with bound_memory_store(dingtou_store):
+        result = _run_delete_memory(
+            {
+                "memory_id": _mem_id(dingtou_store, "每天定投 5 块。"),
+                "text": "每天定投 5 块。",
+                "anchor_text": "万家纳指",
+            }
+        )
+    assert result["ok"] is True
+    assert "每天定投 5 块。" not in _texts(dingtou_store)
+    assert "是每天定投 5 块钱买万家纳指。基金代码0194442。" in _texts(dingtou_store)
+    assert "我想每天定投 5 块。" in _texts(dingtou_store)
+
+
+def test_57_noodle_not_expanded(dingtou_store):
+    """57 号回归：anchor“鸡杂面”不能把拉面扩进来——它和鸡杂面没有共同数字。"""
+    from tools.memory_tool import _find_anchor_matches
+
+    matches = _find_anchor_matches(dingtou_store, "鸡杂面")
+    texts = [t for _i, t in matches]
+    assert "BOOS 喜欢吃鸡杂面。" in texts
+    assert "BOOS 爱吃拉面。" not in texts
+
+
+def test_anchor_slot_expansion_number_conflict_blocked(tmp_path):
+    """数字不同不扩展：“每天喝 2 杯咖啡”扩不到“每天喝 3 杯咖啡”。"""
+    from tools.memory_tool import _find_anchor_matches
+
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("每天喝 2 杯咖啡。", source="user")
+    store.add_memory_text("每天喝 3 杯咖啡。", source="user")
+    matches = _find_anchor_matches(store, "每天喝 2 杯咖啡")
+    texts = [t for _i, t in matches]
+    assert "每天喝 2 杯咖啡。" in texts
+    assert "每天喝 3 杯咖啡。" not in texts
+
+
+def test_update_stays_literal(dingtou_store):
+    """update 不走扩展：old_text“万家纳指”不能用来改未确认的那条。"""
+    from tools.memory_tool import _check_update_anchor
+
+    with bound_memory_store(dingtou_store):
+        error, _augment = _check_update_anchor(
+            {
+                "memory_id": _mem_id(dingtou_store, "每天定投 5 块。"),
+                "old_text": "万家纳指",
+                "new_text": "每天定投 5 块钱买万家纳指。",
+            }
+        )
+    assert error is not None
+    assert "每天定投 5 块。" in _texts(dingtou_store)

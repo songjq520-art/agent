@@ -87,6 +87,9 @@ def test_telemetry_still_off_after_mem0_init(tmp_path, monkeypatch):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     assert store.available is True
     assert os.environ.get("MEM0_TELEMETRY") == "False"
@@ -301,6 +304,9 @@ def test_add_turn_post_call_filter_deletes_leaked_memory(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     result = store.add_turn([{"role": "user", "content": "我叫小宋。"}])
     assert result.get("pending") is True
@@ -344,6 +350,9 @@ def test_search_never_injects_sensitive_memory(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     found = store.search("API 密钥是什么？")
     assert [item["id"] for item in found] == ["fake-normal"]
@@ -366,6 +375,9 @@ def test_search_keyword_supplement_never_injects_sensitive_memory(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     # 问圆通：正常记忆回来，敏感记忆不掺进来。
     found = store.search("圆通是做什么的？")
@@ -542,6 +554,9 @@ def test_add_turn_dedup_preserved(tmp_path):
         chroma_path=tmp_path / "mem0_chroma",
         history_db_path=tmp_path / "history.db",
         version_path=tmp_path / "mem0_versions.json",
+        ledger_path=tmp_path / "memory_events.jsonl",
+        snapshot_path=tmp_path / "memory_events_snapshot.json",
+        backup_dir=tmp_path / "backups",
     )
     turn = [
         {"role": "user", "content": "我喜欢每天早上喝黑咖啡。"},
