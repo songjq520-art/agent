@@ -1,7 +1,8 @@
-# tools/memory_tool.py（记忆管理工具：把长期记忆的查/记/改/删接进聊天）
+# tools/memory_tool.py（记忆管理工具：把长期记忆的查/记/改/删/恢复接进聊天）
 # 作用：45 号——聊天里只接了搜索，BOOS 让删没用的记忆时十二只能说
 #       “没有能直接删长期记忆的工具”。现在把记忆管理也接进来：
-#       列出全部记忆、记一条、改一条、删一条。
+#       列出全部记忆、记一条、改一条、删一条、一次删多条、列出已删的、
+#       恢复一条已删的。
 # 原理：和搜索工具同一套路（见 tools/search_tool.py）——
 #       ContextVar 绑记忆库（每轮/每次请求有自己的绑定，不串线），
 #       register_memory_tools() 登记四个工具，网关按登记执行。
@@ -626,6 +627,309 @@ def _run_delete_memory(args):
     }
 
 
+def _run_list_deleted_memories(args):
+    """列出能恢复的已删记忆（只读）。返回 {count, memories:
+    [{id, text, deleted_at, source}]}，source 是 "trash"（回收站）
+    或 "ledger"（账本）。id 可能为空（账本的 add 事件本来就没有
+    mem0 id，靠原文认）——模型按原文挑，恢复时传 text。"""
+    store, error = _store_or_error()
+    if error is not None:
+        return error
+    try:
+        entries = store.list_deleted_memories()
+    except Exception as exc:  # noqa: BLE001 - 读失败也算执行失败
+        return {"ok": False, "data": None, "error": f"读已删记忆失败：{exc}"}
+    return {
+        "ok": True,
+        "data": {"count": len(entries or []), "memories": entries or []},
+        "error": None,
+    }
+
+
+def _check_revive_anchor(args):
+    """恢复记忆的确认前校验（和 _check_delete_anchor 同一套路）：
+    程序核对模型挑的这条是不是已删里的那条。
+    返回 (error, augment)：error 非空时拒绝（不建卡、不执行）；
+    通过时 augment 带确认卡上原样显示的匹配备注。
+    核对走 store.revive_scope：id 或原文要在已删里找得到，原文
+    要和已删档案里的那条一致，anchor 要在原文里。只读、不改库，
+    确认前和执行前各跑一次。"""
+    store, error = _store_or_error()
+    if error is not None:
+        return error["error"], None
+    memory_id = (args or {}).get("memory_id") or ""
+    text = (args or {}).get("text") or ""
+    anchor = (args or {}).get("anchor_text") or ""
+    if not _norm_anchor_text(anchor):
+        return (
+            "恢复记忆要写 anchor_text：用户原话里的恢复目标"
+            "（比如“冒菜”），没写没法核对。",
+            None,
+        )
+    if not memory_id and not text.strip():
+        return ("恢复记忆要传 memory_id（旧 id）或 text（原文），缺了没法核对。", None)
+    scope = store.revive_scope(memory_id or None, text or None)
+    if not scope.get("found"):
+        return (scope.get("reason") or "已删的记忆里没有这条，没恢复。", None)
+    entry = scope.get("entry") or {}
+    entry_text = (entry.get("text") or "").strip()
+    if text.strip() and not _same_text(entry_text, text):
+        return (
+            "原文对不上已删档案里的那条（可能列表旧了、或抄错了），没恢复。"
+            "请先列出已删记忆，照原文再恢复。",
+            None,
+        )
+    if _norm_anchor_text(anchor) not in _norm_anchor_text(entry_text):
+        return (
+            f"你要恢复的是“{anchor}”，但已删档案里这条原文里没有它，挑错了，"
+            f"没恢复：{entry_text}。请先列出已删记忆，照原文再恢复。",
+            None,
+        )
+    source = "回收站" if (entry.get("source") or "") == "trash" else "账本"
+    note = (
+        f"程序已核对：要恢复的是已删的“{entry_text}”（{source}里留着，"
+        f"anchor“{anchor}”对得上），确认后按原文 + 原来的来源/时间恢复。"
+    )
+    return None, {"_anchor_match": note}
+
+
+def _run_revive_memory(args):
+    """恢复一条已删的长期记忆（2026-11-16 真机测试补的口）。
+
+    调用方必须先调 list_deleted_memories，把 id、原文一起传来；
+    原文对不上已删档案里的就不恢复。恢复按原文 + 原来的来源/
+    确认状态/形成时间重新存一条（新 id），再记一笔 revive 事件。
+    approve=True 只是“网关确认过了”的意思：这个工具登记了
+    needs_confirmation=True，确认卡没点之前网关根本不会调到这里；
+    归属校验（在已删里找得到、原文对得上）那两道关还在
+    revive_scope 里面，一道都不少。
+    """
+    store, error = _store_or_error()
+    if error is not None:
+        return error
+    memory_id = (args or {}).get("memory_id") or ""
+    text = (args or {}).get("text") or ""
+    if not memory_id and not text.strip():
+        return {
+            "ok": False,
+            "data": None,
+            "error": "恢复记忆要传 memory_id（旧 id）或 text（原文），缺了没法恢复。",
+        }
+    # 执行前再验一次 anchor（确认卡建好后库可能变了）。
+    anchor_error, _augment = _check_revive_anchor(args)
+    if anchor_error:
+        return {"ok": False, "data": None, "error": anchor_error}
+    # 原文先记下来：恢复成功后这条就不在已删里了，事后再查就查不到了。
+    scope = store.revive_scope(memory_id or None, text or None)
+    entry_text = ((scope.get("entry") or {}).get("text") or "").strip()
+    try:
+        revived = store.revive_memory(memory_id or None, text or None)
+    except Exception as exc:  # noqa: BLE001 - 恢复失败也算执行失败
+        return {"ok": False, "data": None, "error": f"恢复记忆失败：{exc}"}
+    if revived is False:
+        return {
+            "ok": False,
+            "data": None,
+            "error": "这条记忆恢复不了（已删里没有它，或它已经在库里了）。",
+        }
+    return {
+        "ok": True,
+        "data": {
+            "memory_id": revived if isinstance(revived, str) else None,
+            "text": entry_text or text.strip(),
+            "revived": True,
+        },
+        "error": None,
+    }
+
+
+def _check_batch_delete_anchor(args):
+    """批量删记忆的确认前校验（2026-11-16 真机测试：一次删多条，
+    一张卡、点一次确认就行）。
+
+    每条都按单条删的同一套路验（guard_memory_target + 原文比对），
+    有一条验不过就整批拒绝（不建卡、不执行，错误直接回给模型，
+    让它重新列出再动手）——卡上是一次确认，验不过的条目绝不能
+    混进这一批里。只读、不改库，确认前和执行前各跑一次。
+    通过时 augment 带一张卡上原样显示的清单：每条原文都列出来，
+    BOOS 点之前看得清一次删的是哪几条。
+    """
+    store, error = _store_or_error()
+    if error is not None:
+        return error["error"], None
+    items = (args or {}).get("items") or []
+    anchor = (args or {}).get("anchor_text") or ""
+    if not isinstance(items, list) or not items:
+        return ("批量删记忆要传 items（至少一条 {memory_id, text}），缺了没法删。", None)
+    if len(items) > 20:
+        return ("一次最多删 20 条，多了分批删。", None)
+    if not _norm_anchor_text(anchor):
+        return (
+            "批量删记忆要写 anchor_text：用户原话里的删除目标"
+            "（比如“冒菜”），没写没法核对。",
+            None,
+        )
+    seen_ids = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return ("items 里每一项都应是 {memory_id, text}，有一项形状不对。", None)
+        mid = (item or {}).get("memory_id") or ""
+        text = (item or {}).get("text") or ""
+        if not mid or not text.strip():
+            return ("items 里每一项都要有 memory_id 和 text（列出来的原文），缺了没法删。", None)
+        if mid in seen_ids:
+            return (f"items 里 {mid} 出现了两次，别重复传，删一次就行。", None)
+        seen_ids.add(mid)
+    matches = _find_anchor_matches(store, anchor)
+    picked_texts = []
+    for item in items:
+        memory_id = (item or {}).get("memory_id") or ""
+        text = (item or {}).get("text") or ""
+        guard = guard_memory_target("delete", memory_id, anchor, matches)
+        if not guard["ok"]:
+            if not matches:
+                return (
+                    f"库里没找到含“{anchor}”的记忆，没删。"
+                    "请先列出全部记忆，确认要删的是哪条。",
+                    None,
+                )
+            shown = "；".join(t for _i, t in matches[:3])
+            more = f"（等共 {len(matches)} 条）" if len(matches) > 3 else ""
+            return (
+                f"你要删的是“{anchor}”，但其中一条挑错了，没删：{text}。"
+                f"库里提到“{anchor}”的是：{shown}{more}"
+                "请先列出全部记忆，照原文再删。",
+                None,
+            )
+        picked_text = next(
+            (t for _id, t in matches if _id == guard["target_id"]), ""
+        )
+        if not _same_text(picked_text, text):
+            return (
+                "其中一条原文对不上库里存的那条（可能列表旧了、或抄错了），没删。"
+                "请先列出全部记忆，照原文再删。",
+                None,
+            )
+        picked_texts.append(picked_text)
+    listing = "；".join(f"{i + 1}. {t}" for i, t in enumerate(picked_texts))
+    note = (
+        f"程序已核对：以下 {len(picked_texts)} 条原文里都含 anchor“{anchor}”，"
+        f"确认一次全删：{listing}"
+    )
+    return None, {"_anchor_match": note}
+
+
+def _run_delete_memories(args):
+    """一次删多条长期记忆（2026-11-16 真机测试：BOOS 说“一起删”，
+    一张卡、点一次确认）。
+
+    调用方必须先调 list_memories，把每条的 id、原文一起传来；
+    有一条原文对不上库里的，整批都不删。执行时一条一条串行删
+    （delete 的 57 号锚点校验绝不能被并行绕过去），删完逐条报：
+    全部删完返回 ok=True；有几条没删成时返回 ok=False，但 data 里
+    照样写清删成了哪几条、没删成的是哪几条和原因——绝不谎称全删完了。
+    approve=True 只是“网关确认过了”的意思：这个工具登记了
+    needs_confirmation=True，确认卡没点之前网关根本不会调到这里。
+    """
+    store, error = _store_or_error()
+    if error is not None:
+        return error
+    items = (args or {}).get("items") or []
+    if not isinstance(items, list) or not items:
+        return {
+            "ok": False,
+            "data": None,
+            "error": "批量删记忆要传 items（至少一条 {memory_id, text}），缺了没法删。",
+        }
+    # 执行前再验一次 anchor（确认卡建好后库可能变了）。
+    anchor_error, _augment = _check_batch_delete_anchor(args)
+    if anchor_error:
+        return {"ok": False, "data": None, "error": anchor_error}
+    deleted = []
+    failed = []
+    for item in items:
+        memory_id = (item or {}).get("memory_id") or ""
+        text = (item or {}).get("text") or ""
+        try:
+            scope = store.deletion_scope(memory_id)
+        except Exception as exc:  # noqa: BLE001 - 读范围失败算这一条没删成
+            failed.append(
+                {"memory_id": memory_id, "text": text, "error": f"读删除范围失败：{exc}"}
+            )
+            continue
+        if not (scope or {}).get("found"):
+            failed.append(
+                {
+                    "memory_id": memory_id,
+                    "text": text,
+                    "error": f"找不到这条记忆（id 对不上）：{memory_id}。",
+                }
+            )
+            continue
+        stored_text = ((scope or {}).get("memory") or {}).get("text") or ""
+        if not _same_text(stored_text, text):
+            failed.append(
+                {
+                    "memory_id": memory_id,
+                    "text": text,
+                    "error": "原文对不上库里存的那条（可能列表旧了、或抄错了），没删。",
+                }
+            )
+            continue
+        try:
+            ok = store.delete_memory(memory_id, approve=True)
+        except PermissionError:
+            failed.append(
+                {
+                    "memory_id": memory_id,
+                    "text": text,
+                    "error": "删除需要 BOOS 同意，这次没通过确认，删不了。",
+                }
+            )
+            continue
+        except RuntimeError as exc:
+            failed.append(
+                {
+                    "memory_id": memory_id,
+                    "text": text,
+                    "error": f"删了一半或删失败：{exc}",
+                }
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 - 删失败算这一条没删成
+            failed.append(
+                {"memory_id": memory_id, "text": text, "error": f"删记忆失败：{exc}"}
+            )
+            continue
+        if not ok:
+            failed.append(
+                {
+                    "memory_id": memory_id,
+                    "text": text,
+                    "error": "这条记忆已经不在了（可能刚才已经删过）。",
+                }
+            )
+            continue
+        deleted.append({"memory_id": memory_id, "text": stored_text})
+    if failed:
+        return {
+            "ok": False,
+            "data": {"deleted": deleted, "failed": failed},
+            "error": (
+                f"删了 {len(deleted)} 条，还有 {len(failed)} 条没删成："
+                + "；".join(
+                    f"{(f or {}).get('text') or (f or {}).get('memory_id')}（{(f or {}).get('error')}）"
+                    for f in failed
+                )
+            ),
+        }
+    return {
+        "ok": True,
+        "data": {"deleted": deleted, "failed": []},
+        "error": None,
+    }
+
+
 def _register_one(name, description, parameters, output, risk_level,
                   needs_confirmation, func, replay_safe, side_effect_free,
                   precheck=None):
@@ -654,11 +958,12 @@ def _register_one(name, description, parameters, output, risk_level,
 
 
 def register_memory_tools():
-    """把四个记忆管理工具登记进工具注册表（已登记过时什么都不做，
+    """把记忆管理工具登记进工具注册表（已登记过时什么都不做，
     重复调不会报错）。列是只读（low、不确认、可重跑）；记是 BOOS
     当轮明确让记的（medium、不确认、会改东西、不可重跑）；改和删
     是 medium、要确认、会改东西、不可重跑——确认卡没点之前不执行，
-    执行过一次也绝不重执行（恢复时喂存下来的结果）。"""
+    执行过一次也绝不重执行（恢复时喂存下来的结果）。恢复和批量删
+    和单条删同一条规矩：要确认、会改东西、不可重跑；列已删是只读。"""
     _register_one(
         name="list_memories",
         description=(
@@ -775,7 +1080,9 @@ def register_memory_tools():
             "卡上会注明，确认删的是这一条；"
             "先问清楚再删，别自己挑。删之前会先弹确认卡，卡上显示 anchor"
             "和程序算好的匹配结果，BOOS 点了确认才执行，取消了就不删；"
-            "删了就彻底没了（向量和审计记录都清掉），别删错。"
+            "删掉后向量和审计记录都清掉，但账本里原话留着，之后能用 "
+            "revive_memory 恢复——删错了还能找回来，但别乱删。一次删多条"
+            "时调 delete_memories，别一条一条调这个。"
             "返回 {memory_id, text, history_cleared}。"
         ),
         parameters={
@@ -816,4 +1123,148 @@ def register_memory_tools():
         replay_safe=False,
         side_effect_free=False,
         precheck=_check_delete_anchor,
+    )
+    _register_one(
+        name="list_deleted_memories",
+        description=(
+            "列出能恢复的已删记忆（回收站 + 账本里删掉的原话）。BOOS 让恢复"
+            "一条删掉的记忆之前，先调这个列出已删的，找到要恢复的那条，"
+            "再调 revive_memory。返回 {count, memories: "
+            "[{id, text, deleted_at, source}]}，source 是 \"trash\""
+            "（回收站）或 \"ledger\"（账本）；id 可能为空（账本的 add 事件"
+            "本来就没有 mem0 id），恢复时按原文挑，传 text。"
+        ),
+        parameters={"type": "object", "properties": {}},
+        output=(
+            "成功时 data 是 {count: 一共几条, memories: "
+            "[{id, text, deleted_at, source}]}；"
+            "失败时 ok 为 false，error 里写原因。"
+        ),
+        risk_level="low",
+        needs_confirmation=False,
+        func=_run_list_deleted_memories,
+        replay_safe=True,
+        side_effect_free=True,
+    )
+    _register_one(
+        name="revive_memory",
+        description=(
+            "恢复一条已删的长期记忆。先调 list_deleted_memories 列出已删的，"
+            "找到要恢复的那条，把 memory_id（旧 id，列表里没有时可以不传）、"
+            "text（列出来的原文，一字不差地抄）和 anchor_text（用户原话里的"
+            "恢复目标，比如 BOOS 说“把冒菜恢复回来”时 anchor_text 就是"
+            "“冒菜”）一起传来；原文对不上已删档案里的就不恢复。"
+            "程序会先核对 anchor：挑的这条原文里含 anchor 才建确认卡，"
+            "对不上、没找到时直接拒绝、不建卡；"
+            "恢复按原文 + 原来的来源/确认状态/形成时间重新存一条（新 id），"
+            "再记一笔 revive 事件。恢复之前会先弹确认卡，BOOS 点了确认才"
+            "执行，取消了就不恢复。"
+            "返回 {memory_id（新 id）, text, revived}。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "要恢复的那条记忆的旧 id（list_deleted_memories 里拿到的；没有时可以不传）",
+                    "minLength": 1,
+                },
+                "text": {
+                    "type": "string",
+                    "description": "列出来的原文，一字不差地抄",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                },
+                "anchor_text": {
+                    "type": "string",
+                    "description": "用户原话里的恢复目标（比如“冒菜”）",
+                    "minLength": 1,
+                    "maxLength": 200,
+                },
+                "_anchor_match": {
+                    "type": "string",
+                    "description": "程序算好的匹配结果，确认卡上显示用；模型不用填",
+                    "maxLength": 500,
+                },
+            },
+            "required": ["text", "anchor_text"],
+        },
+        output=(
+            "成功时 data 是 {memory_id（新 id）, text, revived}；"
+            "失败时 ok 为 false，error 里写原因。"
+        ),
+        risk_level="medium",
+        needs_confirmation=True,
+        func=_run_revive_memory,
+        replay_safe=False,
+        side_effect_free=False,
+        precheck=_check_revive_anchor,
+    )
+    _register_one(
+        name="delete_memories",
+        description=(
+            "一次删多条长期记忆。BOOS 说“一起删”“这几条都删掉”时调这个，"
+            "别一条一条调 delete_memory：一次调用、一张确认卡、点一次确认"
+            "就全删。先调 list_memories 列出全部，找到要删的那几条，把"
+            " items（每条 {memory_id, text}，原文一字不差地抄）和 anchor_text"
+            "（用户原话里的删除目标，比如 BOOS 说“把冒菜相关的都删掉”时 "
+            "anchor_text 就是“冒菜”）一起传来；有一条原文对不上库里的，"
+            "整批都不删。程序会先逐条核对 anchor：每条原文里含 anchor 才建"
+            "确认卡，对不上、没找到时直接拒绝、不建卡；卡上会列出要删的"
+            "全部原文，BOOS 点之前看得清一次删的是哪几条，点了确认才执行，"
+            "取消了就不删。删完逐条报结果，有几条没删成会写清楚，绝不谎称"
+            "全删完了。返回 {deleted: [{memory_id, text}], "
+            "failed: [{memory_id, text, error}]}。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "要删的记忆，每条 {memory_id, text}，原文一字不差地抄",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {
+                                "type": "string",
+                                "description": "要删的那条记忆的 id（list_memories 里拿到的）",
+                                "minLength": 1,
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "列出来的原文，一字不差地抄",
+                                "minLength": 1,
+                                "maxLength": 1000,
+                            },
+                        },
+                        "required": ["memory_id", "text"],
+                    },
+                },
+                "anchor_text": {
+                    "type": "string",
+                    "description": "用户原话里的删除目标（比如“冒菜”）",
+                    "minLength": 1,
+                    "maxLength": 200,
+                },
+                "_anchor_match": {
+                    "type": "string",
+                    "description": "程序算好的匹配结果，确认卡上显示用；模型不用填",
+                    "maxLength": 5000,
+                },
+            },
+            "required": ["items", "anchor_text"],
+        },
+        output=(
+            "成功时 data 是 {deleted: [{memory_id, text}], failed: []}；"
+            "有几条没删成时 ok 为 false，error 里写清哪几条没删成和原因，"
+            "data 里照样有 deleted 和 failed 两份清单。"
+        ),
+        risk_level="medium",
+        needs_confirmation=True,
+        func=_run_delete_memories,
+        replay_safe=False,
+        side_effect_free=False,
+        precheck=_check_batch_delete_anchor,
     )

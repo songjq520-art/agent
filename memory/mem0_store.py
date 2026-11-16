@@ -519,7 +519,15 @@ CUSTOM_INSTRUCTIONS = """CUSTOM EXTRACTION RULES — HIGHEST PRIORITY, these ove
     a boast, or an impossible claim rather than a sincere fact about the
     user, do NOT store it. When in doubt whether the user is joking, do
     NOT store it — a missed joke is harmless, a stored joke becomes a
-    false memory the user has to correct later."""
+    false memory the user has to correct later.
+14. NEVER turn a request to manage memories (delete / update / correct a
+    stored memory) into a new fact about the user. "Delete X" only means
+    delete the stored record — it does NOT mean the user no longer likes
+    X, changed their mind, or changed a preference, and "the user asked
+    to delete X" is not a long-term fact worth storing (the deletion
+    itself is already recorded in the ledger). A preference change is
+    only stored when the user explicitly states the new preference in
+    their own words (e.g. "I don't like X anymore")."""
 
 # FIRST_MEMORIES（首批三条记忆，2026-11-07 BOOS 确认过）：
 # 从 memory/memories.py 原样搬过来，只改了一处：第 3 条的预算规则
@@ -704,6 +712,28 @@ VERIFICATION_EXPIRY_HOURS = {"market": 24, "weather": 12, "other": 24}
 
 
 
+
+
+def _describes_memory_management(text):
+    """这段提取出的文本是不是在复述“管记忆的动作”（删/改一条记忆）。
+
+    删/改记忆的动作本身已经记在账本里（delete/update 事件），复述成
+    一条长期记忆没有价值，还容易把动作脑补成偏好变了（“不再喜欢 X”）。
+    只认两种形状：
+    - “删”+“记忆/记录”：比如“要求删除此前记录的相关偏好记忆”、
+      “把这条从记忆里删掉”；
+    - “改”+“记忆”：比如“修改了记忆里的定投金额”。
+    “改”+“记录”不拦（比如“修改了会议记录”是正经工作事实，不是
+    管记忆的动作）。真凭 BOOS 原话说的偏好变化（“我不爱吃冒菜了”）
+    不提删/改记忆，不在这个形状里，不拦。
+    """
+    if not text:
+        return False
+    if "删" in text and ("记忆" in text or "记录" in text):
+        return True
+    if "改" in text and "记忆" in text:
+        return True
+    return False
 
 
 class Mem0Store:
@@ -1807,6 +1837,9 @@ class Mem0Store:
                 "extraction_reason": "mem0_add_failed",
             }
         result = self._drop_sensitive_results(result or {})
+        # 2026-11-16 真机测试（问题 4）：管记忆的动作复述成事实的，
+        # 在这里拦掉——动作本身已经记在账本里了，不用再存一条。
+        result = self._drop_management_action_results(result)
         result = self._apply_coverage_guard(result, before, metadata)
         # 43 号价值关卡先走（一次判全场，低价值的先清掉），再 46 号去重
         # （对照面是提取前的库 + 本轮已留下的新记忆）。
@@ -2426,7 +2459,7 @@ class Mem0Store:
         来源：提取出的记忆记 source="inferred"、user_confirmed=False、
         confidence=0.7（见文件头“来源”一节）——用户明确说过的话，
         但 BOOS 没逐条确认过那个写法；存下来了也不会自动变成已确认。
-        价值判断在提取提示里（CUSTOM_INSTRUCTIONS 第 9–12 条，DeepSeek
+        价值判断在提取提示里（CUSTOM_INSTRUCTIONS 第 9–12、14 条，DeepSeek
         自己判断）：只存值得长期记的，不值得记的/没确认的直接不存。
         隐私（存前脱敏 + 存后复查，两道）：
         提取要把对话原文发给 DeepSeek，秘密不能跟着原文一起发出去——
@@ -2697,6 +2730,50 @@ class Mem0Store:
             kept.append(item)
         if dropped:
             logger.info("提取后过滤：%d 条提取出的记忆含敏感信息，已删除。", dropped)
+        if len(kept) == len(items):
+            return result
+        filtered = dict(result)
+        filtered["results"] = kept
+        return filtered
+
+    def _drop_management_action_results(self, result):
+        """提取后过滤：删掉“把管记忆的动作复述成一条事实”的提取结果。
+
+        2026-11-16 真机测试（问题 4）：BOOS 只说了“把'我爱吃冒菜'这条
+        删掉”，提取却存了一条“用户表示自己不再爱吃冒菜了，并要求删除
+        此前记录的相关偏好记忆”——把删记忆的动作脑补成偏好变了，还拿
+        它当理由拒绝恢复。管记忆的动作（删/改一条记忆）本身已经记在
+        账本里（delete/update 事件），不需要再存一条“用户要求删除/修改
+        记忆”当长期记忆。
+        只拦复述动作本身的条目：文本里同时提到动作词（删/改）和
+        “记忆/记录”。真凭 BOOS 原话说的偏好变化（“我不爱吃冒菜了”，
+        不提删记忆）不在这个形状里，不拦——那是真事实，照常存。
+        和 _drop_sensitive_results 一样的处理：条目已经在库里了，
+        从库里删掉、也不返回给调用方；账本那步在后面，只对留下的
+        条目补记，拦掉的不会进账本。
+        返回过滤后的结果（拦掉的条目不在 results 里）。
+        """
+        items = (result or {}).get("results") or []
+        if not items:
+            return result
+        kept = []
+        dropped = 0
+        for item in items:
+            text = (item or {}).get("memory") or ""
+            if text and _describes_memory_management(text):
+                dropped += 1
+                mem_id = (item or {}).get("id")
+                if mem_id:
+                    try:
+                        self._memory.delete(mem_id)
+                    except Exception:
+                        logger.warning(
+                            "提取后过滤：删除管记忆动作的复述失败。", exc_info=True
+                        )
+                continue
+            kept.append(item)
+        if dropped:
+            logger.info("提取后过滤：%d 条是管记忆动作的复述，已删除。", dropped)
         if len(kept) == len(items):
             return result
         filtered = dict(result)
@@ -5733,6 +5810,13 @@ class Mem0Store:
                     # 功能，不是“向量里还留着”。
                     if (hit or {}).get("is_history"):
                         continue
+                    # 只认同一条记忆：库里还有另一条相同说法的记忆时，
+                    # 搜回来的是那条，不是这条——按 id 认，别按文本认。
+                    # （2026-11-16 真机测试：两条相同的“我爱吃冒菜”，
+                    # 删掉一条后搜还回来另一条，旧的按文本验永远验不
+                    # 过，谎报“删除了一半”。）
+                    if (hit or {}).get("id") != memory_id:
+                        continue
                     if _normalize_memory_text(hit.get("text") or "") == _normalize_memory_text(old_text):
                         search_empty = False
                         break
@@ -6029,6 +6113,242 @@ class Mem0Store:
             }
             for e in self._read_retracted_trash()
         ]
+
+    # ---------- 恢复（2026-11-16 真机测试：恢复工具缺失） ----------
+
+    def _deleted_entries(self):
+        """能恢复的已删记忆（内部用，带恢复要用的全部字段）。
+
+        两处来源并在一起，同一条原文只留一条（回收站的优先，
+        它带旧 id 和完整元数据）：
+        - 回收站（软删除的）：_read_retracted_trash()；
+        - 账本（深度删除的）：ledger_state() 里 key_states 标了
+          deleted 的 add 档案（原话 + 形成时间 + 元数据都在），
+          旧 id 按 id_to_key 反查，查不到就是 None（账本的 add
+          事件本来就没有 mem0 id，靠原话认）。
+        每项 {"id", "text", "metadata", "key", "deleted_at",
+        "source"}，source 是 "trash" 或 "ledger"。只读，不改库。
+        """
+        entries = []
+        seen_texts = set()
+        for item in reversed(self._read_retracted_trash()):
+            text = (item or {}).get("text") or ""
+            if not text:
+                continue
+            norm = _normalize_memory_text(text)
+            if norm in seen_texts:
+                continue
+            seen_texts.add(norm)
+            entries.append(
+                {
+                    "id": (item or {}).get("id"),
+                    "text": text,
+                    "metadata": dict((item or {}).get("metadata") or {}),
+                    "key": None,
+                    "deleted_at": (item or {}).get("deleted_at")
+                    or (item or {}).get("retracted_at"),
+                    "source": "trash",
+                }
+            )
+        try:
+            state = self.ledger_state()
+        except Exception:
+            state = {}
+        key_states = (state or {}).get("key_states") or {}
+        id_to_key = (state or {}).get("id_to_key") or {}
+        key_to_id = {}
+        for mem_id, key in id_to_key.items():
+            key_to_id.setdefault(key, mem_id)
+        # 旧 id 反查 key 不能只靠 id_to_key：add 事件本来就没有 mem0 id，
+        # 纯 add→delete 的那条 id 只在 delete 事件里（memory_id + key
+        # 都带），折叠时 delete 分支又不写 id_to_key——所以这里直接读
+        # 一遍原始事件，把 delete 事件里的 id→key 也补进来。
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            events = []
+        for event in events or []:
+            if (event or {}).get("type") != _ledger.LEDGER_EVENT_DELETE:
+                continue
+            mem_id = (event or {}).get("memory_id")
+            key = (event or {}).get("key")
+            if mem_id and key:
+                key_to_id.setdefault(key, mem_id)
+        for record in reversed((state or {}).get("adds") or []):
+            key = (record or {}).get("key")
+            if not key or key_states.get(key) != _ledger.LEDGER_STATE_DELETED:
+                continue
+            text = (record or {}).get("text") or ""
+            if not text:
+                continue
+            norm = _normalize_memory_text(text)
+            if norm in seen_texts:
+                continue
+            seen_texts.add(norm)
+            meta = dict((record or {}).get("meta") or {})
+            entries.append(
+                {
+                    "id": key_to_id.get(key),
+                    "text": text,
+                    "metadata": meta,
+                    "key": key,
+                    "deleted_at": None,
+                    "source": "ledger",
+                }
+            )
+        return entries
+
+    def list_deleted_memories(self):
+        """列出能恢复的已删记忆：每项 {"id", "text", "deleted_at",
+        "source"}，回收站的在前（新的在前），账本的在后（新的在前）。
+        只读，不改库——给 revive_memory 工具列清单用，模型按原文挑。"""
+        return [
+            {
+                "id": entry.get("id"),
+                "text": entry.get("text") or "",
+                "deleted_at": entry.get("deleted_at"),
+                "source": entry.get("source"),
+            }
+            for entry in self._deleted_entries()
+        ]
+
+    def revive_scope(self, memory_id=None, text=None):
+        """恢复的确认前核对（只读）：要恢复的那条在不在已删里。
+
+        memory_id（旧 id）和 text（原文）至少给一个；两个都给时
+        必须对得上同一条（id 对上的那条原文要和 text 一致）。
+        返回 {"found": bool, "entry": {...} | None, "reason": str}，
+        entry 是 _deleted_entries() 里那一项（带 metadata、key）。
+        """
+        if not memory_id and not (text or "").strip():
+            return {
+                "found": False,
+                "entry": None,
+                "reason": "要恢复哪条没说：传 memory_id（旧 id）或 text（原文）。",
+            }
+        entries = self._deleted_entries()
+        picked = None
+        if memory_id:
+            picked = next(
+                (e for e in entries if (e or {}).get("id") == memory_id), None
+            )
+            if picked is None:
+                return {
+                    "found": False,
+                    "entry": None,
+                    "reason": f"已删的记忆里没有这条（id 对不上）：{memory_id}。",
+                }
+            if (text or "").strip() and _normalize_memory_text(
+                picked.get("text") or ""
+            ) != _normalize_memory_text(text):
+                return {
+                    "found": False,
+                    "entry": None,
+                    "reason": "id 对上的那条原文和传来的 text 不一致，挑错了。",
+                }
+        else:
+            norm = _normalize_memory_text(text)
+            picked = next(
+                (
+                    e
+                    for e in entries
+                    if _normalize_memory_text(e.get("text") or "") == norm
+                ),
+                None,
+            )
+            if picked is None:
+                return {
+                    "found": False,
+                    "entry": None,
+                    "reason": f"已删的记忆里没有这条原文：{text}。",
+                }
+        return {"found": True, "entry": picked, "reason": ""}
+
+    def revive_memory(self, memory_id=None, text=None):
+        """恢复一条已删的记忆（2026-11-16 真机测试：恢复工具缺失）。
+
+        账本是恢复的凭据：删掉的原话在账本档案里留着（add 事件），
+        回收站里留着软删除的原文 + 元数据。恢复就是按原话 + 原元数据
+        重新存一条（新 id），再记一笔 revive 事件——旧 id 在账本里
+        还是 deleted，不影响筛子；新 id 是当前的。
+        来源/确认状态/形成时间都按原样恢复（时间戳用原来的，别写成
+        恢复时间），和 restore_memory（34 号）同一条规矩。
+        原话已经在库里时不重复存，返回 False（调用方按“已经在库里了”
+        回 BOOS，别谎称恢复了）。
+        返回新 id（恢复了）/ False（已删里没有这条 / 存失败）。
+        """
+        if not memory_id and not (text or "").strip():
+            return False
+        with _WRITE_LOCK:
+            scope = self.revive_scope(memory_id, text)
+            if not scope.get("found"):
+                return False
+            entry = scope.get("entry") or {}
+            entry_text = (entry.get("text") or "").strip()
+            if not entry_text:
+                return False
+            # 已经在库里就别重复存。
+            try:
+                current = {
+                    _normalize_memory_text((item or {}).get("text") or "")
+                    for item in self.get_all(include_sensitive=True)
+                }
+            except Exception:
+                return False
+            if _normalize_memory_text(entry_text) in current:
+                return False
+            if (entry.get("source") or "") == "trash":
+                old_id = entry.get("id")
+                if not old_id:
+                    return False
+                if not self.restore_memory(old_id):
+                    return False
+                # restore_memory 只回 True/False：按原文找回新 id。
+                try:
+                    for item in self.get_all(include_sensitive=True):
+                        if _normalize_memory_text(
+                            (item or {}).get("text") or ""
+                        ) == _normalize_memory_text(entry_text):
+                            return (item or {}).get("id") or True
+                except Exception:
+                    pass
+                return True
+            meta = dict(entry.get("metadata") or {})
+            result = self._add_text_with_metadata(
+                entry_text,
+                _provenance(
+                    meta.get("source") or SOURCE_INFERRED,
+                    meta.get("confidence")
+                    if isinstance(meta.get("confidence"), (int, float))
+                    else CONFIDENCE_INFERRED,
+                    bool(meta.get("user_confirmed")),
+                    created_at=meta.get("created_at"),
+                    created_at_source="written",
+                    slot=meta.get("slot"),
+                    is_rule=bool(meta.get("is_rule")),
+                ),
+            )
+            results = (result or {}).get("results") or []
+            if not results:
+                return False
+            new_id = ((results[0] or {}).get("id")) or ""
+            if not new_id:
+                return False
+            # 账本记一笔恢复：恢复的这条原话标回 current——删掉时记的
+            # delete 把它的 key 标成 deleted 了，恢复要把它标回来，
+            # 不然兜底、对账还以为这条是删了的。
+            self._ledger_append(
+                _ledger.LEDGER_EVENT_REVIVE,
+                memory_id=new_id,
+                key=entry.get("key")
+                or _ledger.ledger_event_key(
+                    entry_text, meta.get("created_at")
+                ),
+                note=f"从账本恢复，旧 id {entry.get('id')}。"
+                if entry.get("id")
+                else "从账本恢复。",
+            )
+            return new_id
 
     def history(self, memory_id):
         """取一条记忆的修改历史（mem0 自带的 SQLite 审计记录）。

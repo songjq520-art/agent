@@ -15,6 +15,12 @@
 requests>=2.31
 pytest>=8.0
 
+# tzdata：Windows 的 Python 没有系统时区库，zoneinfo 要靠它才能认
+# "Asia/Shanghai" 这类时区（2026-11-16 笔记本跑套件时 13 个文件
+# 收集报错 ZoneInfoNotFoundError，装了 tzdata 才过）。Linux/macOS
+# 自带系统时区库，装了也没坏处，只当备用。
+tzdata>=2024.1
+
 # 长期记忆（mem0，2026-11-08 试跑实测通过的版本，全部钉死）：
 mem0ai==2.2.1
 chromadb==1.5.9
