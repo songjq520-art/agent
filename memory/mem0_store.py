@@ -152,6 +152,7 @@ from memory.money_slots import (
 from memory.provenance import (
     _provenance,
     _normalize_metadata,
+    _metadata_for_store,
     _credibility_rank,
     _is_core_memory,
     _parse_created_at,
@@ -247,6 +248,7 @@ from memory.versioning import (
 from memory import backup as _backup
 from memory import ledger as _ledger
 from memory import relations as _relations
+from memory import inference as _inference
 from memory.decay import (
     DECAY_DELETE_BACKUP_PREFIX,
     DECAY_DELETE_IDLE_DAYS,
@@ -762,6 +764,7 @@ class Mem0Store:
         protection_events_path=None,
         ledger_path=None,
         snapshot_path=None,
+        inference_calibration_path=None,
         backup_dir=None,
         user_id=DEFAULT_USER_ID,
         budget_tracker=None,
@@ -835,6 +838,35 @@ class Mem0Store:
         # 待定区清空、不存（这是设计，不是丢数据：用户没给下一句，
         # 就当那句还没说定）。
         self._pending_turn = None
+        # _pending_inference（待定的揣摩）：上一轮揣出来、当场问了 BOOS
+        # 的那条推断（见 memory/inference.py + infer_from_turn）。
+        # 只放内存里，重启就没了——问话本身就是当场的；账本里那份
+        # （inference 事件，status pending）才是 durable 的记录。
+        # 下一轮 BOOS 光秃秃地回“对/不对”时，就认这一条；下一轮没回，
+        # 它就过期了（账本里还是 pending，以后对账/自检能翻出来）。
+        self._pending_inference = None
+        # _longterm_skip_until_seq（长期揣摩的跳过线）：攒够 20 条新记忆
+        # 时跑一次长期揣摩；那次模型说“没什么可猜的”时，把当前账本序号
+        # 记下来，下次要再攒够 20 条新的才重跑——不然每轮都多调一次模型。
+        self._longterm_skip_until_seq = 0
+        # 揣摩开口门槛（2026-11-17，校准自动调）：当前门槛是“开口的最
+        # 低把握”（low/medium/high），默认 low——低把握也敢说，只说
+        # “我只是猜的”（BOOS 的铁规矩：揣摩要敢说）。门槛存在
+        # inference_calibration.json 里（默认和账本同目录，gitignore
+        # 覆盖、不进仓库），重启还在；文件没了/读坏了就回默认 low。
+        # _inference_calibration_baseline：上次调门槛时各档的裁决数
+        # （{把握: {confirmed, denied}}）——调门槛只看这之后新来的反馈
+        # （增量），旧账不重复算，不然同一批过分自信的数据每轮都推着
+        # 门槛往上走；新反馈来了也只按新反馈的信号动。
+        self.inference_calibration_path = (
+            Path(inference_calibration_path)
+            if inference_calibration_path
+            else self.ledger_path.parent / "inference_calibration.json"
+        )
+        (
+            self._inference_threshold,
+            self._inference_calibration_baseline,
+        ) = self._load_inference_calibration_state()
         # _just_deleted_texts（本进程里刚删掉的原文）：{归一化原文: 删的时间戳}
         # 2026-11-16 真机测试（拉面）：删完 10 秒，下一轮提交待定区时提取
         # 又把同一条记回来了——账本是兜底，内存里这份是第一道（账本写失败
@@ -1431,6 +1463,7 @@ class Mem0Store:
                 "relations": [],
                 "key_states": {},
                 "id_to_key": {},
+                "inferences": {},
                 "seq_max": 0,
                 "snapshot_seq": None,
             }
@@ -1854,6 +1887,9 @@ class Mem0Store:
         # 2026-11-16 真机测试（问题 4）：管记忆的动作复述成事实的，
         # 在这里拦掉——动作本身已经记在账本里了，不用再存一条。
         result = self._drop_management_action_results(result)
+        # 揣摩守卫（2026-11-16）：本轮问句里的猜，别让提取存进库里
+        # （见 _drop_pending_inference_results）——只拦本轮问过的那句。
+        result = self._drop_pending_inference_results(result, safe_messages)
         # 2026-11-16 真机测试（拉面，根子 1）：刚删的原文别再记回来。
         # 放在去重和账本补记之前——去重看不见已删的（快照是删之后的），
         # 账本补记只对留下的新条记，拦在这里就不会多一笔 add。
@@ -3064,12 +3100,15 @@ class Mem0Store:
             if now is None:
                 # 没了：重新存一条，文本和 metadata 原样带上。
                 # 存完不数成功——成没成等下面统一核对。
+                # 写回前先展平（见 _metadata_for_store）：规整后的
+                # metadata 里 money 是字典形，直接传 Chroma 拒收
+                # （2026-11-16 恒生定投就是这么恢复失败的）。
                 try:
                     self._mem0_add(
                         [{"role": "user", "content": old_text}],
                         self.user_id,
                         False,
-                        dict(old_meta),
+                        _metadata_for_store(old_meta),
                     )
                 except Exception:
                     logger.warning("覆盖守卫：恢复被删的旧记忆失败。", exc_info=True)
@@ -3087,10 +3126,14 @@ class Mem0Store:
                 continue
             # 文本被改了、或者 metadata 被动了：原地恢复，保住原 id。
             # 改完不数成功——成没成等下面统一核对。
+            # 写回前先展平（见 _metadata_for_store）：规整后的 metadata
+            # 里 money 是字典形，直接传 Chroma 拒收（2026-11-16 恒生定投
+            # 就是这么恢复失败的）。
             try:
                 try:
                     self._memory.update(
-                        memory_id=mem_id, text=old_text, metadata=dict(old_meta)
+                        memory_id=mem_id, text=old_text,
+                        metadata=_metadata_for_store(old_meta),
                     )
                 except TypeError:
                     logger.warning(
@@ -4789,6 +4832,49 @@ class Mem0Store:
             if isinstance(data, dict):
                 return data
             return None
+        return None
+
+    def _call_llm_text(self, system_prompt, user_prompt, max_tokens=500):
+        """请 DeepSeek 回一句话大白话（揣摩人心用，_judge_json 的纯文本兄弟）。
+
+        和 _judge_json 同一路：走 mem0 的 LLM 客户端（self._memory.llm.client，
+        和提取同一路，模型 deepseek-flash，温度 0），用量包装建库时已经
+        包住了它的 create，所以这次调用的 Token 也会记进 BudgetTracker；
+        没包住（假对象、没传 tracker）时至少记一条日志，不崩。
+        不同的是不解析 JSON——揣摩的输出就是一句话（设计方案第八节），
+        原样返回调用方解析；第一次被截断（finish_reason == "length"）
+        时用 1000 再试一次。没 LLM 客户端、调用失败、截断两次、回空
+        时返回 None——调用方按“没揣出来”处理，不猜、不拦路，绝不抛异常。
+        """
+        try:
+            client = self._memory.llm.client
+        except Exception:
+            logger.info("揣摩：没有 LLM 客户端，本次不揣。")
+            return None
+        max_tokens_try = max_tokens
+        for attempt in (1, 2):
+            try:
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0,
+                    max_tokens=max_tokens_try,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                finish_reason = getattr(resp.choices[0], "finish_reason", None)
+            except Exception:
+                logger.warning("揣摩：调 DeepSeek 失败。", exc_info=True)
+                return None
+            if finish_reason == "length":
+                if attempt == 1:
+                    max_tokens_try = 1000
+                    continue
+                logger.info("揣摩：重试也被截断。")
+                return None
+            return content or None
         return None
 
     def _expand_correction_fragment(self, fragment_value, old_text):
@@ -6547,6 +6633,716 @@ class Mem0Store:
                 _normalize_memory_text(entry_text), None
             )
             return new_id
+
+    # ---------- 揣摩人心（2026-11-16，设计方案见 memory/inference.py） ----------
+
+    def record_inference(self, guess, evidence, confidence, layer,
+                         mode=_inference.MODE_SPOT, confidence_text=None):
+        """记一条揣摩进账本（待定区），返回推断字典；缺字段就不记。
+
+        推断不是记忆——它只进账本（inference 事件，status pending），
+        不进 mem0。BOOS 当场说“对”才记下（status confirmed，仍只在
+        账本里，不写进 mem0——见 confirm_inference 的说明）；说“不对”
+        就删除（status deleted，不记作废）。
+        同一句已经待定了就不重复记——问一次就够了，问两遍是打扰。
+        猜的内容里有敏感信息时不记。账本写失败时返回 None。
+        """
+        if not isinstance(guess, str) or not guess.strip():
+            return None
+        if not isinstance(evidence, str) or not evidence.strip():
+            return None
+        if confidence not in ("low", "medium", "high"):
+            return None
+        if layer not in _inference.INFERENCE_LAYERS:
+            return None
+        if mode not in (_inference.MODE_SPOT, _inference.MODE_LONGTERM):
+            return None
+        guess = guess.strip()
+        evidence = evidence.strip()
+        if _contains_sensitive(guess) or _contains_sensitive(evidence):
+            logger.info("揣摩：猜的内容里有敏感信息，本次不记。")
+            return None
+        for pending in self.list_pending_inferences():
+            if _normalize_memory_text(
+                pending.get("guess") or ""
+            ) == _normalize_memory_text(guess):
+                return dict(pending)
+        created_at = _now_iso()
+        key = _ledger.ledger_event_key(guess, created_at)
+        conf_text = confidence_text or _inference._CONFIDENCE_TEXT[confidence]
+        event = self._ledger_append(
+            _ledger.LEDGER_EVENT_INFERENCE,
+            key=key,
+            text=guess,
+            evidence=evidence,
+            confidence=confidence,
+            confidence_text=conf_text,
+            layer=layer,
+            mode=mode,
+            status=_inference.STATUS_PENDING,
+            created_at=created_at,
+        )
+        if event is None:
+            return None
+        return {
+            "key": key,
+            "guess": guess,
+            "evidence": evidence,
+            "confidence": confidence,
+            "confidence_text": conf_text,
+            "layer": layer,
+            "mode": mode,
+            "status": _inference.STATUS_PENDING,
+            "seq": event.get("seq"),
+            "created_at": created_at,
+        }
+
+    @staticmethod
+    def _inference_record_to_dict(record):
+        """账本里折叠出的推断档案 → 对外用的推断字典（guess 是猜的内容）。
+        partial：BOOS 只认了一半（“差不多”“对了一半”），确认时标 True。"""
+        record = record or {}
+        return {
+            "key": record.get("key") or "",
+            "guess": record.get("text") or "",
+            "evidence": record.get("evidence") or "",
+            "confidence": record.get("confidence") or "low",
+            "confidence_text": record.get("confidence_text") or "我只是猜的",
+            "layer": record.get("layer") or _inference.LAYER_INDUCTION,
+            "mode": record.get("mode") or _inference.MODE_SPOT,
+            "status": record.get("status") or _inference.STATUS_PENDING,
+            "partial": bool(record.get("partial")),
+            "seq": record.get("seq"),
+            "created_at": record.get("created_at") or "",
+        }
+
+    def list_inferences(self, status=None):
+        """列出账本里的推断（按 seq 排）；status 给了就只列那个状态的。
+        账本读不出来时返回 []，不抛异常。"""
+        try:
+            state = self.ledger_state()
+        except Exception:
+            return []
+        records = (state or {}).get("inferences") or {}
+        out = [self._inference_record_to_dict(r) for r in records.values()]
+        if status is not None:
+            out = [r for r in out if r.get("status") == status]
+        out.sort(
+            key=lambda r: r.get("seq") if isinstance(r.get("seq"), int) else 0
+        )
+        return out
+
+    def list_pending_inferences(self):
+        """列出待定的推断（问了、还没回的那几条）。"""
+        return self.list_inferences(status=_inference.STATUS_PENDING)
+
+    def _set_inference_status(self, key, status, partial=False):
+        """把一条待定推断的状态改掉（确认/否认共用）：账本里追加一笔
+        同 key 的 inference 事件，只带状态，折叠时最新状态赢。
+        partial：BOOS 只认了一半（“差不多”“对了一半”）时 True，账本
+        事件里带上，折叠后档案里留着这个标记。
+        找不到这条待定推断时返回 None，什么都不写。"""
+        if not key:
+            return None
+        pending = next(
+            (r for r in self.list_pending_inferences() if r.get("key") == key),
+            None,
+        )
+        if pending is None:
+            return None
+        event = self._ledger_append(
+            _ledger.LEDGER_EVENT_INFERENCE,
+            key=key,
+            status=status,
+            **({"partial": True} if partial else {}),
+        )
+        if event is None:
+            return None
+        # 新反馈落地了（确认/否认都算）：顺手跑一次校准，看门槛要不要动。
+        # 校准坏了不拦路——确认/否认本身已经记好了。
+        try:
+            self.auto_adjust_inference_threshold()
+        except Exception:
+            logger.warning("揣摩校准：确认/否认后调门槛失败，门槛不动。", exc_info=True)
+        updated = dict(pending)
+        updated["status"] = status
+        if partial:
+            updated["partial"] = True
+        updated["seq"] = event.get("seq")
+        return updated
+
+    def confirm_inference(self, key, partial=False):
+        """BOOS 说“对”：这条推断记下（status confirmed）。
+        partial=True：BOOS 只认了一半（“差不多”“对了一半”）——算认了，
+        状态还是 confirmed，档案里多标一个 partial=True，以后校准和
+        复盘能分得清“全认了”和“只认了一半”。
+        只记账本，不写进 mem0——_provenance 的铁规矩是 user_confirmed
+        只在 source="user" 时才可能是 True，推断来的记忆在 mem0 里
+        永远是未确认的；把确认过的推断写进 mem0 会抹掉“模型猜的”和
+        “BOOS 亲口说的”这条线（诚实底线）。确认过的推断以后揣摩时
+        当“相关记忆”用（从账本里翻），不进检索。内存里那份待定也清掉。
+        找不到这条待定推断时返回 None。"""
+        updated = self._set_inference_status(
+            key, _inference.STATUS_CONFIRMED, partial=partial
+        )
+        if updated is not None and (self._pending_inference or {}).get("key") == key:
+            self._pending_inference = None
+        return updated
+
+    def deny_inference(self, key):
+        """BOOS 说“不对”：这条推断删除（status deleted，不记作废）。
+        账本是 append-only 的，原话留着当审计（只改状态，不抹行）；
+        内存里那份待定也清掉。找不到这条待定推断时返回 None。"""
+        updated = self._set_inference_status(key, _inference.STATUS_DELETED)
+        if updated is not None and (self._pending_inference or {}).get("key") == key:
+            self._pending_inference = None
+        return updated
+
+    def inference_feedback_summary(self):
+        """校准的底子：每次确认/否认都记在账本里，这里按层数一数
+        （设计方案第五节第 7 条只定了“记下来”，校准结果存在哪、
+        怎么调门槛，待细化时定——这里只数数，不调门槛）。
+        返回 {层: {"confirmed": n, "denied": m}}，没有的层不出现。"""
+        summary = {}
+        for record in self.list_inferences():
+            layer = record.get("layer") or _inference.LAYER_INDUCTION
+            entry = summary.setdefault(layer, {"confirmed": 0, "denied": 0})
+            if record.get("status") == _inference.STATUS_CONFIRMED:
+                entry["confirmed"] += 1
+            elif record.get("status") == _inference.STATUS_DELETED:
+                entry["denied"] += 1
+        return summary
+
+    def inference_calibration_summary(self):
+        """校准记账：按模型自己说的把握（low/medium/high）数确认/否认/待定。
+        猜的时候模型说的把握记在 inference 事件的 confidence 里，BOOS
+        最后认不认记在 status 里——账本里本来就有，这里只是按把握
+        聚合一下，不改账本结构。
+        读法：high 那档否认比确认多，就是过分自信（把握说得很大、猜得
+        却老错）；low 那档确认多，就是太保守（没把握的其实猜得挺准）。
+        返回 {把握: {"confirmed": n, "denied": m, "pending": p}}，
+        没有的把握不出现。"""
+        summary = {}
+        for record in self.list_inferences():
+            confidence = record.get("confidence") or "low"
+            entry = summary.setdefault(
+                confidence, {"confirmed": 0, "denied": 0, "pending": 0}
+            )
+            status = record.get("status")
+            if status == _inference.STATUS_CONFIRMED:
+                entry["confirmed"] += 1
+            elif status == _inference.STATUS_DELETED:
+                entry["denied"] += 1
+            elif status == _inference.STATUS_PENDING:
+                entry["pending"] += 1
+        return summary
+
+    def _load_inference_calibration_state(self):
+        """读校准状态文件（门槛 + 上次调门槛时各档的裁决数）。
+
+        文件没了/读坏了/形状不对时回默认（门槛 low、各档 0），不抛异常——
+        校准是辅助，坏了就从默认重来，别把揣摩搞崩。
+        """
+        default = (_inference.INFERENCE_MIN_CONFIDENCE_DEFAULT, {})
+        try:
+            raw = json.loads(
+                Path(self.inference_calibration_path).read_text(encoding="utf-8")
+            )
+        except Exception:
+            return default
+        if not isinstance(raw, dict):
+            return default
+        threshold = raw.get("threshold")
+        if threshold not in _inference.CONFIDENCE_ORDER:
+            threshold = _inference.INFERENCE_MIN_CONFIDENCE_DEFAULT
+        baseline = raw.get("baseline")
+        if not isinstance(baseline, dict):
+            return threshold, {}
+        clean = {}
+        for conf, entry in baseline.items():
+            if conf not in _inference.CONFIDENCE_ORDER:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            confirmed = entry.get("confirmed")
+            denied = entry.get("denied")
+            if (
+                isinstance(confirmed, int)
+                and not isinstance(confirmed, bool)
+                and confirmed >= 0
+                and isinstance(denied, int)
+                and not isinstance(denied, bool)
+                and denied >= 0
+            ):
+                clean[conf] = {"confirmed": confirmed, "denied": denied}
+        return threshold, clean
+
+    def _save_inference_calibration_state(self, threshold, baseline):
+        """写校准状态文件。写失败只记日志、不抛异常——门槛丢了下次按
+        账本重算，揣摩本身不受影响。"""
+        try:
+            path = Path(self.inference_calibration_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {"threshold": threshold, "baseline": baseline},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return True
+        except Exception:
+            logger.warning("揣摩校准：门槛状态写不进去，下次重算。", exc_info=True)
+            return False
+
+    def _meets_inference_threshold(self, confidence):
+        """这条推断的把握够不够开口：把握档位 >= 当前门槛才说。
+        把握不在 low/medium/high 里时按 low 算（往保守里算）。"""
+        order = _inference.CONFIDENCE_ORDER
+        conf = confidence if confidence in order else "low"
+        threshold = self._inference_threshold
+        if threshold not in order:
+            threshold = _inference.INFERENCE_MIN_CONFIDENCE_DEFAULT
+        return order.index(conf) >= order.index(threshold)
+
+    def auto_adjust_inference_threshold(self):
+        """校准：按已裁决的反馈自动调揣摩的开口门槛（2026-11-17）。
+
+        门槛是“开口的最低把握”（low/medium/high，默认 low——低把握也敢说，
+        只说“我只是猜的”）。调门槛的规矩（数字在 memory/inference.py 里，
+        BOOS 改那里就行）：
+          - 只看上次调完之后新来的反馈（增量）：每档新裁决（确认+否认）
+            攒够 5 条，那档才有资格调门槛；旧账不重复算。
+          - 基线（上次看完的那批）什么时候更新：这批有了明确结论才更新——
+            动了、到顶/到底了、两边打架了；证据不够、胜负不明时不更新，
+            继续攒着（到顶了不更新，旧信号会一直留着、以后反方向的证据
+            来了还堵在那儿）。
+          - 胜出那边要领先至少 2 条才动（3 比 2 这种胶着的不动）。
+          - 一次最多动一档，上限 high、下限 low。
+          - high 档否认多 = 过分自信 → 门槛往上提；low 档确认多 = 太保守
+            → 门槛往下放；两边同时喊反方向时不动（证据打架，等更多反馈）。
+        注意：数的是“上次调完之后新来的”那一批，不是累计总数——累计数
+        会让旧信号一直推着门槛走（比如 high 档以前否认多，即使后来猜准
+        了也还在往上推）。增量只看新反馈，信号过时了就不再推。
+        触发点：确认/否认落账本时（_set_inference_status）顺手跑一次。
+        返回 {"threshold": 当前门槛, "changed": 是否动了, "reason": 原因}。
+        绝不抛异常——校准坏了不能把揣摩和聊天搞崩。
+        """
+        try:
+            summary = self.inference_calibration_summary()
+            baseline = self._inference_calibration_baseline or {}
+            order = _inference.CONFIDENCE_ORDER
+            min_decide = _inference.CALIBRATION_MIN_DECIDE
+            min_margin = _inference.CALIBRATION_MIN_MARGIN
+            step = _inference.CALIBRATION_STEP
+            # 新来的反馈（增量）：每档现在数减掉上次调完时的数；账本被压
+            # 缩/重置导致数倒退时按 0 算（不拿负数当信号）。
+            delta = {}
+            for conf in order:
+                entry = summary.get(conf) or {}
+                base = baseline.get(conf) or {}
+                delta[conf] = {
+                    "confirmed": max(
+                        0, entry.get("confirmed", 0) - base.get("confirmed", 0)
+                    ),
+                    "denied": max(
+                        0, entry.get("denied", 0) - base.get("denied", 0)
+                    ),
+                }
+            new_decided = sum(
+                entry["confirmed"] + entry["denied"] for entry in delta.values()
+            )
+            threshold = self._inference_threshold
+            if threshold not in order:
+                threshold = _inference.INFERENCE_MIN_CONFIDENCE_DEFAULT
+            if new_decided == 0:
+                return {
+                    "threshold": threshold,
+                    "changed": False,
+                    "reason": "no_new_feedback",
+                }
+            high = delta.get("high") or {}
+            low = delta.get("low") or {}
+            high_decided = high.get("confirmed", 0) + high.get("denied", 0)
+            low_decided = low.get("confirmed", 0) + low.get("denied", 0)
+            raise_it = (
+                high_decided >= min_decide
+                and high.get("denied", 0) - high.get("confirmed", 0) >= min_margin
+            )
+            lower_it = (
+                low_decided >= min_decide
+                and low.get("confirmed", 0) - low.get("denied", 0) >= min_margin
+            )
+            new_threshold = threshold
+            reason = "no_clear_signal"
+            if raise_it and lower_it:
+                reason = "conflicting_signals"
+            elif raise_it:
+                idx = min(order.index(threshold) + step, len(order) - 1)
+                new_threshold = order[idx]
+                reason = (
+                    "overconfident_high"
+                    if new_threshold != threshold
+                    else "already_at_ceiling"
+                )
+            elif lower_it:
+                idx = max(order.index(threshold) - step, 0)
+                new_threshold = order[idx]
+                reason = (
+                    "too_conservative_low"
+                    if new_threshold != threshold
+                    else "already_at_floor"
+                )
+            changed = new_threshold != threshold
+            # 基线什么时候记到现在这批：只有这批反馈已经有了明确结论才记——
+            # 动了、到顶/到底了、两边打架了。证据不够、胜负不明时不记，继续
+            # 攒着（比如 high 档 3 否认 2 确认，再来几条否认攒够了就动）。
+            # 到顶了不记的话，旧信号会一直留着、以后反方向的证据来了还堵
+            # 在那儿；打架了不记的话，同一批打架的证据会一直堵着。
+            consume = changed or reason in (
+                "already_at_ceiling",
+                "already_at_floor",
+                "conflicting_signals",
+            )
+            if consume:
+                new_baseline = {
+                    conf: {
+                        "confirmed": (summary.get(conf) or {}).get("confirmed", 0),
+                        "denied": (summary.get(conf) or {}).get("denied", 0),
+                    }
+                    for conf in order
+                }
+                self._inference_threshold = new_threshold
+                self._inference_calibration_baseline = new_baseline
+                self._save_inference_calibration_state(new_threshold, new_baseline)
+            return {
+                "threshold": new_threshold,
+                "changed": changed,
+                "reason": reason,
+            }
+        except Exception:
+            logger.warning("揣摩校准：自动调门槛失败，门槛不动。", exc_info=True)
+            return {
+                "threshold": self._inference_threshold,
+                "changed": False,
+                "reason": "error",
+            }
+
+    def count_new_memories_since_longterm(self):
+        """自上次长期揣摩以来新记了几条记忆（账本 add 事件按 seq 数）。
+        长期揣摩本身就是标记（它的 seq）；上次长期揣摩说“没什么可猜的”
+        时记下的跳过线（_longterm_skip_until_seq）也算数——不然每轮都
+        多调一次模型。账本读不出来时返回 0（不揣，别把聊天搞崩）。"""
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            return 0
+        baseline = self._longterm_skip_until_seq or 0
+        for event in events or []:
+            if (event or {}).get("type") != _ledger.LEDGER_EVENT_INFERENCE:
+                continue
+            if (event or {}).get("mode") != _inference.MODE_LONGTERM:
+                continue
+            seq = (event or {}).get("seq")
+            if isinstance(seq, int):
+                baseline = max(baseline, seq)
+        count = 0
+        for event in events or []:
+            if (event or {}).get("type") != _ledger.LEDGER_EVENT_ADD:
+                continue
+            seq = (event or {}).get("seq")
+            if isinstance(seq, int) and seq > baseline:
+                count += 1
+        return count
+
+    def infer_from_turn(self, messages):
+        """一轮答完后的揣摩（当场揣摩的主力入口，run_question 调它）。
+        顺序：先处理上一轮的待定推断（本轮光秃秃地回“对/不对”就是在
+        回上一句的问话）→ 攒够 20 条新记忆就做长期、不做当场 →
+        否则当场揣摩本轮对话。一轮最多问一句。
+        返回 {"resolved": {"result": "confirmed"/"denied", ...推断字典},
+        "inference": 推断字典}；没揣出来、没模型、出错时返回 {}，
+        绝不抛异常——揣摩失败不能把已经拿到的回答搞崩。
+        """
+        try:
+            return self._infer_from_turn_inner(messages)
+        except Exception:
+            logger.warning("揣摩失败，本轮不问。", exc_info=True)
+            return {}
+
+    def _infer_from_turn_inner(self, messages):
+        result = {}
+        latest_user = _latest_user_content(messages or [])
+        # 1. 先处理上一轮的待定推断。只认紧接着问话的下一轮
+        # （_pending_inference 是上一轮刚问的那条）；本轮没回，
+        # 它就过期了（账本里还是 pending，以后对账/自检能翻出来）。
+        # 回话先按词表一眼看清（对/差不多/不对，带后半句的也认，后半句
+        # 是他补充的新信息，留在 resolved["extra"] 里）；一眼看不清的
+        # 再用模型判一轮；模型也判不出来就留待定，宁可不认，不可认错。
+        pending = self._pending_inference
+        self._pending_inference = None
+        if not latest_user:
+            return result
+        classified = _inference.classify_inference_reply(latest_user)
+        if pending is not None and classified["verdict"] == "unclear":
+            classified = self._classify_reply_with_llm(pending, latest_user)
+        verdict = classified["verdict"]
+        extra = classified.get("extra") or ""
+        if pending is not None and verdict in ("confirmed", "partial", "denied"):
+            if verdict == "confirmed":
+                resolved = self.confirm_inference(pending.get("key"))
+                resolved_result = "confirmed"
+            elif verdict == "partial":
+                # “差不多”“对了一半”：算认了，状态还是 confirmed，
+                # 档案里多标 partial=True（以后校准分得清全认和半认）。
+                resolved = self.confirm_inference(pending.get("key"), partial=True)
+                resolved_result = "confirmed"
+            else:
+                resolved = self.deny_inference(pending.get("key"))
+                resolved_result = "denied"
+            if resolved is not None:
+                entry = {"result": resolved_result, "extra": extra, **resolved}
+                if verdict == "partial":
+                    entry["partial"] = True
+                result["resolved"] = entry
+            # 这一轮就是在回上一句揣摩，别再当场揣——拿一句回答揣只会
+            # 揣出“你确认了刚才的推断”这种循环话。
+            return result
+        if verdict in ("confirmed", "partial", "denied"):
+            # 没待定推断时，“对/不对”这种回答也别拿来揣（只有一句回答，
+            # 没东西可揣）。
+            return result
+        # 2. 长期模式攒够了就做长期，不做当场（一轮只问一句）。
+        # 长期那次模型说“没什么可猜的”，就把跳过线记到当前序号，
+        # 下次再攒够 20 条新的才重跑。
+        if self.count_new_memories_since_longterm() >= _inference.LONGTERM_THRESHOLD:
+            longterm = self._run_longterm_inference()
+            if longterm is not None:
+                self._pending_inference = longterm
+                result["inference"] = longterm
+                return result
+            try:
+                state = self.ledger_state()
+                self._longterm_skip_until_seq = (state or {}).get("seq_max") or 0
+            except Exception:
+                pass
+        # 3. 当场揣摩：本轮对话 + 相关记忆喂给模型，有把握的才说。
+        spot = self._run_spot_inference(messages)
+        if spot is not None:
+            self._pending_inference = spot
+            result["inference"] = spot
+        return result
+
+    def _classify_reply_with_llm(self, pending, latest_user):
+        """回话不是一眼能看清时，用模型判一判：确认/部分/否认/不清楚。
+        模型只回两行（第一行四词里的一个，第二行是新补充的信息，没有
+        就写“无”）。没模型、模型回的认不出来时返回 unclear——不认、
+        不删，推断留待定。绝不抛异常。"""
+        try:
+            question = _inference.render_inference_question(pending or {})
+            prompt = (
+                "BOOS 刚被问了一句揣摩，他回了一句。请判断他这句是在回那个揣摩吗，"
+                "是确认、部分确认、否认，还是看不出来？\n"
+                f"问的是：{question}\n"
+                f"他回的是：{latest_user}\n"
+                "只输出两行：第一行只写“确认”“部分”“否认”“不清楚”四个词里的一个；"
+                "第二行写他这句里除了确认/否认之外新补充的信息，没有就写“无”。"
+            )
+            raw = self._call_llm_text("你是十二的分类助手，只输出两行。", prompt)
+            if not raw:
+                return {"verdict": "unclear", "extra": ""}
+            return _inference.parse_reply_verdict(raw)
+        except Exception:
+            logger.warning("揣摩：模型判回话失败，本次不认。", exc_info=True)
+            return {"verdict": "unclear", "extra": ""}
+
+    def _call_inference(self, prompt):
+        """调一次模型、解析一次揣摩（一句话）。解析失败时用更严的
+        要求再试一次（只输出那一句话，不要加解释），两次都解析不出来
+        返回 None——不猜、不拦路。"""
+        raw = self._call_llm_text(
+            "你是十二的揣摩助手，只输出一句话。", prompt
+        )
+        if raw:
+            parsed = _inference.parse_inference_output(raw)
+            if parsed is not None:
+                return parsed
+        raw = self._call_llm_text(
+            "你是十二的揣摩助手，只输出一句话。",
+            prompt + "\n只输出那一句话，不要加任何解释。",
+        )
+        if not raw:
+            return None
+        return _inference.parse_inference_output(raw)
+
+    def _run_spot_inference(self, messages):
+        """当场揣摩：本轮对话 + 相关记忆喂给模型，有把握的才说。
+        返回记好的推断字典，没揣出来时返回 None。
+        对话是脱敏后发给模型的（和 add_turn 一路）；相关记忆按最新
+        一句搜，不强化（揣摩只是“用上”看看，不是真用上，别因为揣摩
+        一次就把一条记忆的衰减计数刷上去）。"""
+        latest_user = _latest_user_content(messages or [])
+        if not latest_user:
+            return None
+        lines = []
+        for msg in messages or []:
+            role = (msg or {}).get("role")
+            content = (msg or {}).get("content") or ""
+            if role not in ("user", "assistant") or not content.strip():
+                continue
+            who = "BOOS" if role == "user" else "十二"
+            lines.append(f"{who}：{_redact_sensitive(content)}")
+        conversation = "\n".join(lines[-6:])
+        if not conversation.strip():
+            return None
+        related_text = ""
+        try:
+            related = self.search(latest_user, top_k=5, reinforce=False) or []
+            related_text = _inference.format_related_memories(related)
+        except Exception:
+            logger.warning(
+                "揣摩：相关记忆没搜到，本次只按对话揣。", exc_info=True
+            )
+        # 以前确认过的推断也喂进去（从账本里翻，不进检索）：他以前就是
+        # 这么想的、一贯的习惯是什么——揣的时候从对他的了解出发，别凭空猜。
+        try:
+            confirmed = self.list_inferences(
+                status=_inference.STATUS_CONFIRMED
+            )[-5:]
+            confirmed_text = _inference.format_confirmed_inferences(confirmed)
+            if confirmed_text:
+                related_text = (
+                    f"{related_text}\n{confirmed_text}".strip()
+                    if related_text
+                    else confirmed_text
+                )
+        except Exception:
+            logger.warning(
+                "揣摩：已确认的推断没翻到，本次只按对话和相关记忆揣。",
+                exc_info=True,
+            )
+        prompt = _inference.build_inference_prompt(conversation, related_text)
+        parsed = self._call_inference(prompt)
+        if parsed is None:
+            return None
+        if not self._meets_inference_threshold(parsed["confidence"]):
+            # 门槛拦住了：把握不够，不问、不记——没说出口的猜不用进待定区。
+            logger.info(
+                "揣摩：把握 %s 没到门槛 %s，本次不问。",
+                parsed["confidence"],
+                self._inference_threshold,
+            )
+            return None
+        return self.record_inference(
+            parsed["guess"],
+            parsed["evidence"],
+            parsed["confidence"],
+            parsed["layer"],
+            mode=_inference.MODE_SPOT,
+            confidence_text=parsed["confidence_text"],
+        )
+
+    def _run_longterm_inference(self):
+        """长期模式：最近 20 条新记的记忆里找最反常的，猜一个模式。
+        返回记好的推断字典，没揣出来时返回 None。"""
+        try:
+            state = self.ledger_state()
+            adds = (state or {}).get("adds") or []
+        except Exception:
+            return None
+        recent = adds[-_inference.LONGTERM_THRESHOLD:]
+        lines = []
+        for entry in recent:
+            text = (entry or {}).get("text") or ""
+            if text.strip():
+                lines.append(text)
+        if not lines:
+            return None
+        prompt = _inference.build_longterm_inference_prompt("\n".join(lines))
+        parsed = self._call_inference(prompt)
+        if parsed is None:
+            return None
+        if not self._meets_inference_threshold(parsed["confidence"]):
+            # 门槛拦住了：把握不够，不问、不记——没说出口的猜不用进待定区。
+            logger.info(
+                "揣摩：把握 %s 没到门槛 %s，本次不问。",
+                parsed["confidence"],
+                self._inference_threshold,
+            )
+            return None
+        return self.record_inference(
+            parsed["guess"],
+            parsed["evidence"],
+            parsed["confidence"],
+            parsed["layer"],
+            mode=_inference.MODE_LONGTERM,
+            confidence_text=parsed["confidence_text"],
+        )
+
+    def _asked_inference_guesses(self, messages):
+        """本轮对话里问过（assistant 消息里出现过）的推断原文（归一化）。
+        只拦这一轮问过的——BOOS 以后自己重新说起同一句时，提取照常存。
+        任何状态的推断都算（待定/已确认/已删除都拦）：问句里的猜要是被
+        提取存进 mem0，待定的会变成没确认的事实，已确认的会丢了“模型
+        猜的”这条线，已删除的会死灰复燃。"""
+        asked = set()
+        assistant_texts = []
+        for msg in messages or []:
+            if (msg or {}).get("role") == "assistant":
+                content = (msg or {}).get("content") or ""
+                if content:
+                    assistant_texts.append(_normalize_memory_text(content))
+        if not assistant_texts:
+            return asked
+        joined = "\n".join(assistant_texts)
+        for record in self.list_inferences():
+            norm = _normalize_memory_text((record or {}).get("guess") or "")
+            if norm and norm in joined:
+                asked.add(norm)
+        return asked
+
+    def _drop_pending_inference_results(self, result, safe_messages):
+        """提取后过滤：刚问出口的揣摩，别让提取把它当事实存进库里。
+
+        问句是十二自己说的（assistant 消息），但提取时 assistant 的话
+        原样透传当上下文（见 _filter_extraction_messages），模型会把
+        问句里的猜当成 BOOS 的事实提出来——2026-11-16 删记忆那次，
+        助手复述的“不再爱吃冒菜”就是这么被存成一条记忆的。
+        只拦本轮问过的那句（问句在 safe_messages 里才拦）：BOOS 以后
+        自己重新说起同一句时，提取照常存。
+        条目已经在库里了，和 _drop_deleted_text_results 一路回滚；
+        回滚不掉的照实记日志、不藏着。返回过滤后的结果（拦掉的条目
+        不在 results 里），拦了几条记在 inference_dropped 里。
+        """
+        items = (result or {}).get("results") or []
+        if not items:
+            return result
+        asked = self._asked_inference_guesses(safe_messages)
+        if not asked:
+            return result
+        dropped = []
+        kept = []
+        for item in items:
+            mem_text = (item or {}).get("memory") or ""
+            if mem_text and _normalize_memory_text(mem_text) in asked:
+                dropped.append(item)
+            else:
+                kept.append(item)
+        if not dropped:
+            return result
+        survivors = self._rollback_new_memories(dropped)
+        survivor_ids = {(item or {}).get("id") for item in survivors}
+        actually_dropped = [
+            item for item in dropped if (item or {}).get("id") not in survivor_ids
+        ]
+        result["results"] = kept + survivors
+        result["inference_dropped"] = len(actually_dropped)
+        if survivors:
+            logger.warning(
+                "提取揣摩拦截：%d 条刚问的推断没清掉（仍在库里）。",
+                len(survivors),
+            )
+        return result
 
     def history(self, memory_id):
         """取一条记忆的修改历史（mem0 自带的 SQLite 审计记录）。

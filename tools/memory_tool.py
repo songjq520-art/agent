@@ -1157,6 +1157,8 @@ def register_memory_tools():
     _register_one(
         name="delete_memory",
         description=(
+            "一次只删一条记忆。要删 2 条及以上时别调这个，调 delete_memories"
+            "（一次调用、一张确认卡、点一次确认就全删）。"
             "删一条长期记忆。先调 list_memories 列出全部，找到要删的那条，"
             "把 memory_id、text（列出来的原文，一字不差地抄）和 anchor_text"
             "（用户原话里的删除目标，比如 BOOS 说“删掉鸡杂面”时 anchor_text"
@@ -1167,8 +1169,7 @@ def register_memory_tools():
             "先问清楚再删，别自己挑。删之前会先弹确认卡，卡上显示 anchor"
             "和程序算好的匹配结果，BOOS 点了确认才执行，取消了就不删；"
             "删掉后向量和审计记录都清掉，但账本里原话留着，之后能用 "
-            "revive_memory 恢复——删错了还能找回来，但别乱删。一次删多条"
-            "时调 delete_memories，别一条一条调这个。"
+            "revive_memory 恢复——删错了还能找回来，但别乱删。"
             "返回 {memory_id, text, history_cleared}。"
         ),
         parameters={
@@ -1289,6 +1290,7 @@ def register_memory_tools():
     _register_one(
         name="delete_memories",
         description=(
+            "一次删 2 条及以上记忆时调这个；只删一条时调 delete_memory。"
             "一次删多条长期记忆。BOOS 说“一起删”“这几条都删掉”时调这个，"
             "别一条一条调 delete_memory：一次调用、一张确认卡、点一次确认"
             "就全删。先调 list_memories 列出全部，找到要删的那几条，把"

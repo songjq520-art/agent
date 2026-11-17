@@ -338,6 +338,30 @@ def _normalize_metadata(raw, item=None):
         "superseded": superseded,
     }
 
+
+def _metadata_for_store(metadata):
+    """把规整过的 metadata 转成能写回 Chroma 的形状（写回前用）。
+
+    _normalize_metadata 返回的 money 是字典形（{amount, currency, period,
+    target}），Chroma 只接受标量值，存 dict 会炸掉整条写入——2026-11-16
+    恒生定投就是这么在守卫恢复（_restore_snapshot_memories）时被拒收的：
+    旧记忆按快照原样写回去，money 字典原样传进去，整条 update/add 失败。
+    所以写回前把 money 字典展平成四个 money_* 标量字段（见 _flatten_money，
+    和 _provenance 写的那头同一个做法），读回来 _normalize_metadata 再拼
+    回字典形，来回不丢东西。别的字段本来就是标量，原样留着。
+    money 不是字典时（没有金额）直接去掉这个键；形状坏了的字典展平后
+    是四个 None（见 _flatten_money），不清掉旧字段、不把坏形状往库里写。
+    不改传进来的字典，返回一份新的。只管 money 这一个已知的 dict 字段——
+    规整后的 metadata 里别的字段都是标量；万一以后多出别的 dict 字段，
+    Chroma 照常会拒收、调用方的 except 会记日志，不在这里悄悄吞掉。
+    """
+    meta = dict(metadata or {})
+    money = meta.pop("money", None)
+    if isinstance(money, dict):
+        meta.update(_flatten_money(money))
+    return meta
+
+
 # ---------- 时间戳 + 覆盖规则（第一步，2026-11-10） ----------
 # 规则（BOOS 定的）：时间戳决定新旧，来源可信度决定有没有资格覆盖。
 # 同级里新的胜出，旧的标“被取代”但原话留着；低可信度的新记忆不能

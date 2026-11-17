@@ -284,6 +284,31 @@ class IncompleteMetadataFakeMemory(FakeMemory):
         return super().add(messages, user_id=user_id, infer=infer, metadata=metadata)
 
 
+class ChromaLikeFakeMemory(FakeMemory):
+    """像 Chroma 一样校验 metadata：dict/list 值直接拒收。
+
+    真实 Chroma 只接受标量 metadata 值（str/int/float/bool/None），
+    dict 值整条写入就 ValueError。FakeMemory 本来不校验，守卫恢复时
+    传了 money 字典也测不出来——这个假对象补上这道校验，专门测
+    “金额记忆恢复时 metadata 必须展平”。
+    """
+
+    def _check_metadata(self, metadata):
+        for key, value in (metadata or {}).items():
+            if isinstance(value, (dict, list)):
+                raise ValueError(
+                    f"Chroma 不接受 dict/list 值的 metadata：{key}={value!r}"
+                )
+
+    def add(self, messages, user_id=None, infer=True, metadata=None):
+        self._check_metadata(metadata)
+        return super().add(messages, user_id=user_id, infer=infer, metadata=metadata)
+
+    def update(self, memory_id, text=None, metadata=None):
+        self._check_metadata(metadata)
+        return super().update(memory_id, text=text, metadata=metadata)
+
+
 class FailDeleteMutatingFakeMemory(MutatingFakeMemory):
     """捣乱（add 里改旧记忆）+ delete 一律抛错。
 
@@ -849,6 +874,61 @@ def test_restore_partial_success_and_failure(tmp_path):
     items = {item["id"]: item for item in store.get_all()}
     assert items[old_sqlite]["text"] == "数据库用 SQLite。"
     assert items[old_coffee]["text"] == "我现在把咖啡改成拿铁了。"
+
+
+def test_restore_money_memory_with_flat_metadata(tmp_path):
+    """恒生定投的恢复：守卫按快照写回旧记忆时，金额字段要展平成标量。
+
+    2026-11-16 真机：恒生定投更新时 metadata 传了 dict（money 字典），
+    Chroma 拒收，整条恢复失败。规整后的 metadata 里 money 是字典形，
+    写回前必须展平成四个 money_* 标量字段（见 _metadata_for_store），
+    读回来再拼回字典形——文本和金额字段都原样回来。
+    """
+    store = make_fake_store(tmp_path, memory=ChromaLikeFakeMemory())
+    store.add_memory_text("我每天定投5块买恒生。", source="user")
+    before = store.get_all()
+    assert len(before) == 1
+    old_id = before[0]["id"]
+    assert before[0]["metadata"]["money"] == {
+        "amount": 5,
+        "currency": "CNY",
+        "period": "day",
+        "target": "恒生",
+    }
+    # 假装提取那步里 mem0.add 把旧记忆的文本改了（守卫要按快照恢复它）。
+    store._memory.update(memory_id=old_id, text="我每天定投10块买恒生。")
+    result = store._restore_snapshot_memories(before)
+    assert result == {"verified": True, "restored": 1, "failed_ids": []}
+    items = {item["id"]: item for item in store.get_all()}
+    assert items[old_id]["text"] == "我每天定投5块买恒生。"
+    assert items[old_id]["metadata"]["money"] == {
+        "amount": 5,
+        "currency": "CNY",
+        "period": "day",
+        "target": "恒生",
+    }
+
+
+def test_restore_deleted_money_memory_with_flat_metadata(tmp_path):
+    """恒生定投被删了再恢复：重新存那条路也要展平，不能传 dict。"""
+    store = make_fake_store(tmp_path, memory=ChromaLikeFakeMemory())
+    store.add_memory_text("我每天定投5块买恒生。", source="user")
+    before = store.get_all()
+    assert len(before) == 1
+    old_id = before[0]["id"]
+    # 假装提取那步里 mem0.add 把旧记忆删了。
+    store._memory.delete(old_id)
+    result = store._restore_snapshot_memories(before)
+    assert result == {"verified": True, "restored": 1, "failed_ids": []}
+    items = store.get_all()
+    assert len(items) == 1
+    assert items[0]["text"] == "我每天定投5块买恒生。"
+    assert items[0]["metadata"]["money"] == {
+        "amount": 5,
+        "currency": "CNY",
+        "period": "day",
+        "target": "恒生",
+    }
 
 
 def test_rollback_delete_noop_leaves_visible_leftover(tmp_path):

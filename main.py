@@ -23,6 +23,7 @@ from config import (
     get_model_status,
 )
 from memory import mem0_store
+from memory import inference as _inference
 from memory.conversation_summary import (
     ConversationSummaryStore,
     make_deepseek_summarizer,
@@ -678,6 +679,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 聊天纠错：add_turn 里已经改好/问好了，这里只把结果用人话告诉
     # BOOS（见 _print_correction_result），并放进返回里供调用方看。
     correction = None
+    inference = None
     if mem0_store is not None:
         # 收尾只存 BOOS 的原话 + 最后的回答：记忆提示块、摘要、
         # 工具中间结果都不进长期记忆。
@@ -696,6 +698,22 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
         if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
             print("刚说的那句已经撤回，不记了。")
+        # 揣摩人心（2026-11-16）：回答完后看一眼本轮对话，有把握就当场
+        # 猜一句问 BOOS。不能放在 save_turn 里——save_turn 是后台存
+        # （outbox），揣摩要同步问出来，所以这里单独调一次。
+        # 揣摩失败不影响已经拿到的回答（infer_from_turn 内部不抛异常）。
+        # 问句和确认/否认的结果都追加到 result["text"] 后面——chat_loop
+        # 打印 result["text"]、网页服务也从这里拿回答，一处钩子两边都覆盖；
+        # 追加的内容也进了 history，下一轮揣摩和提取都能看见它。
+        inference = mem0_store.infer_from_turn(recent)
+        resolved = (inference or {}).get("resolved")
+        if resolved is not None:
+            result["text"] += "\n" + _inference.render_inference_resolved(resolved)
+        new_inference = (inference or {}).get("inference")
+        if new_inference is not None:
+            result["text"] += "\n" + _inference.render_inference_question(
+                new_inference
+            )
     logger.info(
         "timing | run_question total=%.1fms %s",
         timer.total_ms(),
@@ -712,6 +730,9 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         # 48 号：本轮调过的搜索记录（DeepSeek 工具循环那条路才有，其他路是空列表）。
         "searches": searches,
         **({"correction": correction} if correction is not None else {}),
+        # 揣摩人心（2026-11-16）：本轮的揣摩结果（见上面的钩子），
+        # 没揣出来/没待定要处理时是 None，调用方（面板/日志）按需看。
+        **({"inference": inference} if inference is not None else {}),
     }
 
 

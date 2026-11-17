@@ -16,9 +16,12 @@
 #   （旧的被新说法取代，旧 id 标上，原话留着）、dormant（30 天没人找
 #   只打标沉底）、revive（沉底的被用上、回到原话态）、delete（真删了，
 #   只等 BOOS 亲口说）、promote（一次性经历出现够 3 个不同天、晋升成
-#   稳定事实）。另外两种是机器用的，不是记忆事实：relate（两条记忆的
-#   关系记录，见 memory/relations.py）、snapshot（一年压缩一次的快照
-#   标记，见 compact_ledger）。
+#   稳定事实）。揣摩人心又加了一种（2026-11-16，见 memory/inference.py）：
+#   inference（猜到了 BOOS 心里想什么，带猜了什么、凭什么、把握、层、
+#   状态 pending/confirmed/deleted；确认/否认是同一类型的新事件，
+#   按 key 折叠、最新状态赢）。另外两种是机器用的，不是记忆事实：
+#   relate（两条记忆的关系记录，见 memory/relations.py）、snapshot
+#   （一年压缩一次的快照标记，见 compact_ledger）。
 #
 # 序号：每行带 seq，严格递增；启动时对序号（verify_ledger 查缺口，
 # reconcile 时按 key 补索引）。“add”事件没有 mem0 id（写账本时索引
@@ -38,13 +41,14 @@ from pathlib import Path
 from memory.keywords import _extract_keywords, _keyword_weight
 from memory.timeutil import _now_iso
 
-# 账本事件类型：6 种记忆事实 + 2 种机器标记。
+# 账本事件类型：6 种记忆事实 + 推断 + 2 种机器标记。
 LEDGER_EVENT_ADD = "add"
 LEDGER_EVENT_SUPERSEDE = "supersede"
 LEDGER_EVENT_DORMANT = "dormant"
 LEDGER_EVENT_REVIVE = "revive"
 LEDGER_EVENT_DELETE = "delete"
 LEDGER_EVENT_PROMOTE = "promote"
+LEDGER_EVENT_INFERENCE = "inference"
 LEDGER_EVENT_RELATE = "relate"
 LEDGER_EVENT_SNAPSHOT = "snapshot"
 LEDGER_EVENT_TYPES = (
@@ -54,6 +58,7 @@ LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_REVIVE,
     LEDGER_EVENT_DELETE,
     LEDGER_EVENT_PROMOTE,
+    LEDGER_EVENT_INFERENCE,
     LEDGER_EVENT_RELATE,
     LEDGER_EVENT_SNAPSHOT,
 )
@@ -230,11 +235,18 @@ def resolve_state(events, snapshot=None):
     返回 {"by_id": {mem0_id: {"state", ...}}, "adds": [add 事件的
     原话档案，按 seq 排], "relations": [关系记录], "key_states":
     {add 的 key: "current"/"superseded"/"dormant"/"deleted"},
-    "id_to_key": {mem0_id: 当前原话的 key}, "seq_max": 最大序号,
+    "id_to_key": {mem0_id: 当前原话的 key}, "inferences": {推断的 key:
+    {"key", "text", "evidence", "confidence", "confidence_text",
+    "layer", "mode", "status", "seq", "created_at", "partial"}，按 key 认},
+    "seq_max": 最大序号,
     "snapshot_seq": 快照截止到的序号（没有快照就是 None）}。
     折叠规则（只认账本，不猜）：
       - add：进原话档案（key/text/meta/seq），不碰 by_id——写账本时
         mem0 id 还没建出来，id 要靠对账（reconcile）认；key 标 current；
+      - inference：按 key 认一条推断——第一次出现时建档案（猜了什么 /
+        凭什么 / 把握 / 层 / 路子 / 状态，缺的字段按空字符串 / pending
+        补）；同一 key 再出现时只更新状态（和带过来的字段），原话、
+        凭据这些不重写——确认/否认就是同一 key 的新事件，最新状态赢；
       - supersede：supersedes_id 和 memory_id 不同时，旧 id 标
         superseded（原话留着，档案里还有）；同一 id 时是原地纠正，
         状态还是 current，旧话记一条 history。两种都把旧原话的 key
@@ -258,6 +270,7 @@ def resolve_state(events, snapshot=None):
     relations = []
     key_states = {}
     id_to_key = {}
+    inferences = {}
     seq_max = 0
     snapshot_seq = None
     if snapshot is not None:
@@ -272,6 +285,8 @@ def resolve_state(events, snapshot=None):
             key_states[key] = state
         for mem_id, key in (snapshot.get("id_to_key") or {}).items():
             id_to_key[mem_id] = key
+        for key, entry in (snapshot.get("inferences") or {}).items():
+            inferences[key] = dict(entry)
         if isinstance(snapshot_seq, int):
             seq_max = snapshot_seq
     for event in events or []:
@@ -291,6 +306,42 @@ def resolve_state(events, snapshot=None):
             )
             if key:
                 key_states[key] = LEDGER_STATE_CURRENT
+        elif etype == LEDGER_EVENT_INFERENCE:
+            # 推断按 key 认：第一次出现建档案，之后同一 key 的事件只
+            # 更新状态（确认/否认就记一笔同 key 的新事件，最新状态赢）。
+            if key:
+                record = inferences.get(key)
+                if record is None:
+                    record = {
+                        "key": key,
+                        "text": event.get("text") or "",
+                        "evidence": event.get("evidence") or "",
+                        "confidence": event.get("confidence") or "low",
+                        "confidence_text": event.get("confidence_text") or "我只是猜的",
+                        "layer": event.get("layer") or "induction",
+                        "mode": event.get("mode") or "spot",
+                        "status": event.get("status") or "pending",
+                        "seq": seq,
+                        "created_at": event.get("created_at") or "",
+                        # 部分确认（“差不多”“对了一半”）：只认了，没全认。
+                        # 建档案时默认 False，确认那一笔事件带了 True 才变 True。
+                        "partial": bool(event.get("partial")),
+                    }
+                    inferences[key] = record
+                else:
+                    for field in (
+                        "text",
+                        "evidence",
+                        "confidence",
+                        "confidence_text",
+                        "layer",
+                        "mode",
+                        "status",
+                        "partial",
+                    ):
+                        if event.get(field):
+                            record[field] = event.get(field)
+                    record["seq"] = seq
         elif etype == LEDGER_EVENT_SUPERSEDE:
             old_id = event.get("supersedes_id")
             if old_id and old_id != mem_id:
@@ -368,6 +419,7 @@ def resolve_state(events, snapshot=None):
         "relations": relations,
         "key_states": key_states,
         "id_to_key": id_to_key,
+        "inferences": inferences,
         "seq_max": seq_max,
         "snapshot_seq": snapshot_seq,
     }
@@ -468,7 +520,7 @@ def write_snapshot(path, state, seq_max):
 
     快照里有：截止序号 snapshot_seq、by_id 状态、全部原话档案 adds、
     关系 relations、原话状态 key_states、id 到原话的映射 id_to_key、
-    写快照的时间；最后附 checksum，读的时候验。
+    推断档案 inferences、写快照的时间；最后附 checksum，读的时候验。
     原话都在快照里——压完账本截断了，快照就是档案。
     返回快照文件路径（字符串）。"""
     path = Path(path)
@@ -482,6 +534,7 @@ def write_snapshot(path, state, seq_max):
         "relations": (state or {}).get("relations") or [],
         "key_states": (state or {}).get("key_states") or {},
         "id_to_key": (state or {}).get("id_to_key") or {},
+        "inferences": (state or {}).get("inferences") or {},
     }
     payload["checksum"] = snapshot_checksum(payload)
     tmp = path.with_suffix(".tmp")
