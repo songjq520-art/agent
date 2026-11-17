@@ -590,6 +590,16 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             summary_text = ""
         if summary_text:
             model_prompt = summary_text + "\n\n" + model_prompt
+    # 揣摩改成跟十一一样（2026-11-17，BOOS定）：不固定每轮问一次，
+    # 改成让模型自己在回话里猜——觉得有东西可猜就直接说，没东西可
+    # 猜就正常回。指令放在 model_prompt 最前面，当作给模型的提示。
+    model_prompt = (
+        "【给十二的提示】你是十二，BOOS的个人助理。聊天时，如果你觉得"
+        "BOOS话里有没说出口的想法、想要什么，就直接说出来猜一猜：用大白话"
+        "说你猜了什么、为什么这么猜（从他以前说过的话出发），然后问他一句"
+        "'对吗？'。不要每句话都猜，只有真的觉得有东西可猜时才猜；"
+        "没东西可猜就正常回。\n\n" + model_prompt
+    )
     # 按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型），
     # 并把路由算出的模型名传给 Provider——路由说用哪个模型就用哪个，
     # 不能丢了 routing["model"]、让 Provider 又按默认模型自己猜。
@@ -698,22 +708,11 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
         if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
             print("刚说的那句已经撤回，不记了。")
-        # 揣摩人心（2026-11-16）：回答完后看一眼本轮对话，有把握就当场
-        # 猜一句问 BOOS。不能放在 save_turn 里——save_turn 是后台存
-        # （outbox），揣摩要同步问出来，所以这里单独调一次。
-        # 揣摩失败不影响已经拿到的回答（infer_from_turn 内部不抛异常）。
-        # 问句和确认/否认的结果都追加到 result["text"] 后面——chat_loop
-        # 打印 result["text"]、网页服务也从这里拿回答，一处钩子两边都覆盖；
-        # 追加的内容也进了 history，下一轮揣摩和提取都能看见它。
-        inference = mem0_store.infer_from_turn(recent)
-        resolved = (inference or {}).get("resolved")
-        if resolved is not None:
-            result["text"] += "\n" + _inference.render_inference_resolved(resolved)
-        new_inference = (inference or {}).get("inference")
-        if new_inference is not None:
-            result["text"] += "\n" + _inference.render_inference_question(
-                new_inference
-            )
+        # 揣摩改成跟十一一样（2026-11-17，BOOS定）：不再固定每轮调
+        # infer_from_turn 追加一句正式的猜——猜由模型自己在回话里
+        # 说（见上面 model_prompt 里的提示），不在这里单独问了。
+        # inference 保持 None，返回里不带它。
+        inference = None
     logger.info(
         "timing | run_question total=%.1fms %s",
         timer.total_ms(),
