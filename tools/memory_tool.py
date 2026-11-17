@@ -655,25 +655,13 @@ def _run_delete_memory(args):
             "data": None,
             "error": "这条记忆已经不在了（可能刚才已经删过）。",
         }
-    # 2026-11-16 拉面：同一句话可能存了多份（显式记 + 提取各一份），
-    # 只删一个 id 就报“删掉了”，另一份还活着。确认卡上列清的副本
-    # （_check_delete_anchor 里算好的），这里一起删掉、逐条报。
-    # 副本删失败不翻盘：主条已经删掉了，失败的副本单独列出来，
-    # 让模型告诉 BOOS、别谎称全删干净了。
+    # 2026-11-17 火锅：单条删除只删指定的那一个 id，绝不顺手删
+    # 同一句话的其他副本——“删重复、留一条”时，多删的那个正是
+    # 该留下的。以前这里用 _live_copies_of_text 把同文副本全删了，
+    # 导致“留 00:29、删 00:41”结果两条都没了。要删多份时调用方
+    # 用批量删 delete_memories，把每条 id 都列在确认卡上。
     extra_deleted = []
     extra_failed = []
-    for other_id, other_text in _live_copies_of_text(
-        store, stored_text, exclude_id=memory_id
-    ):
-        try:
-            if store.delete_memory(other_id, approve=True):
-                extra_deleted.append(
-                    {"memory_id": other_id, "text": other_text}
-                )
-            else:
-                extra_failed.append({"memory_id": other_id, "text": other_text})
-        except Exception:  # noqa: BLE001 - 副本删失败单独报，不翻盘
-            extra_failed.append({"memory_id": other_id, "text": other_text})
     return {
         "ok": True,
         "data": {

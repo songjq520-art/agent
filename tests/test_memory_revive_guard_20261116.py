@@ -177,13 +177,14 @@ def test_explicit_plus_extraction_same_sentence_keeps_one_copy(tmp_path):
     assert _texts(store) == ["我爱吃拉面。"]
 
 
-# ---------- 小项 4：单条删除按文本删时，清掉全部副本 ----------
+# ---------- 小项 4：单条删除只删指定的 id，不顺手清副本 ----------
 
 
 def test_text_delete_removes_all_live_copies(tmp_path):
     """同一句话存了两份（显式记“我爱吃拉面。”+ 提取“BOOS 爱吃拉面。”），
-    单条删除按文本删时两份一起删、确认卡上逐条列清；不要只删一个 id
-    就报“删掉了”，另一份还活着。"""
+    单条删除只删指定的那一个 id，另一份活着不动——“删重复、留一条”时，
+    多删的那个正是该留下的（2026-11-17 火锅：留 00:29、删 00:41 结果
+    两条都没了）。要删多份时用批量删，把每条 id 都列在确认卡上。"""
     store = make_fake_store(tmp_path)
     first = _add_raw(store, "我爱吃拉面。")
     second = _add_raw(store, "BOOS 爱吃拉面。")
@@ -200,9 +201,8 @@ def test_text_delete_removes_all_live_copies(tmp_path):
             {"memory_id": first, "text": "我爱吃拉面。", "anchor_text": "拉面"}
         )
     assert result["ok"] is True
-    assert len(result["data"]["extra_deleted"]) == 1
-    assert result["data"]["extra_deleted"][0]["memory_id"] == second
-    assert _texts(store) == []
+    assert result["data"]["extra_deleted"] == []
+    assert _texts(store) == ["BOOS 爱吃拉面。"]
 
 
 # ---------- 小项 5：恢复失败的两种原因分开说 ----------
