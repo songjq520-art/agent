@@ -102,9 +102,23 @@ def get_relations(state, memory_id):
     return out
 
 
-def is_linked(state, memory_id):
+def is_linked(state, memory_id, graph=None):
     """这条记忆有没有别的记忆连着它（沉底前查三道里的第三道）。
 
     连着就不沉、不删——删之前要先问 BOOS，不能悄悄把有关联的
-    记忆清掉。"""
+    记忆清掉。图谱推理第一期：传了 graph 就查图（图上的记忆—记忆边
+    和记忆—实体边都算连着，失效边不算）；不传就读账本的 relations
+    记录（老行为，测试和旧调用方照常）。
+    注意：memory_id 在这里是 mem0 id（账本 relate 事件的口径），
+    图里记忆节点按账本 key 认——传 graph 时调用方要先把 id 换成
+    key（ledger_state 的 id_to_key），换不出来就按没连着算。
+    """
+    if graph is not None:
+        try:
+            key = (state or {}).get("id_to_key", {}).get(memory_id)
+            if key:
+                return bool(graph.is_linked(key))
+        except Exception:
+            pass
+        return False
     return bool(get_relations(state, memory_id))

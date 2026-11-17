@@ -441,6 +441,7 @@ def project_and_filter(items, state, include_history=False):
     返回的新列表里每项都是原字典的拷贝，不动输入。
     """
     by_id = (state or {}).get("by_id") or {}
+    key_states = (state or {}).get("key_states") or {}
     out = []
     for item in items or []:
         mem_id = (item or {}).get("id")
@@ -450,6 +451,22 @@ def project_and_filter(items, state, include_history=False):
         if ledger_state is None:
             if meta.get("superseded") is True:
                 ledger_state = LEDGER_STATE_SUPERSEDED
+            else:
+                # id 查不着时再按 key 查（key = 原话 + created_at 的哈希，
+                # 见 ledger_event_key）：图上找回来的记忆没有 mem0 id
+                # （id=None，账本档案里的原话），by_id 永远查不着它——
+                # 不按 key 查，筛子就认不出它是被取代/删了的，问“以前”
+                # 时 is_history 会错标成 False。图是索引不是账本，筛子
+                # 的口径还是账本说了算，这里只是多一条查法。
+                try:
+                    item_key = ledger_event_key(
+                        (item or {}).get("text") or "",
+                        meta.get("created_at"),
+                    )
+                except Exception:
+                    item_key = None
+                if item_key:
+                    ledger_state = key_states.get(item_key)
         if ledger_state in (
             LEDGER_STATE_SUPERSEDED,
             LEDGER_STATE_DELETED,
