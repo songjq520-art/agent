@@ -23,6 +23,7 @@ from config import (
     get_model_status,
 )
 from memory import mem0_store
+from memory import inference as _inference
 from memory.conversation_summary import (
     ConversationSummaryStore,
     make_deepseek_summarizer,
@@ -589,6 +590,19 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             summary_text = ""
         if summary_text:
             model_prompt = summary_text + "\n\n" + model_prompt
+    # 揣摩（2026-11-17，BOOS定）：不固定每轮问一次，也不主动找东西猜。
+    # 模型正常聊天就行；只有 BOOS 话里有个很明显、没说出口的想法时，
+    # 才在回话里顺带提一句。别把观察到的规律当成猜，别在交代做事
+    # （恢复/删除/查东西）和简单回话（“可以”“好”“对”“不对”）上猜。
+    # 不确定就别猜。BOOS 2026-11-17 说：不是要跟十一一模一样，十二就是十二。
+    model_prompt = (
+        "【给十二的提示】你是十二，BOOS的个人助理。正常聊天就行，不用特意猜；"
+        "只有 BOOS 话里有个很明显、没说出口的想法或想要的东西时，才在回话里"
+        "顺带提一句：用大白话说你猜了什么、为什么这么猜（从他以前说过的话出发），"
+        "然后问他一句'对吗？'。别把观察到的规律当成猜，别猜他下一步要干嘛；"
+        "他交代你做事（比如恢复、删除、查东西）的时候不猜；'可以'、'好'、"
+        "'对'、'不对'这种简单的回话也不猜。不确定就别猜，没东西可猜就正常回。\n\n" + model_prompt
+    )
     # 按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型），
     # 并把路由算出的模型名传给 Provider——路由说用哪个模型就用哪个，
     # 不能丢了 routing["model"]、让 Provider 又按默认模型自己猜。
@@ -678,6 +692,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 聊天纠错：add_turn 里已经改好/问好了，这里只把结果用人话告诉
     # BOOS（见 _print_correction_result），并放进返回里供调用方看。
     correction = None
+    inference = None
     if mem0_store is not None:
         # 收尾只存 BOOS 的原话 + 最后的回答：记忆提示块、摘要、
         # 工具中间结果都不进长期记忆。
@@ -696,6 +711,11 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
         if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
             print("刚说的那句已经撤回，不记了。")
+        # 揣摩改成跟十一一样（2026-11-17，BOOS定）：不再固定每轮调
+        # infer_from_turn 追加一句正式的猜——猜由模型自己在回话里
+        # 说（见上面 model_prompt 里的提示），不在这里单独问了。
+        # inference 保持 None，返回里不带它。
+        inference = None
     logger.info(
         "timing | run_question total=%.1fms %s",
         timer.total_ms(),
@@ -712,6 +732,9 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         # 48 号：本轮调过的搜索记录（DeepSeek 工具循环那条路才有，其他路是空列表）。
         "searches": searches,
         **({"correction": correction} if correction is not None else {}),
+        # 揣摩人心（2026-11-16）：本轮的揣摩结果（见上面的钩子），
+        # 没揣出来/没待定要处理时是 None，调用方（面板/日志）按需看。
+        **({"inference": inference} if inference is not None else {}),
     }
 
 

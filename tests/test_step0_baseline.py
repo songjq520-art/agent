@@ -182,6 +182,10 @@ class _SleepyMem0Stub:
         time.sleep(0.02)
         return {"pending": True, "results": [], "queued": True, "turn_id": turn_id}
 
+    def infer_from_turn(self, messages):
+        """揣摩人心（2026-11-16）：假对象不揣，返回空结果（没揣出来）。"""
+        return {}
+
 
 def test_run_question_returns_timings(tmp_path, monkeypatch):
     """计时：run_question 返回里带 timings，四截（搜记忆、读摘要、调模型、

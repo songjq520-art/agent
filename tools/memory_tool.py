@@ -655,25 +655,13 @@ def _run_delete_memory(args):
             "data": None,
             "error": "这条记忆已经不在了（可能刚才已经删过）。",
         }
-    # 2026-11-16 拉面：同一句话可能存了多份（显式记 + 提取各一份），
-    # 只删一个 id 就报“删掉了”，另一份还活着。确认卡上列清的副本
-    # （_check_delete_anchor 里算好的），这里一起删掉、逐条报。
-    # 副本删失败不翻盘：主条已经删掉了，失败的副本单独列出来，
-    # 让模型告诉 BOOS、别谎称全删干净了。
+    # 2026-11-17 火锅：单条删除只删指定的那一个 id，绝不顺手删
+    # 同一句话的其他副本——“删重复、留一条”时，多删的那个正是
+    # 该留下的。以前这里用 _live_copies_of_text 把同文副本全删了，
+    # 导致“留 00:29、删 00:41”结果两条都没了。要删多份时调用方
+    # 用批量删 delete_memories，把每条 id 都列在确认卡上。
     extra_deleted = []
     extra_failed = []
-    for other_id, other_text in _live_copies_of_text(
-        store, stored_text, exclude_id=memory_id
-    ):
-        try:
-            if store.delete_memory(other_id, approve=True):
-                extra_deleted.append(
-                    {"memory_id": other_id, "text": other_text}
-                )
-            else:
-                extra_failed.append({"memory_id": other_id, "text": other_text})
-        except Exception:  # noqa: BLE001 - 副本删失败单独报，不翻盘
-            extra_failed.append({"memory_id": other_id, "text": other_text})
     return {
         "ok": True,
         "data": {
@@ -1157,6 +1145,8 @@ def register_memory_tools():
     _register_one(
         name="delete_memory",
         description=(
+            "一次只删一条记忆。要删 2 条及以上时别调这个，调 delete_memories"
+            "（一次调用、一张确认卡、点一次确认就全删）。"
             "删一条长期记忆。先调 list_memories 列出全部，找到要删的那条，"
             "把 memory_id、text（列出来的原文，一字不差地抄）和 anchor_text"
             "（用户原话里的删除目标，比如 BOOS 说“删掉鸡杂面”时 anchor_text"
@@ -1167,8 +1157,7 @@ def register_memory_tools():
             "先问清楚再删，别自己挑。删之前会先弹确认卡，卡上显示 anchor"
             "和程序算好的匹配结果，BOOS 点了确认才执行，取消了就不删；"
             "删掉后向量和审计记录都清掉，但账本里原话留着，之后能用 "
-            "revive_memory 恢复——删错了还能找回来，但别乱删。一次删多条"
-            "时调 delete_memories，别一条一条调这个。"
+            "revive_memory 恢复——删错了还能找回来，但别乱删。"
             "返回 {memory_id, text, history_cleared}。"
         ),
         parameters={
@@ -1289,6 +1278,7 @@ def register_memory_tools():
     _register_one(
         name="delete_memories",
         description=(
+            "一次删 2 条及以上记忆时调这个；只删一条时调 delete_memory。"
             "一次删多条长期记忆。BOOS 说“一起删”“这几条都删掉”时调这个，"
             "别一条一条调 delete_memory：一次调用、一张确认卡、点一次确认"
             "就全删。先调 list_memories 列出全部，找到要删的那几条，把"
