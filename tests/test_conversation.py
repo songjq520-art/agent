@@ -20,14 +20,34 @@ from providers.muse import MuseProvider
 from tools.agent_loop import LOOP_SYSTEM_MESSAGE
 
 
+def _strip_mind_reading_prefix(content):
+    """剥掉揣摩提示前缀：main.py 拼在每句本轮用户消息前面的
+    【给十二的提示】……\\n\\n，只留 BOOS 的原话（2026-11-17 揣摩
+    合进 main 后，生产代码故意这么发；测试只关心原话对不对）。"""
+    marker = "【给十二的提示】"
+    if isinstance(content, str) and content.startswith(marker):
+        idx = content.find("\n\n")
+        if idx != -1:
+            return content[idx + 2 :]
+    return content
+
+
 def _assert_loop_messages(sent, *expected_after_system):
     """断言工具循环发给模型的消息列表：第一条是系统消息（基础规矩 +
     今天日期，30 号），后面是 expected_after_system（历史 + 本轮问题，
     29 号起第二轮也带历史）。系统消息只断言“以基础规矩开头”，
-    不断言整句相等——日期是现算的，每天都不一样。"""
+    不断言整句相等——日期是现算的，每天都不一样。
+    本轮用户消息会带揣摩提示前缀（见 _strip_mind_reading_prefix），
+    比较前先剥掉；历史里的旧消息没有前缀，原样比。"""
     assert sent[0]["role"] == "system"
     assert sent[0]["content"].startswith(LOOP_SYSTEM_MESSAGE)
-    assert sent[1:] == list(expected_after_system)
+    actual = [
+        {"role": m["role"], "content": _strip_mind_reading_prefix(m["content"])}
+        if m["role"] == "user"
+        else m
+        for m in sent[1:]
+    ]
+    assert actual == list(expected_after_system)
 
 
 def _fake_ok_response(text="你好，我是 DeepSeek。", prompt_tokens=100, completion_tokens=50):

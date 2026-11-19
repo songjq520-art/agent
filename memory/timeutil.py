@@ -21,12 +21,15 @@ _NOW_LOCK = threading.Lock()
 
 _NOW_LAST = None
 
-def _now_iso():
-    """现在的时间，UTC 的 ISO 时间串（固定 6 位微秒，带 Z），供 metadata 用。
+def _now_dt():
+    """单调递增的现在（datetime，UTC）：同一进程里每次调用都比上一次大。
 
-    小数部分固定 6 位：isoformat() 默认会省略微秒为 0 时的小数点，
-    '...T03:00:00Z' 按字符串排会比 '...T03:00:00.000001Z' 大——
-    字符串顺序就和时间顺序反了。固定 6 位后，字符串顺序就是时间顺序。
+    _now_iso() 和 _now_epoch() 共用这一个源——删记忆的时间戳、
+    待定轮的 created_at、账本的 ts 必须在同一条单调时间线上比
+    先后，否则 Windows 粗时钟下会撞车或跑反：raw datetime.now()
+    在同一滴答里返回值相同，_now_iso() 的 +1 微秒又会跑到墙钟
+    前面去，删在前的事反而显得比后说的轮次晚（2026-11-19 全套
+    flaky 的根子，mem0_forget / revive_guard 在笔记本上时挂时过）。
     """
     global _NOW_LAST
     now = datetime.now(timezone.utc)
@@ -34,7 +37,25 @@ def _now_iso():
         if _NOW_LAST is not None and now <= _NOW_LAST:
             now = _NOW_LAST + timedelta(microseconds=1)
         _NOW_LAST = now
-    return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return now
+
+
+def _now_epoch():
+    """单调递增的现在（epoch 秒，float）：和 _now_iso() 同一个源，
+    供删记忆的时间戳、待定轮的 created_at 用——它们要和账本 ts
+    （_now_iso 写）比先后，必须走同一条单调线，别用 raw
+    datetime.now().timestamp()（见 _now_dt）。"""
+    return _now_dt().timestamp()
+
+
+def _now_iso():
+    """现在的时间，UTC 的 ISO 时间串（固定 6 位微秒，带 Z），供 metadata 用。
+
+    小数部分固定 6 位：isoformat() 默认会省略微秒为 0 时的小数点，
+    '...T03:00:00Z' 按字符串排会比 '...T03:00:00.000001Z' 大——
+    字符串顺序就和时间顺序反了。固定 6 位后，字符串顺序就是时间顺序。
+    """
+    return _now_dt().isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 def _parse_created_at(value):
     """把 created_at 字符串解析成带时区的 datetime，解析不出返回 None。

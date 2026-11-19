@@ -108,6 +108,7 @@ from memory.outbox import MemoryOutbox
 from memory.timeutil import (
     _today,
     _now_iso,
+    _now_epoch,
     _parse_created_at,
     _next_write_seq,
     _NOW_LOCK,
@@ -249,6 +250,11 @@ from memory import backup as _backup
 from memory import ledger as _ledger
 from memory import relations as _relations
 from memory import inference as _inference
+# （图谱推理第一期，2026-11-18：图快照 + 实体抽取 + PPR 检索。
+# 图是索引不是账本，快照放 memory/graph_snapshot.json，和账本同目录，
+# .gitignore 里 memory/*.json* 已覆盖，不进仓库。）
+from memory import graph as _graph_mod
+from memory.graph_entities import extract_entities, extract_query_entities
 from memory.decay import (
     DECAY_DELETE_BACKUP_PREFIX,
     DECAY_DELETE_IDLE_DAYS,
@@ -764,6 +770,7 @@ class Mem0Store:
         protection_events_path=None,
         ledger_path=None,
         snapshot_path=None,
+        graph_path=None,
         inference_calibration_path=None,
         backup_dir=None,
         user_id=DEFAULT_USER_ID,
@@ -805,6 +812,18 @@ class Mem0Store:
             if snapshot_path
             else project_root / "memory" / "memory_events_snapshot.json"
         )
+        # 图谱推理第一期：图快照放 memory/graph_snapshot.json（和账本
+        # 同目录）。默认跟账本走——测试里账本指到临时目录时，图也跟
+        # 过去，不污染工作区。_graph 懒建：第一次存入/检索时才读快照
+        # （没有就从账本重建），启动不为它多花时间；_graph_lock 管
+        # 这把懒建 + 写快照，别让两个线程同时建两张图。
+        self.graph_path = (
+            Path(graph_path)
+            if graph_path
+            else self.ledger_path.parent / "graph_snapshot.json"
+        )
+        self._graph = None
+        self._graph_lock = threading.Lock()
         self.backup_dir = (
             Path(backup_dir)
             if backup_dir
@@ -1138,10 +1157,20 @@ class Mem0Store:
             key=lambda item: item.get("decay_weight") or 0,
             reverse=True,
         )
+        # 账本状态先读出来：图合并和投影过滤共用一份，不读两遍。
+        ledger_state = self.ledger_state()
+        # 图检索（图谱推理第一期）：种子实体 → PPR 一步多跳，两路分数
+        # 归一化相加。插在关键词补充之后、投影过滤之前；图是空的、
+        # 种子找不着、PPR 没命中时什么都不做，老路结果原样。
+        # 失败只记日志、不抛异常（_graph_merge 内部全包住了）。
+        self._graph_merge(
+            results, seen_texts, query, top_k, include_history, ledger_state
+        )
         # 投影过滤之前先把这一批的 key 都记下来：被筛掉的（睡着的、
         # 被取代的、删了的）原话，兜底那步也不许再从账本里捞回来——
         # 筛子刚扔掉的，兜底不能再捡回来当现况（账本兜底只补“索引
-        # 里丢了”的，不补“筛子判了旧的”）。
+        # 里丢了”的，不补“筛子判了旧的”）。图上找回来的也算在里头，
+        # 一样不许兜底再捡。
         pre_filter_keys = {
             _ledger.ledger_event_key(
                 item.get("text") or "",
@@ -1149,7 +1178,6 @@ class Mem0Store:
             )
             for item in results
         }
-        ledger_state = self.ledger_state()
         # 投影过滤：被取代的、睡着的默认不给；问“以前”才放出来。
         results = _ledger.project_and_filter(
             results, ledger_state, include_history=include_history
@@ -1476,6 +1504,287 @@ class Mem0Store:
     def ledger_repair(self):
         """修账本：扔掉末尾写一半的残行（见 memory/ledger.py repair_ledger）。"""
         return _ledger.repair_ledger(self.ledger_path)
+
+    # ---------- 图谱推理第一期（2026-11-18） ----------
+
+    def _get_graph(self):
+        """拿图（懒建）：快照在就读快照，没有/读坏了就从账本重建。
+
+        图是索引，坏了从账本重建，不拦路；重建失败返回一张空图，
+        检索照常走老路。_graph_lock 管懒建 + 写快照，别让两个线程
+        同时建两张图。
+        """
+        with self._graph_lock:
+            if self._graph is not None:
+                return self._graph
+            graph = _graph_mod.MemoryGraph(self.graph_path)
+            if not graph.load():
+                try:
+                    events, _info = _ledger.read_events(self.ledger_path)
+                except Exception:
+                    events = []
+                try:
+                    graph.rebuild_from_events(events)
+                    # 重建完就把快照写盘（2026-11-19 真机教训：之前
+                    # 这里只重建不写盘，快照一直没有，服务每次启动
+                    # 都现重建）。写失败只记日志、不拦路——图是索引。
+                    try:
+                        graph.save()
+                    except Exception:
+                        logger.warning("图快照写盘失败：下次启动再重建。", exc_info=True)
+                except Exception:
+                    logger.warning("图从账本重建失败：本次用空图。", exc_info=True)
+                    graph = _graph_mod.MemoryGraph(self.graph_path)
+            self._graph = graph
+            return graph
+
+    def _graph_add_memory(self, key, text, metadata, seq):
+        """把一条新记忆接进图（抽实体、连边、判关系、写快照）。
+
+        只在 _ledger_record_add 成功后调（新 add 事件落盘了）。
+        实体先走免费的，抽不到再调一次 _judge_json 兜底（flash，
+        温度 0）；抽取失败、关系判不出来、快照写不进去都只记日志、
+        不抛异常——图是索引，坏了从账本重建，绝不能因为图写不进去
+        就把存入搞崩。
+        关系只和“连着同一实体”的旧记忆判（图上邻居），不全库扫；
+        判出来的写成记忆—记忆边（只在图里，不另写 relate 事件——
+        重建时按账本重判一遍，同一对关系不会重复进账本）。
+        """
+        if not key or not (text or "").strip():
+            return
+        try:
+            graph = self._get_graph()
+        except Exception:
+            logger.warning("图接新记忆失败：图没建起来。", exc_info=True)
+            return
+        try:
+            entities = extract_entities(text, llm_judge=self._judge_json)
+            with self._graph_lock:
+                graph.add_memory(
+                    key,
+                    text,
+                    entities,
+                    valid_at=(metadata or {}).get("created_at"),
+                    source_seq=seq if isinstance(seq, int) else None,
+                )
+                # 关系：只和连着同一实体的旧记忆判（图上邻居）。
+                try:
+                    state = self.ledger_state()
+                except Exception:
+                    state = {}
+                adds_by_key = {
+                    (record or {}).get("key"): record
+                    for record in (state or {}).get("adds") or []
+                    if (record or {}).get("key")
+                }
+                candidates = set()
+                for name, _kind in entities:
+                    ent_id = _graph_mod.entity_node_id(name)
+                    for edge in graph.edges:
+                        if edge.get("kind") != _graph_mod.EDGE_MENTIONS:
+                            continue
+                        if edge.get("invalid_at"):
+                            continue
+                        if edge.get("from") == ent_id:
+                            other = edge.get("to")
+                        elif edge.get("to") == ent_id:
+                            other = edge.get("from")
+                        else:
+                            continue
+                        if isinstance(other, str) and other.startswith("mem:"):
+                            candidates.add(other[4:])
+                candidates.discard(key)
+                for old_key in sorted(candidates):
+                    old_record = adds_by_key.get(old_key)
+                    if old_record is None:
+                        continue
+                    relation = _relations.classify_relation(
+                        old_record.get("text") or "",
+                        old_record.get("meta") or {},
+                        text,
+                        metadata or {},
+                    )
+                    if relation is not None:
+                        graph.add_relation(old_key, key, relation, source_seq=seq if isinstance(seq, int) else None)
+                try:
+                    graph.save()
+                except Exception:
+                    logger.warning("图快照写盘失败：记忆本身已经进账本了。", exc_info=True)
+        except Exception:
+            logger.warning("图接新记忆失败：本次只记账本、不记图。", exc_info=True)
+
+    def _graph_merge(self, results, seen_texts, query, top_k, include_history, ledger_state):
+        """图检索合并：种子实体 → PPR 一步多跳，两路分数归一化相加。
+
+        就地改 results（按合并分重排、截到 top_k），seen_texts 同步更新。
+        图是空的、种子找不着、PPR 没命中时什么都不做，老路结果原样。
+        失败只记日志、不抛异常——图是加分项，不是必经之路。
+        合并分 = 归一化向量分 + 归一化 PPR 分：向量分是老路语义检索
+        的分数（关键词补充的没有，就当 0）；PPR 分是图上跑出来的。
+        图上找回来的新记忆按账本原话拼成结果项（source="graph"，
+        id 能对上就对上，对不上就是 None，和账本兜底项一个待遇——
+        拿来回答问题可以，拿去 update / 纠错不行）。
+        """
+        try:
+            graph = self._get_graph()
+        except Exception:
+            logger.warning("图检索失败：图没建起来。", exc_info=True)
+            return
+        if not graph.nodes or not graph.edges:
+            return
+        try:
+            seeds = extract_query_entities(query, llm_judge=self._judge_json)
+        except Exception:
+            logger.warning("图检索失败：种子实体没抽出来。", exc_info=True)
+            return
+        seeds = [
+            name for name in (seeds or [])
+            if _graph_mod.entity_node_id(name) in graph.nodes
+        ]
+        if not seeds:
+            return
+        try:
+            key_states = (ledger_state or {}).get("key_states") or {}
+            # 失效时间从账本事件里拿（supersede / delete 那笔的 ts），
+            # 拿不到就按已有的 invalid_at 留着——sync_validity 只看
+            # invalid_at 有没有值，时间本身不影响 PPR。
+            invalid_ts = {}
+            try:
+                events, _info = _ledger.read_events(self.ledger_path)
+                for event in events or []:
+                    if event.get("type") in (
+                        _ledger.LEDGER_EVENT_SUPERSEDE,
+                        _ledger.LEDGER_EVENT_DELETE,
+                    ) and event.get("key"):
+                        invalid_ts[event["key"]] = event.get("ts")
+            except Exception:
+                invalid_ts = {}
+            with self._graph_lock:
+                graph.sync_validity(key_states, invalid_ts)
+                # 记忆种子的分：老路语义结果的归一化分 × 0.05。
+                vector_scores = {}
+                for item in results:
+                    if item.get("source") != "semantic":
+                        continue
+                    score = item.get("score")
+                    if score is None:
+                        continue
+                    item_key = _ledger.ledger_event_key(
+                        item.get("text") or "",
+                        (item.get("metadata") or {}).get("created_at"),
+                    )
+                    vector_scores[item_key] = float(score)
+                max_vector = max(vector_scores.values()) if vector_scores else 0.0
+                memory_seeds = (
+                    {key: score / max_vector for key, score in vector_scores.items()}
+                    if max_vector > 0
+                    else {}
+                )
+                ppr_scores = graph.ppr(
+                    seeds, memory_seeds, include_history=include_history
+                )
+            if not ppr_scores:
+                return
+            max_ppr = max(ppr_scores.values())
+            if max_ppr <= 0:
+                return
+            norm_ppr = {key: score / max_ppr for key, score in ppr_scores.items()}
+            norm_vector = (
+                {key: score / max_vector for key, score in vector_scores.items()}
+                if max_vector > 0
+                else {}
+            )
+            # 账本原话档案（key → text/meta），图上找回来的新记忆靠它
+            # 拼成结果项。id 固定是 None，和账本兜底项一个待遇：它是
+            # 账本档案里的原话，拿来回答问题可以，拿去 update / 纠错 /
+            # 打标记不行——账本里的 id_to_key 可能过期（索引换过、条目
+            # 删过），按它给 id 会让纠正拿着一个不存在的 id 去改库
+            # （2026-11-18 测出来的：空库纠正错拿了 fake-1 去 update）。
+            adds_by_key = {
+                (record or {}).get("key"): record
+                for record in (ledger_state or {}).get("adds") or []
+                if (record or {}).get("key")
+            }
+            now_dt = datetime.now(timezone.utc)
+            by_key = {}
+            for item in results:
+                item_key = _ledger.ledger_event_key(
+                    item.get("text") or "",
+                    (item.get("metadata") or {}).get("created_at"),
+                )
+                by_key[item_key] = item
+            merged = []
+            for item in results:
+                item_key = _ledger.ledger_event_key(
+                    item.get("text") or "",
+                    (item.get("metadata") or {}).get("created_at"),
+                )
+                combined = norm_vector.get(item_key, 0.0) + norm_ppr.get(item_key, 0.0)
+                item["graph_score"] = norm_ppr.get(item_key, 0.0)
+                item["combined_score"] = combined
+                merged.append(item)
+            for key, ppr_norm in norm_ppr.items():
+                if key in by_key:
+                    continue
+                record = adds_by_key.get(key)
+                if record is None:
+                    continue
+                text = record.get("text") or ""
+                if not text or text in seen_texts:
+                    continue
+                if _contains_sensitive(text):
+                    continue
+                hit_state = key_states.get(key)
+                if not include_history and hit_state in (
+                    _ledger.LEDGER_STATE_SUPERSEDED,
+                    _ledger.LEDGER_STATE_DELETED,
+                ):
+                    continue
+                meta = _normalize_metadata(record.get("meta") or {})
+                merged.append(
+                    {
+                        "id": None,
+                        "text": text,
+                        "score": None,
+                        "source": "graph",
+                        "metadata": meta,
+                        "confirmed": meta["confirmed"],
+                        "decay_weight": decay_weight(
+                            meta["decay_kind"],
+                            meta["last_used_at"],
+                            now_dt,
+                            is_core=_is_core_memory(meta),
+                        ),
+                        "graph_score": ppr_norm,
+                        "combined_score": ppr_norm,
+                        "is_history": bool(
+                            include_history
+                            and hit_state
+                            in (
+                                _ledger.LEDGER_STATE_SUPERSEDED,
+                                _ledger.LEDGER_STATE_DELETED,
+                            )
+                        ),
+                        "history_state": hit_state
+                        if include_history
+                        and hit_state
+                        in (
+                            _ledger.LEDGER_STATE_SUPERSEDED,
+                            _ledger.LEDGER_STATE_DELETED,
+                        )
+                        else None,
+                    }
+                )
+                seen_texts.add(text)
+            merged.sort(
+                key=lambda item: (item.get("combined_score") or 0)
+                * (item.get("decay_weight") or 0),
+                reverse=True,
+            )
+            results[:] = merged[:top_k]
+        except Exception:
+            logger.warning("图检索合并失败：本次只用老路结果。", exc_info=True)
+            return
 
     def relate_memories(self, memory_id, related_id, relation, note=""):
         """记一条记忆关系（只留四种：取代 / 补充 / 冲突 / 关联）。
@@ -1932,7 +2241,7 @@ class Mem0Store:
                 when_f = float(when)
             except (TypeError, ValueError):
                 continue
-            if when_f >= cutoff:
+            if when_f > cutoff:
                 out[norm] = when_f
         try:
             events, _info = _ledger.read_events(self.ledger_path)
@@ -1954,7 +2263,7 @@ class Mem0Store:
             elif etype == _ledger.LEDGER_EVENT_REVIVE:
                 key_deleted_at.pop(key, None)
         for key, when in key_deleted_at.items():
-            if when < cutoff:
+            if when <= cutoff:
                 continue
             text = key_text.get(key) or ""
             if not text:
@@ -2593,10 +2902,13 @@ class Mem0Store:
                 identity_items.append(detected)
         # created_at：这轮话是什么时候说的——提取复活拦截的分水岭
         # （2026-11-16 拉面）：删在这之后才拦，删在之前的是 BOOS 重新说起，不拦。
+        # 必须走单调的 _now_epoch()，别用 raw datetime.now()：账本删记录的
+        # ts 是 _now_iso()（同一单调源），raw 墙钟在 Windows 粗时钟下会
+        # 落后于它，删在前的事反而显得晚（2026-11-19 全套 flaky 的根子）。
         self._pending_turn = {
             "messages": messages,
             "identity": identity_items,
-            "created_at": datetime.now(timezone.utc).timestamp(),
+            "created_at": _now_epoch(),
         }
 
     def add_turn(self, messages):
@@ -2850,7 +3162,8 @@ class Mem0Store:
                 "identity": identity_items,
                 # created_at：本轮话是什么时候说的——提取复活拦截的分水岭
                 # （2026-11-16 拉面）：删在这之后才拦，删在之前的是 BOOS 重新说起，不拦。
-                "created_at": datetime.now(timezone.utc).timestamp(),
+                # 走单调的 _now_epoch()（见上面那处 _pending_turn 的注释）。
+                "created_at": _now_epoch(),
             }
             out = {
                 "pending": True,
@@ -4020,10 +4333,13 @@ class Mem0Store:
         meta 只放标量字段（来源/置信度/是否确认/时间/写序号/槽位/
         是否规则/衰减种类/重要性），和 add 事件的档案格式一致。
         返回记好的事件，写失败返回 None（or_raise 时抛异常）。
+        图谱推理第一期：add 事件落盘后，顺手把这条记忆接进图
+        （抽实体、连边、判关系、写快照）——图是索引，失败只记日志、
+        不拦路（_graph_add_memory 内部全包住了）。
         """
         meta = metadata or {}
         if or_raise:
-            return self._ledger_append_or_raise(
+            event = self._ledger_append_or_raise(
                 _ledger.LEDGER_EVENT_ADD,
                 key=_ledger.ledger_event_key(text, meta.get("created_at")),
                 text=text,
@@ -4039,22 +4355,31 @@ class Mem0Store:
                     "importance": meta.get("importance"),
                 },
             )
-        return self._ledger_append(
-            _ledger.LEDGER_EVENT_ADD,
-            key=_ledger.ledger_event_key(text, meta.get("created_at")),
-            text=text,
-            meta={
-                "source": meta.get("source"),
-                "confidence": meta.get("confidence"),
-                "user_confirmed": meta.get("user_confirmed"),
-                "created_at": meta.get("created_at"),
-                "write_seq": meta.get("write_seq"),
-                "slot": meta.get("slot"),
-                "is_rule": meta.get("is_rule", False),
-                "decay_kind": meta.get("decay_kind"),
-                "importance": meta.get("importance"),
-            },
-        )
+        else:
+            event = self._ledger_append(
+                _ledger.LEDGER_EVENT_ADD,
+                key=_ledger.ledger_event_key(text, meta.get("created_at")),
+                text=text,
+                meta={
+                    "source": meta.get("source"),
+                    "confidence": meta.get("confidence"),
+                    "user_confirmed": meta.get("user_confirmed"),
+                    "created_at": meta.get("created_at"),
+                    "write_seq": meta.get("write_seq"),
+                    "slot": meta.get("slot"),
+                    "is_rule": meta.get("is_rule", False),
+                    "decay_kind": meta.get("decay_kind"),
+                    "importance": meta.get("importance"),
+                },
+            )
+        if event is not None:
+            self._graph_add_memory(
+                event.get("key"),
+                text,
+                meta,
+                event.get("seq") if isinstance(event.get("seq"), int) else None,
+            )
+        return event
 
     def _ledger_ensure_add(self, text, metadata, key):
         """删之前先确认账本里有这条的 add 档案：没有就补记一笔
@@ -5798,6 +6123,14 @@ class Mem0Store:
             # 它能翻出来是档案的功能，不是“旧文本还在索引里”。
             if (hit or {}).get("is_history"):
                 continue
+            # 图那路的命中也不算：图是账本的索引（图谱推理第一期），
+            # 校验时取代事件还没写进账本，账本还认旧原话是“当前”的，
+            # 图自然还会把它捡回来——那不是“索引里还有旧文本”，是
+            # 图滞后账本一步。校验通过、取代事件写进账本之后，下次
+            # 检索图就把它筛掉了。索引里还有没有旧文本，只看语义/
+            # 关键词那两路（它们带 mem0 id，图那路没有）。
+            if (hit or {}).get("source") == "graph":
+                continue
             if _normalize_memory_text(hit.get("text") or "") == _normalize_memory_text(old_text):
                 return {"ok": False, "reason": "旧文本还能检索到"}
         return {"ok": True, "reason": ""}
@@ -6184,12 +6517,13 @@ class Mem0Store:
                 key=delete_key,
             )
             # 内存里也记一笔刚删（提取复活拦截的第一道，见
-            # _drop_deleted_text_results；账本是兜底）。
+            # _drop_deleted_text_results；账本是兜底）。时间戳走单调的
+            # _now_epoch()：要和待定轮 created_at、账本 ts 在同一条
+            # 时间线上比先后，raw datetime.now() 在 Windows 粗时钟下
+            # 会落后（2026-11-19 全套 flaky 的根子）。
             norm_old = _normalize_memory_text(old_text)
             if norm_old:
-                self._just_deleted_texts[norm_old] = (
-                    datetime.now(timezone.utc).timestamp()
-                )
+                self._just_deleted_texts[norm_old] = _now_epoch()
             return True
 
     # ---------- 34 号：撤回软删除（能恢复） ----------
@@ -6313,11 +6647,10 @@ class Mem0Store:
                     key=delete_key,
                 )
                 # 内存里也记一笔刚删（提取复活拦截的第一道）。
+                # 时间戳走单调的 _now_epoch()（见上面那处 _just_deleted_texts 的注释）。
                 norm_item = _normalize_memory_text(item.get("text") or "")
                 if norm_item:
-                    self._just_deleted_texts[norm_item] = (
-                        datetime.now(timezone.utc).timestamp()
-                    )
+                    self._just_deleted_texts[norm_item] = _now_epoch()
             return deleted
 
     def restore_memory(self, memory_id):
