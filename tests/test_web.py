@@ -18,6 +18,8 @@ import pytest
 
 from config import BudgetTracker
 from conftest import make_fake_store
+from memory.mem0_store import CONFIDENCE_INFERRED, SOURCE_INFERRED, _provenance
+from tasks.task_store import TaskStore, make_task
 from web.server import ChatState, ServerConfig, create_server
 
 
@@ -55,19 +57,30 @@ class FakeMem0Store:
         # 第二步衰减：每次 search() 有没有要求强化（reinforce=True），
         # 供测试核对“真把记忆用上了才强化”的接线。
         self.reinforce_calls = []
+        # 2026-11-19：每次调用带进来的本轮编号（另记三个列表，不动
+        # 上面两个的形状，老测试不用改）。
+        self.direct_turn_ids = []
+        self.search_turn_ids = []
+        self.saved_turn_ids = []
 
-    def add_memory_text(self, text, source="user"):
+    def add_memory_text(self, text, source="user", turn_id=None):
         """25 号直存：记下来，放进 memories 里让下一轮 search() 能找到
-        （和真实库“存完下一句就能查到”一致），返回非空表示存成了。"""
+        （和真实库“存完下一句就能查到”一致），返回非空表示存成了。
+        turn_id（2026-11-19）：本轮的 id，另记在 direct_turn_ids 里，
+        供测试核对“记住”直存也带上了本轮编号。"""
         self.direct_stored.append({"text": text, "source": source})
+        self.direct_turn_ids.append(turn_id)
         if text not in self.memories:
             self.memories.append(text)
         return {"results": [{"id": f"d{len(self.direct_stored)}", "memory": text, "event": "ADD"}]}
 
-    def search(self, query, top_k=5, reinforce=False):
+    def search(self, query, top_k=5, reinforce=False, turn_id=None):
         """返回固定的记忆列表（每项和真实 Mem0Store.search() 的格式一致）。
-        reinforce 跟真实签名对齐（默认 False），只记下来、不真写回。"""
+        reinforce 跟真实签名对齐（默认 False），只记下来、不真写回。
+        turn_id（2026-11-19）：本轮的 id，记在 search_turn_ids 里，
+        供测试核对“检索强化带上了本轮编号”。"""
         self.reinforce_calls.append(bool(reinforce))
+        self.search_turn_ids.append(turn_id)
         return [
             {"id": f"m{i}", "text": text, "score": 0.9, "source": "semantic"}
             for i, text in enumerate(self.memories[:top_k])
@@ -81,7 +94,10 @@ class FakeMem0Store:
     def save_turn(self, messages, turn_id=None):
         """26 号后台存：假 store 不模拟后台线程，直接走 add_turn 当场存
         （和真实库“纠错/撤回走同步”的那条路一致），返回 add_turn 的结果。
-        这样 web 层“回答后存了本轮对话”的核对（saved_turns）不用改。"""
+        这样 web 层“回答后存了本轮对话”的核对（saved_turns）不用改。
+        turn_id（2026-11-19）：本轮的 id，记在 saved_turn_ids 里，
+        供测试核对“收尾存记忆用的是同一轮编号”。"""
+        self.saved_turn_ids.append(turn_id)
         return self.add_turn(messages)
 
     def note_context(self, memories):
@@ -1503,3 +1519,123 @@ def test_page_new_chat_opens_immediately_and_summarizes_in_background():
     assert "已开始新对话" in html
     assert "async function pollClosedSummary(closedId, triesLeft, anchorWrap)" in html
     assert "pollClosedSummary(data.closed_id, 30, startedWrap)" in html
+
+# ---------- turn_id 提前到检索之前（2026-11-19） ----------
+# ask() 在检索之前就生成本轮 id，一路传给检索强化、run_question、
+# 收尾存记忆；确认恢复时从任务里读回来接着用。
+
+
+def test_ask_threads_same_turn_id_through_search_run_question_and_save(tmp_path, monkeypatch):
+    """ask() 一轮里：检索强化、run_question、收尾存记忆用的都是同一个
+    turn_id——ask() 在检索之前就生成，run_question 和 save_turn 各拿一份。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    mem0_store = FakeMem0Store(memories=["我喜欢喝咖啡。"])
+    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    seen = {}
+
+    def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["turn_id"] = kwargs.get("turn_id")
+        return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _capturing_fake)
+    result = state.ask("今天天气怎么样？")
+    assert result["mode"] == "real"
+    turn_id = seen["turn_id"]
+    assert turn_id  # 生成了，不是 None/空串
+    # 检索强化带的是这轮的 id，收尾存记忆也是同一个。
+    assert mem0_store.search_turn_ids == [turn_id]
+    assert mem0_store.saved_turn_ids == [turn_id]
+
+
+def test_ask_remember_passes_turn_id_to_direct_store(tmp_path, monkeypatch):
+    """“记住……”那轮：直存、检索强化、run_question 用的也是同一个 turn_id；
+    收尾照旧跳过 add_turn。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    mem0_store = FakeMem0Store(memories=[])
+    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    seen = {}
+
+    def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["turn_id"] = kwargs.get("turn_id")
+        return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _capturing_fake)
+    result = state.ask("记住，我喜欢喝冰美式")
+    assert result["mode"] == "real"
+    turn_id = seen["turn_id"]
+    assert turn_id
+    assert mem0_store.direct_turn_ids == [turn_id]
+    assert mem0_store.search_turn_ids == [turn_id]
+    assert mem0_store.saved_turn_ids == []
+
+
+def test_resolve_approval_keeps_waiting_turn_id(tmp_path, monkeypatch):
+    """确认恢复：等确认那轮的 turn_id 存在任务里，恢复后 run_question
+    和收尾存记忆还用这个 id，不另起一个。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    mem0_store = FakeMem0Store(memories=[])
+    task_store = TaskStore(file_path=tmp_path / "tasks.json")
+    task = make_task("帮我查一下天气", "deepseek-flash")
+    task["turn_id"] = "turn-9"
+    task["history_index"] = 0
+    task_store.save(task)
+
+    class _FakeGateway:
+        def resolve_approval(self, store, task_id, approval_id, decision):
+            return {"decision": "cancelled", "task": task, "result": None}
+
+    state = ChatState(
+        budget_tracker=tracker,
+        mem0_store=mem0_store,
+        tool_gateway=_FakeGateway(),
+        task_store=task_store,
+    )
+    seen = {}
+
+    def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["turn_id"] = kwargs.get("turn_id")
+        return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _capturing_fake)
+    result = state.resolve_approval(task["task_id"], "appr-1", "cancel")
+    assert result["ok"] is True
+    assert seen["turn_id"] == "turn-9"
+    assert mem0_store.saved_turn_ids == ["turn-9"]
+
+
+def test_ask_real_store_reinforces_once_per_turn(tmp_path, monkeypatch):
+    """真实 store + 真实 run_question：一轮里 ask() 和 run_question 各
+    检索强化一次（同一个 turn_id），被用上的记忆会话只记一次。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    store = make_fake_store(tmp_path)
+    result = store._add_text_with_metadata(
+        "BOOS 去盐湖城出差了。", _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
+    )
+    memory_id = (result.get("results") or [{}])[0].get("id")
+    assert memory_id
+    state = ChatState(budget_tracker=tracker, mem0_store=store)
+
+    import web.server as server_module
+
+    orig_run_question = server_module.run_question
+    seen = {}
+
+    def _wrapping_run_question(prompt, budget_tracker=None, messages=None, **kwargs):
+        seen["turn_id"] = kwargs.get("turn_id")
+        return orig_run_question(prompt, budget_tracker=budget_tracker, messages=messages, **kwargs)
+
+    monkeypatch.setattr("web.server.run_question", _wrapping_run_question)
+    with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()):
+        response = state.ask("BOOS 去盐湖城出差了吗？")
+    assert response["mode"] == "real"
+    turn_id = seen["turn_id"]
+    assert turn_id
+    # 两次强化（ask 那次 + run_question 那次）是同一轮：会话只记这一个。
+    meta = None
+    for item in store.get_all(include_sensitive=True):
+        if item["id"] == memory_id:
+            meta = item["metadata"]
+    assert meta is not None
+    assert meta["decay_seen_sessions"] == [turn_id]
+    assert len(meta["decay_seen_dates"]) == 1

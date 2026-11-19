@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import sys
+import uuid
 from pathlib import Path
 
 from config import (
@@ -453,7 +454,7 @@ def _run_deepseek_with_tools(prompt, original_prompt, model_prompt, provider,
     }
 
 
-def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, resume_task=None, pending_tool_result=None, user_declined=False, original_prompt=None, confirm_callback=None):
+def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, resume_task=None, pending_tool_result=None, user_declined=False, original_prompt=None, confirm_callback=None, turn_id=None):
     """跑一次普通问答任务（最简单的运行示例）.
 
     参数 prompt：用户的问题；task_type：任务类型，默认 "question"。
@@ -487,6 +488,9 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     参数 confirm_callback：命令行下用的确认函数，收到 approval 字典
     返回 True（确认）/ False（取消）；网页不传——网页要先把确认卡
     推给 BOOS，等他点了再调 run_question 恢复。
+    参数 turn_id：本轮的 id（2026-11-19）——网页 ask() 在检索之前就
+    生成、传进来；命令行直接调时不传，这里现生成一个。检索强化和存
+    记忆用同一个 id：强化记的“这轮用过”和存进去的那轮是同一轮。
     返回：字典，含 mode（模式）、route（路由结果）、result（模型结果或 None）、message（提示）。
     模式：
       - "demo"（演示模式）：无 Key，只演示配置 + 路由，不调用模型；
@@ -558,6 +562,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 记忆提示块和摘要已经在存着的循环消息里了，再拼一份会重复。
     # searches（48 号）：本轮调过的搜索记录，DeepSeek 工具循环那条路才有，
     # 其他路是空列表；最终返回里带上，网页显示在回答下面。
+    # 2026-11-19：本轮的 turn_id 在检索之前就生成——强化要按会话记，
+    # 检索发生时这轮的编号必须已经有了；存记忆时用同一个 id。
+    # 调用方（网页 ask）传了就用传的，没传（命令行）现生成一个。
+    turn_id = turn_id or uuid.uuid4().hex
     searches = []
     # 先找相关记忆，拼进发给模型的问题里（历史里仍记原话，
     # 这里只改发给模型的那一份）；找不到记忆时原样提问，不注入近似记忆。
@@ -567,7 +575,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             with timer.measure("memory_search_ms"):
                 # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
                 # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
-                memories = mem0_store.search(prompt, top_k=5, reinforce=True)
+                memories = mem0_store.search(prompt, top_k=5, reinforce=True, turn_id=turn_id)
             # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
             # “当前在聊什么”的提示（见 Mem0Store.note_context）。
             mem0_store.note_context(memories)
@@ -704,7 +712,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             ]
         )[-6:]
         with timer.measure("memory_save_ms"):
-            saved = mem0_store.save_turn(recent)
+            saved = mem0_store.save_turn(recent, turn_id=turn_id)
         correction = _print_correction_result(saved)
         _print_protection_result(saved)
         # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，

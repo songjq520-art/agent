@@ -1077,8 +1077,9 @@ class Mem0Store:
         一律不传，绝不能把“找候选”也算成“用上了”（好几个纠错测试
         都断言了“检索不写回”，见 tests/test_mem0_correction.py）。
         turn_id（2026-11-19）：提问这轮的 id——强化时记进被用上记忆
-        的会话集合（见 reinforce_memories）；调用方现在还没传，不传
-        时只按日期数。
+        的会话集合（见 reinforce_memories）。提问流程（main.py
+        run_question、web/server.py ask）在检索之前就生成、传进来；
+        不传时只按日期数（老路子）。
         投影过滤（最终方案，2026-11-13）：检索回来之后再过筛子——
         被取代的、删了的默认不给（is_history=False 的才是当前记忆）；
         问“以前”时传 include_history=True 才放出来，并标
@@ -4048,7 +4049,12 @@ class Mem0Store:
         for memory_id in memory_ids or []:
             if not memory_id:
                 continue
-            outcome = self._decay_touch(memory_id, now=now, record_occurrence=False)
+            # 强化就是一次“出现”：日期和会话都记进集合——同一轮里强化
+            # 几次只算一次（record_seen_occurrence 按 turn_id 去重），
+            # 不同轮各算一次。没传 turn_id 时只按日期数（老路子）。
+            outcome = self._decay_touch(
+                memory_id, now=now, record_occurrence=True, turn_id=turn_id
+            )
             if outcome["ok"]:
                 reinforced.append(memory_id)
                 if outcome["restored"]:
@@ -4659,8 +4665,8 @@ class Mem0Store:
         """手动存一条记忆原文（CLI“记住：内容”用，不经过提取）。
 
         参数 text：记忆内容原文；layers：保留给以后用；
-        turn_id：这条记忆是哪一轮里写进去的（add_turn 传进来）；
-        手动存的没有轮次，不传。
+        turn_id：这条记忆是哪一轮里写进去的（add_turn 传进来；
+        网页“记住”那路传本轮的 id）；不传时只按日期数。
         source：这条记忆的来源，默认 "user"——CLI“记住”是 BOOS
         亲口让记住的，所以记 source="user"、user_confirmed=True、
         confidence=1.0，并把这份 metadata 传给 mem0.add（以前这里
@@ -4691,7 +4697,7 @@ class Mem0Store:
                 # （去重已经判了这是同一条，不是冲突——先标冲突、再强化）。
                 # 记失败也不拦路：记忆本身还在，只是这次没数上。
                 try:
-                    self._record_decay_occurrence(duplicate["id"])
+                    self._record_decay_occurrence(duplicate["id"], turn_id=turn_id)
                 except Exception:
                     logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
                 return {
@@ -4726,7 +4732,7 @@ class Mem0Store:
                 logger.info("手动存记忆：同槽位已有相同金额的记忆，本次未重复存。")
                 # 第二步衰减：同槽位同金额又被提到一次，记一笔“不同天出现”。
                 try:
-                    self._record_decay_occurrence(slot_duplicate["id"])
+                    self._record_decay_occurrence(slot_duplicate["id"], turn_id=turn_id)
                 except Exception:
                     logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
                 return {
@@ -4766,7 +4772,7 @@ class Mem0Store:
                 # 第二步衰减：同一件事又被提到一次，记一笔“不同天出现”
                 # （模型已经裁决了这是同一件事、不是冲突——先标冲突、再强化）。
                 try:
-                    self._record_decay_occurrence(near["id"])
+                    self._record_decay_occurrence(near["id"], turn_id=turn_id)
                 except Exception:
                     logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
                 return {

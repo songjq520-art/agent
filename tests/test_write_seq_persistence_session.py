@@ -333,3 +333,43 @@ def test_no_turn_still_promotes_by_days(tmp_path):
     assert len(meta["decay_seen_dates"]) == 3
     assert meta["decay_seen_sessions"] == []
     assert meta["decay_kind"] == DECAY_KIND_STABLE
+
+# ---------- 2d. 强化按会话记（2026-11-19：turn_id 提前到检索之前） ----------
+
+
+def test_reinforce_same_turn_twice_counts_once(tmp_path):
+    """同一轮强化两次只算一次：两次 reinforce 都是 turn-1，
+    会话集合只有 1 个，日期也只有创建那天。"""
+    store = make_fake_store(tmp_path=tmp_path)
+    memory_id = _add_episodic(store, "BOOS 去盐湖城出差了。")
+    assert store.reinforce_memories([memory_id], turn_id="turn-1")["reinforced"] == [memory_id]
+    assert store.reinforce_memories([memory_id], turn_id="turn-1")["reinforced"] == [memory_id]
+    meta = _meta_of(store, memory_id)
+    assert meta["decay_seen_sessions"] == ["turn-1"]
+    assert len(meta["decay_seen_dates"]) == 1
+    assert meta["decay_kind"] == DECAY_KIND_EPISODIC
+
+
+def test_reinforce_different_turns_counts_each(tmp_path):
+    """不同轮强化各算一次：三天三轮各强化一次，日期 3 个、会话 3 个，
+    晋升成稳定事实，账本里记一条 PROMOTE 事件。"""
+    store = make_fake_store(tmp_path=tmp_path)
+    memory_id = _add_episodic(store, "BOOS 去盐湖城出差了。")
+    day0 = _meta_of(store, memory_id)["decay_last_seen_day"]
+    base = datetime.fromisoformat(day0)
+    for i, turn in enumerate(("turn-1", "turn-2", "turn-3")):
+        day = (base + timedelta(days=i)).date().isoformat()
+        result = store.reinforce_memories([memory_id], now=_at(day), turn_id=turn)
+        assert result["reinforced"] == [memory_id]
+    meta = _meta_of(store, memory_id)
+    assert len(meta["decay_seen_dates"]) == 3
+    assert meta["decay_seen_sessions"] == ["turn-1", "turn-2", "turn-3"]
+    assert meta["decay_kind"] == DECAY_KIND_STABLE
+    events, _info = _ledger.read_events(store.ledger_path)
+    promotes = [
+        event
+        for event in events
+        if event.get("type") == _ledger.LEDGER_EVENT_PROMOTE
+        and event.get("memory_id") == memory_id
+    ]
+    assert len(promotes) == 1

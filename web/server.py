@@ -99,6 +99,7 @@ import os
 import sys
 import threading
 import traceback
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -517,6 +518,10 @@ class ChatState:
             # 第 0 步地基：计时——搜记忆、调模型、存记忆各花多久都记下来，
             # 26 号“慢在哪”才有数。只量时间、不改行为。
             timer = Timer()
+            # 2026-11-19：本轮的 turn_id 在检索之前就生成——强化要按会话记，
+            # 检索发生时这轮的编号必须已经有了；“记住”直存、run_question
+            # 的检索强化、收尾存记忆都用同一个 id。
+            turn_id = uuid.uuid4().hex
             # 25 号：“记住……”先直存（和命令行同一条路），别等下一轮。
             # 直存用 add_memory_text：原文存、记 source="user" 已确认、
             # 自带去重（库里已有就不重复存），不经过提取、不调模型，所以快。
@@ -533,7 +538,7 @@ class ChatState:
                 if content:
                     try:
                         result = self.mem0_store.add_memory_text(
-                            content, source="user"
+                            content, source="user", turn_id=turn_id
                         )
                         remember_stored = bool(result)
                     except Exception:
@@ -547,7 +552,9 @@ class ChatState:
                     with timer.measure("memory_search_ms"):
                         # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
                         # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
-                        memories = self.mem0_store.search(prompt, top_k=5, reinforce=True)
+                        memories = self.mem0_store.search(
+                            prompt, top_k=5, reinforce=True, turn_id=turn_id
+                        )
                     # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
                     # “当前在聊什么”的提示（见 Mem0Store.note_context）。
                     self.mem0_store.note_context(memories)
@@ -574,6 +581,7 @@ class ChatState:
                     task_store=self.task_store,
                     search_service=self.search_service,
                     original_prompt=prompt,
+                    turn_id=turn_id,
                 )
             # run_question 里量的时间（调模型、读摘要）并进本轮的计时。
             for _name, _ms in (outcome.get("timings") or {}).items():
@@ -599,6 +607,10 @@ class ChatState:
                 if waiting_task.get("task_id"):
                     try:
                         waiting_task["history_index"] = len(self.messages)
+                        # 2026-11-19：本轮的编号也存进任务里——确认恢复后
+                        # 收尾存记忆还用这个 id，强化记的“这轮用过”和存
+                        # 进去的那轮是同一轮。
+                        waiting_task["turn_id"] = turn_id
                         self.task_store.save(waiting_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
@@ -638,11 +650,12 @@ class ChatState:
                 skip_memory_save=remember_stored,
                 # 48 号：本轮调过的搜索记录，页面显示在回答下面。
                 searches=outcome.get("searches"),
+                turn_id=turn_id,
             )
 
     def _finish_turn_locked(self, prompt, reply_text, model_name, cost_usd, usage,
                             insert_at=None, timer=None, skip_memory_save=False,
-                            searches=None):
+                            searches=None, turn_id=None):
         """一轮问答答完了的收尾（调用方已拿着锁）：把本轮问答写进历史、
         更新对话摘要、存进长期记忆。返回给页面展示的字典。
         ask() 和 resolve_approval() 共用这一段，保证确认恢复后的那轮
@@ -657,6 +670,9 @@ class ChatState:
         参数 skip_memory_save：25 号——本轮是“记住……”且已经直存进库时
         传 True，收尾跳过 add_turn（这条已经在库里了，再提取会重复存）。
         直存失败时不跳过，走老路。
+        参数 turn_id：本轮的 id（2026-11-19）——ask() 在检索之前就生成、
+        一路传下来；收尾存记忆用这个 id，和强化记的“这轮用过”是同一轮。
+        不传时 save_turn 里现生成一个（老路子）。
         """
         if timer is None:
             timer = Timer()
@@ -735,7 +751,7 @@ class ChatState:
             with timer.measure("memory_save_ms"):
                 # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
                 # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
-                saved = self.mem0_store.save_turn(recent)
+                saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
             if isinstance(saved, dict):
                 correction = saved.get("correction")
         response = {
@@ -847,6 +863,9 @@ class ChatState:
                 if task is None:
                     return {"ok": False, "reason": f"找不到任务：{task_id}。"}
                 task_id = task["task_id"]
+            # 2026-11-19：等确认那轮的编号存在任务里（ask() 存的）——恢复后
+            # 收尾存记忆还用这个 id；老任务没存时 run_question 里现生成一个。
+            turn_id = task.get("turn_id")
             # 45 号：记忆工具要用的记忆库绑到当前上下文——确认后执行
             # 删/改记忆时，网关在这里直接调工具函数，得能读到库；
             # 下面恢复循环时模型可能再调记忆工具，也得绑着。
@@ -873,6 +892,7 @@ class ChatState:
                         resume_task=resolved["task"],
                         user_declined=True,
                         original_prompt=goal,
+                        turn_id=turn_id,
                     )
             else:  # 确认执行了
                 with bound_memory_store(self.mem0_store):
@@ -888,6 +908,7 @@ class ChatState:
                         resume_task=resolved["task"],
                         pending_tool_result=resolved["result"],
                         original_prompt=goal,
+                        turn_id=turn_id,
                     )
             # 第 0 步地基：恢复这轮调模型的时间并进计时，再传给收尾一起记；
             # 停在下一张确认卡上时也记一条日志（第 0 步留的小缺口）。
@@ -903,6 +924,8 @@ class ChatState:
                 if next_task.get("task_id") and next_task.get("history_index") is None:
                     try:
                         next_task["history_index"] = len(self.messages)
+                        if turn_id:
+                            next_task["turn_id"] = turn_id
                         self.task_store.save(next_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
@@ -942,6 +965,7 @@ class ChatState:
                 # 48 号：确认恢复的那轮调过的搜索记录（任务里攒的，确认前
                 # 调过的也在里面），页面显示在回答下面。
                 searches=outcome.get("searches"),
+                turn_id=turn_id,
             )
             response["ok"] = True
             return response
@@ -1035,6 +1059,9 @@ class ChatState:
             if not ok:
                 return {"ok": False, "reason": "任务状态变了，可能已经有人处理过了。"}
             task = current
+            # 2026-11-19：等确认那轮的编号存在任务里（ask() 存的）——恢复后
+            # 收尾存记忆还用这个 id；老任务没存时 run_question 里现生成一个。
+            turn_id = task.get("turn_id")
             goal = task.get("goal") or ""
             # 没存下循环消息的任务（老记录、或存盘时正好断了）：不拿空历史
             # 去问模型（模型会直接报错），按新任务从头跑——原话还在，
@@ -1053,6 +1080,7 @@ class ChatState:
                     search_service=self.search_service,
                     resume_task=resume_task,
                     original_prompt=goal,
+                    turn_id=turn_id,
                 )
             except Exception:
                 # 恢复没跑起来：把任务放回原来的状态，不挂着 RUNNING。
@@ -1072,6 +1100,8 @@ class ChatState:
                 if next_task.get("task_id") and next_task.get("history_index") is None:
                     try:
                         next_task["history_index"] = len(self.messages)
+                        if turn_id:
+                            next_task["turn_id"] = turn_id
                         self.task_store.save(next_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
@@ -1113,6 +1143,7 @@ class ChatState:
                 result.get("cost_usd"),
                 result.get("usage"),
                 timer=timer,
+                turn_id=turn_id,
             )
             # 循环正常收尾会把任务标 COMPLETED；万一还是 RUNNING（比如
             # 恢复的那条路没走到收尾），这里补标一下，别留悬案。
