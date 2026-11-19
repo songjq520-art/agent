@@ -174,6 +174,9 @@ def test_graph_rebuild_from_ledger(tmp_path):
     rebuilt = store._get_graph()
     assert len(rebuilt.edges) == before_edges
     assert len(rebuilt.nodes) == before_nodes
+    # 重建完快照要写盘（2026-11-19 真机教训：之前重建不写盘，
+    # 快照一直没有，服务每次启动都现重建）。
+    assert Path(store.graph_path).exists()
     # 重建后多跳还在。
     scores = rebuilt.ppr(["定投"])
     state = store.ledger_state()
@@ -184,6 +187,25 @@ def test_graph_rebuild_from_ledger(tmp_path):
     assert "万家纳指的基金代码是 019441" in {
         key_to_text.get(key) for key in scores
     }
+
+
+def test_graph_build_from_events_writes_snapshot(tmp_path):
+    """手动重建要写盘：build_graph_from_events(path=...) 跑完，
+    快照文件要在，读回来节点边数一致（2026-11-19 真机回归：
+    笔记本上跑完 34 条、Test-Path 还是 False，就是这处没写盘）。"""
+    events = [
+        {"type": "add", "seq": 1, "key": "k1",
+         "text": "每天定投 5 块钱买万家纳指", "ts": "2026-11-19T00:00:00", "meta": {}},
+        {"type": "add", "seq": 2, "key": "k2",
+         "text": "万家纳指的基金代码是 019441", "ts": "2026-11-19T00:01:00", "meta": {}},
+    ]
+    snapshot = tmp_path / "graph_snapshot.json"
+    graph, info = graph_mod.build_graph_from_events(events, path=str(snapshot))
+    assert info["saved"] is True
+    assert snapshot.exists()
+    reloaded = graph_mod.load_graph(snapshot)
+    assert len(reloaded.nodes) == len(graph.nodes)
+    assert len(reloaded.edges) == len(graph.edges)
 
 
 def test_graph_no_full_text_in_snapshot(tmp_path):

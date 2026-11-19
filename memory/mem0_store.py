@@ -108,6 +108,7 @@ from memory.outbox import MemoryOutbox
 from memory.timeutil import (
     _today,
     _now_iso,
+    _now_epoch,
     _parse_created_at,
     _next_write_seq,
     _NOW_LOCK,
@@ -1524,6 +1525,13 @@ class Mem0Store:
                     events = []
                 try:
                     graph.rebuild_from_events(events)
+                    # 重建完就把快照写盘（2026-11-19 真机教训：之前
+                    # 这里只重建不写盘，快照一直没有，服务每次启动
+                    # 都现重建）。写失败只记日志、不拦路——图是索引。
+                    try:
+                        graph.save()
+                    except Exception:
+                        logger.warning("图快照写盘失败：下次启动再重建。", exc_info=True)
                 except Exception:
                     logger.warning("图从账本重建失败：本次用空图。", exc_info=True)
                     graph = _graph_mod.MemoryGraph(self.graph_path)
@@ -2233,7 +2241,7 @@ class Mem0Store:
                 when_f = float(when)
             except (TypeError, ValueError):
                 continue
-            if when_f >= cutoff:
+            if when_f > cutoff:
                 out[norm] = when_f
         try:
             events, _info = _ledger.read_events(self.ledger_path)
@@ -2255,7 +2263,7 @@ class Mem0Store:
             elif etype == _ledger.LEDGER_EVENT_REVIVE:
                 key_deleted_at.pop(key, None)
         for key, when in key_deleted_at.items():
-            if when < cutoff:
+            if when <= cutoff:
                 continue
             text = key_text.get(key) or ""
             if not text:
@@ -2894,10 +2902,13 @@ class Mem0Store:
                 identity_items.append(detected)
         # created_at：这轮话是什么时候说的——提取复活拦截的分水岭
         # （2026-11-16 拉面）：删在这之后才拦，删在之前的是 BOOS 重新说起，不拦。
+        # 必须走单调的 _now_epoch()，别用 raw datetime.now()：账本删记录的
+        # ts 是 _now_iso()（同一单调源），raw 墙钟在 Windows 粗时钟下会
+        # 落后于它，删在前的事反而显得晚（2026-11-19 全套 flaky 的根子）。
         self._pending_turn = {
             "messages": messages,
             "identity": identity_items,
-            "created_at": datetime.now(timezone.utc).timestamp(),
+            "created_at": _now_epoch(),
         }
 
     def add_turn(self, messages):
@@ -3151,7 +3162,8 @@ class Mem0Store:
                 "identity": identity_items,
                 # created_at：本轮话是什么时候说的——提取复活拦截的分水岭
                 # （2026-11-16 拉面）：删在这之后才拦，删在之前的是 BOOS 重新说起，不拦。
-                "created_at": datetime.now(timezone.utc).timestamp(),
+                # 走单调的 _now_epoch()（见上面那处 _pending_turn 的注释）。
+                "created_at": _now_epoch(),
             }
             out = {
                 "pending": True,
@@ -6505,12 +6517,13 @@ class Mem0Store:
                 key=delete_key,
             )
             # 内存里也记一笔刚删（提取复活拦截的第一道，见
-            # _drop_deleted_text_results；账本是兜底）。
+            # _drop_deleted_text_results；账本是兜底）。时间戳走单调的
+            # _now_epoch()：要和待定轮 created_at、账本 ts 在同一条
+            # 时间线上比先后，raw datetime.now() 在 Windows 粗时钟下
+            # 会落后（2026-11-19 全套 flaky 的根子）。
             norm_old = _normalize_memory_text(old_text)
             if norm_old:
-                self._just_deleted_texts[norm_old] = (
-                    datetime.now(timezone.utc).timestamp()
-                )
+                self._just_deleted_texts[norm_old] = _now_epoch()
             return True
 
     # ---------- 34 号：撤回软删除（能恢复） ----------
@@ -6634,11 +6647,10 @@ class Mem0Store:
                     key=delete_key,
                 )
                 # 内存里也记一笔刚删（提取复活拦截的第一道）。
+                # 时间戳走单调的 _now_epoch()（见上面那处 _just_deleted_texts 的注释）。
                 norm_item = _normalize_memory_text(item.get("text") or "")
                 if norm_item:
-                    self._just_deleted_texts[norm_item] = (
-                        datetime.now(timezone.utc).timestamp()
-                    )
+                    self._just_deleted_texts[norm_item] = _now_epoch()
             return deleted
 
     def restore_memory(self, memory_id):

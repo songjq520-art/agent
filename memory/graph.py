@@ -632,8 +632,15 @@ def load_graph(path):
 def build_graph_from_events(events, path=None):
     """从账本事件建一张新图（重建的入口）。
 
-    返回 (graph, {"nodes", "edges"})。
+    path 给了就把快照写盘（2026-11-19 真机教训：之前这里只建图
+    不写盘，笔记本上跑完 34 条、Test-Path 还是 False，快照一直
+    没有，服务只能每次启动现重建）。写盘失败抛 OSError——手动
+    重建时调用方要看得见；服务里走 _get_graph 那条路，写失败只
+    记日志（见 mem0_store._get_graph）。
+
+    返回 (graph, {"nodes", "edges", "saved"})。
     """
     graph = MemoryGraph(path)
     info = graph.rebuild_from_events(events)
+    info["saved"] = graph.save() if path is not None else False
     return graph, info
