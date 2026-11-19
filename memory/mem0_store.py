@@ -111,6 +111,7 @@ from memory.timeutil import (
     _now_epoch,
     _parse_created_at,
     _next_write_seq,
+    _seed_write_seq,
     _NOW_LOCK,
     _NOW_LAST,
     _WRITE_SEQ_LOCK,
@@ -276,6 +277,10 @@ from memory.decay import (
     decay_should_go_dormant,
     decay_weight,
     promotion_reached,
+    record_seen_occurrence,
+    should_promote,
+    _dump_seen_list,
+    _parse_seen_list,
 )
 
 logger = logging.getLogger("agent")
@@ -919,6 +924,34 @@ class Mem0Store:
             )
             self._memory = self._build_memory()
             self._attach_usage_wrapper()
+        # 写序号持久化（2026-11-19）：_WRITE_SEQ 是进程内自增、重启
+        # 归零，新进程写的序号会比库里已有的小，排序键平局时就分不
+        # 出新旧。启动时扫一遍库里现有的 write_seq，取最大那个当起点
+        # （见 _seed_write_seq_from_store）——之后新写的序号一定比库
+        # 里的大。扫不出来（库空、读失败）就从 0 开始，和以前一样；
+        # 扫失败绝不能把启动搞崩。
+        self._seed_write_seq_from_store()
+
+    def _seed_write_seq_from_store(self):
+        """启动时把写序号抬到库里最大的 write_seq（见 __init__）。
+
+        扫一遍现有记忆的 metadata，取最大的 write_seq 喂给
+        _seed_write_seq（只往上抬）。库空、或读失败时返回 0、不播种，
+        启动照常进行——播种失败绝不能把启动搞崩。
+        返回播种到的最大值（没播种时是 0）。"""
+        try:
+            snapshot = self._snapshot_all()
+        except Exception:
+            logger.warning("写序号播种：读库失败，本次不播种。", exc_info=True)
+            return 0
+        max_seq = 0
+        for item in snapshot or []:
+            seq = ((item or {}).get("metadata") or {}).get("write_seq")
+            if isinstance(seq, int) and not isinstance(seq, bool) and seq > max_seq:
+                max_seq = seq
+        if max_seq:
+            _seed_write_seq(max_seq)
+        return max_seq
 
     def _build_memory(self):
         """建一个真实的 mem0 Memory（DeepSeek + 本地 bge + 本地 Chroma）。
@@ -1017,7 +1050,7 @@ class Mem0Store:
 
     # ---------- 检索（提问前） ----------
 
-    def search(self, query, top_k=5, reinforce=False, include_history=False):
+    def search(self, query, top_k=5, reinforce=False, include_history=False, turn_id=None):
         """搜和问题相关的记忆（语义检索 + 关键词补充信号）。
 
         返回：记忆列表，每项为 {"id", "text", "score", "source",
@@ -1043,6 +1076,9 @@ class Mem0Store:
         没返回的候选一条也不抬。内部检索（纠错找候选、守卫找邻居）
         一律不传，绝不能把“找候选”也算成“用上了”（好几个纠错测试
         都断言了“检索不写回”，见 tests/test_mem0_correction.py）。
+        turn_id（2026-11-19）：提问这轮的 id——强化时记进被用上记忆
+        的会话集合（见 reinforce_memories）；调用方现在还没传，不传
+        时只按日期数。
         投影过滤（最终方案，2026-11-13）：检索回来之后再过筛子——
         被取代的、删了的默认不给（is_history=False 的才是当前记忆）；
         问“以前”时传 include_history=True 才放出来，并标
@@ -1246,6 +1282,7 @@ class Mem0Store:
                         if item.get("id") and not item.get("is_history")
                     ],
                     now=now_dt,
+                    turn_id=turn_id,
                 )
             except Exception:
                 logger.warning("检索强化写回失败：记忆本身还在。", exc_info=True)
@@ -2125,7 +2162,7 @@ class Mem0Store:
             return None
         return {"correction": correction}
 
-    def _extract_and_save_turn(self, safe_messages, extract_since=None):
+    def _extract_and_save_turn(self, safe_messages, extract_since=None, turn_id=None):
         """正常提取保存（add_turn 的老路子，只做这一件事）。
 
         调 mem0.add 提取本轮对话、去重、存入；提取出的记忆里万一
@@ -2173,7 +2210,9 @@ class Mem0Store:
                 "protection_reason": "snapshot_failed",
                 "results": [],
             }
-        metadata = _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
+        metadata = _provenance(
+            SOURCE_INFERRED, CONFIDENCE_INFERRED, False, turn_id=turn_id
+        )
         try:
             result = self._mem0_add(
                 safe_messages,
@@ -2208,7 +2247,7 @@ class Mem0Store:
         # 43 号价值关卡先走（一次判全场，低价值的先清掉），再 46 号去重
         # （对照面是提取前的库 + 本轮已留下的新记忆）。
         result = self._value_gate_extraction_results(result)
-        result = self._dedupe_extraction_results(result, before)
+        result = self._dedupe_extraction_results(result, before, turn_id=turn_id)
         # 27 号：提取出的新记忆里带金额的，把结构化金额字段贴上。
         # 提取时 metadata 是整批共用的、不知道每条写了什么，只能事后
         # 按文本贴；放在去重之后（被删掉的就不用贴了）。
@@ -2354,6 +2393,7 @@ class Mem0Store:
                         "confidence": CONFIDENCE_INFERRED,
                         "user_confirmed": False,
                         "created_at": created_at,
+                        "turn_id": (batch_metadata or {}).get("turn_id"),
                     },
                 )
         except Exception:
@@ -2444,7 +2484,9 @@ class Mem0Store:
             # extract_since：待定轮说话的时间——这轮之后删掉的原文，
             # 提取时拦掉，不再记回来（2026-11-16 拉面）。
             extracted = self._extract_and_save_turn(
-                filtered, extract_since=pending.get("created_at")
+                filtered,
+                extract_since=pending.get("created_at"),
+                turn_id=pending.get("turn_id"),
             )
             results = (extracted or {}).get("results") or []
             # 保护失败的标记要往上传：本轮没写成、或回滚过，调用方
@@ -2506,7 +2548,7 @@ class Mem0Store:
         纠错/撤回的结果要立刻回给页面展示，不能等后台。
         """
         if self._needs_sync_save(messages):
-            return self.add_turn(messages)
+            return self.add_turn(messages, turn_id=turn_id)
         if self._outbox is None:
             self._outbox = MemoryOutbox(self)
             self._outbox.start()
@@ -2876,7 +2918,7 @@ class Mem0Store:
                 }
         return outcomes
 
-    def _pend_correction_remainder(self, safe_messages, latest_user):
+    def _pend_correction_remainder(self, safe_messages, latest_user, turn_id=None):
         """纠正轮里非纠正部分的句子进待定区（Plan C 2 号）。
 
         safe_messages 是本轮及最近几轮的完整消息；把其中最后一条
@@ -2909,9 +2951,10 @@ class Mem0Store:
             "messages": messages,
             "identity": identity_items,
             "created_at": _now_epoch(),
+            "turn_id": turn_id,
         }
 
-    def add_turn(self, messages):
+    def add_turn(self, messages, turn_id=None):
         """把本轮对话存进长期记忆（回答后调一次）。
 
         Plan C（2026-11-09）：本轮不立即存，先放进待定区（_pending_turn），
@@ -2925,6 +2968,9 @@ class Mem0Store:
         其余和以前一样（纠错时带 "correction" 键）。
 
         参数 messages：本轮及最近几轮的消息列表（user/assistant 交替）。
+        参数 turn_id：本轮的 id（save_turn/outbox 传进来）；存进待定区，
+        提交时写进新记忆的 metadata 和账本 add 事件（见
+        _commit_pending_turn）；不传就没有轮次信息，老路子照常走。
         mem0 自己调 DeepSeek 提取（自动存，BOOS 已同意不用确认），
         再去重、存进向量库。整个写入走全局写锁，一次只让一个写，
         防止并发写出重复记忆。
@@ -3090,7 +3136,9 @@ class Mem0Store:
                     # not_found：挑中的那条已经不在库里了（被删了），
                     # 新说法还是他确认过的，直接当新记忆存下来。
                     saved = self.add_memory_text(
-                        pending.get("new_text") or "", source=SOURCE_USER
+                        pending.get("new_text") or "",
+                        source=SOURCE_USER,
+                        turn_id=turn_id,
                     )
                     if isinstance(saved, dict):
                         saved = dict(saved)
@@ -3109,14 +3157,16 @@ class Mem0Store:
                 if handled is not None:
                     # 2 号：纠正那一轮里别的句子别丢——去掉纠错句，
                     # 剩下的按正常轮次进待定区，下一轮正常存。
-                    self._pend_correction_remainder(safe_messages, latest_user)
+                    self._pend_correction_remainder(
+                        safe_messages, latest_user, turn_id=turn_id
+                    )
                     # 上一轮提交的保护失败不能丢在半路：纠错结果里
                     # 没有保护字段，上一轮的才补进来；只填空、不覆盖。
                     _carry_protection_fields(committed, handled)
                     return handled
                 # not_found：库里没有冲突的旧记忆——新说法当成一条新记忆，
                 # 走正常提取保存（下面），结果里附上这次纠错的尝试记录。
-                normal = self._extract_and_save_turn(safe_messages)
+                normal = self._extract_and_save_turn(safe_messages, turn_id=turn_id)
                 if isinstance(normal, dict):
                     normal = dict(normal)
                     normal["correction"] = _correction_result(outcome)
@@ -3164,6 +3214,7 @@ class Mem0Store:
                 # （2026-11-16 拉面）：删在这之后才拦，删在之前的是 BOOS 重新说起，不拦。
                 # 走单调的 _now_epoch()（见上面那处 _pending_turn 的注释）。
                 "created_at": _now_epoch(),
+                "turn_id": turn_id,
             }
             out = {
                 "pending": True,
@@ -3903,17 +3954,19 @@ class Mem0Store:
     # dormant）：账本是家，索引上的标记也要在账本里留痕，记账失败
     # 不拦路（记忆本身的标记已经写回去了）。
 
-    def _decay_touch(self, memory_id, now=None, record_occurrence=False):
+    def _decay_touch(self, memory_id, now=None, record_occurrence=False, turn_id=None):
         """用上了一条记忆：刷新 last_used_at，顺带把沉底态唤醒回原话态。
 
         沉底态的唤醒：decay_state 从 dormant 回到 verbatim，清掉
         decay_dormant_at；文本从没动过，不用从备份里恢复原话。
         被用上也顺带清掉 decay_delete_due（用上了就不在待删之列）。
         核心记忆不写回：权重恒为 1，也不会被月扫收起来，没什么可刷新的。
-        record_occurrence=True 时再记一笔“不同天出现”：今天和上次
-        被提到的日期不同才加数（一次聊天里说 3 遍不算）；够 3 个不同天，
-        一次性经历就晋升成稳定事实（kind 改 stable，衰减变慢；
+        record_occurrence=True 时再记一笔“出现”：日期和会话各记一个
+        集合（见 decay.record_seen_occurrence）——同一轮里说 3 遍只算
+        一次，新日期且新会话才 +1，跨午夜但同一轮不算；两个集合都够
+        3 个，一次性经历就晋升成稳定事实（kind 改 stable，衰减变慢；
         importance 不动——晋升是“沉得慢一点”，不是变成核心）。
+        turn_id 是这轮的 id（调用方传进来）；没传时只按日期数（老路子）。
         只在去重已经判了“是同一件事”之后调（先标冲突、再强化）。
         返回 {"ok", "restored", "promoted"}；写回失败返回 ok=False，
         不抛异常（记忆本身还在，只是这次没刷新时间）。"""
@@ -3937,15 +3990,36 @@ class Mem0Store:
         metadata.pop("decay_delete_due", None)
         promoted = False
         if record_occurrence:
-            last_seen = metadata.get("decay_last_seen_day")
-            seen = metadata.get("decay_seen_days")
-            if not isinstance(seen, int) or isinstance(seen, bool):
-                seen = 0
-            if last_seen != today:
-                seen = seen + 1 if seen else 1
-                metadata["decay_seen_days"] = seen
+            # 出现集合（2026-11-19）：日期和会话各记一个集合，晋升要
+            # 两个都够 3（见 decay.should_promote）。老记忆没有这两个
+            # 集合时，从 decay_last_seen_day 起步——只有最后一次被提到
+            # 的日期可考，算 1 个日期；会话一个也不可考，从空起步。
+            old_dates = _parse_seen_list(metadata.get("decay_seen_dates"))
+            if not old_dates:
+                _last_seen_day = metadata.get("decay_last_seen_day")
+                if isinstance(_last_seen_day, str) and _last_seen_day:
+                    old_dates = [_last_seen_day]
+            old_sessions = _parse_seen_list(metadata.get("decay_seen_sessions"))
+            old_seen = metadata.get("decay_seen_days")
+            if not isinstance(old_seen, int) or isinstance(old_seen, bool):
+                old_seen = 0
+            new_dates, new_sessions, date_added = record_seen_occurrence(
+                old_dates, old_sessions, today, turn_id
+            )
+            metadata["decay_seen_dates"] = _dump_seen_list(new_dates)
+            metadata["decay_seen_sessions"] = _dump_seen_list(new_sessions)
+            if date_added:
+                # 老字段跟着集合走：不同天数就是日期集合的大小；老记忆
+                # 以前数出来的天数比集合大时，按大的留（不往回降）。
+                metadata["decay_seen_days"] = max(old_seen, len(new_dates))
                 metadata["decay_last_seen_day"] = today
-                if meta["decay_kind"] == DECAY_KIND_EPISODIC and promotion_reached(seen):
+            if meta["decay_kind"] == DECAY_KIND_EPISODIC:
+                if should_promote(new_dates, new_sessions):
+                    metadata["decay_kind"] = DECAY_KIND_STABLE
+                    promoted = True
+                elif not new_sessions and promotion_reached(len(new_dates)):
+                    # 没会话信息可考的老路子（老记忆、没传 turn_id 的
+                    # 调用）：只按不同天数晋升，老行为不变。
                     metadata["decay_kind"] = DECAY_KIND_STABLE
                     promoted = True
         try:
@@ -3959,10 +4033,13 @@ class Mem0Store:
             self._ledger_append(_ledger.LEDGER_EVENT_PROMOTE, memory_id=memory_id)
         return {"ok": True, "restored": restored, "promoted": promoted}
 
-    def reinforce_memories(self, memory_ids, now=None):
+    def reinforce_memories(self, memory_ids, now=None, turn_id=None):
         """把检索里真正用上的几条记忆强化一次（只强化传进来的这几条，
         不抬整个候选池——search(reinforce=True) 传的是返回结果的 id）。
         沉底态的被用上就回到原话态（见 _decay_touch）。核心记忆不写回。
+        强化也记一笔“出现”（见 _decay_touch 的 record_occurrence）：
+        被拼进回答就是一次出现，日期和会话都记进集合。turn_id 是提问
+        这轮的 id（search 传进来）；没传时只按日期数。
         返回 {"reinforced", "restored", "failed"}；写回失败只记在 failed
         里，不抛异常。"""
         reinforced = []
@@ -3980,13 +4057,16 @@ class Mem0Store:
                 failed.append(memory_id)
         return {"reinforced": reinforced, "restored": restored, "failed": failed}
 
-    def _record_decay_occurrence(self, memory_id, now=None):
-        """同一件事又被提到一次：记一笔“不同天出现”，够 3 次不同天就晋升。
-        调用点都在去重返回“重复”之后——裁决已经说了这是同一件事、
-        不是冲突（先标冲突、再强化，坑 2 的定法）。同一天重复提不加数。
+    def _record_decay_occurrence(self, memory_id, now=None, turn_id=None):
+        """同一件事又被提到一次：记一笔“出现”，够 3 个不同天且 3 个
+        不同会话就晋升。调用点都在去重返回“重复”之后——裁决已经说了
+        这是同一件事、不是冲突（先标冲突、再强化，坑 2 的定法）。
+        turn_id 是这轮的 id（调用方传进来）；没传时只按日期数（老路子）。
         返回 True（记上了）或 False（记失败，记忆本身还在）。"""
         try:
-            outcome = self._decay_touch(memory_id, now=now, record_occurrence=True)
+            outcome = self._decay_touch(
+                memory_id, now=now, record_occurrence=True, turn_id=turn_id
+            )
             return bool(outcome["ok"])
         except Exception:
             logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
@@ -4185,7 +4265,7 @@ class Mem0Store:
             "errors": errors,
         }
 
-    def _dedupe_extraction_results(self, results, before_items):
+    def _dedupe_extraction_results(self, results, before_items, turn_id=None):
         """提取路径去重（46 号）：新提取的记忆里，库里已有同一件事的删掉。
 
         顺序：先精确匹配（完全相同），再近似匹配（向量预筛 + 模型判同一件事）。
@@ -4279,7 +4359,9 @@ class Mem0Store:
                     # 第二步衰减：同一件事又出现一次，记一笔“不同天出现”
                     # （裁决已经说了这是重复、不是冲突——先标冲突、再强化）。
                     try:
-                        self._record_decay_occurrence(canonical.get("id"))
+                        self._record_decay_occurrence(
+                            canonical.get("id"), turn_id=turn_id
+                        )
                     except Exception:
                         logger.warning(
                             "衰减出现次数写回失败：记忆本身还在。", exc_info=True
@@ -4330,7 +4412,7 @@ class Mem0Store:
         or_raise=True 时写失败就抛——“先写账本再写索引”的那一步
         （add_memory_text）；否则写失败只记日志、不拦路（种子、
         规则、纠正后的新说法这类“索引里已经有了”的补记）。
-        meta 只放标量字段（来源/置信度/是否确认/时间/写序号/槽位/
+        meta 只放标量字段（来源/置信度/是否确认/时间/写序号/轮次/槽位/
         是否规则/衰减种类/重要性），和 add 事件的档案格式一致。
         返回记好的事件，写失败返回 None（or_raise 时抛异常）。
         图谱推理第一期：add 事件落盘后，顺手把这条记忆接进图
@@ -4349,6 +4431,7 @@ class Mem0Store:
                     "user_confirmed": meta.get("user_confirmed"),
                     "created_at": meta.get("created_at"),
                     "write_seq": meta.get("write_seq"),
+                    "turn_id": meta.get("turn_id"),
                     "slot": meta.get("slot"),
                     "is_rule": meta.get("is_rule", False),
                     "decay_kind": meta.get("decay_kind"),
@@ -4366,6 +4449,7 @@ class Mem0Store:
                     "user_confirmed": meta.get("user_confirmed"),
                     "created_at": meta.get("created_at"),
                     "write_seq": meta.get("write_seq"),
+                    "turn_id": meta.get("turn_id"),
                     "slot": meta.get("slot"),
                     "is_rule": meta.get("is_rule", False),
                     "decay_kind": meta.get("decay_kind"),
@@ -4571,10 +4655,12 @@ class Mem0Store:
             "consensus": False,
         }
 
-    def add_memory_text(self, text, layers=None, source="user"):
+    def add_memory_text(self, text, layers=None, source="user", turn_id=None):
         """手动存一条记忆原文（CLI“记住：内容”用，不经过提取）。
 
         参数 text：记忆内容原文；layers：保留给以后用；
+        turn_id：这条记忆是哪一轮里写进去的（add_turn 传进来）；
+        手动存的没有轮次，不传。
         source：这条记忆的来源，默认 "user"——CLI“记住”是 BOOS
         亲口让记住的，所以记 source="user"、user_confirmed=True、
         confidence=1.0，并把这份 metadata 传给 mem0.add（以前这里
@@ -4719,6 +4805,7 @@ class Mem0Store:
                 verification_status=verification_status,
                 requires_confirmation=requires_confirmation,
                 expires_at=expires_at,
+                turn_id=turn_id,
             )
             # 先写账本、再写索引（最终方案）：账本是家，mem0 只是索引。
             # 账本写不进去时这次不写索引、返回 {}——写记忆失败不能把

@@ -89,7 +89,7 @@ class _RaisingStore:
     def __init__(self):
         self.calls = 0
 
-    def add_turn(self, messages):
+    def add_turn(self, messages, turn_id=None):
         self.calls += 1
         raise RuntimeError("模拟后台存记忆一直失败")
 
@@ -99,9 +99,11 @@ class _RecordingStore:
 
     def __init__(self):
         self.calls = 0
+        self.last_turn_id = None
 
-    def add_turn(self, messages):
+    def add_turn(self, messages, turn_id=None):
         self.calls += 1
+        self.last_turn_id = turn_id
         return {"pending": True, "results": []}
 
 
@@ -132,6 +134,7 @@ def test_52_outbox_success_reports_committed(tmp_path):
     assert outbox.turn_status(turn_id) == "committed"
     assert outbox.failed_turns() == []
     assert store.calls == 1
+    assert store.last_turn_id == turn_id
     outbox.stop()
 
 

@@ -3,7 +3,7 @@
 
 import re
 from datetime import datetime, timezone
-from memory.decay import DECAY_KIND_EPISODIC, DECAY_KIND_STABLE, DECAY_STATE_DORMANT, DECAY_STATE_VERBATIM, classify_decay_kind
+from memory.decay import DECAY_KIND_EPISODIC, DECAY_KIND_STABLE, DECAY_STATE_DORMANT, DECAY_STATE_VERBATIM, _dump_seen_list, _parse_seen_list, classify_decay_kind
 from memory.money_slots import KNOWN_SLOTS, _MONEY_UNSET, _flatten_money, _normalize_money_metadata
 from memory.timeutil import _next_write_seq, _now_iso, _parse_created_at
 
@@ -16,6 +16,8 @@ from memory.timeutil import _next_write_seq, _now_iso, _parse_created_at
 #           固定 6 位小数、带 Z——见 _now_iso）。
 #   write_seq：同一批写进去的序号（进程内严格递增，和 created_at 一起
 #           排新旧，见 _memory_order_key）。
+#   turn_id：这条记忆是哪一轮对话里写进去的（2026-11-19，save_turn /
+#           add_turn 传进来）；没轮次的老路子没有这个字段。
 #   created_at_source：这个时间是哪来的——"written"（这次写进去的）、
 #           "backfilled"（老记忆后补的，见 backfill_timestamps）、
 #           "migrated"（迁移时沿用的旧日期，见 migrate_from_v1）。
@@ -33,6 +35,9 @@ from memory.timeutil import _next_write_seq, _now_iso, _parse_created_at
 #           和用得多不多分开算）、last_used_at（最后一次用上的时间，
 #           写时就是现在）、decay_seen_days（不同天被提到的天数，写时
 #           记 1）、decay_last_seen_day（上次被提到的日期 YYYY-MM-DD）、
+#           decay_seen_dates（出现过的自然日集合，JSON 字符串，写时记
+#           今天）、decay_seen_sessions（出现过的轮次 turn_id 集合，
+#           JSON 字符串，写时记这轮）、
 #           decay_state（verbatim 原话 / dormant 沉底——30 天没人找
 #           只打标，原话和向量文本都不动）、
 #           decay_delete_due（月扫标的“满半年没人找、等 BOOS 亲口说删”，
@@ -70,7 +75,8 @@ CREATED_AT_SOURCES = ("written", "backfilled", "migrated")
 def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
                 created_at_source="written", is_rule=False, money=_MONEY_UNSET,
                 verification_status=None, requires_confirmation=False,
-                expires_at=None, conflict_for_review=False, needs_review=False):
+                expires_at=None, conflict_for_review=False, needs_review=False,
+                turn_id=None):
     """拼一份来源元数据（存记忆时传给 mem0.add 的 metadata 参数）。
 
     source 不是 "user" 时一律按 "inferred" 存（调用方传错也不让它
@@ -100,6 +106,8 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
     needs_review 是模型裁决把握不够（confidence <0.80 或判失败），
     等兜底清理时再看。都是 True 才写进 metadata。
     每次调都新拿一个 write_seq（同一批里的先后靠它分）。
+    turn_id（2026-11-19）：这轮对话的 id，传了就写进 metadata（没传
+    不记）；出现集合写时就算一次——今天进日期集合、这轮进会话集合。
     """
     source = SOURCE_USER if source == SOURCE_USER else SOURCE_INFERRED
     if created_at_source not in CREATED_AT_SOURCES:
@@ -112,6 +120,12 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
         "confidence": confidence,
         "user_confirmed": bool(user_confirmed) and source == SOURCE_USER,
     }
+    # turn_id（2026-11-19）：这条记忆是哪一轮对话里写进去的——
+    # save_turn/add_turn 传进来，账本 add 事件和这里都记同一份
+    # （见 mem0_store._ledger_record_add / _ledger_extraction_adds）。
+    # 没传就不记（老路子、手动存的没有轮次）。
+    if isinstance(turn_id, str) and turn_id:
+        metadata["turn_id"] = turn_id
     # 第二步衰减：新记忆自带衰减字段（见 memory/decay.py 的 DECAY 常量注释）。
     # kind 按“核心 / BOOS 亲口说的 / 模型提取的”分，不猜关键词——
     # 核心（已确认、带槽位、规则）记 stable；BOOS 亲口说的稳定事实/
@@ -130,7 +144,14 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
     metadata["importance"] = "high" if _decay_core else "normal"
     metadata["last_used_at"] = _now_iso()
     metadata["decay_seen_days"] = 1
-    metadata["decay_last_seen_day"] = datetime.now(timezone.utc).date().isoformat()
+    _seen_day = datetime.now(timezone.utc).date().isoformat()
+    metadata["decay_last_seen_day"] = _seen_day
+    # 出现集合（2026-11-19）：写时就算出现过一次——今天进日期集合，
+    # 这轮（有就记）进会话集合。存 JSON 字符串（Chroma 不接受 list 值）。
+    metadata["decay_seen_dates"] = _dump_seen_list([_seen_day])
+    metadata["decay_seen_sessions"] = _dump_seen_list(
+        [turn_id] if isinstance(turn_id, str) and turn_id else []
+    )
     metadata["decay_state"] = DECAY_STATE_VERBATIM
     if slot in KNOWN_SLOTS:
         metadata["slot"] = slot
@@ -182,10 +203,11 @@ def _normalize_metadata(raw, item=None):
     顶层找——metadata 里的优先，顶层是兜底。没传 item 时只看 metadata，
     行为和以前一样。
     返回：{"source", "created_at", "created_at_source", "write_seq",
-           "confidence", "user_confirmed", "confirmed", "slot",
+           "turn_id", "confidence", "user_confirmed", "confirmed", "slot",
            "pending_confirmation", "is_rule", "money",
            "decay_kind", "importance", "last_used_at", "decay_seen_days",
-           "decay_last_seen_day", "decay_state", "decay_delete_due",
+           "decay_last_seen_day", "decay_seen_dates", "decay_seen_sessions",
+           "decay_state", "decay_delete_due",
            "superseded"}，其中 confirmed
     就是 user_confirmed（取了个短名字，方便调用方判断“能不能当作事实用”）。
     衰减字段（第二步）：只认合法值，别的按缺失处理；老记忆没有这些
@@ -195,6 +217,7 @@ def _normalize_metadata(raw, item=None):
     created_at = None
     created_at_source = None
     write_seq = None
+    turn_id = None
     confidence = None
     user_confirmed = False
     slot = None
@@ -220,6 +243,9 @@ def _normalize_metadata(raw, item=None):
         raw_seq = raw.get("write_seq")
         if isinstance(raw_seq, int) and not isinstance(raw_seq, bool):
             write_seq = raw_seq
+        raw_turn = raw.get("turn_id")
+        if isinstance(raw_turn, str) and raw_turn:
+            turn_id = raw_turn
         raw_conf = raw.get("confidence")
         if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool):
             if 0 <= raw_conf <= 1:
@@ -266,6 +292,8 @@ def _normalize_metadata(raw, item=None):
     last_used_at = None
     decay_seen_days = None
     decay_last_seen_day = None
+    decay_seen_dates = []
+    decay_seen_sessions = []
     decay_state = DECAY_STATE_VERBATIM
     decay_delete_due = False
     superseded = False
@@ -287,6 +315,10 @@ def _normalize_metadata(raw, item=None):
             r"\d{4}-\d{2}-\d{2}", raw_seen_day
         ):
             decay_last_seen_day = raw_seen_day
+        # 出现集合（2026-11-19）：库里是 JSON 字符串，规整后是列表；
+        # 规整过的再规整（快照比对那条路）传进来的已经是列表，也认。
+        decay_seen_dates = _parse_seen_list(raw.get("decay_seen_dates"))
+        decay_seen_sessions = _parse_seen_list(raw.get("decay_seen_sessions"))
         raw_state = raw.get("decay_state")
         if raw_state in (DECAY_STATE_VERBATIM, DECAY_STATE_DORMANT):
             decay_state = raw_state
@@ -315,6 +347,7 @@ def _normalize_metadata(raw, item=None):
         "created_at": created_at,
         "created_at_source": created_at_source,
         "write_seq": write_seq,
+        "turn_id": turn_id,
         "confidence": confidence,
         "user_confirmed": user_confirmed,
         "confirmed": user_confirmed,
@@ -333,6 +366,8 @@ def _normalize_metadata(raw, item=None):
         "last_used_at": last_used_at,
         "decay_seen_days": decay_seen_days,
         "decay_last_seen_day": decay_last_seen_day,
+        "decay_seen_dates": decay_seen_dates,
+        "decay_seen_sessions": decay_seen_sessions,
         "decay_state": decay_state,
         "decay_delete_due": decay_delete_due,
         "superseded": superseded,
@@ -351,14 +386,21 @@ def _metadata_for_store(metadata):
     回字典形，来回不丢东西。别的字段本来就是标量，原样留着。
     money 不是字典时（没有金额）直接去掉这个键；形状坏了的字典展平后
     是四个 None（见 _flatten_money），不清掉旧字段、不把坏形状往库里写。
-    不改传进来的字典，返回一份新的。只管 money 这一个已知的 dict 字段——
-    规整后的 metadata 里别的字段都是标量；万一以后多出别的 dict 字段，
+    不改传进来的字典，返回一份新的。只管 money 这一个已知的 dict 字段、
+    和 decay_seen_dates / decay_seen_sessions 这两个已知的 list 字段——
+    规整后的 metadata 里别的字段都是标量；万一以后多出别的 dict/list 字段，
     Chroma 照常会拒收、调用方的 except 会记日志，不在这里悄悄吞掉。
     """
     meta = dict(metadata or {})
     money = meta.pop("money", None)
     if isinstance(money, dict):
         meta.update(_flatten_money(money))
+    # 出现集合（2026-11-19）：规整后是列表，写回 Chroma 前要变回
+    # JSON 字符串——和 money 一个道理，list 值直接传 Chroma 拒收
+    # （恢复旧记忆那条路走这里，丢了集合就对不上快照）。
+    for key in ("decay_seen_dates", "decay_seen_sessions"):
+        if isinstance(meta.get(key), list):
+            meta[key] = _dump_seen_list(meta[key])
     return meta
 
 

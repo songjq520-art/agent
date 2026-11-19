@@ -177,7 +177,7 @@ class MemoryOutbox:
         raised = None
         for attempt in range(1, self._SAVE_RETRIES + 1):
             try:
-                outcome = self._store.add_turn(messages)
+                outcome = self._store.add_turn(messages, turn_id=turn_id)
                 break
             except Exception as exc:  # noqa: BLE001 - 重试完还失败才记失败清单
                 raised = exc
