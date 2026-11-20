@@ -1,6 +1,7 @@
 # memory/provenance.py（来源与可信度：元数据、来源分层、冲突裁决）
 # 从 memory/mem0_store.py 拆出来，行为不变。
 
+import json
 import re
 from datetime import datetime, timezone
 from memory.decay import DECAY_KIND_EPISODIC, DECAY_KIND_STABLE, DECAY_STATE_DORMANT, DECAY_STATE_VERBATIM, _dump_seen_list, _parse_seen_list, classify_decay_kind
@@ -454,6 +455,33 @@ def _metadata_for_store(metadata):
         if isinstance(meta.get(key), list):
             meta[key] = _dump_seen_list(meta[key])
     return meta
+
+
+def _clean_chroma_metadata(metadata):
+    """把一份 metadata 洗成 Chroma 能接受的形状（Bug 4①，2026-11-20）。
+
+    Chroma 只接受标量值（str/int/float/bool）：None、list、dict 直通
+    会在底层被拒收（ValueError），而 _mem0_add 的回退只接 TypeError、
+    接不住——入口清洗才是主防线，回退补调 update 只是第二道保险。
+    洗法：先走 _metadata_for_store（money 字典拍平、两个出现集合变
+    JSON 字符串），再剔掉值为 None 的键、把剩下的 list/dict 变 JSON
+    字符串、其他非标量值变 str。不改传进来的字典，返回一份新的。
+    不是字典时原样返回（调用方自己处理）。
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+    meta = _metadata_for_store(metadata)
+    out = {}
+    for key, value in meta.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            out[key] = value
+        elif isinstance(value, (dict, list)):
+            out[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            out[key] = str(value)
+    return out
 
 
 # ---------- 时间戳 + 覆盖规则（第一步，2026-11-10） ----------

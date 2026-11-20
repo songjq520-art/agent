@@ -155,6 +155,7 @@ from memory.provenance import (
     _provenance,
     _normalize_metadata,
     _metadata_for_store,
+    _clean_chroma_metadata,
     _credibility_rank,
     _is_core_memory,
     _should_be_curated,
@@ -2439,6 +2440,10 @@ class Mem0Store:
         正常调用方都走 _provenance，本来就有时间，这只是兜底。
         """
         if isinstance(metadata, dict):
+            # Bug 4①（2026-11-20）：入口清洗——Chroma 只接受标量值，
+            # None / list / dict 直通会在底层被拒收（ValueError），而
+            # 下面的回退只接 TypeError，接不住；清洗才是主防线。
+            metadata = _clean_chroma_metadata(metadata)
             created = metadata.get("created_at")
             if not (isinstance(created, str) and created):
                 metadata = dict(metadata)
@@ -2452,7 +2457,37 @@ class Mem0Store:
             if "metadata" not in str(exc):
                 raise
             logger.warning("底层 add 不支持 metadata 参数：本次记忆没带来源信息。")
-            return self._memory.add(messages, user_id=user_id, infer=infer)
+            result = self._memory.add(messages, user_id=user_id, infer=infer)
+            # 第二道保险：回退存下的新记忆，补写一份清洗过的 metadata——
+            # 只补本次新存的（event == "ADD"），不碰 mem0 判定更新的旧条
+            # （它的来源不能被这次的推断来源盖掉）。补写失败只记日志，
+            # 记忆本身还在，只没带来源信息。
+            try:
+                clean_meta = (
+                    _clean_chroma_metadata(metadata)
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if clean_meta:
+                    for _item in (result or {}).get("results") or []:
+                        if (_item or {}).get("event") != "ADD":
+                            continue
+                        _mid = (_item or {}).get("id")
+                        if not _mid:
+                            continue
+                        try:
+                            self._memory.update(
+                                memory_id=_mid, metadata=clean_meta
+                            )
+                        except Exception:
+                            logger.warning(
+                                "回退后补写 metadata 失败：记忆 %s 没带来源信息。",
+                                _mid,
+                                exc_info=True,
+                            )
+            except Exception:
+                logger.warning("回退后补写 metadata 失败。", exc_info=True)
+            return result
 
     # ---------- 聊天纠错接线（“你记错了”走 correct_memory） ----------
     # 背景：correct_memory() 本身能改，但聊天里说“你记错了”时没人调它——

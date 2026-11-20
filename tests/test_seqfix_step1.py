@@ -218,3 +218,109 @@ def test_bug6_fallback_candidates_from_context_and_slot(tmp_path):
         cand["id"] == coffee_id and cand["source"] == "slot"
         for cand in slot_cands
     ), slot_cands
+
+
+# ---------- Bug 4①：元数据入口清洗（_clean_chroma_metadata） ----------
+
+
+def test_bug4a_clean_chroma_metadata_drops_none_and_flattens(tmp_path):
+    """Bug 4①（清洗函数本身）：None 剔掉、list/dict 变 JSON 字符串、
+    money 字典拍平——洗完只剩 Chroma 接受的标量值。"""
+    from memory.provenance import _clean_chroma_metadata
+
+    cleaned = _clean_chroma_metadata({
+        "source": "user",
+        "turn_id": None,
+        "slot": None,
+        "money": {
+            "amount": 5,
+            "currency": "CNY",
+            "period": "day",
+            "target": "万家纳指",
+        },
+        "decay_seen_dates": ["2026-11-20"],
+        "custom_list": [1, 2],
+        "custom_dict": {"a": 1},
+        "confidence": 0.7,
+        "flag": True,
+    })
+    assert cleaned["source"] == "user"
+    assert "turn_id" not in cleaned and "slot" not in cleaned
+    assert cleaned["money_amount"] == 5
+    assert cleaned["money_target"] == "万家纳指"
+    assert isinstance(cleaned["decay_seen_dates"], str)
+    assert isinstance(cleaned["custom_list"], str)
+    assert isinstance(cleaned["custom_dict"], str)
+    assert cleaned["confidence"] == 0.7
+    assert cleaned["flag"] is True
+    assert all(
+        isinstance(value, (str, int, float, bool))
+        for value in cleaned.values()
+    )
+
+
+def test_bug4a_mem0_add_cleans_none_metadata(tmp_path):
+    """Bug 4①（入口）：_mem0_add 之前先洗——底层收到的 metadata 里
+    没有 None、没有 list/dict（对账重建那条路传进来的 turn_id/slot
+    经常是 None）。"""
+    from conftest import FakeMemory
+
+    class _RecordingFakeMemory(FakeMemory):
+        def __init__(self):
+            super().__init__()
+            self.seen_metadata = []
+
+        def add(self, messages, user_id=None, infer=True, metadata=None):
+            self.seen_metadata.append(metadata)
+            return super().add(
+                messages, user_id=user_id, infer=infer, metadata=metadata
+            )
+
+    mem = _RecordingFakeMemory()
+    store = make_fake_store(tmp_path, memory=mem)
+    store._mem0_add(
+        [{"role": "user", "content": "我喜欢喝茶"}],
+        store.user_id,
+        False,
+        {"source": "user", "turn_id": None, "slot": None, "custom": [1]},
+    )
+    assert mem.seen_metadata
+    got = mem.seen_metadata[0]
+    assert got is not None
+    assert "turn_id" not in got and "slot" not in got
+    assert all(
+        isinstance(value, (str, int, float, bool)) for value in got.values()
+    )
+
+
+def test_bug4a_mem0_add_fallback_rewrites_clean_metadata(tmp_path):
+    """Bug 4①（第二道保险）：底层不支持 metadata 时回退重存，随后把
+    清洗过的 metadata 补写回去——新记忆不丢来源（write_seq 还在）。"""
+    from conftest import FakeMemory
+    from memory.mem0_store import (
+        _provenance,
+        CONFIDENCE_USER,
+        SOURCE_USER,
+    )
+
+    class _NoMetadataFakeMemory(FakeMemory):
+        def add(self, messages, user_id=None, infer=True, metadata=None):
+            if metadata is not None:
+                raise TypeError(
+                    "add() got an unexpected keyword argument 'metadata'"
+                )
+            return super().add(
+                messages, user_id=user_id, infer=infer, metadata=None
+            )
+
+    mem = _NoMetadataFakeMemory()
+    store = make_fake_store(tmp_path, memory=mem)
+    store._add_text_with_metadata(
+        "我喜欢喝茶",
+        _provenance(SOURCE_USER, CONFIDENCE_USER, True),
+    )
+    stored = store.get_all()
+    assert [item["text"] for item in stored] == ["我喜欢喝茶"]
+    meta = stored[0]["metadata"]
+    assert meta["source"] == "user"
+    assert isinstance(meta.get("write_seq"), int)
