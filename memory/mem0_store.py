@@ -2922,6 +2922,24 @@ class Mem0Store:
         except Exception:
             logger.warning("提交待定记忆后改回执失败：turn_id=%s。", tid, exc_info=True)
 
+    def _drop_retracted_outbox_turn(self, pending):
+        """撤回：删掉待定轮的 outbox 落盘文件（Bug 5，2026-11-20）。
+
+        只清内存待定区不够：那轮早经 save_turn 写盘了，盘文件一直
+        留着（_save_one 只在真正落库时才删），重启后 recover_pending
+        会把它捞回来重存——已撤回的内容就被悄悄存回去了。所以撤回
+        分支里同步删盘。回执标 dropped（不是 committed：这轮根本没
+        提交，标 committed 是撒谎，见 outbox.mark_dropped）。
+        outbox 不存在（直接调 add_turn 的测试）时什么都不做。
+        """
+        tid = (pending or {}).get("turn_id")
+        if not tid or self._outbox is None:
+            return
+        try:
+            self._outbox.mark_dropped(tid)
+        except Exception:
+            logger.warning("撤回后删发件箱文件失败：turn_id=%s。", tid, exc_info=True)
+
     def _commit_pending_turn(self):
         """提交待定区里上一轮对话（Plan C 闸门 3）。
 
@@ -3587,6 +3605,9 @@ class Mem0Store:
             if bare_retraction and pending is not None and not assistant_asked:
                 self._pending_turn = None
                 self._pending_correction = None
+                # Bug 5：待定轮的 outbox 落盘文件也删掉，不然重启后
+                # recover_pending 会把它捞回来重存。
+                self._drop_retracted_outbox_turn(pending)
                 # 34 号：撤回这句本身也别留给以后提取——把它记成已处理，
                 # 否则下一轮提交滑动窗口时，“不不不”这类撤回句会被当成
                 # 新事实提出来（鸡杂面那次就是撤回句被存成了第二条记忆）。
@@ -3643,6 +3664,8 @@ class Mem0Store:
                                 if (m or {}).get("role") == "user"
                             )
                             self._pending_turn = None
+                            # Bug 5：同上，删盘。
+                            self._drop_retracted_outbox_turn(pending)
                         self._pending_correction = None
                         # 34 号：撤回这句本身也别留给以后提取——把它记成
                         # 已处理，否则下一轮提交滑动窗口时，撤回句

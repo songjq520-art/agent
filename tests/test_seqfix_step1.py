@@ -36,3 +36,63 @@ def test_bug1_project_and_filter_drops_voided_even_with_history():
     out = project_and_filter(normal, state)
     assert len(out) == 1
     assert out[0]["is_history"] is False
+
+
+# ---------- Bug 5：撤回要删掉 outbox 落盘文件 ----------
+
+
+def _bug5_parked_turn(store, tmp_path, turn_id="turn-1"):
+    """先让一轮经 outbox 写盘、再进待定区（文件还留着）：复现撤回前
+    的状态。返回 (outbox, pending_dir)。"""
+    from memory.outbox import MemoryOutbox
+
+    pending_dir = tmp_path / "outbox_pending"
+    outbox = MemoryOutbox(store, pending_dir=pending_dir)
+    store._outbox = outbox
+    messages = [
+        {"role": "user", "content": "我喜欢吃拉面。"},
+        {"role": "assistant", "content": "记下了。"},
+    ]
+    outbox.submit(messages, turn_id=turn_id)
+    assert (pending_dir / f"{turn_id}.json").exists()
+    # 后台存一遍：只进待定区（pending），文件还留着（没真正落库）。
+    outbox._save_one(turn_id, messages)
+    assert outbox.turn_status(turn_id) == "pending"
+    assert (pending_dir / f"{turn_id}.json").exists()
+    return outbox, pending_dir
+
+
+def test_bug5_bare_retraction_drops_outbox_file(tmp_path):
+    """Bug 5：光秃秃撤回（“不不不。”）时，待定轮的 outbox 落盘文件
+    必须删掉——否则重启后 recover_pending 会把它捞回来重存，
+    已撤回的内容就被悄悄存回去了。回执标 dropped，不是 committed。"""
+    from memory.outbox import MemoryOutbox
+
+    store = make_fake_store(tmp_path)
+    outbox, pending_dir = _bug5_parked_turn(store, tmp_path)
+    result = store.add_turn([
+        {"role": "user", "content": "不不不。"},
+        {"role": "assistant", "content": "好的，不算。"},
+    ])
+    assert result.get("retracted") is True
+    assert not (pending_dir / "turn-1.json").exists()
+    assert outbox.turn_status("turn-1") == "dropped"
+    # 重启后捞不回来：文件没了，recover_pending 不该再交出这一轮。
+    outbox2 = MemoryOutbox(store, pending_dir=pending_dir)
+    assert outbox2.recover_pending() == 0
+
+
+def test_bug5_judged_retraction_drops_outbox_file(tmp_path):
+    """Bug 5（模型判意图那路撤回）：“其实也不是很喜欢吃。”判撤回后，
+    同样删盘、标 dropped。"""
+    store = make_fake_store(tmp_path)
+    # 只测“判撤回之后”的程序行为，判本身靠模型（同 test_plan_c）。
+    store._judge_retraction_intent = lambda *a, **k: True
+    outbox, pending_dir = _bug5_parked_turn(store, tmp_path)
+    result = store.add_turn([
+        {"role": "user", "content": "其实也不是很喜欢吃。"},
+        {"role": "assistant", "content": "好的。"},
+    ])
+    assert result.get("retracted") is True
+    assert not (pending_dir / "turn-1.json").exists()
+    assert outbox.turn_status("turn-1") == "dropped"

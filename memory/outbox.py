@@ -102,6 +102,22 @@ class MemoryOutbox:
         with self._outcomes_lock:
             self._outcomes[turn_id] = {"status": "committed", "result": result}
 
+    def mark_dropped(self, turn_id):
+        """撤回一轮：删掉它的落盘文件，回执标成已撤回（dropped）。
+
+        撤回的轮次根本没提交，绝不能调 mark_committed（那会把回执
+        标成已提交，以后查回执以为这轮存进去了）。删盘失败只记日志，
+        不拦回执；turn_id 为空时什么都不做。
+        """
+        if not turn_id:
+            return
+        try:
+            self._drop_pending(turn_id)
+        except Exception:
+            logger.warning("回执改已撤回后删发件箱文件失败：turn_id=%s。", turn_id, exc_info=True)
+        with self._outcomes_lock:
+            self._outcomes[turn_id] = {"status": "dropped", "result": None}
+
     def recover_pending(self):
         """启动时捞回盘上没存完的轮次（57 号）：按文件名排序重交进队列，
         返回捞回的轮数。文件坏了的跳过并记日志，不拦启动。"""
@@ -141,7 +157,8 @@ class MemoryOutbox:
 
     def turn_status(self, turn_id):
         """一轮记忆的回执（52 号）：pending（还在队列里/正在存）、
-        committed（存完了）、failed（存失败了）、unknown（没见过这个 turn_id）。"""
+        committed（存完了）、failed（存失败了）、dropped（撤回了、文件已删，
+        不会再存）、unknown（没见过这个 turn_id）。"""
         with self._outcomes_lock:
             outcome = self._outcomes.get(turn_id)
         if outcome is not None:
