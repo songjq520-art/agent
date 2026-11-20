@@ -2,7 +2,18 @@
 # 每个 Bug 修完补在这里；全部离线（FakeMemory），不碰真实 mem0、不联网。
 # 依据：~/workspace/十二记忆代码审查核实-2026-11-20.md。
 
+from datetime import datetime, timedelta, timezone
+
 from conftest import make_fake_store
+from memory.mem0_store import (
+    CONFIDENCE_INFERRED,
+    SOURCE_INFERRED,
+    _provenance,
+)
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
 
 
 # ---------- Bug 1：作废的玩笑记忆不再被检索注入 ----------
@@ -324,3 +335,103 @@ def test_bug4a_mem0_add_fallback_rewrites_clean_metadata(tmp_path):
     meta = stored[0]["metadata"]
     assert meta["source"] == "user"
     assert isinstance(meta.get("write_seq"), int)
+
+
+# ---------- Bug 3：search 管线重构（宽召回 + RRF + 先筛后截 + 条件档案闸） ----------
+
+
+def _bug3_add_inferred(store, text):
+    result = store._add_text_with_metadata(
+        text, _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
+    )
+    return (result.get("results") or [{}])[0].get("id")
+
+
+def _bug3_age(store, memory_id, days):
+    raw = store._raw_metadata_for(memory_id)
+    assert raw is not None
+    old = _utc_now() - timedelta(days=days)
+    raw["last_used_at"] = old.isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    store._memory.update(memory_id=memory_id, metadata=raw)
+
+
+def _bug3_meta_of(store, memory_id):
+    for item in store.get_all(include_sensitive=True):
+        if item["id"] == memory_id:
+            return item["metadata"]
+    raise AssertionError(f"库里没有 {memory_id}")
+
+
+def _bug3_make_dormant(store, text):
+    """存一条记忆、老化 40 天、月扫标沉底，返回 id。"""
+    from memory.decay import DECAY_STATE_DORMANT
+
+    memory_id = _bug3_add_inferred(store, text)
+    _bug3_age(store, memory_id, 40)
+    store.sweep_monthly()
+    assert _bug3_meta_of(store, memory_id)["decay_state"] == DECAY_STATE_DORMANT
+    return memory_id
+
+
+def test_bug3_filter_before_truncation_keeps_good_item(tmp_path):
+    """Bug 3（先筛后截）：语义前 5 全是被取代的，好的那条排第 6——
+    旧流程语义只取 top_k=5，好的那条进不来、只能靠账本兜底捡回来
+    （source 是 ledger、没 id）；新流程宽召回 20 条再筛，好的那条
+    走主路回来（source 是 semantic、有 id）。"""
+    store = make_fake_store(tmp_path)
+    for suffix in ("呀", "呢", "啊", "哦", "吧"):
+        old_id = _bug3_add_inferred(store, f"我喜欢喝咖啡{suffix}")
+        outcome = store.correct_memory(
+            f"我喜欢喝咖啡{suffix}", f"我现在不喝这个了{suffix}"
+        )
+        assert outcome["status"] == "updated", outcome
+    good_id = _bug3_add_inferred(store, "我喜欢喝茶")
+    results = store.search("我喜欢喝咖啡")
+    assert [item["id"] for item in results] == [good_id]
+    assert results[0]["source"] == "semantic"
+    assert not any(
+        "喝咖啡" in item["text"] for item in results
+    ), [item["text"] for item in results]
+
+
+def test_bug3_rrf_fusion_math():
+    """Bug 3（RRF 融合分）：三路排名按 1/(60+rank) 相加，多路都有的
+    在前——标准 RRF，k=60，b 在三路里都靠前，排第一。"""
+    from memory.bm25 import reciprocal_rank_fusion
+
+    fused = reciprocal_rank_fusion(
+        [["a", "b", "c"], ["b", "a", "d"], ["c", "b"]], k=60
+    )
+    assert [doc_id for doc_id, _score in fused] == ["b", "a", "c", "d"]
+
+
+def test_bug3_archive_gate_skipped_for_dated_query(tmp_path):
+    """Bug 3（条件档案闸：日期）：常用层最好语义分 1.0 ≥ 0.6，但查询
+    带“昨天”——问的就是旧账，档案层不屏蔽，沉底的也进来。"""
+    store = make_fake_store(tmp_path)
+    dormant_id = _bug3_make_dormant(store, "喝咖啡，每天一杯")
+    active_id = _bug3_add_inferred(store, "昨天我喜欢喝咖啡")
+    results = store.search("昨天我喜欢喝咖啡")
+    ids = [item["id"] for item in results]
+    assert active_id in ids
+    assert dormant_id in ids
+    dormant = next(item for item in results if item["id"] == dormant_id)
+    assert dormant["layer"] == "archive"
+
+
+def test_bug3_archive_gate_skipped_for_fund_entity(tmp_path):
+    """Bug 3（条件档案闸：实体）：常用层最好语义分 0.8 ≥ 0.6，但查询
+    点了基金“万家纳指”——问的就是这只基金，档案层不屏蔽。
+    咖啡这类东西不算明确实体，别把闸翻过来（见
+    test_archive_excluded_when_active_is_strong）。"""
+    store = make_fake_store(tmp_path)
+    dormant_id = _bug3_make_dormant(store, "万家纳指的基金代码是 019441")
+    active_id = _bug3_add_inferred(store, "定投万家纳指")
+    results = store.search("万家纳指定投怎么样")
+    ids = [item["id"] for item in results]
+    assert active_id in ids
+    assert dormant_id in ids
+    dormant = next(item for item in results if item["id"] == dormant_id)
+    assert dormant["layer"] == "archive"

@@ -266,7 +266,13 @@ from memory import tone as _tone
 # 图是索引不是账本，快照放 memory/graph_snapshot.json，和账本同目录，
 # .gitignore 里 memory/*.json* 已覆盖，不进仓库。）
 from memory import graph as _graph_mod
-from memory.graph_entities import extract_entities, extract_query_entities
+from memory.graph_entities import (
+    ENTITY_KIND_FUND,
+    ENTITY_KIND_PERSON,
+    extract_entities,
+    extract_entities_free,
+    extract_query_entities,
+)
 from memory.decay import (
     DECAY_DELETE_BACKUP_PREFIX,
     DECAY_DELETE_IDLE_DAYS,
@@ -1201,9 +1207,11 @@ class Mem0Store:
         decision_reason（一句话原因），调用方看到就问 BOOS 定。
         补丁 1 两段式检索：每项多一个 layer 键（"active" 常用层 /
         "archive" 档案层 = 沉底态）；常用层最好的一条语义分 ≥ 0.6 时
-        档案层不进结果，低于 0.6 时进来（标清是档案）。补丁 5：关键词
-        补充改走 BM25 排名，原样匹配（基金代码/数字/人名）的那几条在
-        关键词组里排最前面（项上 exact_match=True）。
+        档案层不进结果，低于 0.6 时进来（标清是档案）；查询带明确日期
+        或人/基金实体时不过这道闸（Bug 3 条件档案闸）。三路 RRF 融合
+        （Bug 3）：语义、BM25、图谱各出一路排名，标准 RRF（k=60）融成
+        一路，再乘衰减权重，原样匹配（基金代码/数字/人名）的那几条在
+        前面（项上 exact_match=True）。
         注意：search 不按来源过滤——提取的（inferred）记忆和未确认的
         旧记忆也会返回，调用方（main.py 的 _memory_block）按来源决定
         怎么用：已确认的才能当作事实，未确认的不能当作事实。
@@ -1232,20 +1240,21 @@ class Mem0Store:
         账本是空的（刚启用、还没记过）时筛子不过滤，行为和以前一模一样。
         账本兜底：当前结果不够 top_k 时，翻账本原话按关键词找，
         补在后面（source="ledger"，score 是关键词权重，不是语义分）。
-        流程：
+        流程（Bug 3，2026-11-20：宽召回 → RRF 融合 → 先筛后截）：
         0. 精选先查（预整理，2026-11-20）：清单（curated）里的记忆先用
            BM25 打分，取最相关的前 3 条放最前面；再走下面几路填剩下的
            位置，文本去重，总数不超过 top_k。
-        1. mem0 语义检索（top_k 条），只留分数 ≥ 阈值（默认 0.4）的。
-           分数不够的直接丢掉，不注入——宁可不带记忆，也别把看着像的
-           记忆当答案（BOOS 的硬规矩：不知道一定要说不知道）。
-        2. 关键词补充：把库里所有记忆拿出来（get_all），用 v1 的两字窗口
-           关键词再筛一遍，命中（权重 ≥ 2）且语义结果里没有的，追加在后面。
-           这是给精确专有名词（“圆通”“Kimi”）兜底，Chroma 没有 BM25，
-           语义万一漏了，关键词能捞回来。
-        3. 总数不超过 top_k；任何一步出错都只记日志、返回已拿到的结果，
-           不抛异常、不拦聊天。
-        4. 敏感过滤（用时拦截）：不管哪路信号拿到的记忆，只要含有敏感
+        1. 宽召回：mem0 语义检索放大到 top_k*4 条，只留分数 ≥ 阈值
+           （默认 0.4）的；BM25 全库打分取前 top_k*4；图谱 PPR 在
+           语义结果上跑，找回多跳相关的记忆。三路各出一份排名。
+        2. RRF 融合：三路排名按标准 RRF（k=60）融成一路，再乘衰减权重，
+           原样匹配（基金代码/数字/人名）的排在前面；图上才找得到的
+           记忆（账本原话、没 id）按图的顺序缀在后面。
+        3. 先筛后截：账本投影过滤（被取代/删了/作废的默认不给）和条件
+           档案闸都在截断之前跑完——被筛掉的不占位置；截到 top_k 后
+           不够再走账本兜底补位。
+        4. 任何一步出错都只记日志、返回已拿到的结果，不抛异常、不拦聊天。
+        5. 敏感过滤（用时拦截）：不管哪路信号拿到的记忆，只要含有敏感
            信息（密码、密钥、身份证号、银行卡号……）就整条跳过、不注入——
            旧库里在过滤加上之前就已存下的敏感记忆，也绝不能拼进发给模型
            的问题里。跳过几条只记个数，不记内容。
@@ -1333,8 +1342,17 @@ class Mem0Store:
                         _raw_meta.get("created_at"),
                     )
                 )
+        # 宽召回（Bug 3，2026-11-20）：语义放大到 top_k*4，BM25 全库、
+        # 图谱 PPR 各出一路排名，最后 RRF 融合——先宽后筛，截断之前
+        # 不丢候选（旧流程语义只取 top_k、被取代的占了位置就把好的
+        # 挤出去了）。candidates 是 id → 结果项，排序只动排名列表。
+        wide_k = max(top_k * 4, top_k)
+        candidates = {}
+        semantic_ranked = []
+        bm25_ranked = []
+        exact_ids = set()
         try:
-            raw = self._memory.search(query, filters={"user_id": self.user_id}, top_k=top_k)
+            raw = self._memory.search(query, filters={"user_id": self.user_id}, top_k=wide_k)
             for item in (raw or {}).get("results", []):
                 score = item.get("score")
                 # 分数缺失时不注入（不知道它有多相关，就当它不相关）。
@@ -1358,104 +1376,116 @@ class Mem0Store:
                     now_dt,
                     is_core=_is_core_memory(metadata),
                 )
-                results.append(
-                    {
-                        "id": item.get("id"),
-                        "text": text,
-                        "score": score,
-                        "source": "semantic",
-                        "metadata": metadata,
-                        "confirmed": metadata["confirmed"],
-                        "decay_weight": weight,
-                    }
-                )
+                candidates[item.get("id")] = {
+                    "id": item.get("id"),
+                    "text": text,
+                    "score": score,
+                    "source": "semantic",
+                    "metadata": metadata,
+                    "confirmed": metadata["confirmed"],
+                    "decay_weight": weight,
+                }
+                semantic_ranked.append(item.get("id"))
                 seen_texts.add(text)
         except Exception:
             logger.warning("mem0 语义检索失败：本次只用关键词补充信号。", exc_info=True)
-        # 关键词补充信号（补丁 5：BM25 + 原样匹配，排在语义结果后面，
-        # 不超过 top_k 总数）。v1 的两字窗口权重（_keyword_weight）换成
-        # BM25 排名：中文长词一样拆两字窗口，但加了词频饱和和长度归一化，
-        # 常见词不再靠长度刷分。原样匹配（基金代码、数字、人名原样命中）
-        # 的排在关键词组最前面——按 BM25 顺序排（整句命中的 BM25 分高，
-        # 只含一个裸数字的排后面，不拿裸数字冒充精确命中）。
-        if len(results) < top_k:
-            try:
-                if all_items is None:
-                    all_items = self._fetch_all_raw()
-                docs = [
-                    {"id": item.get("id"), "text": item.get("memory") or ""}
-                    for item in (all_items or {}).get("results", [])
-                ]
-                by_id = {doc["id"]: item for doc, item in zip(docs, (all_items or {}).get("results", []))}
-                exact_ids = set(_bm25.extract_exact_matches(query, docs))
-                ranked = _bm25.bm25_search(query, docs, top_k=top_k)
-                ranked_ids = [hit["id"] for hit in ranked]
-                exact_first = [doc_id for doc_id in ranked_ids if doc_id in exact_ids]
-                rest = [doc_id for doc_id in ranked_ids if doc_id not in exact_ids]
-                for doc_id in exact_first + rest:
-                    if len(results) >= top_k:
-                        break
-                    item = by_id.get(doc_id)
-                    if item is None:
-                        continue
-                    text = item.get("memory") or ""
-                    if not text or text in seen_texts:
-                        continue
-                    if _contains_sensitive(text):
-                        skipped_sensitive += 1
-                        continue
-                    metadata = _normalize_metadata(item.get("metadata"), item)
-                    results.append(
-                        {
-                            "id": item.get("id"),
-                            "text": text,
-                            "score": None,
-                            "source": "keyword",
-                            "metadata": metadata,
-                            "confirmed": metadata["confirmed"],
-                            "exact_match": doc_id in exact_ids,
-                            "decay_weight": decay_weight(
-                                metadata["decay_kind"],
-                                metadata["last_used_at"],
-                                now_dt,
-                                is_core=_is_core_memory(metadata),
-                            ),
-                        }
-                    )
-                    seen_texts.add(text)
-            except Exception:
-                logger.warning("mem0 关键词补充检索失败。", exc_info=True)
+        # BM25 宽召回（Bug 3）：全库都打分、取前 wide_k，不再“语义
+        # 不够才补”——关键词信号和语义信号平等进 RRF。原样匹配
+        # （基金代码/数字/人名）记在项上，融合时加分在前。
+        try:
+            if all_items is None:
+                all_items = self._fetch_all_raw()
+            docs = [
+                {"id": item.get("id"), "text": item.get("memory") or ""}
+                for item in (all_items or {}).get("results", [])
+            ]
+            by_id = {doc["id"]: item for doc, item in zip(docs, (all_items or {}).get("results", []))}
+            exact_ids = set(_bm25.extract_exact_matches(query, docs))
+            ranked = _bm25.bm25_search(query, docs, top_k=wide_k)
+            for hit in ranked:
+                doc_id = hit["id"]
+                item = by_id.get(doc_id)
+                if item is None:
+                    continue
+                text = item.get("memory") or ""
+                if not text:
+                    continue
+                if doc_id in candidates:
+                    # 语义路已经有这条：只补原样匹配标记，排名两路都有它。
+                    candidates[doc_id]["exact_match"] = doc_id in exact_ids
+                    bm25_ranked.append(doc_id)
+                    continue
+                if text in seen_texts:
+                    # 同一文本已被另一条占了位置（精选/语义），不再重复占位。
+                    continue
+                if _contains_sensitive(text):
+                    skipped_sensitive += 1
+                    continue
+                metadata = _normalize_metadata(item.get("metadata"), item)
+                candidates[doc_id] = {
+                    "id": item.get("id"),
+                    "text": text,
+                    "score": None,
+                    "source": "keyword",
+                    "metadata": metadata,
+                    "confirmed": metadata["confirmed"],
+                    "exact_match": doc_id in exact_ids,
+                    "decay_weight": decay_weight(
+                        metadata["decay_kind"],
+                        metadata["last_used_at"],
+                        now_dt,
+                        is_core=_is_core_memory(metadata),
+                    ),
+                }
+                bm25_ranked.append(doc_id)
+                seen_texts.add(text)
+        except Exception:
+            logger.warning("mem0 关键词补充检索失败。", exc_info=True)
         if skipped_sensitive:
             logger.info("检索：%d 条记忆含敏感信息，已跳过，不注入。", skipped_sensitive)
-        # 衰减排位：精选组不动（已按 BM25 分排好）；语义组按“原始分 ×
-        # 权重”排，关键词组按“原样匹配优先、再按权重”排——都是稳定排序，
-        # 权重全是 1.0 时顺序和原来一模一样；关键词组还是排在语义组后面
-        # （补充信号不抢主信号的位置）。
-        curated_end = sum(1 for item in results if item.get("source") == "curated")
-        semantic_count = sum(1 for item in results if item.get("source") == "semantic")
-        semantic_end = curated_end + semantic_count
-        results[curated_end:semantic_end] = sorted(
-            results[curated_end:semantic_end],
-            key=lambda item: (item.get("score") or 0) * (item.get("decay_weight") or 0),
-            reverse=True,
+        # 账本状态先读出来：图合并和投影过滤共用一份，不读两遍。
+        ledger_state = self.ledger_state()
+        # 图检索（图谱推理第一期）+ RRF 融合（Bug 3）：图在宽召回池上
+        # 跑 PPR（种子是语义结果的实体），它的顺序是第三路排名；三路
+        # （语义、BM25、图）按标准 RRF（k=60）融成一路，再乘衰减权重、
+        # 原样匹配的在前。图上才找得到的记忆（id 是 None，账本原话）
+        # 没法按 id 融合，按图的顺序缀在融合结果后面、截断之前。
+        # _graph_merge 内部全包住了异常，图坏了只丢图这路。
+        graph_ranked = []
+        graph_only = []
+        wide_list = list(candidates.values())
+        self._graph_merge(
+            wide_list, seen_texts, query, wide_k, include_history, ledger_state
         )
-        results[semantic_end:] = sorted(
-            results[semantic_end:],
+        for _item in wide_list:
+            if _item.get("id") is None:
+                graph_only.append(_item)
+            else:
+                graph_ranked.append(_item.get("id"))
+        for _cid, _item in candidates.items():
+            _item.setdefault("exact_match", _cid in exact_ids)
+        fused = _bm25.reciprocal_rank_fusion(
+            [semantic_ranked, bm25_ranked, graph_ranked], k=60
+        )
+        fused_items = []
+        for _doc_id, _rrf in fused:
+            _item = candidates.get(_doc_id)
+            if _item is None:
+                continue
+            _item["_rrf"] = _rrf
+            fused_items.append(_item)
+        fused_items.sort(
             key=lambda item: (
                 1 if item.get("exact_match") else 0,
-                item.get("decay_weight") or 0,
+                (item.get("_rrf") or 0) * (item.get("decay_weight") or 0),
             ),
             reverse=True,
         )
-        # 账本状态先读出来：图合并和投影过滤共用一份，不读两遍。
-        ledger_state = self.ledger_state()
-        # 图检索（图谱推理第一期）：种子实体 → PPR 一步多跳，两路分数
-        # 归一化相加。插在关键词补充之后、投影过滤之前；图是空的、
-        # 种子找不着、PPR 没命中时什么都不做，老路结果原样。
-        # 失败只记日志、不抛异常（_graph_merge 内部全包住了）。
-        self._graph_merge(
-            results, seen_texts, query, top_k, include_history, ledger_state
-        )
+        for _item in fused_items:
+            _item.pop("_rrf", None)
+        # 精选置顶不动，后面跟融合结果、再跟图专属项。
+        results.extend(fused_items)
+        results.extend(graph_only)
         # Bug 1：图上找回来的账本原话里，作废的按 key 拦掉（meta 里
         # 没有 voided 标记，筛子认不出来）。
         if voided_keys:
@@ -1510,7 +1540,30 @@ class Mem0Store:
                     if meta.get("decay_state") == DECAY_STATE_DORMANT
                     else "active"
                 )
-            if best_active >= ARCHIVE_SEARCH_THRESHOLD:
+            # 条件档案闸（Bug 3）：只有常用层确实够强（最好语义分
+            # ≥ 0.6）且查询没点名档案里的东西时才屏蔽沉底记忆；查询
+            # 带明确日期（“昨天”“11 月 11 日”）或明确实体（人、基金）
+            # 时不过这道闸——问的就是旧账/那个人，别拦。咖啡这类东西
+            # 不算明确实体（THING 不点名），别把闸翻过来。
+            skip_gate = False
+            try:
+                from tools.date_numbers import resolve_requested_date
+
+                if resolve_requested_date(query) is not None:
+                    skip_gate = True
+            except Exception:
+                logger.warning("档案闸：解析查询日期失败，本次不过日期判断。", exc_info=True)
+            if not skip_gate:
+                try:
+                    entities = extract_entities_free(query)
+                    if any(
+                        kind in (ENTITY_KIND_PERSON, ENTITY_KIND_FUND)
+                        for _name, kind in entities
+                    ):
+                        skip_gate = True
+                except Exception:
+                    logger.warning("档案闸：抽查询实体失败，本次不过实体判断。", exc_info=True)
+            if best_active >= ARCHIVE_SEARCH_THRESHOLD and not skip_gate:
                 results = [
                     item for item in results if item.get("layer") == "active"
                 ]
@@ -1522,6 +1575,9 @@ class Mem0Store:
                     if meta.get("decay_state") == DECAY_STATE_DORMANT
                     else "active"
                 )
+        # 宽召回池在这里才截到 top_k：投影过滤和档案闸都在截断之前
+        # 跑完（Bug 3）——被筛掉的不占位置，精选置顶不动。
+        results = results[:top_k]
         # 账本兜底：当前结果不够时，翻账本原话按关键词找，补在后面。
         # 只补“当前”的原话：账本里标了 superseded / deleted 的 key
         # 不当现况（除非问的就是以前，include_history=True 时才放
