@@ -5362,6 +5362,7 @@ class Mem0Store:
         kept = []
         superseded_count = 0
         held_count = 0
+        kept_old_count = 0
         if batch_metadata is None:
             batch_metadata = _provenance(
                 SOURCE_INFERRED, CONFIDENCE_INFERRED, False, turn_id=turn_id
@@ -5449,6 +5450,34 @@ class Mem0Store:
                     )
                     known.append({"id": mem_id, "text": mem_text})
                     held_count += 1
+                    continue
+                if resolution.get("action") == "keep_old":
+                    # Bug 2（2026-11-20）：旧条赢——新条是迟到的旧写入，
+                    # 不顶掉旧条；当证据挂到旧条下，挂上后新条删掉（走
+                    # 下面的回滚）；挂不上也不丢事实，新条照常留。
+                    if self._append_duplicate_evidence(
+                        supersede_target,
+                        mem_text,
+                        new_source=SOURCE_INFERRED,
+                        new_confidence=None,
+                    ):
+                        try:
+                            self._record_decay_occurrence(
+                                supersede_target.get("id"), turn_id=turn_id
+                            )
+                        except Exception:
+                            logger.warning(
+                                "金额去重：keep_old 出现次数写回失败。",
+                                exc_info=True,
+                            )
+                        kept_old_count += 1
+                        dropped.append(item)
+                        continue
+                    logger.warning(
+                        "金额去重：keep_old 证据没挂上，新条照常留。"
+                    )
+                    kept.append(item)
+                    known.append({"id": mem_id, "text": mem_text})
                     continue
                 updated = self._supersede_money_memory(
                     supersede_target,
@@ -5562,6 +5591,8 @@ class Mem0Store:
         results["dedup_dropped"] = len(actually_dropped)
         if superseded_count:
             results["money_superseded"] = superseded_count
+        if kept_old_count:
+            results["money_kept_old"] = kept_old_count
         if held_count:
             results["money_held_pending"] = held_count
         if survivors:
@@ -5993,6 +6024,44 @@ class Mem0Store:
                         ],
                         "held_pending": True,
                     }
+                if resolution.get("action") == "keep_old":
+                    # Bug 2（2026-11-20）：旧条赢——新说法是迟到的旧写入，
+                    # 不顶掉旧条；当证据挂到旧条下，挂上后返回已有那条
+                    # （不重复存）；挂不上也不丢事实，继续往下存新条。
+                    if self._append_duplicate_evidence(
+                        supersede_target,
+                        safe_text,
+                        new_source=SOURCE_USER
+                        if source == SOURCE_USER
+                        else SOURCE_INFERRED,
+                        new_confidence=confidence,
+                    ):
+                        try:
+                            self._record_decay_occurrence(
+                                supersede_target.get("id"), turn_id=turn_id
+                            )
+                        except Exception:
+                            logger.warning(
+                                "手动存记忆：keep_old 出现次数写回失败。",
+                                exc_info=True,
+                            )
+                        logger.info(
+                            "手动存记忆：同槽位旧值更新时间更晚，"
+                            "新说法已当证据挂到旧条下。"
+                        )
+                        return {
+                            "results": [
+                                {
+                                    "id": supersede_target.get("id"),
+                                    "memory": (supersede_target or {}).get("text"),
+                                    "event": "NONE",
+                                }
+                            ],
+                            "duplicate": True,
+                        }
+                    logger.warning(
+                        "手动存记忆：keep_old 证据没挂上，继续存新条。"
+                    )
                 updated = self._supersede_money_memory(
                     supersede_target,
                     safe_text,

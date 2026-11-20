@@ -96,3 +96,67 @@ def test_bug5_judged_retraction_drops_outbox_file(tmp_path):
     assert result.get("retracted") is True
     assert not (pending_dir / "turn-1.json").exists()
     assert outbox.turn_status("turn-1") == "dropped"
+
+
+# ---------- Bug 2：keep_old 分支（旧条赢，新条当证据，不并存） ----------
+
+
+def _bug2_old_money_memory(store):
+    """种一条同槽位旧金额记忆：推断来源、写序号故意给得很大（比新批
+    的还晚），让 _resolve_conflict 判 keep_old。返回旧条 id。"""
+    from memory.mem0_store import (
+        _provenance,
+        CONFIDENCE_INFERRED,
+        SOURCE_INFERRED,
+    )
+
+    old_meta = _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
+    old_meta["write_seq"] = 10 ** 9
+    result = store._add_text_with_metadata("每天定投5块买万家纳指", old_meta)
+    return (result.get("results") or [{}])[0].get("id")
+
+
+def _bug2_evidence_texts(store, memory_id):
+    import json
+
+    raw = store._raw_metadata_for(memory_id)
+    assert raw is not None
+    evidence = raw.get("evidence") or ""
+    if isinstance(evidence, str) and evidence:
+        return [entry.get("text") for entry in json.loads(evidence)]
+    return []
+
+
+def test_bug2_dedupe_keep_old_appends_evidence(tmp_path):
+    """Bug 2（提取路）：同槽位新金额判成 keep_old 时，旧条不动、新条
+    当证据挂到旧条下、不并存两条。修之前新条照常留下来，新旧并存。"""
+    store = make_fake_store(tmp_path)
+    old_id = _bug2_old_money_memory(store)
+    before = store.get_all()
+    added = store._memory.add(
+        [{"role": "user", "content": "每天定投10块买万家纳指"}],
+        user_id=store.user_id,
+        infer=False,
+        metadata=None,
+    )
+    new_id = (added.get("results") or [{}])[0].get("id")
+    out = store._dedupe_extraction_results(
+        {"results": [{"id": new_id, "memory": "每天定投10块买万家纳指", "event": "ADD"}]},
+        before,
+        turn_id="t1",
+    )
+    assert out.get("money_kept_old") == 1
+    assert store._memory.all_texts() == ["每天定投5块买万家纳指"]
+    assert "每天定投10块买万家纳指" in _bug2_evidence_texts(store, old_id)
+
+
+def test_bug2_add_memory_text_keep_old_appends_evidence(tmp_path):
+    """Bug 2（手动存路）：同槽位新金额判成 keep_old 时，旧条不动、
+    新说法当证据挂到旧条下、返回已有那条，不并存两条。"""
+    store = make_fake_store(tmp_path)
+    old_id = _bug2_old_money_memory(store)
+    result = store.add_memory_text("每天定投10块买万家纳指", source="inferred")
+    assert result.get("duplicate") is True
+    assert (result.get("results") or [{}])[0].get("id") == old_id
+    assert store._memory.all_texts() == ["每天定投5块买万家纳指"]
+    assert "每天定投10块买万家纳指" in _bug2_evidence_texts(store, old_id)
