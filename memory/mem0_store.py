@@ -1178,6 +1178,11 @@ class Mem0Store:
                 text = item.get("memory") or ""
                 if not text:
                     continue
+                # 同一文本只占一席：重复记忆折叠（2026-11-20 牛肉面事故：
+                # 19 份冒菜占满语义 top_k=5，牛肉面事件进不来；BM25 环路
+                # 和账本兜底环路早有同款检查，语义环路缺了这一道）。
+                if text in seen_texts:
+                    continue
                 if _contains_sensitive(text):
                     skipped_sensitive += 1
                     continue
