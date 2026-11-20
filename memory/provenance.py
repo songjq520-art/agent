@@ -188,6 +188,12 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
         # 展平成四个标量字段存（见 _flatten_money）：Chroma 不接受
         # dict 值的 metadata，存 dict 会炸掉整条写入。
         metadata.update(_flatten_money(money))
+    # 预整理（2026-11-20）：最重要的记忆进精选清单（curated 标记）——
+    # 条件照搬十一的 MEMORY.md（见 _should_be_curated）：核心 / BOOS
+    # 亲口确认 / 规则 / 晋升成稳定事实；玩笑、测试、假设、已作废的不进。
+    # 写的时候满足 (a)/(b)/(c) 就打上；(d) 晋升那条在 _decay_touch 里打。
+    if _should_be_curated(metadata):
+        metadata["curated"] = True
     return metadata
 
 def _normalize_metadata(raw, item=None):
@@ -223,7 +229,7 @@ def _normalize_metadata(raw, item=None):
            "decay_kind", "importance", "last_used_at", "decay_seen_days",
            "decay_last_seen_day", "decay_seen_dates", "decay_seen_sessions",
            "decay_state", "decay_delete_due",
-           "superseded"}，其中 confirmed
+           "superseded", "curated"}，其中 confirmed
     就是 user_confirmed（取了个短名字，方便调用方判断“能不能当作事实用”）。
     衰减字段（第二步）：只认合法值，别的按缺失处理；老记忆没有这些
     字段时走派生默认值（见 return 前的派生段）——不猜、不抬可信度。
@@ -251,6 +257,7 @@ def _normalize_metadata(raw, item=None):
     tone_source = None
     voided = False
     voided_at = None
+    curated = False
     if isinstance(raw, dict):
         raw_source = raw.get("source")
         if raw_source in (SOURCE_USER, SOURCE_INFERRED):
@@ -313,6 +320,9 @@ def _normalize_metadata(raw, item=None):
         if raw_tone_source in ("local", "model"):
             tone_source = raw_tone_source
         voided = raw.get("voided") is True
+        # 预整理（2026-11-20）：curated 只有明确是 True（布尔值）才算，
+        # 跟 is_rule、pending_confirmation 一个做法。
+        curated = raw.get("curated") is True
         raw_voided_at = raw.get("voided_at")
         if isinstance(raw_voided_at, str) and raw_voided_at:
             voided_at = raw_voided_at
@@ -402,6 +412,7 @@ def _normalize_metadata(raw, item=None):
         "tone_source": tone_source,
         "voided": voided,
         "voided_at": voided_at,
+        "curated": curated,
         "decay_kind": decay_kind,
         "importance": importance,
         "last_used_at": last_used_at,
@@ -487,6 +498,26 @@ def _is_core_memory(metadata):
     """
     meta = _normalize_metadata(metadata)
     return bool(meta["confirmed"]) or meta["slot"] in KNOWN_SLOTS
+
+
+def _should_be_curated(metadata):
+    """这条记忆进不进精选清单（预整理，2026-11-20）。
+
+    条件照搬十一的 MEMORY.md（BOOS 定）：进清单（任一满足就进）——
+    (a) 核心记忆（_is_core_memory，六类）；(b) BOOS 亲口确认
+    （source=user 且 user_confirmed=True，_is_core_memory 已含这一条）；
+    (c) 规则（is_rule=True）；(d) 晋升成稳定事实（decay_kind=stable）。
+    不进清单（任一满足就不进）——tone 是 joke / test / hypothesis，
+    或 voided=True。
+    raw 和规整过的都能传（内部走 _normalize_metadata）。
+    """
+    meta = _normalize_metadata(metadata)
+    if meta["voided"] or meta["tone"] in ("joke", "test", "hypothesis"):
+        return False
+    if _is_core_memory(meta) or meta["is_rule"]:
+        return True
+    return meta["decay_kind"] == DECAY_KIND_STABLE
+
 
 # _parse_created_at：实现在 memory/timeutil.py，这里只转引（见上面 import），
 # 旧的 from memory.provenance import _parse_created_at 不用改。

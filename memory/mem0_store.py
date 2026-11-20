@@ -157,6 +157,7 @@ from memory.provenance import (
     _metadata_for_store,
     _credibility_rank,
     _is_core_memory,
+    _should_be_curated,
     _parse_created_at,
     _memory_order_key,
     _resolve_conflict,
@@ -335,6 +336,11 @@ RETRIEVAL_THRESHOLD = 0.4
 # （mem0 内部按 top_k*4 从向量库取，1000 就是取 4000 条，个人库没压力；
 # 遥测已关，top_k ≥ 50 的 mem0 提示也不会打出来。）
 FETCH_ALL_TOP_K = 1000
+
+# CURATED_SEARCH_MAX（精选先查一次最多取几条，预整理，2026-11-20）：
+# 清单里的记忆再重要，一次也最多占 3 个位置，剩下的位置留给语义、
+# 关键词、图谱、账本——防止精选把结果占满。
+CURATED_SEARCH_MAX = 3
 
 # KEYWORD_MIN_WEIGHT（关键词补充信号的最低权重）：语义检索之外，
 # 再用 v1 那套中文两字窗口关键词做补充。权重 = 匹配到的关键词长度之和，
@@ -797,6 +803,81 @@ def _cn_numerals_to_digits(text):
     return _CN_NUMERAL_PHRASE_RE.sub(_replace, text)
 
 
+def _authorize_content_change(action, target_meta, actor, new_text=None,
+                              new_confidence=None, conflict_outcome=None):
+    """记忆访问权限（2026-11-20）：改内容类操作要授权，整理类永远允许。
+
+    两类操作：
+    - 整理类（只改元数据，不改原文、不删）：打标签、调权重、刷新
+      last_used_at、记出现集合、晋升 kind、标 dormant/review/grounding、
+      打 void 标记、提建议 → 永远允许（action="organize"）。
+    - 改内容类（改原文或删）：重写原文、删记忆、拿没确认的盖掉已确认的
+      → 要授权，按 actor 和动作判。
+    action 取值与规则：
+    - "organize"：永远允许。
+    - "delete"：只有 actor="boos" 才允许。
+    - "rewrite_text"：只有 actor="boos" 才允许。
+    - "overwrite_confirmed"：只有 actor="boos" 且新内容可信度不低于
+      旧的（new_confidence >= 旧 confidence）才允许。
+    - "restore"：只有新文本逐字和原来一样（new_text == 原文）才允许。
+    - "supersede"：只有 _resolve_conflict 判了新胜出
+      （conflict_outcome="supersede_old"）才允许。
+    - "delete_just_written"：允许（系统，写时安全过滤/回滚，删的是
+      本轮刚写的），记一条 info 日志。
+    target_meta 是目标记忆的 metadata（规整过或原始的都行）；restore
+    时里面要带 "text"（原文）。actor 是 "boos" 或 "system"。
+    返回 (allowed, reason)。拒绝时记 logger.warning（含 action、actor、
+    记忆 id、原因，不记原文内容）。
+    """
+    meta = target_meta if isinstance(target_meta, dict) else {}
+    mem_id = meta.get("id")
+    if action == "organize":
+        return True, "整理类操作，只改元数据、不改原文、不删，系统自动做。"
+    if action == "delete_just_written":
+        logger.info("记忆权限：系统删除本轮刚写的记忆 id=%s。", mem_id)
+        return True, "删的是本轮刚写、还没立住的内容。"
+    reason = None
+    if action == "delete":
+        if actor == "boos":
+            return True, "BOOS 同意删除。"
+        reason = "只有 BOOS 能删已立的记忆。"
+    elif action == "rewrite_text":
+        if actor == "boos":
+            return True, "BOOS 亲口纠正/换新值。"
+        reason = "只有 BOOS 能改已立记忆的原文。"
+    elif action == "overwrite_confirmed":
+        old_conf = meta.get("confidence")
+        if (
+            actor == "boos"
+            and isinstance(new_confidence, (int, float))
+            and not isinstance(new_confidence, bool)
+            and isinstance(old_conf, (int, float))
+            and not isinstance(old_conf, bool)
+            and new_confidence >= old_conf
+        ):
+            return True, "BOOS 确认，且新内容可信度不低于旧的。"
+        reason = "拿没确认的盖已确认的，要 BOOS 点头且新内容可信度不低于旧的。"
+    elif action == "restore":
+        old_text = meta.get("text") or ""
+        if new_text is not None and new_text == old_text:
+            return True, "原样恢复，文本逐字和原来一样。"
+        reason = "恢复只能原样恢复，文本和原来不一样的不许写。"
+    elif action == "supersede":
+        if conflict_outcome == "supersede_old":
+            return True, "_resolve_conflict 判了新胜出。"
+        reason = "只有 _resolve_conflict 判了新胜出才能顶掉旧条。"
+    else:
+        reason = "未知的改内容动作，默认拒绝。"
+    logger.warning(
+        "记忆权限拒绝：action=%s actor=%s id=%s 原因=%s",
+        action,
+        actor,
+        mem_id,
+        reason,
+    )
+    return False, reason
+
+
 class Mem0Store:
     """mem0 长期记忆的适配器（项目里唯一直接碰 mem0 的类）。
 
@@ -1108,7 +1189,8 @@ class Mem0Store:
 
         返回：记忆列表，每项为 {"id", "text", "score", "source",
         "metadata", "confirmed", "decay_weight", "is_history"}，source 是
-        "semantic"（语义）、"keyword"（关键词补充）或 "ledger"（账本兜底），
+        "semantic"（语义）、"keyword"（关键词补充）、"curated"（精选清单
+        先查）或 "ledger"（账本兜底），
         metadata 是规整过的来源信息（见 _normalize_metadata），confirmed
         是“BOOS 是否逐条确认过”（只有 source="user" 的记忆才可能是 True），
         decay_weight 是这条记忆现在的衰减权重（0.10–1.0，核心记忆恒为 1.0），
@@ -1150,6 +1232,9 @@ class Mem0Store:
         账本兜底：当前结果不够 top_k 时，翻账本原话按关键词找，
         补在后面（source="ledger"，score 是关键词权重，不是语义分）。
         流程：
+        0. 精选先查（预整理，2026-11-20）：清单（curated）里的记忆先用
+           BM25 打分，取最相关的前 3 条放最前面；再走下面几路填剩下的
+           位置，文本去重，总数不超过 top_k。
         1. mem0 语义检索（top_k 条），只留分数 ≥ 阈值（默认 0.4）的。
            分数不够的直接丢掉，不注入——宁可不带记忆，也别把看着像的
            记忆当答案（BOOS 的硬规矩：不知道一定要说不知道）。
@@ -1168,6 +1253,69 @@ class Mem0Store:
         seen_texts = set()
         skipped_sensitive = 0
         now_dt = datetime.now(timezone.utc)
+        # 第 0 步：精选先查（预整理，2026-11-20）——清单（curated）里的
+        # 记忆先用 BM25 打分，取最相关的前 3 条放结果最前面；全库只读
+        # 一次（all_items），和下面的关键词补充共用，不多读。
+        all_items = None
+        try:
+            all_items = self._fetch_all_raw()
+        except Exception:
+            logger.warning("精选先查：读全库失败，本次跳过精选。", exc_info=True)
+        if all_items:
+            try:
+                curated_docs = []
+                curated_by_id = {}
+                for _item in (all_items or {}).get("results", []):
+                    _meta = _normalize_metadata(
+                        _item.get("metadata"), _item
+                    )
+                    if not _meta.get("curated"):
+                        continue
+                    _text = _item.get("memory") or ""
+                    if not _text or _text in seen_texts:
+                        continue
+                    if _contains_sensitive(_text):
+                        skipped_sensitive += 1
+                        continue
+                    curated_docs.append(
+                        {"id": _item.get("id"), "text": _text}
+                    )
+                    curated_by_id[_item.get("id")] = _item
+                for _hit in _bm25.bm25_search(
+                    query, curated_docs, top_k=CURATED_SEARCH_MAX
+                ):
+                    _item = curated_by_id.get(_hit["id"])
+                    if _item is None:
+                        continue
+                    _text = _item.get("memory") or ""
+                    if not _text or _text in seen_texts:
+                        continue
+                    _meta = _normalize_metadata(
+                        _item.get("metadata"), _item
+                    )
+                    results.append(
+                        {
+                            "id": _item.get("id"),
+                            "text": _text,
+                            # score 记 None：这是 BM25 关键词命中，不是语义分；
+                            # 和 keyword 项一个规矩（语义分或 None），BM25 的
+                            # 分只用来在精选组里排位，不进这个字段。
+                            "score": None,
+                            "source": "curated",
+                            "metadata": _meta,
+                            "confirmed": _meta["confirmed"],
+                            "layer": "active",
+                            "decay_weight": decay_weight(
+                                _meta["decay_kind"],
+                                _meta["last_used_at"],
+                                now_dt,
+                                is_core=_is_core_memory(_meta),
+                            ),
+                        }
+                    )
+                    seen_texts.add(_text)
+            except Exception:
+                logger.warning("精选先查失败：本次不用精选结果。", exc_info=True)
         try:
             raw = self._memory.search(query, filters={"user_id": self.user_id}, top_k=top_k)
             for item in (raw or {}).get("results", []):
@@ -1215,7 +1363,8 @@ class Mem0Store:
         # 只含一个裸数字的排后面，不拿裸数字冒充精确命中）。
         if len(results) < top_k:
             try:
-                all_items = self._fetch_all_raw()
+                if all_items is None:
+                    all_items = self._fetch_all_raw()
                 docs = [
                     {"id": item.get("id"), "text": item.get("memory") or ""}
                     for item in (all_items or {}).get("results", [])
@@ -1261,12 +1410,15 @@ class Mem0Store:
                 logger.warning("mem0 关键词补充检索失败。", exc_info=True)
         if skipped_sensitive:
             logger.info("检索：%d 条记忆含敏感信息，已跳过，不注入。", skipped_sensitive)
-        # 衰减排位：语义组按“原始分 × 权重”排，关键词组按“原样匹配优先、
-        # 再按权重”排——都是稳定排序，权重全是 1.0 时顺序和原来一模一样；
-        # 关键词组还是排在语义组后面（补充信号不抢主信号的位置）。
-        semantic_end = sum(1 for item in results if item.get("source") == "semantic")
-        results[:semantic_end] = sorted(
-            results[:semantic_end],
+        # 衰减排位：精选组不动（已按 BM25 分排好）；语义组按“原始分 ×
+        # 权重”排，关键词组按“原样匹配优先、再按权重”排——都是稳定排序，
+        # 权重全是 1.0 时顺序和原来一模一样；关键词组还是排在语义组后面
+        # （补充信号不抢主信号的位置）。
+        curated_end = sum(1 for item in results if item.get("source") == "curated")
+        semantic_count = sum(1 for item in results if item.get("source") == "semantic")
+        semantic_end = curated_end + semantic_count
+        results[curated_end:semantic_end] = sorted(
+            results[curated_end:semantic_end],
             key=lambda item: (item.get("score") or 0) * (item.get("decay_weight") or 0),
             reverse=True,
         )
@@ -2056,6 +2208,17 @@ class Mem0Store:
                 if not text:
                     failed.append(
                         {"key": entry.get("key"), "reason": "账本里这条没原话"}
+                    )
+                    continue
+                allowed, _reason = _authorize_content_change(
+                    "restore", {"text": text, **meta}, "system", new_text=text
+                )
+                if not allowed:
+                    failed.append(
+                        {
+                            "key": entry.get("key"),
+                            "reason": "权限拒绝：恢复的文本与账本原文不一致。",
+                        }
                     )
                     continue
                 try:
@@ -3001,6 +3164,21 @@ class Mem0Store:
                     "status": "unchanged",
                     "memory_id": existing["id"],
                 }
+            allowed, _reason = _authorize_content_change(
+                "rewrite_text",
+                {
+                    "id": existing["id"],
+                    **(existing.get("metadata") or {}),
+                },
+                "boos",
+            )
+            if not allowed:
+                return {
+                    "slot": slot,
+                    "value": value,
+                    "status": "failed",
+                    "memory_id": existing["id"],
+                }
             try:
                 self._memory.update(
                     memory_id=existing["id"],
@@ -3036,6 +3214,21 @@ class Mem0Store:
         if slot != SLOT_SOUL:
             legacy = self._find_slot_memory_by_slot_text(slot)
             if legacy is not None:
+                allowed, _reason = _authorize_content_change(
+                    "rewrite_text",
+                    {
+                        "id": legacy["id"],
+                        **(legacy.get("metadata") or {}),
+                    },
+                    "boos",
+                )
+                if not allowed:
+                    return {
+                        "slot": slot,
+                        "value": value,
+                        "status": "failed",
+                        "memory_id": legacy["id"],
+                    }
                 try:
                     self._memory.update(
                         memory_id=legacy["id"],
@@ -3064,6 +3257,21 @@ class Mem0Store:
         if slot != SLOT_SOUL:
             near = self._find_near_duplicate_memory(text, self.get_all())
             if near is not None:
+                allowed, _reason = _authorize_content_change(
+                    "rewrite_text",
+                    {
+                        "id": near["id"],
+                        **(near.get("metadata") or {}),
+                    },
+                    "boos",
+                )
+                if not allowed:
+                    return {
+                        "slot": slot,
+                        "value": value,
+                        "status": "failed",
+                        "memory_id": near["id"],
+                    }
                 try:
                     self._memory.update(
                         memory_id=near["id"],
@@ -3559,12 +3767,23 @@ class Mem0Store:
             if text and _contains_sensitive(text):
                 dropped += 1
                 if mem_id:
-                    try:
-                        self._memory.delete(mem_id)
-                    except Exception:
-                        logger.warning(
-                            "提取后过滤：删除含敏感信息的记忆失败。", exc_info=True
-                        )
+                    # 记忆访问权限（2026-11-20）：删的是本轮刚写的，
+                    # action="delete_just_written"，系统，记日志。
+                    allowed, _reason = _authorize_content_change(
+                        "delete_just_written", {"id": mem_id}, "system"
+                    )
+                    if allowed:
+                        try:
+                            self._memory.delete(mem_id)
+                        except Exception:
+                            logger.warning(
+                                "提取后过滤：删除含敏感信息的记忆失败。",
+                                exc_info=True,
+                            )
+                    else:
+                        # 权限拒绝：不删、也不从结果里去掉（留在 kept 里）。
+                        dropped -= 1
+                        kept.append(item)
                 continue
             kept.append(item)
         if dropped:
@@ -3603,12 +3822,22 @@ class Mem0Store:
                 dropped += 1
                 mem_id = (item or {}).get("id")
                 if mem_id:
-                    try:
-                        self._memory.delete(mem_id)
-                    except Exception:
-                        logger.warning(
-                            "提取后过滤：删除管记忆动作的复述失败。", exc_info=True
-                        )
+                    # 记忆访问权限（2026-11-20）：删的是本轮刚写的，
+                    # action="delete_just_written"，系统，记日志。
+                    allowed, _reason = _authorize_content_change(
+                        "delete_just_written", {"id": mem_id}, "system"
+                    )
+                    if allowed:
+                        try:
+                            self._memory.delete(mem_id)
+                        except Exception:
+                            logger.warning(
+                                "提取后过滤：删除管记忆动作的复述失败。",
+                                exc_info=True,
+                            )
+                    else:
+                        dropped -= 1
+                        kept.append(item)
                 continue
             kept.append(item)
         if dropped:
@@ -3804,6 +4033,23 @@ class Mem0Store:
                 # 写回前先展平（见 _metadata_for_store）：规整后的
                 # metadata 里 money 是字典形，直接传 Chroma 拒收
                 # （2026-11-16 恒生定投就是这么恢复失败的）。
+                allowed, _reason = _authorize_content_change(
+                    "restore",
+                    {"id": mem_id, "text": old_text, **old_meta},
+                    "system",
+                    new_text=old_text,
+                )
+                if not allowed:
+                    # 恢复被拒：不重存，记进 attempted，核对时会算进失败。
+                    attempted.append(
+                        {
+                            "lookup_id": None,
+                            "report_id": mem_id,
+                            "text": old_text,
+                            "metadata": old_meta,
+                        }
+                    )
+                    continue
                 try:
                     self._mem0_add(
                         [{"role": "user", "content": old_text}],
@@ -3830,6 +4076,22 @@ class Mem0Store:
             # 写回前先展平（见 _metadata_for_store）：规整后的 metadata
             # 里 money 是字典形，直接传 Chroma 拒收（2026-11-16 恒生定投
             # 就是这么恢复失败的）。
+            allowed, _reason = _authorize_content_change(
+                "restore",
+                {"id": mem_id, "text": old_text, **old_meta},
+                "system",
+                new_text=old_text,
+            )
+            if not allowed:
+                attempted.append(
+                    {
+                        "lookup_id": mem_id,
+                        "report_id": mem_id,
+                        "text": old_text,
+                        "metadata": old_meta,
+                    }
+                )
+                continue
             try:
                 try:
                     self._memory.update(
@@ -3907,6 +4169,14 @@ class Mem0Store:
             else:
                 no_id.append(item)
         for item in with_id:
+            # 记忆访问权限（2026-11-20）：回滚删的是本轮刚写的，
+            # action="delete_just_written"，系统，记日志；被拒就留着，
+            # 核对时会算进残留。
+            allowed, _reason = _authorize_content_change(
+                "delete_just_written", {"id": item["id"]}, "system"
+            )
+            if not allowed:
+                continue
             try:
                 self._memory.delete(item["id"])
             except Exception:
@@ -4210,7 +4480,9 @@ class Mem0Store:
             logger.warning("价值关卡：%d 条低价值记忆没删掉（仍在库里）。", len(survivors))
         return results
 
-    def _supersede_money_memory(self, known_item, new_text, new_money):
+    def _supersede_money_memory(
+        self, known_item, new_text, new_money, conflict_action=None
+    ):
         """53 号：同槽位新值——旧条原地更新成新说法（id 不变，审计里留
         UPDATE 行），返回更新后的条目字典；更新失败返回 None（调用方
         按“没合并”处理，新条照常留，别丢事实）。
@@ -4220,6 +4492,19 @@ class Mem0Store:
         都按整份传才稳。"""
         known_id = (known_item or {}).get("id")
         if not known_id or not new_text:
+            return None
+        # 记忆访问权限（2026-11-20）：顶掉旧条要 _resolve_conflict 判了
+        # 新胜出（调用方把判的结果传进来）；没判、或判了不胜出，都不顶。
+        allowed, _reason = _authorize_content_change(
+            "supersede",
+            {
+                "id": known_id,
+                **((known_item or {}).get("metadata") or {}),
+            },
+            "system",
+            conflict_outcome=conflict_action,
+        )
+        if not allowed:
             return None
         metadata = dict((known_item or {}).get("metadata") or {})
         metadata.pop("money", None)
@@ -4422,11 +4707,14 @@ class Mem0Store:
             if meta["decay_kind"] == DECAY_KIND_EPISODIC:
                 if should_promote(new_dates, new_sessions, tone=tone):
                     metadata["decay_kind"] = DECAY_KIND_STABLE
+                    # 预整理（2026-11-20）：晋升成稳定事实，进精选清单。
+                    metadata["curated"] = True
                     promoted = True
                 elif not new_sessions and promotion_reached(len(new_dates)):
                     # 没会话信息可考的老路子（老记忆、没传 turn_id 的
                     # 调用）：只按不同天数晋升，老行为不变。
                     metadata["decay_kind"] = DECAY_KIND_STABLE
+                    metadata["curated"] = True
                     promoted = True
         try:
             self._memory.update(memory_id=memory_id, text=text, metadata=metadata)
@@ -4566,6 +4854,9 @@ class Mem0Store:
         if metadata is None:
             return False
         metadata["tone"] = tone
+        if tone in ("joke", "test", "hypothesis"):
+            # 预整理（2026-11-20）：打标玩笑/测试/假设，出精选清单。
+            metadata.pop("curated", None)
         if isinstance(evidence, str) and evidence:
             metadata["tone_evidence"] = evidence
         if source in ("local", "model"):
@@ -4726,6 +5017,8 @@ class Mem0Store:
             return {"ok": False, "reason": "not_found"}
         metadata["voided"] = True
         metadata["voided_at"] = _now_iso()
+        # 预整理（2026-11-20）：作废，出精选清单。
+        metadata.pop("curated", None)
         tone = metadata.get("tone")
         if tone not in ("joke", "test", "hypothesis"):
             metadata["tone"] = "joke"
@@ -4736,6 +5029,39 @@ class Mem0Store:
             self._memory.update(memory_id=memory_id, metadata=metadata)
         except Exception:
             logger.warning("作废标记写回失败：记忆本身还在。", exc_info=True)
+            return {"ok": False, "reason": "update_failed"}
+        return {"ok": True, "memory_id": memory_id}
+
+    def confirm_memory(self, memory_id):
+        """BOOS 亲口确认一条已存的记忆（预整理维护点，2026-11-20）。
+
+        user_confirmed 置 True（来源也记成 user——确认就是 BOOS 亲口
+        认了这条），同时进精选清单（curated=True）。玩笑/测试/假设、
+        或已作废的记忆不确认（返回 ok=False）；确认是整理类操作
+        （只改元数据，不改原文、不删），不用走 _authorize_content_change。
+        找不到返回 ok=False，不抛异常。
+        """
+        if not memory_id:
+            return {"ok": False, "reason": "no_id"}
+        metadata = self._raw_metadata_for(memory_id)
+        if metadata is None:
+            return {"ok": False, "reason": "not_found"}
+        meta = _normalize_metadata(metadata)
+        if meta.get("voided") or meta.get("tone") in (
+            "joke",
+            "test",
+            "hypothesis",
+        ):
+            return {"ok": False, "reason": "joke_or_voided"}
+        metadata["user_confirmed"] = True
+        metadata["source"] = SOURCE_USER
+        metadata.pop("pending_confirmation", None)
+        if _should_be_curated(metadata):
+            metadata["curated"] = True
+        try:
+            self._memory.update(memory_id=memory_id, metadata=metadata)
+        except Exception:
+            logger.warning("确认标记写回失败：记忆本身还在。", exc_info=True)
             return {"ok": False, "reason": "update_failed"}
         return {"ok": True, "memory_id": memory_id}
 
@@ -4803,7 +5129,12 @@ class Mem0Store:
                 last_used_at = meta.get("last_used_at")
                 kind = meta.get("decay_kind") or DECAY_KIND_EPISODIC
                 mark_dormant = state == DECAY_STATE_VERBATIM and decay_should_go_dormant(
-                    kind, last_used_at, now_dt, is_core=False
+                    kind,
+                    last_used_at,
+                    now_dt,
+                    is_core=False,
+                    # 预整理（2026-11-20）：精选清单的记忆不沉底。
+                    is_curated=bool(meta.get("curated")),
                 )
                 mark_delete_due = decay_should_delete(last_used_at, now_dt, is_core=False)
                 if not mark_dormant and not mark_delete_due:
@@ -5065,7 +5396,10 @@ class Mem0Store:
                     held_count += 1
                     continue
                 updated = self._supersede_money_memory(
-                    supersede_target, mem_text, new_money
+                    supersede_target,
+                    mem_text,
+                    new_money,
+                    conflict_action=resolution.get("action"),
                 )
                 if updated is not None:
                     supersede_target.update(updated)
@@ -5186,7 +5520,7 @@ class Mem0Store:
         （add_memory_text）；否则写失败只记日志、不拦路（种子、
         规则、纠正后的新说法这类“索引里已经有了”的补记）。
         meta 只放标量字段（来源/置信度/是否确认/时间/写序号/轮次/槽位/
-        是否规则/衰减种类/重要性），和 add 事件的档案格式一致。
+        是否规则/是否精选/衰减种类/重要性），和 add 事件的档案格式一致。
         返回记好的事件，写失败返回 None（or_raise 时抛异常）。
         图谱推理第一期：add 事件落盘后，顺手把这条记忆接进图
         （抽实体、连边、判关系、写快照）——图是索引，失败只记日志、
@@ -5207,6 +5541,7 @@ class Mem0Store:
                     "turn_id": meta.get("turn_id"),
                     "slot": meta.get("slot"),
                     "is_rule": meta.get("is_rule", False),
+                    "curated": meta.get("curated", False),
                     "decay_kind": meta.get("decay_kind"),
                     "importance": meta.get("importance"),
                 },
@@ -5225,6 +5560,7 @@ class Mem0Store:
                     "turn_id": meta.get("turn_id"),
                     "slot": meta.get("slot"),
                     "is_rule": meta.get("is_rule", False),
+                    "curated": meta.get("curated", False),
                     "decay_kind": meta.get("decay_kind"),
                     "importance": meta.get("importance"),
                 },
@@ -5603,7 +5939,10 @@ class Mem0Store:
                         "held_pending": True,
                     }
                 updated = self._supersede_money_memory(
-                    supersede_target, safe_text, new_money
+                    supersede_target,
+                    safe_text,
+                    new_money,
+                    conflict_action=resolution.get("action"),
                 )
                 if updated is not None:
                     logger.info("手动存记忆：同槽位新金额，旧条已更新成新说法。")
@@ -6925,6 +7264,30 @@ class Mem0Store:
                 slot=old_metadata.get("slot"),
                 money=_extract_money_metadata(safe_new),
             )
+            # 记忆访问权限（2026-11-20）：纠正是 BOOS 亲口改原文，
+            # actor="boos"，过 helper 再写。
+            allowed, _reason = _authorize_content_change(
+                "rewrite_text",
+                {"id": mem_id, **(old_metadata or {})},
+                "boos",
+            )
+            if not allowed:
+                return {
+                    "status": "failed",
+                    "memory_id": mem_id,
+                    "old_text": old_stored_text,
+                    "new_text": new_text,
+                    "candidates": [],
+                    "reason": "权限拒绝：改原文要 BOOS 亲口定。",
+                    "layer": layer,
+                    "resolution": "failed",
+                    "audit": _audit(
+                        picked_id=mem_id,
+                        judge_reason=judge_reason,
+                        similarity=similarity,
+                        cands=candidates,
+                    ),
+                }
             try:
                 try:
                     self._memory.update(mem_id, text=safe_new, metadata=new_metadata)
@@ -6958,19 +7321,23 @@ class Mem0Store:
                 # 27 号：旧的金额字段也写回去（旧说法带金额时恢复它；
                 # 旧说法没金额时传 None，把纠正那步贴上的清掉）。
                 try:
+                    _rollback_meta = _provenance(
+                        old_metadata.get("source") or SOURCE_INFERRED,
+                        old_metadata.get("confidence")
+                        if isinstance(old_metadata.get("confidence"), (int, float))
+                        else CONFIDENCE_INFERRED,
+                        bool(old_metadata.get("user_confirmed")),
+                        created_at=old_metadata.get("created_at"),
+                        created_at_source=old_metadata.get("created_at_source")
+                        or "written",
+                        slot=old_metadata.get("slot"),
+                        money=old_metadata.get("money"),
+                    )
+                    if old_metadata.get("curated"):
+                        # 回滚不丢精选标记：旧条原来在清单里，恢复时还留着。
+                        _rollback_meta["curated"] = True
                     self._memory.update(
-                        mem_id, text=old_stored_text, metadata=_provenance(
-                            old_metadata.get("source") or SOURCE_INFERRED,
-                            old_metadata.get("confidence")
-                            if isinstance(old_metadata.get("confidence"), (int, float))
-                            else CONFIDENCE_INFERRED,
-                            bool(old_metadata.get("user_confirmed")),
-                            created_at=old_metadata.get("created_at"),
-                            created_at_source=old_metadata.get("created_at_source")
-                            or "written",
-                            slot=old_metadata.get("slot"),
-                            money=old_metadata.get("money"),
-                        )
+                        mem_id, text=old_stored_text, metadata=_rollback_meta
                     )
                 except Exception:
                     logger.warning("纠错回滚失败：记忆 %s 可能处于新旧混合状态。", mem_id, exc_info=True)
@@ -7399,6 +7766,18 @@ class Mem0Store:
                 return False
             old_text = owned[memory_id].get("text") or ""
             history_count = len(self.history(memory_id))
+            # 记忆访问权限（2026-11-20）：删已立的记忆要 BOOS 授权——
+            # approve=True 本来就是 BOOS 点了确认，这里再过一道 helper。
+            allowed, _reason = _authorize_content_change(
+                "delete",
+                {
+                    "id": memory_id,
+                    **(owned[memory_id].get("metadata") or {}),
+                },
+                "boos",
+            )
+            if not allowed:
+                raise PermissionError("删除被权限拒绝：只有 BOOS 能删记忆。")
             self._journal_add(memory_id, old_text, history_count)
             try:
                 self._memory.delete(memory_id)
@@ -7539,6 +7918,15 @@ class Mem0Store:
             if memory_id not in owned:
                 return False
             item = owned[memory_id]
+            # 记忆访问权限（2026-11-20）：撤回是 BOOS 已确认的意图，
+            # actor="boos"，删记忆要过 helper。
+            allowed, _reason = _authorize_content_change(
+                "delete",
+                {"id": memory_id, **(item.get("metadata") or {})},
+                "boos",
+            )
+            if not allowed:
+                return False
             trash = self._read_retracted_trash()
             # 已经在回收站里的不重复记。
             # 判断 c 号：软删除的记录带 deleted_at（删掉的时间）和

@@ -161,12 +161,14 @@ def promotion_reached(seen_days):
     )
 
 
-def decay_should_go_dormant(kind, last_used_at, now=None, is_core=False):
+def decay_should_go_dormant(kind, last_used_at, now=None, is_core=False,
+                             is_curated=False):
     """这条记忆该标沉底了吗：30 天没人找，且权重已经掉到 0.30 下面。
-    核心记忆永远不标；没时间的老记忆不标（闲了多久都算不出来）。
-    只判“该不该打标”，标了也只是打标——原话和文本都不动（见
-    sweep_monthly）。"""
-    if is_core:
+    核心记忆永远不标；精选清单（curated）的记忆也不沉底（2026-11-20，
+    最重要的记忆常年待在常用层）；没时间的老记忆不标（闲了多久都算
+    不出来）。只判“该不该打标”，标了也只是打标——原话和文本都不动
+    （见 sweep_monthly）。"""
+    if is_core or is_curated:
         return False
     idle = _decay_idle_days(last_used_at, now)
     if idle is None or idle < DECAY_DORMANT_IDLE_DAYS:
