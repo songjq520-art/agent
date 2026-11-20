@@ -431,6 +431,8 @@ def project_and_filter(items, state, include_history=False):
     默认只放“当前”的：被取代的（superseded）、删了的（deleted）
     不给；问“以前”时（include_history=True）才放出来，并标
     is_history=True 和 history_state（“这是以前的”）。
+    已作废的（voided）永远不给：作废不是“以前”，问“以前”也不放
+    出来（Bug 1，2026-11-20）——作废的玩笑原话不能再被当成事实注入。
     睡着的（dormant）不屏蔽：它是衰减的标签（30 天没人找），不是
     “不是当前了”——衰减分支的定法是权重只管排位、不管能不能搜到，
     睡着的照常能搜到、被用上就唤醒；筛子把它屏蔽掉就和衰减分支
@@ -467,6 +469,12 @@ def project_and_filter(items, state, include_history=False):
                     item_key = None
                 if item_key:
                     ledger_state = key_states.get(item_key)
+        if meta.get("voided") is True:
+            # Bug 1（2026-11-20）：已作废的玩笑记忆永远不返回——作废
+            # 不是“以前”，问“以前”也不放出来；作废的原话不能再被
+            # 当成事实注入。账本里没有 voided 状态（void_joke_memory
+            # 只写 Chroma metadata），这里只认 metadata 上的标记。
+            continue
         if ledger_state in (
             LEDGER_STATE_SUPERSEDED,
             LEDGER_STATE_DELETED,

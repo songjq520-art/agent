@@ -1316,6 +1316,22 @@ class Mem0Store:
                     seen_texts.add(_text)
             except Exception:
                 logger.warning("精选先查失败：本次不用精选结果。", exc_info=True)
+        # Bug 1（2026-11-20）：已作废的玩笑记忆不再被检索注入——
+        # 索引里 metadata 带 voided 的那几条，先把它们的账本 key
+        # 记下来：图谱和账本兜底那两路是从账本原话拼的、meta 里没有
+        # voided 标记，筛子（project_and_filter）认不出来，得在这里
+        # 按 key 拦。索引直出的那几路（精选/语义/关键词）由筛子按
+        # metadata 拦（见 ledger.project_and_filter）。
+        voided_keys = set()
+        for _item in (all_items or {}).get("results", []):
+            _raw_meta = (_item or {}).get("metadata") or {}
+            if _raw_meta.get("voided") is True:
+                voided_keys.add(
+                    _ledger.ledger_event_key(
+                        _item.get("memory") or "",
+                        _raw_meta.get("created_at"),
+                    )
+                )
         try:
             raw = self._memory.search(query, filters={"user_id": self.user_id}, top_k=top_k)
             for item in (raw or {}).get("results", []):
@@ -1439,6 +1455,18 @@ class Mem0Store:
         self._graph_merge(
             results, seen_texts, query, top_k, include_history, ledger_state
         )
+        # Bug 1：图上找回来的账本原话里，作废的按 key 拦掉（meta 里
+        # 没有 voided 标记，筛子认不出来）。
+        if voided_keys:
+            results = [
+                item
+                for item in results
+                if _ledger.ledger_event_key(
+                    item.get("text") or "",
+                    (item.get("metadata") or {}).get("created_at"),
+                )
+                not in voided_keys
+            ]
         # 投影过滤之前先把这一批的 key 都记下来：被筛掉的（睡着的、
         # 被取代的、删了的）原话，兜底那步也不许再从账本里捞回来——
         # 筛子刚扔掉的，兜底不能再捡回来当现况（账本兜底只补“索引
@@ -1517,6 +1545,10 @@ class Mem0Store:
                 ):
                     text = hit.get("text") or ""
                     if not text or text in seen_texts:
+                        continue
+                    # Bug 1：账本兜底翻出来的原话里，作废的按 key 拦掉
+                    # （账本事件的 meta 里没有 voided 标记，筛子认不出来）。
+                    if hit.get("key") in voided_keys:
                         continue
                     hit_state = key_states.get(hit.get("key"))
                     if not include_history and hit_state in (
