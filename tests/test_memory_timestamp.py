@@ -762,6 +762,33 @@ def test_restore_verify_catches_readd_with_incomplete_metadata(tmp_path):
     assert items[0]["metadata"]["write_seq"] is None
 
 
+
+def test_restore_skips_when_same_text_already_in_store(tmp_path):
+    """id 查不到但相同文本已在库里时，恢复不重存（不造重复）。
+
+    2026-11-20 冒菜 20 份的根因：服务启动时覆盖守卫把冒菜误判成
+    “丢了”（快照 id 在当前库里查不到），又重存了一份。修法是恢复前
+    按内容再查一次：相同文本已在库里就不重存。
+    """
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我爱的是冒菜，不是麻辣烫", source="user")
+    before = store.get_all()
+    old_id = before[0]["id"]
+    # 模拟假阳性：快照里的旧 id 没了，但相同文本已在库里（换了个新 id）。
+    store._memory.delete(old_id)
+    store._add_text_with_metadata(
+        "我爱的是冒菜，不是麻辣烫", _provenance("user", 1.0, True)
+    )
+    assert len(store.get_all()) == 1
+    result = store._restore_snapshot_memories(before)
+    assert result == {"verified": True, "restored": 0, "failed_ids": []}
+    # 没重存：库里还是只有 1 份冒菜，且就是后存的那份（id 没变）。
+    items = store.get_all()
+    assert len(items) == 1
+    assert items[0]["text"] == "我爱的是冒菜，不是麻辣烫"
+    assert items[0]["id"] != old_id
+
+
 def test_restore_verify_read_failure_marks_unverified(tmp_path):
     """恢复后核对读库失败：verified=False，不能算恢复成功。
 

@@ -3743,7 +3743,16 @@ class Mem0Store:
                 "text": text,
                 "metadata": _normalize_metadata((item or {}).get("metadata"), item),
             }
+        # 库里已有的文本集合：恢复前按内容再查一次。id 对不上时，
+        # 只要相同文本已在库里就不重存——id 查不到可能是假阳性
+        # （启动瞬间读不全、快照 id 旧了、mem0 的 add 动了 id），
+        # 重存只会造重复（2026-11-20 冒菜 20 份就是这么来的）。
+        # 只比文本，不要求 metadata 全对上：底层 add 的 metadata
+        # 回退会丢 write_seq/confidence，metadata 对不上是常态。
+        # 文本比对方式和 _verify_after_repair 一致：逐字相等。
+        current_texts = {entry["text"] for entry in current.values()}
         attempted = []
+        skipped = []
         for old in before_items:
             mem_id = (old or {}).get("id")
             old_text = (old or {}).get("text") or ""
@@ -3752,6 +3761,22 @@ class Mem0Store:
             old_meta = _normalize_metadata((old or {}).get("metadata"))
             now = current.get(mem_id)
             if now is None:
+                logger.info(
+                    "覆盖守卫：快照里的旧记忆 id=%s 在当前库里查不到"
+                    "（当前库 %d 条），文本：%s",
+                    mem_id,
+                    len(current),
+                    old_text[:60],
+                )
+                if old_text in current_texts:
+                    # 内容已在库里：id 对不上是假阳性，跳过恢复，不重存。
+                    logger.info(
+                        "覆盖守卫：相同文本已在库里，跳过恢复，"
+                        "不重存（id=%s）。",
+                        mem_id,
+                    )
+                    skipped.append(mem_id)
+                    continue
                 # 没了：重新存一条，文本和 metadata 原样带上。
                 # 存完不数成功——成没成等下面统一核对。
                 # 写回前先展平（见 _metadata_for_store）：规整后的
@@ -3805,12 +3830,24 @@ class Mem0Store:
                     "metadata": old_meta,
                 }
             )
+        if skipped:
+            logger.info(
+                "覆盖守卫：%d 条旧记忆因相同文本已在库里而跳过恢复，"
+                "未重存。",
+                len(skipped),
+            )
         if not attempted:
             return {"verified": True, "restored": 0, "failed_ids": []}
         # 改完再读一遍核对：没报错不等于恢复了，读回来对上了才算。
         # 核对读库失败时一个都没确认，全算没恢复（失败关闭）。
         check = self._verify_after_repair(attempted, [])
         if not check["read_ok"]:
+            logger.info(
+                "覆盖守卫：恢复后核对读库失败，restored=0，"
+                "failed_ids=%s，attempted=%d 条。",
+                [item["report_id"] for item in attempted],
+                len(attempted),
+            )
             return {
                 "verified": False,
                 "restored": 0,
@@ -3818,8 +3855,13 @@ class Mem0Store:
             }
         failed_ids = check["missing"]
         restored = len(attempted) - len(failed_ids)
-        if restored:
-            logger.info("提取后守卫：按快照恢复了 %d 条被改动的旧记忆。", restored)
+        logger.info(
+            "提取后守卫：按快照恢复了 %d 条被改动的旧记忆"
+            "（failed_ids=%s，attempted=%d 条）。",
+            restored,
+            failed_ids,
+            len(attempted),
+        )
         return {"verified": True, "restored": restored, "failed_ids": failed_ids}
 
     def _rollback_new_memories(self, items):
@@ -3896,6 +3938,7 @@ class Mem0Store:
         """
         if not before_items:
             return results
+        logger.info("覆盖守卫：提取后核对，before_items=%d 条。", len(before_items))
         results = dict(results or {})
         restore = self._restore_snapshot_memories(before_items)
         items = (results or {}).get("results") or []
