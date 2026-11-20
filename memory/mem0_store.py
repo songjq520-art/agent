@@ -3723,7 +3723,9 @@ class Mem0Store:
             detected = _detect_correction(latest_user) if latest_user else None
             if detected is not None:
                 outcome = self.correct_memory(
-                    detected["fact"], detected["fact"]
+                    detected["fact"],
+                    detected["fact"],
+                    exclude_identical_to_new=True,
                 )
                 handled = self._handle_correction_outcome(outcome)
                 if handled is not None:
@@ -6312,7 +6314,7 @@ class Mem0Store:
     # 两者共用一道规矩：绝不谎称成功——改失败原记忆不动、报失败；
     # 删失败（或删了一半）报清楚哪一步没成，日志/返回值里不写“已删除”。
 
-    def _find_correction_candidates(self, old_text, top_k=5):
+    def _find_correction_candidates(self, old_text, top_k=5, new_text=None):
         """找“纠错要改的那条记忆”的候选（供 correct_memory 用）。
 
         两路信号，和 search 一样：
@@ -6322,6 +6324,10 @@ class Mem0Store:
         "confirmed"}]，按分数从高到低排（关键词捞回的分数记 None，
         排在有分数的后面）。调用方按这个结果判断“唯一/多个/没有”。
         出错时返回 []（找不到就报找不到，不猜）。
+        new_text（Bug 6）：传了时，两路一个没找着就再到最近上下文和
+        同槽位旧记忆里找（见 _correction_fallback_candidates）——
+        新旧句字面重合低（比如“住上海” vs “住北京”）时，直接检索
+        找不着冲突的旧条，纠错会被静默吞掉。
         """
         candidates = []
         seen_ids = set()
@@ -6333,10 +6339,15 @@ class Mem0Store:
                     candidates.append(item)
         except Exception:
             logger.warning("纠错：语义找候选失败，只用关键词找。", exc_info=True)
+        # 关键词找候选和兜底 recall 共用一次全库读：读库次数是有测试
+        # 在数的（test_correction_not_found_keeps_current_round_protection），
+        # 兜底不能再单独读一次。
+        all_items = None
         try:
             keywords = _extract_keywords(old_text)
             if keywords:
-                for item in self.get_all(include_sensitive=True):
+                all_items = self.get_all(include_sensitive=True)
+                for item in all_items:
                     mem_id = item.get("id")
                     if not mem_id or mem_id in seen_ids:
                         continue
@@ -6358,7 +6369,68 @@ class Mem0Store:
                         )
         except Exception:
             logger.warning("纠错：关键词找候选失败。", exc_info=True)
+        if not candidates and new_text:
+            # Bug 6 场景 2：直接检索一个没找着，再到上下文/同槽位里找。
+            candidates = self._correction_fallback_candidates(
+                new_text, all_items=all_items
+            )
         return candidates
+
+    def _correction_fallback_candidates(
+        self, new_text, exclude_ids=None, all_items=None
+    ):
+        """纠错候选的兜底 recall（Bug 6 场景 2）：直接检索（语义 + 关键词）
+        一个没找着时，再到最近对话上下文和同槽位旧记忆里找。
+
+        - 最近上下文（_recent_context_ids）：刚聊过的那条很可能就是要
+          改的那条，字面重合低也认；
+        - 同槽位：和新说法有共同核心槽位（extract_core_slots 交集，
+          和去重裁决同一套槽位口径）的旧记忆。
+        只在直接检索为空时调（见 _find_correction_candidates）：槽位
+        是宽召回，直接检索够用时不往池子里加噪音（单候选变多候选会
+        改走模型判，离线没模型就变 ambiguous）。
+        返回和 _find_correction_candidates 同形的候选列表（score 记
+        None，source 是 "context" 或 "slot"）。出错返回 []，不猜。
+        """
+        out = []
+        seen = set(exclude_ids or [])
+        try:
+            if all_items is None:
+                all_items = self.get_all(include_sensitive=True)
+            by_id = {(item or {}).get("id"): item for item in all_items}
+        except Exception:
+            logger.warning("纠错兜底候选：读库失败。", exc_info=True)
+            return out
+
+        def _as_candidate(item, source):
+            meta = (item or {}).get("metadata") or _normalize_metadata(None)
+            return {
+                "id": (item or {}).get("id"),
+                "text": (item or {}).get("text") or "",
+                "score": None,
+                "source": source,
+                "metadata": meta,
+                "confirmed": (meta or {}).get("confirmed", False),
+            }
+
+        for mem_id in list(self._recent_context_ids):
+            if not mem_id or mem_id in seen:
+                continue
+            item = by_id.get(mem_id)
+            if item is None:
+                continue
+            seen.add(mem_id)
+            out.append(_as_candidate(item, "context"))
+        slots = extract_core_slots(new_text)
+        if slots:
+            for item in by_id.values():
+                mem_id = (item or {}).get("id")
+                if not mem_id or mem_id in seen:
+                    continue
+                if extract_core_slots((item or {}).get("text") or "") & slots:
+                    seen.add(mem_id)
+                    out.append(_as_candidate(item, "slot"))
+        return out
 
     def _judge_correction(self, new_text, candidates):
         """请 DeepSeek 判断：新说法到底在纠正候选里的哪一条。
@@ -7115,12 +7187,17 @@ class Mem0Store:
             return (items[0] or {}).get("id")
         return None
 
-    def correct_memory(self, old_text, new_text):
+    def correct_memory(self, old_text, new_text, exclude_identical_to_new=False):
         """纠错：把一条记错的记忆换成正确的（原地替换，同一 id）。
 
         什么时候调：BOOS 说“你记错了”并给出正确说法时（或以后网页端/
         命令行的纠错入口调）。old_text 是“错的那句大概是什么”
         （调用方从刚检索到的那条记忆里取），new_text 是正确的说法。
+        exclude_identical_to_new（只给 add_turn 的纠错调用传 True）：
+        add_turn 是把新说法同时当 old_text 和 new_text 传进来——和新
+        说法相同的候选是新说法自己，不是该改的那条，匹配前排除它；
+        网页/命令行明确指旧条时不传，old_text 和 new_text 相同就是
+        unchanged（别把另一条相似记忆改了）。
         流程：
         1. 先找候选（_find_correction_candidates）。
            - 候选里有和 old_text 规整后完全相同的，先认它（哪怕还有
@@ -7227,12 +7304,45 @@ class Mem0Store:
                 "audit": _audit(),
             }
         with _WRITE_LOCK:
-            candidates = self._find_correction_candidates(old_text)
+            candidates = self._find_correction_candidates(
+                old_text,
+                new_text=new_text if exclude_identical_to_new else None,
+            )
             target = None
             layer = "none"
             judge_reason = None
             similarity = None
             normalized_old = _normalize_memory_text(old_text)
+            normalized_new = _normalize_memory_text(new_text)
+            if exclude_identical_to_new and normalized_old == normalized_new:
+                # Bug 6 场景 1：old_text 就是新说法本身（add_turn 传
+                # detected["fact"] 当两边）；和新说法一字不差的候选是
+                # 新说法自己，不是该改的那条——精确匹配前先排除它，
+                # 否则精确匹配误命中它、报 unchanged，真正该改的冲突
+                # 旧条纹丝不动。只剩它时：到上下文/同槽位再找一圈，
+                # 还没有才照常报 unchanged（新说法已经存着、没有冲突）。
+                others = [
+                    item
+                    for item in candidates
+                    if _normalize_memory_text(item.get("text") or "")
+                    != normalized_new
+                ]
+                if others:
+                    candidates = others
+                elif candidates:
+                    extra = [
+                        item
+                        for item in self._correction_fallback_candidates(
+                            new_text,
+                            exclude_ids={
+                                (item or {}).get("id") for item in candidates
+                            },
+                        )
+                        if _normalize_memory_text(item.get("text") or "")
+                        != normalized_new
+                    ]
+                    if extra:
+                        candidates = extra
             for item in candidates:
                 if _normalize_memory_text(item.get("text") or "") == normalized_old:
                     target = item

@@ -160,3 +160,61 @@ def test_bug2_add_memory_text_keep_old_appends_evidence(tmp_path):
     assert (result.get("results") or [{}])[0].get("id") == old_id
     assert store._memory.all_texts() == ["每天定投5块买万家纳指"]
     assert "每天定投10块买万家纳指" in _bug2_evidence_texts(store, old_id)
+
+
+# ---------- Bug 6：纠错候选池（上下文 + 同槽位，排除新说法自己） ----------
+
+
+def test_bug6_correction_replaces_conflicting_not_identical(tmp_path):
+    """Bug 6 场景 1：库里有“喜欢喝茶”（和新说法同义）和“喜欢喝咖啡”
+    （冲突），用户说“你记错了，我喜欢喝茶”→ 该改的是咖啡那条，
+    不是报 unchanged。修之前精确匹配命中了茶自己，咖啡纹丝不动。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我喜欢喝茶", source="user")
+    store.add_memory_text("我喜欢喝咖啡", source="user")
+    result = store.add_turn([
+        {"role": "user", "content": "你记错了，我喜欢喝茶。"},
+        {"role": "assistant", "content": "明白，我更新一下。"},
+    ])
+    assert result["correction"]["status"] == "updated"
+    texts = [item["text"] for item in store.get_all()]
+    assert not any("咖啡" in text for text in texts), texts
+    assert any("喝茶" in text for text in texts)
+
+
+def test_bug6_correction_finds_conflict_via_recent_context(tmp_path):
+    """Bug 6 场景 2：新旧句字面重合低（“住上海” vs “住北京”），直接
+    检索找不着冲突的旧条；但旧条在最近对话上下文里，兜底 recall
+    找回来、照常纠正。修之前报 not_found，新说法单独存一条、旧的还在。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我家在北京", source="user")
+    home_id = store.get_all()[0]["id"]
+    store.note_context([{"id": home_id}])
+    result = store.add_turn([
+        {"role": "user", "content": "你记错了，我住上海。"},
+        {"role": "assistant", "content": "明白，我更新一下。"},
+    ])
+    assert result["correction"]["status"] == "updated"
+    assert result["correction"]["memory_id"] == home_id
+    texts = [item["text"] for item in store.get_all()]
+    assert not any("北京" in text for text in texts), texts
+
+
+def test_bug6_fallback_candidates_from_context_and_slot(tmp_path):
+    """Bug 6（兜底 recall 本身）：直接检索为空时，上下文 id 进候选池；
+    同槽位（共同核心槽位）的旧记忆也进候选池。"""
+    store = make_fake_store(tmp_path)
+    store.add_memory_text("我家在北京", source="user")
+    home_id = store.get_all()[0]["id"]
+    store.note_context([{"id": home_id}])
+    cands = store._find_correction_candidates("我住上海", new_text="我住上海")
+    assert [cand["id"] for cand in cands] == [home_id]
+    assert cands[0]["source"] == "context"
+    store2 = make_fake_store(tmp_path)
+    store2.add_memory_text("我喜欢喝咖啡", source="user")
+    coffee_id = store2.get_all()[0]["id"]
+    slot_cands = store2._correction_fallback_candidates("我喜欢喝茶")
+    assert any(
+        cand["id"] == coffee_id and cand["source"] == "slot"
+        for cand in slot_cands
+    ), slot_cands
