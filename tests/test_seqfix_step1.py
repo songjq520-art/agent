@@ -435,3 +435,42 @@ def test_bug3_archive_gate_skipped_for_fund_entity(tmp_path):
     assert dormant_id in ids
     dormant = next(item for item in results if item["id"] == dormant_id)
     assert dormant["layer"] == "archive"
+
+
+# ---------- Bug 4③：key 时间基准统一（correct_memory 复用旧 created_at） ----------
+
+
+def test_bug4c_correction_reuses_old_created_at(tmp_path):
+    """Bug 4③：纠正后新条 metadata 的 created_at 还是旧条那个时间
+    （不是纠正那一刻的新时间），SUPERSEDE 事件的 current_key 等于
+    ledger_event_key(new_text, old_created_at)——和
+    _supersede_money_memory 一个基准。"""
+    from memory import ledger as _ledger
+
+    old_created_at = "2026-11-10T08:00:00.000000Z"
+    store = make_fake_store(tmp_path)
+    result = store._add_text_with_metadata(
+        "我喜欢喝咖啡",
+        _provenance(
+            SOURCE_INFERRED, CONFIDENCE_INFERRED, False,
+            created_at=old_created_at,
+        ),
+    )
+    memory_id = (result.get("results") or [{}])[0].get("id")
+    assert _bug3_meta_of(store, memory_id)["created_at"] == old_created_at
+    outcome = store.correct_memory("我喜欢喝咖啡", "我喜欢喝茶")
+    assert outcome["status"] == "updated", outcome
+    assert _bug3_meta_of(store, memory_id)["created_at"] == old_created_at
+    events, _info = _ledger.read_events(store.ledger_path)
+    supersedes = [
+        event for event in events
+        if event.get("type") == _ledger.LEDGER_EVENT_SUPERSEDE
+        and event.get("memory_id") == memory_id
+    ]
+    assert supersedes, "账本里没有这条纠正的 SUPERSEDE 事件"
+    assert supersedes[-1].get("current_key") == _ledger.ledger_event_key(
+        "我喜欢喝茶", old_created_at
+    )
+    assert supersedes[-1].get("key") == _ledger.ledger_event_key(
+        "我喜欢喝咖啡", old_created_at
+    )

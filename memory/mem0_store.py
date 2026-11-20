@@ -7582,10 +7582,19 @@ class Mem0Store:
             # 下次改名时按槽位找不到旧记忆，就会并存两条。
             # 27 号：新说法带金额就把金额字段贴上；没金额就传 None
             # （显式清掉——旧说法带金额、新说法不带时，旧字段不能留着）。
+            # Bug 4③（2026-11-20）：纠正复用旧条原 created_at——
+            # 和 _supersede_money_memory 一个基准（它用旧条时间算新
+            # 旧两个 key）；旧条没时间时 _provenance 照常用新鲜时间。
+            # 记忆是同一件事的“改写”，不是新长出来的记忆，时间不该
+            # 因为纠正就变年轻；_verify_correction 和回滚只认 id 和
+            # 文本，不碰 created_at，不受影响。
             new_metadata = _provenance(
                 SOURCE_USER,
                 CONFIDENCE_USER,
                 True,
+                created_at=old_metadata.get("created_at"),
+                created_at_source=old_metadata.get("created_at_source")
+                or "written",
                 slot=old_metadata.get("slot"),
                 money=_extract_money_metadata(safe_new),
             )
@@ -7693,8 +7702,8 @@ class Mem0Store:
             # 旧话留在账本里，以后翻账本还能找回“以前记错的那句”）。
             # key 带上：旧原话的 key 标 superseded，新原话的 key 标
             # current——对账、兜底按 key 认旧话，不会把错的那句复活。
-            # 注意：new_metadata 是新编的 created_at（纠正发生在现在），
-            # current_key 必须按新时间算，和下面补记的 add 事件是同一个 key。
+            # 注意：new_metadata 复用旧条 created_at（见上），current_key
+            # 按旧时间算，和下面补记的 add 事件是同一个 key。
             old_created_at = (old_metadata or {}).get("created_at")
             self._ledger_append(
                 _ledger.LEDGER_EVENT_SUPERSEDE,
