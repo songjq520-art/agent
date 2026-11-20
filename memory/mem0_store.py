@@ -1103,7 +1103,7 @@ class Mem0Store:
 
     # ---------- 检索（提问前） ----------
 
-    def search(self, query, top_k=5, reinforce=False, include_history=False, turn_id=None):
+    def search(self, query, top_k=10, reinforce=False, include_history=False, turn_id=None):
         """搜和问题相关的记忆（语义检索 + 关键词补充信号）。
 
         返回：记忆列表，每项为 {"id", "text", "score", "source",

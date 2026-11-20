@@ -466,7 +466,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     DeepSeek 走工具循环，29 号起两条路都带历史），
     预算预估也覆盖完整历史。
     参数 mem0_store：mem0 长期记忆库（Mem0Store），不传时不带记忆；
-    传了时，提问前先用问题搜相关记忆（search，top_k=5），有结果就拼
+    传了时，提问前先用问题搜相关记忆（search，top_k=10），有结果就拼
     成提示块塞进发给模型的问题里（历史里仍记原话），没搜到记忆就
     什么都不拼、原样提问（不知道一定要说不知道，不注入近似记忆）；
     回答成功后，把本轮及最近的消息（含刚追加的新问答）存进长期记忆
@@ -575,7 +575,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             with timer.measure("memory_search_ms"):
                 # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
                 # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
-                memories = mem0_store.search(prompt, top_k=5, reinforce=True, turn_id=turn_id)
+                memories = mem0_store.search(prompt, top_k=10, reinforce=True, turn_id=turn_id)
             # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
             # “当前在聊什么”的提示（见 Mem0Store.note_context）。
             mem0_store.note_context(memories)
