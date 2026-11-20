@@ -2016,16 +2016,38 @@ class Mem0Store:
                 )
             ]
             existing_keys = set()
+            existing_texts = set()
             for item in self.get_all(include_sensitive=True):
                 meta = (item or {}).get("metadata") or {}
+                text = (item or {}).get("text") or ""
                 existing_keys.add(
-                    _ledger.ledger_event_key(
-                        item.get("text") or "", meta.get("created_at")
-                    )
+                    _ledger.ledger_event_key(text, meta.get("created_at"))
                 )
+                if text:
+                    existing_texts.add(text)
             missing = [
                 entry for entry in adds if entry.get("key") not in existing_keys
             ]
+            # 内容已在索引里时不重建：key 对不上可能是重建时 metadata
+            # 回退丢了 created_at（2026-11-20 冒菜：账本 seq 3 的 key
+            # 永远对不上，每次启动都重建一份）。只按 key 认会无限
+            # 重建，须再按内容查一次。文本比对方式和
+            # _verify_after_repair 一致：逐字相等。
+            skipped = []
+            kept = []
+            for entry in missing:
+                text = entry.get("text") or ""
+                if text and text in existing_texts:
+                    skipped.append(entry.get("key"))
+                    continue
+                kept.append(entry)
+            if skipped:
+                logger.info(
+                    "账本对账：%d 条账本记忆因相同文本已在索引里"
+                    "而跳过重建，未写回。",
+                    len(skipped),
+                )
+            missing = kept
             reconciled = []
             failed = []
             for entry in missing:
