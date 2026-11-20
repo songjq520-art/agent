@@ -479,9 +479,10 @@ def test_correction_of_name_keeps_slot(tmp_path):
 # ---------- 待定区本身：沉默不存、下一轮才提交 ----------
 
 
-def test_pending_turn_not_stored_until_next_turn(tmp_path):
-    """待定区：只有一轮对话、没有下一轮时，什么都不存；
-    下一轮来了，上一轮才提交。"""
+def test_pending_turn_parked_until_next_turn_or_idle(tmp_path):
+    """待定区：只有一轮对话、没有下一轮时，刚打完那一刻什么都不存；
+    下一轮来了，上一轮立刻提交；闲置满 60 秒也会提交（见
+    test_chat_extraction_runs.py，不用等下一轮）。"""
     store = make_fake_store(tmp_path)
     result = store.add_turn([{"role": "user", "content": "我喜欢喝咖啡。"}])
     assert result.get("pending") is True

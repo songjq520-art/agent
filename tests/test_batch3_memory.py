@@ -553,7 +553,8 @@ def test_04_same_topic_at_080_passes(tmp_path):
 
 def test_26_save_turn_queues_and_flush_stores(tmp_path):
     """26 号：save_turn 把本轮放进 outbox 就返回（queued=True），
-    不等存完；flush_pending 后记忆才落库——回答先回、记忆后存。"""
+    不等存完；flush_pending 后记忆落库——回答先回、记忆后存。
+    （闲置满 60 秒也会自动落库，见 test_chat_extraction_runs.py。）"""
     store = make_fake_store(tmp_path)
     result = store.save_turn(_round("我喜欢喝冰美式。", "记下了。"))
     assert result.get("queued") is True

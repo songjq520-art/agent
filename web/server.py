@@ -1868,6 +1868,13 @@ def main(argv=None):
                 print(f"长期记忆：给 {backfilled} 条老记忆补了时间戳。", flush=True)
         except Exception:
             logger.warning("补记忆时间戳失败：本次不补。", exc_info=True)
+        # 闲置提交 + 启动恢复（2026-11-20 游泳事故）：服务器启动时就建并
+        # 启动 outbox，捞回盘上没存完的轮次——别等第一次聊天才懒建，否则
+        # 重启后没人接话，落盘的轮次就没人消费、待定区也没人提交。
+        try:
+            mem0_store.ensure_outbox_started()
+        except Exception:
+            logger.warning("启动后台 outbox 失败：重启后待存的轮次要等第一次聊天才恢复。", exc_info=True)
     # 对话摘要：常驻服务启动时建一个 ConversationSummaryStore（只建一次），
     # 每轮后历史超上限就总结压缩、记一笔最近对话，开新对话/停服务时总结保存。
     # 建不好时不带摘要运行，服务照常启动。

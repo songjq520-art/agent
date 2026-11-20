@@ -465,6 +465,12 @@ DECAY_DELETE_BACKUP_PREFIX = "decay-delete-backup-"
 # 所以 0.5 不会把真事实拦在外面。BOOS 看了可以调（见第 3 批报告）。
 VALUE_THRESHOLD = 0.5
 
+# PENDING_IDLE_SECONDS（待定区闲置提交：正常轮次先进待定区，等下一轮或等闲置
+# 这么久才提交提取——给“不不不”撤回留窗口，又保证最后一轮没人接话时也
+# 能落库（2026-11-20 游泳那句就是没下一轮才丢的）。测试里可以改小
+# store._pending_idle_seconds，不用真等 60 秒。
+PENDING_IDLE_SECONDS = 60.0
+
 # RETRACTION_CANDIDATE_MARKERS（撤回候选触发词）：34 号。
 # 撤回判断分两步：先用这些词便宜地筛出“可能是撤回”的句子，再请模型
 # 判意图——不是每轮都请模型（贵），也不是只认整句信号词（漏）。
@@ -898,11 +904,17 @@ class Mem0Store:
         # 不撤回才真正存入（见 add_turn / _commit_pending_turn）。
         # 结构 {"messages": [...], "identity": [{"slot","value","text"}]}，
         # identity 是本轮最新一句 user 消息里认出的身份陈述（代码定的，
-        # 见 _detect_identity_statement）。只放内存里，重启就没了——
-        # 没来得及提交的对话本来就是临时的；沉默（没有下一轮）时，
-        # 待定区清空、不存（这是设计，不是丢数据：用户没给下一句，
-        # 就当那句还没说定）。
+        # 见 _detect_identity_statement）。
+        # 2026-11-20 游泳事故之后：待定区不再只等下一轮——闲置满
+        # _pending_idle_seconds（默认 60 秒）也提交（_on_pending_idle），
+        # 保证最后一轮没人接话时也能落库；outbox 落盘文件在真正落库前
+        # 一直留着（见 _commit_pending_turn），重启能捞回来重交。
         self._pending_turn = None
+        # _pending_idle_seconds / _pending_timer（待定区闲置提交）：
+        # 停车后（重）启一个守护定时器，到点仍是同一轮就提交；新轮次
+        # 来了就取消旧的、重设。测试里可以改小 _pending_idle_seconds。
+        self._pending_idle_seconds = PENDING_IDLE_SECONDS
+        self._pending_timer = None
         # _pending_inference（待定的揣摩）：上一轮揣出来、当场问了 BOOS
         # 的那条推断（见 memory/inference.py + infer_from_turn）。
         # 只放内存里，重启就没了——问话本身就是当场的；账本里那份
@@ -2618,6 +2630,76 @@ class Mem0Store:
 
     # ---------- Plan C：待定区提交 + 同槽位 UPDATE + 身份种子 ----------
 
+    def _arm_pending_timer(self, turn_id):
+        """给待定区停车后（重）启闲置定时器：到点仍是同一轮就提交。
+
+        每来一个新 add_turn 就取消旧定时器重设——撤回窗口从“等到下一轮”
+        变成“等闲置这么久”，“不不不”在窗口内仍能丢掉待定区；窗口过了
+        没人接话，定时器自己提交，保证最后一轮也能落库（2026-11-20
+        游泳事故）。定时器是守护线程，不拦进程退出；起不来只记日志、
+        不拦提交（退回成“只等下一轮”的老行为）。
+        """
+        self._cancel_pending_timer()
+        if not turn_id:
+            return
+        try:
+            timer = threading.Timer(
+                self._pending_idle_seconds, self._on_pending_idle, args=(turn_id,)
+            )
+            timer.daemon = True
+            timer.start()
+            self._pending_timer = timer
+        except Exception:
+            logger.warning("待定区闲置定时器没起来：本轮要等下一轮或关机才提交。", exc_info=True)
+
+    def _cancel_pending_timer(self):
+        timer = getattr(self, "_pending_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._pending_timer = None
+
+    def _on_pending_idle(self, turn_id):
+        """闲置定时器到点：待定区还是同一轮时提交它。"""
+        with _WRITE_LOCK:
+            pending = self._pending_turn
+            if pending is None or pending.get("turn_id") != turn_id:
+                return
+            try:
+                self._commit_pending_turn()
+            except Exception:
+                logger.warning("闲置提交待定记忆失败：等下一轮或关机时再试。", exc_info=True)
+
+    def ensure_outbox_started(self):
+        """启动后台 outbox（服务器启动时调，别等第一次聊天才懒建）。
+
+        启动时顺带捞回盘上没存完的轮次（recover_pending）：重启后就算
+        没人马上聊天，落盘的轮次也能被消费、进待定区、再由闲置定时器
+        提交（2026-11-20 游泳事故：重启后没人接话，轮次就没人管）。
+        """
+        if self._outbox is None:
+            self._outbox = MemoryOutbox(self)
+            self._outbox.start()
+        return self._outbox
+
+    def _drop_committed_outbox_turn(self, pending, out=None):
+        """待定轮真正落库后：删掉它的 outbox 落盘文件，回执改成已提交。
+
+        只在提交成功（没失败）时调——失败的留着文件、等下一轮重试。
+        _commit_pending_turn 里调；outbox 不存在（直接调 add_turn 的
+        测试）时什么都不做。
+        """
+        tid = (pending or {}).get("turn_id")
+        if not tid or self._outbox is None:
+            return
+        # 删盘在 mark_committed 里一起做（落库了才不用留着）。
+        try:
+            self._outbox.mark_committed(tid, out)
+        except Exception:
+            logger.warning("提交待定记忆后改回执失败：turn_id=%s。", tid, exc_info=True)
+
     def _commit_pending_turn(self):
         """提交待定区里上一轮对话（Plan C 闸门 3）。
 
@@ -2640,6 +2722,8 @@ class Mem0Store:
         self._pending_turn = None
         if pending is None:
             return {}
+        # 本轮正在提交，闲置定时器不用再等它（新轮次来了会重设）。
+        self._cancel_pending_timer()
         identity_outcomes = []
         for item in pending.get("identity") or []:
             outcome = self._upsert_slot_memory(
@@ -2698,6 +2782,7 @@ class Mem0Store:
                 if key and key not in self._committed_user_keys:
                     self._committed_user_keys.append(key)
         if not results and not identity_outcomes and not protection_failed and not extraction_failed:
+            self._drop_committed_outbox_turn(pending)
             return {}
         out = {"results": results, "identity": identity_outcomes}
         if grounding_flagged:
@@ -2717,6 +2802,8 @@ class Mem0Store:
                 (m or {}).get("content") or "" for m in fresh
                 if (m or {}).get("role") == "user"
             ]
+        else:
+            self._drop_committed_outbox_turn(pending, out)
         return out
 
     def flush_pending(self):
@@ -2746,9 +2833,7 @@ class Mem0Store:
         """
         if self._needs_sync_save(messages):
             return self.add_turn(messages, turn_id=turn_id)
-        if self._outbox is None:
-            self._outbox = MemoryOutbox(self)
-            self._outbox.start()
+        self.ensure_outbox_started()
         tid = self._outbox.submit(messages, turn_id=turn_id)
         return {"pending": True, "results": [], "queued": True, "turn_id": tid}
 
@@ -3413,6 +3498,9 @@ class Mem0Store:
                 "created_at": _now_epoch(),
                 "turn_id": turn_id,
             }
+            # 闲置提交（2026-11-20 游泳事故）：停车后（重）启定时器，闲置满
+            # _pending_idle_seconds 仍是这轮就提交；新轮次来了会重设。
+            self._arm_pending_timer(turn_id)
             out = {
                 "pending": True,
                 "results": (committed or {}).get("results") or [],
@@ -3967,6 +4055,36 @@ class Mem0Store:
             )
         return results
 
+    def _has_event_date(self, text):
+        """文本里有没有“具体日期”——能把一次性的事件和一般喜好分开的信号。
+
+        绝对日期（2026年11月19日这种带数字的）一定算；相对日期
+        （今天/昨天/昨晚……）也算，但“我喜欢……”这种喜好句不算——
+        “我喜欢今天天气真好”里的“今天”只是说今天天气，不是一件
+        发生过的事（2026-11-20 test_43：别把闲话也护下来）。
+        """
+        if not isinstance(text, str) or not text.strip():
+            return False
+        has_relative = False
+        for slot in extract_core_slots(text):
+            if not slot.startswith("date:"):
+                continue
+            val = slot[5:]
+            if any(ch.isdigit() for ch in val):
+                return True
+            has_relative = True
+        if has_relative and "喜欢" not in text.lower():
+            return True
+        return False
+
+    def _value_gate_protected(self, item):
+        """价值关卡不得删的条（修 1 + 修 2，2026-11-20 牛肉面事故）：
+        守卫已标待确认的，或带具体日期的事件记忆。"""
+        if (item or {}).get("pending_confirmation"):
+            return True
+        text = (item or {}).get("memory") or ""
+        return self._has_event_date(text)
+
     def _value_gate_extraction_results(self, results):
         """价值关卡（43 号）：提取出的新记忆，值不值得长期记的再判一次。
 
@@ -3977,20 +4095,32 @@ class Mem0Store:
         判不出来（没客户端、调用失败、回的不是 JSON）时全留——关卡
         失败关闭，别把真事实拦在外面。results 里没有新记忆时直接返回。
         删掉的条数记在 results["value_dropped"] 里（调用方和面板看得见）。
+        守卫已标待确认的、带具体日期的事件记忆不删（修 1、修 2，2026-11-20
+        牛肉面事故）：前者是挂起来等 BOOS，后者是 episodic 记忆靠衰减沉底。
         """
         items = (results or {}).get("results") or []
         if not items:
             return results
-        scored = self._judge_value_scores([
+        # 修 1 + 修 2（2026-11-20 牛肉面事故）：守卫已标待确认的、带具体
+        # 日期的一次性事件，不送去打分——前者是“挂起来等 BOOS”，后者是
+        # episodic 记忆该靠衰减沉底；两道都不该被价值关卡删掉。
+        # （去重里金额分支已有“守卫在前、关卡在后”的同款保护，这里补上。）
+        score_items = [
             {"id": (item or {}).get("id"), "text": (item or {}).get("memory") or ""}
             for item in items
-            if (item or {}).get("id") and (item or {}).get("memory")
-        ])
+            if (item or {}).get("id")
+            and (item or {}).get("memory")
+            and not self._value_gate_protected(item)
+        ]
+        scored = self._judge_value_scores(score_items) if score_items else {}
         if scored is None:
             return results
         dropped = []
         kept = []
         for item in items:
+            if self._value_gate_protected(item):
+                kept.append(item)
+                continue
             mem_id = (item or {}).get("id")
             score = scored.get(mem_id)
             if score is not None and score < VALUE_THRESHOLD:
@@ -4900,6 +5030,18 @@ class Mem0Store:
                 }
             )
             if verdict["verdict"] == "duplicate":
+                # 修 3（2026-11-20 牛肉面事故的防守）：守卫已挂起的条不能删——
+                # 像金额分支那样留着、不挂证据、不进 dropped，等 BOOS 定。
+                if (item or {}).get("pending_confirmation"):
+                    kept.append(
+                        {
+                            **item,
+                            "pending_confirmation": True,
+                            "held_pending": True,
+                        }
+                    )
+                    known.append({"id": mem_id, "text": mem_text})
+                    continue
                 # 重复：新条当证据挂到旧条下（旧条是主条——BOOS 亲口说的
                 # 留主条，提取出来的当证据），新条删掉。
                 canonical = verdict["candidate"]
@@ -6172,10 +6314,17 @@ class Mem0Store:
         # 57 号：_slot_values_conflict 现在也认“宾语不同”（冒菜≠拉面），
         # 不同事实不会再被硬合并线误并；同义改写（“喜欢喝冰美式”vs
         # “喜欢冰美式”，宾语都是冰美式）照常走硬合并。
+        # 修 4（2026-11-20 牛肉面事故的防守）：新记忆带具体日期、候选最高分
+        # 那条没有时，是“事件 vs 喜好”，不是同一件事——硬合并和模型判重复
+        # 都要否决，留着。程序规则兜底，不依赖模型每次都判对。
+        _new_has_date = self._has_event_date(new_text)
+        _top_has_date = self._has_event_date(top_text)
+        _dated_event_vs_undated = _new_has_date and not _top_has_date
         if (
             top_sim >= DEDUP_HARD_THRESHOLD
             and not _slot_values_conflict(new_text, top_text)
             and self._judge_available()
+            and not _dated_event_vs_undated
         ):
             return {
                 "verdict": "duplicate", "confidence": 0.95,
@@ -6196,6 +6345,12 @@ class Mem0Store:
                 "candidate": candidates[0], "judged": True,
             }
         if verdict["is_duplicate"] and verdict["confidence"] >= 0.80:
+            if _dated_event_vs_undated:
+                return {
+                    "verdict": "new", "confidence": 1.0,
+                    "reason": "新记忆带具体日期、候选没有：事件 vs 喜好，不是同一件事",
+                    "candidate": None, "judged": False,
+                }
             return {
                 "verdict": "duplicate", "confidence": verdict["confidence"],
                 "reason": verdict["reason"] or "模型裁决为重复",
@@ -6298,6 +6453,7 @@ class Mem0Store:
             "给下面每条新提取的记忆打价值分（0–1 分），判断它值不值得长期记住。\n"
             "高分（0.7 以上）：稳定事实、明确偏好、重要决定、以后还会用到的事；\n"
             "低分（0.3 以下）：一次性请求、临时状态、闲聊、琐事、问完就没用的事；\n"
+            "带具体日期/地点的一次性经历是值得记的 episodic 记忆，不是琐事，不打低分；\n"
             "拿不准的往低打。\n"
             "只返回一个 JSON，不要解释，格式：\n"
             '{"scores": [{"id": "<记忆 id>", "score": 0.8}, ...]}\n'
