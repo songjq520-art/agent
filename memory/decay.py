@@ -50,6 +50,10 @@ DECAY_PROMOTION_SESSIONS = 3  # 晋升要的会话数：和天数一样，3 个�
 DECAY_STATE_VERBATIM = "verbatim"
 DECAY_STATE_DORMANT = "dormant"
 DECAY_DELETE_BACKUP_PREFIX = "decay-delete-backup-"
+# 未确认权重封顶（补丁 4，第二层）：没经过 BOOS 确认的记忆权重
+# 升不到最高——错的也爬不上去。初始值 0.80，以后按回测调（BOOS 定：
+# 衰减参数有了真实数据再调，封顶值也是参数，先不动它）。
+UNCONFIRMED_WEIGHT_CAP = 0.80
 
 
 def _decay_now_dt(now=None):
@@ -131,6 +135,20 @@ def decay_weight(kind, last_used_at, now=None, is_core=False):
     half_life = DECAY_HALF_LIFE_DAYS.get(kind, DECAY_HALF_LIFE_DAYS[DECAY_KIND_EPISODIC])
     weight = 0.5 ** (idle / half_life)
     return max(DECAY_WEIGHT_FLOOR, min(1.0, weight))
+
+
+def effective_weight(kind, last_used_at, now=None, is_core=False,
+                     user_confirmed=False):
+    """一条记忆实际用的权重：衰减权重再过一道未确认封顶。
+
+    没经过 BOOS 确认的记忆（user_confirmed=False），权重最高只到
+    UNCONFIRMED_WEIGHT_CAP（0.80），升不到 1.0——错的也爬不上去
+    （补丁 4 第二层）。已确认的、核心的照常满格。权重只管排位，
+    不管“能不能搜到”，和 decay_weight 一个规矩。"""
+    weight = decay_weight(kind, last_used_at, now, is_core=is_core)
+    if is_core or user_confirmed:
+        return weight
+    return min(weight, UNCONFIRMED_WEIGHT_CAP)
 
 
 def promotion_reached(seen_days):
@@ -237,13 +255,17 @@ def record_seen_occurrence(seen_dates, seen_sessions, today, turn_id):
     return sorted(dates), sorted(sessions), False
 
 
-def should_promote(seen_dates, seen_sessions, is_core=False):
+def should_promote(seen_dates, seen_sessions, is_core=False, tone=None):
     """这条记忆该晋升成稳定事实了吗：出现过的自然日 ≥3 且出现过的
     会话 ≥3，且不是核心记忆（核心记忆本来就是稳定事实，不用晋升）。
     seen_dates / seen_sessions 传集合、列表或库里的 JSON 字符串都行。
+    tone（补丁 3）：玩笑 / 测试 / 假设打标的记忆不晋升——打标的记忆
+    照常存、照常能搜，但不算进晋升次数；没打标（None）按认真算。
     只判“该不该晋升”，晋升本身（改 kind、记 PROMOTE 事件）是调用方
     的事（见 Mem0Store._decay_touch）。"""
     if is_core:
+        return False
+    if tone in ("joke", "test", "hypothesis"):
         return False
     dates = _parse_seen_list(seen_dates)
     sessions = _parse_seen_list(seen_sessions)

@@ -251,6 +251,15 @@ from memory import backup as _backup
 from memory import ledger as _ledger
 from memory import relations as _relations
 from memory import inference as _inference
+# （记忆整理，2026-11-19：补丁 5 BM25 关键词索引 + 原样匹配，补丁 1
+# 两段式检索——都只在 search 里用，见 search 的注释。）
+from memory import bm25 as _bm25
+# （记忆整理，2026-11-19：补丁 3 语气、补丁 4 对原话、十三节模型路由——
+# 语气本地筛 + 对原话检查在写流程里调，路由在后台判语气和自检抽查时调。）
+from memory import content_check as _content_check
+from memory import model_router as _model_router
+from memory import self_check as _self_check
+from memory import tone as _tone
 # （图谱推理第一期，2026-11-18：图快照 + 实体抽取 + PPR 检索。
 # 图是索引不是账本，快照放 memory/graph_snapshot.json，和账本同目录，
 # .gitignore 里 memory/*.json* 已覆盖，不进仓库。）
@@ -332,6 +341,12 @@ FETCH_ALL_TOP_K = 1000
 # ≥ 2 才算命中（至少一个两字关键词）。补充信号只排在语义结果后面，
 # 且不超过 top_k 总数；召回不够时再调，不够时再考虑融合。
 KEYWORD_MIN_WEIGHT = 2
+
+# ARCHIVE_SEARCH_THRESHOLD（补丁 1 两段式检索的门槛，初始值 0.6，
+# 以后按回测调）：常用层里最好的一条语义分 ≥ 这个数，就只给常用层，
+# 档案层的不进结果；低于它，档案层的也进来（标清是档案）。
+# 语义分是 mem0 给的 0–1 分；没有语义结果时按 0 算（档案层进来）。
+ARCHIVE_SEARCH_THRESHOLD = 0.6
 
 # CONTEXT_IDS_MAX（最近对话上下文记多少条记忆 id）：note_context 记的
 # 最近几轮提问时检索到的记忆 id 上限（deque，满了旧的自动挤掉）。
@@ -750,6 +765,32 @@ def _describes_memory_management(text):
     return False
 
 
+# 中文数字短语（补丁 4 对原话用）：后面跟了量词/单位、或在句末的才转，
+# “一起”“一般”“十分喜欢”里的“一/十”不转（不是数字，别乱碰）。
+# 转法复用 correction_text._parse_chinese_number（十/百/千组合都认，
+# “两”算 2）；“万”它不认（“一万块”转不出来，留原样——对不上时只标
+# 待复核，不判错，模型抽查是兜底）。
+_CN_NUMERAL_PHRASE_RE = re.compile(
+    r"[零一二三四五六七八九十百千两]{1,8}"
+    r"(?=[块元万亿%％个只支天月年次]|小时|分钟|秒|$)"
+)
+
+
+def _cn_numerals_to_digits(text):
+    """把文本里的中文数字短语转成阿拉伯数字（只转数字短语，别的不动）。
+    对原话检查之前，记忆文本和出处原话都先过一遍这个：BOOS 原话常说
+    “五块”，提取出来的记忆常写“5 块”——不转的话每个数都对不上，
+    全被误标待复核。转不出来的（比如带“万”的）留原样。"""
+    if not text:
+        return text or ""
+
+    def _replace(match):
+        parsed = _parse_chinese_number(match.group(0))
+        return str(parsed) if parsed is not None else match.group(0)
+
+    return _CN_NUMERAL_PHRASE_RE.sub(_replace, text)
+
+
 class Mem0Store:
     """mem0 长期记忆的适配器（项目里唯一直接碰 mem0 的类）。
 
@@ -1060,6 +1101,14 @@ class Mem0Store:
         是“BOOS 是否逐条确认过”（只有 source="user" 的记忆才可能是 True），
         decay_weight 是这条记忆现在的衰减权重（0.10–1.0，核心记忆恒为 1.0），
         is_history 是不是“以前的”（被取代/睡着的，默认不返回，见下）。
+        补丁 2：reinforce=True（真用上）时，被用上的记忆里有待确认 /
+        冲突待审的，项上多两个键——needs_boos_decision=True 和
+        decision_reason（一句话原因），调用方看到就问 BOOS 定。
+        补丁 1 两段式检索：每项多一个 layer 键（"active" 常用层 /
+        "archive" 档案层 = 沉底态）；常用层最好的一条语义分 ≥ 0.6 时
+        档案层不进结果，低于 0.6 时进来（标清是档案）。补丁 5：关键词
+        补充改走 BM25 排名，原样匹配（基金代码/数字/人名）的那几条在
+        关键词组里排最前面（项上 exact_match=True）。
         注意：search 不按来源过滤——提取的（inferred）记忆和未确认的
         旧记忆也会返回，调用方（main.py 的 _memory_block）按来源决定
         怎么用：已确认的才能当作事实，未确认的不能当作事实。
@@ -1141,48 +1190,63 @@ class Mem0Store:
                 seen_texts.add(text)
         except Exception:
             logger.warning("mem0 语义检索失败：本次只用关键词补充信号。", exc_info=True)
-        # 关键词补充信号（排在语义结果后面，不超过 top_k 总数）。
+        # 关键词补充信号（补丁 5：BM25 + 原样匹配，排在语义结果后面，
+        # 不超过 top_k 总数）。v1 的两字窗口权重（_keyword_weight）换成
+        # BM25 排名：中文长词一样拆两字窗口，但加了词频饱和和长度归一化，
+        # 常见词不再靠长度刷分。原样匹配（基金代码、数字、人名原样命中）
+        # 的排在关键词组最前面——按 BM25 顺序排（整句命中的 BM25 分高，
+        # 只含一个裸数字的排后面，不拿裸数字冒充精确命中）。
         if len(results) < top_k:
             try:
-                keywords = _extract_keywords(query)
-                if keywords:
-                    all_items = self._fetch_all_raw()
-                    for item in (all_items or {}).get("results", []):
-                        if len(results) >= top_k:
-                            break
-                        text = item.get("memory") or ""
-                        if not text or text in seen_texts:
-                            continue
-                        if _contains_sensitive(text):
-                            skipped_sensitive += 1
-                            continue
-                        weight, _matched = _keyword_weight(text, keywords)
-                        if weight >= KEYWORD_MIN_WEIGHT:
-                            metadata = _normalize_metadata(item.get("metadata"), item)
-                            results.append(
-                                {
-                                    "id": item.get("id"),
-                                    "text": text,
-                                    "score": None,
-                                    "source": "keyword",
-                                    "metadata": metadata,
-                                    "confirmed": metadata["confirmed"],
-                                    "decay_weight": decay_weight(
-                                        metadata["decay_kind"],
-                                        metadata["last_used_at"],
-                                        now_dt,
-                                        is_core=_is_core_memory(metadata),
-                                    ),
-                                }
-                            )
-                            seen_texts.add(text)
+                all_items = self._fetch_all_raw()
+                docs = [
+                    {"id": item.get("id"), "text": item.get("memory") or ""}
+                    for item in (all_items or {}).get("results", [])
+                ]
+                by_id = {doc["id"]: item for doc, item in zip(docs, (all_items or {}).get("results", []))}
+                exact_ids = set(_bm25.extract_exact_matches(query, docs))
+                ranked = _bm25.bm25_search(query, docs, top_k=top_k)
+                ranked_ids = [hit["id"] for hit in ranked]
+                exact_first = [doc_id for doc_id in ranked_ids if doc_id in exact_ids]
+                rest = [doc_id for doc_id in ranked_ids if doc_id not in exact_ids]
+                for doc_id in exact_first + rest:
+                    if len(results) >= top_k:
+                        break
+                    item = by_id.get(doc_id)
+                    if item is None:
+                        continue
+                    text = item.get("memory") or ""
+                    if not text or text in seen_texts:
+                        continue
+                    if _contains_sensitive(text):
+                        skipped_sensitive += 1
+                        continue
+                    metadata = _normalize_metadata(item.get("metadata"), item)
+                    results.append(
+                        {
+                            "id": item.get("id"),
+                            "text": text,
+                            "score": None,
+                            "source": "keyword",
+                            "metadata": metadata,
+                            "confirmed": metadata["confirmed"],
+                            "exact_match": doc_id in exact_ids,
+                            "decay_weight": decay_weight(
+                                metadata["decay_kind"],
+                                metadata["last_used_at"],
+                                now_dt,
+                                is_core=_is_core_memory(metadata),
+                            ),
+                        }
+                    )
+                    seen_texts.add(text)
             except Exception:
                 logger.warning("mem0 关键词补充检索失败。", exc_info=True)
         if skipped_sensitive:
             logger.info("检索：%d 条记忆含敏感信息，已跳过，不注入。", skipped_sensitive)
-        # 衰减排位：语义组按“原始分 × 权重”排，关键词组按权重排——
-        # 都是稳定排序，权重全是 1.0 时顺序和原来一模一样；关键词组
-        # 还是排在语义组后面（补充信号不抢主信号的位置）。
+        # 衰减排位：语义组按“原始分 × 权重”排，关键词组按“原样匹配优先、
+        # 再按权重”排——都是稳定排序，权重全是 1.0 时顺序和原来一模一样；
+        # 关键词组还是排在语义组后面（补充信号不抢主信号的位置）。
         semantic_end = sum(1 for item in results if item.get("source") == "semantic")
         results[:semantic_end] = sorted(
             results[:semantic_end],
@@ -1191,7 +1255,10 @@ class Mem0Store:
         )
         results[semantic_end:] = sorted(
             results[semantic_end:],
-            key=lambda item: item.get("decay_weight") or 0,
+            key=lambda item: (
+                1 if item.get("exact_match") else 0,
+                item.get("decay_weight") or 0,
+            ),
             reverse=True,
         )
         # 账本状态先读出来：图合并和投影过滤共用一份，不读两遍。
@@ -1219,6 +1286,44 @@ class Mem0Store:
         results = _ledger.project_and_filter(
             results, ledger_state, include_history=include_history
         )
+        # 补丁 1 两段式检索：先给常用层，不够再翻档案。
+        # 每条结果标 layer（active/archive，档案 = 沉底态 dormant）；
+        # 常用层里最好的一条语义分 ≥ 0.6 时，档案层的不进结果（够用了
+        # 就别翻旧账）；低于 0.6 时档案层的也进来（标清是档案），被用上
+        # 就回常用层（_decay_touch 唤醒，见 reinforce）。门槛只看语义分
+        # （mem0 的 0–1 分）：关键词补充没有可比的分数，不参与算分；
+        # 没有语义结果时按 0 算，档案层进来。include_history=True
+        # （问“以前”）时不过这道闸——问的就是旧账，全给。
+        if not include_history:
+            best_active = 0.0
+            for item in results:
+                if item.get("source") != "semantic":
+                    continue
+                meta = (item or {}).get("metadata") or {}
+                if meta.get("decay_state") == DECAY_STATE_DORMANT:
+                    continue
+                score = item.get("score")
+                if isinstance(score, (int, float)) and score > best_active:
+                    best_active = score
+            for item in results:
+                meta = (item or {}).get("metadata") or {}
+                item["layer"] = (
+                    "archive"
+                    if meta.get("decay_state") == DECAY_STATE_DORMANT
+                    else "active"
+                )
+            if best_active >= ARCHIVE_SEARCH_THRESHOLD:
+                results = [
+                    item for item in results if item.get("layer") == "active"
+                ]
+        else:
+            for item in results:
+                meta = (item or {}).get("metadata") or {}
+                item["layer"] = (
+                    "archive"
+                    if meta.get("decay_state") == DECAY_STATE_DORMANT
+                    else "active"
+                )
         # 账本兜底：当前结果不够时，翻账本原话按关键词找，补在后面。
         # 只补“当前”的原话：账本里标了 superseded / deleted 的 key
         # 不当现况（除非问的就是以前，include_history=True 时才放
@@ -1272,6 +1377,23 @@ class Mem0Store:
             except Exception:
                 logger.warning("账本兜底检索失败：本次只用索引里的结果。", exc_info=True)
         if reinforce and results:
+            # 补丁 2 真用上时再问：被用上的记忆里有“待确认 / 冲突待审”的，
+            # 在返回项上标出来（needs_boos_decision + 一句话原因），
+            # 调用方（main.py / web 面板）看到就问 BOOS 定——平时不打扰，
+            # 只在真用上时问。只标、不写库，问不问由调用方定，检索不拦路。
+            for item in results:
+                meta = (item or {}).get("metadata") or {}
+                if meta.get("pending_confirmation"):
+                    item["needs_boos_decision"] = True
+                    item["decision_reason"] = (
+                        "这条是后来推断出来的新说法，跟 BOOS 确认过的旧说法"
+                        "对着干，挂在这等你定。"
+                    )
+                elif meta.get("conflict_for_review"):
+                    item["needs_boos_decision"] = True
+                    item["decision_reason"] = (
+                        "这条跟库里另一条说法对着干，等你定哪条是对的。"
+                    )
             # 真正用上了才强化：只强化返回的、不是历史的那几条——
             # 历史记忆被翻出来看看不算“用上了”，不能把它唤醒回原话态。
             # 写回失败也不拦聊天——记忆本身还在，只是这次没刷新时间。
@@ -2248,16 +2370,74 @@ class Mem0Store:
         # 43 号价值关卡先走（一次判全场，低价值的先清掉），再 46 号去重
         # （对照面是提取前的库 + 本轮已留下的新记忆）。
         result = self._value_gate_extraction_results(result)
-        result = self._dedupe_extraction_results(result, before, turn_id=turn_id)
+        result = self._dedupe_extraction_results(
+            result, before, turn_id=turn_id, batch_metadata=metadata
+        )
         # 27 号：提取出的新记忆里带金额的，把结构化金额字段贴上。
         # 提取时 metadata 是整批共用的、不知道每条写了什么，只能事后
         # 按文本贴；放在去重之后（被删掉的就不用贴了）。
         result = self._attach_money_metadata(result)
+        # 补丁 3 语气 + 补丁 4 对原话：对留下的每条新记忆——
+        # 本地筛出玩笑/测试/假设的直接打标；筛不出来的排队等大模型
+        # 后台判；数字/代码跟本轮原话对不上的标待复核 + 对原话标记。
+        # 放在最后做：前面几步（守卫、去重、贴金额字段）都可能改
+        # metadata，语气标和对原话标最后写才不会被盖掉。
+        self._tag_extraction_results_tone_and_grounding(result, safe_messages)
         # 提取路径补记账本：mem0 自己拆句，事前不知道文本，只能事后
         # 对留下的新条补记 add 事件（UPDATE 的是同槽位新值，
         # _supersede_money_memory 里已经记了 supersede，不重复记）。
         self._ledger_extraction_adds(result, metadata)
         return result
+
+    def _tag_extraction_results_tone_and_grounding(self, result, safe_messages):
+        """提取收尾：语气打标 + 对原话检查（补丁 3、补丁 4 第一层）。
+        只对留下的新条做（results 里的每条，有 id 和文本的都算，
+        包括同槽位新值 UPDATE 的那条——新说法本身也是这轮的话）。
+        语气：本地筛出玩笑/测试/假设的直接打标（tone + 证据 +
+        source=local）；筛不出来的排进 tone_pending.jsonl，等大模型
+        后台判。拿不准不猜，排队就是“还没判”，不是“认真”。
+        对原话：数字/代码跟本轮用户原话对不上的，标 needs_review +
+        grounding_flag（只标、不删，月自检“最可能错的 5 条”会捞它）；
+        记进 results["grounding_flagged"]，调用方看得见。原话为空
+        （这轮没用户说话）时不查——没出处就是没法对，不标。
+        中文数字先转阿拉伯数字再比（“五块”对“5 块”算对上）。
+        失败只记日志、不拦路：打标是对原话的辅助，不能把提取搞崩。"""
+        items = (result or {}).get("results") or []
+        if not items:
+            return
+        source_text = "\n".join(
+            (msg or {}).get("content") or ""
+            for msg in safe_messages or []
+            if (msg or {}).get("role") == "user"
+        )
+        source_norm = _cn_numerals_to_digits(source_text) if source_text.strip() else ""
+        grounded_flagged = []
+        for item in items:
+            mem_id = (item or {}).get("id")
+            mem_text = (item or {}).get("memory") or ""
+            if not mem_id or not mem_text:
+                continue
+            tone, evidence = self._local_tone_for(mem_text)
+            if tone is not None:
+                if self._tag_memory_tone(mem_id, tone, evidence, "local"):
+                    item["tone"] = tone
+            else:
+                self._tone_queue_append(mem_id, mem_text)
+            if not source_norm:
+                continue
+            try:
+                check = _content_check.grounding_check(
+                    _cn_numerals_to_digits(mem_text), source_norm
+                )
+            except Exception:
+                logger.warning("对原话检查失败：这条先不标。", exc_info=True)
+                continue
+            if not check.get("ok"):
+                self._mark_memory_review(mem_id, needs_review=True)
+                self._mark_memory_grounding(mem_id)
+                grounded_flagged.append(mem_id)
+        if grounded_flagged:
+            result["grounding_flagged"] = grounded_flagged
 
     def _deleted_text_times(self, cutoff_epoch):
         """cutoff 之后被删掉的原文（归一化原文 → 删的时间戳，epoch 秒）。
@@ -2420,7 +2600,16 @@ class Mem0Store:
                 # 扁平四个标量字段贴上去（见 _flatten_money）：Chroma
                 # 不接受 dict 值的 metadata，直接传 {"money": {...}}
                 # 会炸掉整条 update。
-                self._memory.update(memory_id=mem_id, metadata=_flatten_money(money))
+                # 先拿原始整份 metadata 再合并着写：只传 money 字段时，
+                # 替换式 update（测试用的 FakeMemory）会把之前打上的
+                # 标记（待确认、语气）全丢掉；真实 mem0 是合并式、不会
+                # 丢，但两边都按整份传才稳（见 _mark_memory_review 注释）。
+                raw = self._raw_metadata_for(mem_id)
+                if raw is None:
+                    logger.warning("金额字段：这条记忆读不出来，没贴上。")
+                    continue
+                raw.update(_flatten_money(money))
+                self._memory.update(memory_id=mem_id, metadata=raw)
             except TypeError:
                 logger.warning("金额字段：底层 update 不支持 metadata 参数，本条没贴上。")
             except Exception:
@@ -2479,6 +2668,7 @@ class Mem0Store:
         results = []
         protection_failed = False
         extraction_failed = False
+        grounding_flagged = []
         extracted = {}
         filtered = _filter_extraction_messages(fresh)
         if filtered:
@@ -2496,6 +2686,10 @@ class Mem0Store:
             # 手写一个键一个键地传，残留原文就是这么漏掉的。
             protection_failed = bool((extracted or {}).get("protection_failed"))
             extraction_failed = bool((extracted or {}).get("extraction_failed"))
+            # 补丁 4：对原话标出来的那几条也往上传——调用方得知道这轮
+            # 有记忆跟原话对不上（只标待复核、不拦路），不然只留在
+            # 提取那一层，谁也看不见。
+            grounding_flagged = (extracted or {}).get("grounding_flagged") or []
         failed = protection_failed or extraction_failed
         if not failed:
             # 提取成功（或过滤后什么都不剩，本来就没什么可提）：指纹记下来，
@@ -2506,6 +2700,8 @@ class Mem0Store:
         if not results and not identity_outcomes and not protection_failed and not extraction_failed:
             return {}
         out = {"results": results, "identity": identity_outcomes}
+        if grounding_flagged:
+            out["grounding_flagged"] = grounding_flagged
         if protection_failed:
             _carry_protection_fields(extracted, out)
         if extraction_failed:
@@ -3990,7 +4186,16 @@ class Mem0Store:
         metadata["last_used_at"] = _decay_iso(now_dt)
         metadata.pop("decay_delete_due", None)
         promoted = False
-        if record_occurrence:
+        # 补丁 3：玩笑 / 测试 / 假设打标的、或已作废的记忆，不计出现次数、
+        # 不晋升——打标的照常存、照常能搜、照常唤醒，只是不算进晋升次数。
+        # （should_promote 里也有一道同样的闸：万一这条在打标之前已经
+        # 攒够了次数，晋升那步也拦得住；两道闸各管各的，别只留一道。）
+        tone = meta.get("tone")
+        counts_for_promotion = (
+            tone not in ("joke", "test", "hypothesis")
+            and not bool(meta.get("voided"))
+        )
+        if record_occurrence and counts_for_promotion:
             # 出现集合（2026-11-19）：日期和会话各记一个集合，晋升要
             # 两个都够 3（见 decay.should_promote）。老记忆没有这两个
             # 集合时，从 decay_last_seen_day 起步——只有最后一次被提到
@@ -4015,7 +4220,7 @@ class Mem0Store:
                 metadata["decay_seen_days"] = max(old_seen, len(new_dates))
                 metadata["decay_last_seen_day"] = today
             if meta["decay_kind"] == DECAY_KIND_EPISODIC:
-                if should_promote(new_dates, new_sessions):
+                if should_promote(new_dates, new_sessions, tone=tone):
                     metadata["decay_kind"] = DECAY_KIND_STABLE
                     promoted = True
                 elif not new_sessions and promotion_reached(len(new_dates)):
@@ -4077,6 +4282,283 @@ class Mem0Store:
         except Exception:
             logger.warning("衰减出现次数写回失败：记忆本身还在。", exc_info=True)
             return False
+
+    # ---------- 记忆整理：语气判标 + 大模型路由 ----------
+    # 补丁 3 两段式判语气 + 十三节主力/备选模型 + BOOS 的预算规矩
+    # （2026-11-19：超了只提醒、不断服务）。
+    # 语气标在 metadata 里（tone / tone_evidence / tone_source /
+    # voided，见 provenance._provenance）：打标的照常存、照常能搜，
+    # 只不算进晋升、盖不掉已确认的记忆。
+    # 本地筛（local_tone_screen）只认明确的说法和关键词；筛不出来的
+    # 排进 tone_pending.jsonl（账本同目录），等后台 process_tone_queue
+    # 请大模型判——不堵聊天。判不出来的留着下次再判，不猜成认真、
+    # 也不猜成玩笑；大模型说拿不准时按认真算（见 tone.py）。
+
+    def _tone_queue_path(self):
+        return self.ledger_path.parent / "tone_pending.jsonl"
+
+    def _tone_queue_read(self):
+        """读出待判语气的队（每行 {"memory_id", "text", "queued_at"}）。
+        文件没有、读坏了返回 []，不抛异常。"""
+        path = self._tone_queue_path()
+        entries = []
+        try:
+            if not path.exists():
+                return []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("memory_id"):
+                    entries.append(entry)
+        except OSError:
+            logger.warning("语气待判队读失败。", exc_info=True)
+        return entries
+
+    def _tone_queue_write(self, entries):
+        """把待判语气的队整个写回去（原子替换，写坏了旧队还在）。
+        返回 True（写好了）或 False。"""
+        path = self._tone_queue_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text(
+                "".join(
+                    json.dumps(entry, ensure_ascii=False) + "\n"
+                    for entry in entries or []
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            logger.warning("语气待判队写失败。", exc_info=True)
+            return False
+
+    def _tone_queue_append(self, memory_id, text):
+        """一条记忆排进待判语气的队（已在队里的不重复排）。
+        写失败只记日志、不拦路（判语气是后台活，不能把写记忆搞崩）。"""
+        if not memory_id:
+            return False
+        entries = self._tone_queue_read()
+        if any(entry.get("memory_id") == memory_id for entry in entries):
+            return True
+        entries.append(
+            {
+                "memory_id": memory_id,
+                "text": text or "",
+                "queued_at": _now_iso(),
+            }
+        )
+        return self._tone_queue_write(entries)
+
+    def _tag_memory_tone(self, memory_id, tone, evidence, source):
+        """给一条已存的记忆打上语气标（tone / tone_evidence / tone_source）。
+        先拿原始整份 metadata 再合并着写（见 _mark_memory_review 注释）。
+        返回 True（打上了）或 False。"""
+        if not memory_id or tone not in _tone.TONE_VALUES:
+            return False
+        metadata = self._raw_metadata_for(memory_id)
+        if metadata is None:
+            return False
+        metadata["tone"] = tone
+        if isinstance(evidence, str) and evidence:
+            metadata["tone_evidence"] = evidence
+        if source in ("local", "model"):
+            metadata["tone_source"] = source
+        try:
+            self._memory.update(memory_id=memory_id, metadata=metadata)
+        except Exception:
+            logger.warning("语气标记写回失败：记忆本身还在。", exc_info=True)
+            return False
+        return True
+
+    def _mark_memory_grounding(self, memory_id):
+        """给一条记忆打上 grounding_flag（补丁 4 第一层：跟出处对不上）。
+        和 _mark_memory_review 同一套写法。返回 True / False。"""
+        if not memory_id:
+            return False
+        metadata = self._raw_metadata_for(memory_id)
+        if metadata is None:
+            return False
+        metadata["grounding_flag"] = True
+        try:
+            self._memory.update(memory_id=memory_id, metadata=metadata)
+        except Exception:
+            logger.warning("对原话标记写回失败：记忆本身还在。", exc_info=True)
+            return False
+        return True
+
+    def _local_tone_for(self, text):
+        """本地筛一段记忆文本（补丁 3 第一段）：返回 (tone, evidence)
+        或 (None, None)。只认明确的说法和关键词，不猜。"""
+        try:
+            return _tone.local_tone_screen(text)
+        except Exception:
+            logger.warning("本地语气筛失败：这条先不打标。", exc_info=True)
+            return (None, None)
+
+    def organizing_router(self):
+        """整理记忆的大模型路由（懒建）：主力 deepseek-v4-pro，备选
+        flash，本地降级；每月 3 美元上限超了只提醒、不断服务
+        （见 memory/model_router.py）。状态文件在账本同目录。
+        建不出来（比如没配 DeepSeek Key）时返回 None——调用方走
+        本地降级，不抛异常。"""
+        router = getattr(self, "_organizing_router", None)
+        if router is not None:
+            return router
+        try:
+            router = _model_router.OrganizingModelRouter(
+                state_path=str(
+                    self.ledger_path.parent / "organizing_router_state.json"
+                ),
+                budget_tracker=self.budget_tracker,
+            )
+        except Exception:
+            logger.warning("整理记忆路由建不起来：本次走本地降级。", exc_info=True)
+            return None
+        self._organizing_router = router
+        return router
+
+    def pending_notices(self):
+        """等着告诉 BOOS 的事（目前只有一条：整理记忆的大模型超预算了）。
+        返回 [{"kind", "message", ...}]，没有时 []。对话层（main.py /
+        web 面板）在下一轮对话开头调它，告诉 BOOS、由他决定要不要停；
+        BOOS 回话后调 organizing_router().acknowledge_notice() 认领，
+        同一月里不再提醒。"""
+        router = self.organizing_router()
+        if router is None:
+            return []
+        try:
+            notice = router.pending_notice()
+        except Exception:
+            return []
+        if notice is None:
+            return []
+        return [{"kind": "organizing_over_budget", **notice}]
+
+    def process_tone_queue(self, router=None):
+        """后台判语气：把 tone_pending.jsonl 里的队一批一批判完。
+        每条拿 tone_judgment_prompts 请大模型判（走 organizing_router，
+        主力 + 备选 + 本地降级，费用记进整理记忆的 3 美元预算）；
+        判出来的打标（tone / 证据 / source=model）；判不出来的（模型
+        没回、没判官、路由建不起来）留队里下次再判，不猜。
+        记忆已经没了、或已经打过标的跳过（队里那行直接清掉）。
+        返回 {"judged", "tagged", "remaining", "skipped"}，不抛异常。
+        调用方（后台任务/月扫/手动）按这个看进度；不在聊天流程里调。"""
+        entries = self._tone_queue_read()
+        if not entries:
+            return {"judged": 0, "tagged": 0, "remaining": 0, "skipped": 0}
+        if router is None:
+            router = self.organizing_router()
+        judged = 0
+        tagged = 0
+        skipped = 0
+        remaining = []
+        probe_primary = True  # 每批开头探一次主力（恢复了就切回去）
+        for entry in entries:
+            memory_id = entry.get("memory_id")
+            text = entry.get("text") or ""
+            if not memory_id or not text:
+                skipped += 1
+                continue
+            raw = self._raw_metadata_for(memory_id)
+            if raw is None:
+                skipped += 1  # 记忆已经没了，队里这行不要了
+                continue
+            if (raw.get("tone") in _tone.TONE_VALUES
+                    and raw.get("tone") != _tone.TONE_SERIOUS):
+                skipped += 1  # 已经打过非认真的标了，不用再判
+                continue
+            if raw.get("voided"):
+                skipped += 1
+                continue
+            if router is None:
+                remaining.append(entry)
+                continue
+            system_prompt, user_prompt = _tone.tone_judgment_prompts(text)
+            try:
+                out = router.judge(
+                    system_prompt,
+                    user_prompt,
+                    max_tokens=300,
+                    purpose="tone",
+                    probe_primary=probe_primary,
+                )
+            except Exception:
+                out = None
+            probe_primary = False
+            if out is None:
+                remaining.append(entry)  # 大模型没回，留队里下次再判
+                continue
+            judged += 1
+            tone, evidence = _tone.parse_tone_judgment(out.get("text"))
+            if tone is None:
+                remaining.append(entry)  # 判不出来，留队里下次再判
+                continue
+            if self._tag_memory_tone(memory_id, tone, evidence, "model"):
+                tagged += 1
+            else:
+                remaining.append(entry)
+        self._tone_queue_write(remaining)
+        return {
+            "judged": judged,
+            "tagged": tagged,
+            "remaining": len(remaining),
+            "skipped": skipped,
+        }
+
+    def void_joke_memory(self, memory_id):
+        """BOOS 后来说“那句是开玩笑的”：这条记忆作废。
+        打 voided 标记（原话留着，不删）、语气记成 joke（已经打过
+        test / hypothesis 的保留原标——反正都不计晋升），已经晋升成
+        稳定事实的打回一次性（decay_kind 回 episodic）。由它晋升的
+        也一起作废：出现次数是按条记的，别条的晋升不靠它，所以打回
+        它自己就够了。返回 {"ok", ...}，不抛异常。"""
+        if not memory_id:
+            return {"ok": False, "reason": "no_id"}
+        metadata = self._raw_metadata_for(memory_id)
+        if metadata is None:
+            return {"ok": False, "reason": "not_found"}
+        metadata["voided"] = True
+        metadata["voided_at"] = _now_iso()
+        tone = metadata.get("tone")
+        if tone not in ("joke", "test", "hypothesis"):
+            metadata["tone"] = "joke"
+            metadata["tone_source"] = "local"
+        if metadata.get("decay_kind") == DECAY_KIND_STABLE:
+            metadata["decay_kind"] = DECAY_KIND_EPISODIC
+        try:
+            self._memory.update(memory_id=memory_id, metadata=metadata)
+        except Exception:
+            logger.warning("作废标记写回失败：记忆本身还在。", exc_info=True)
+            return {"ok": False, "reason": "update_failed"}
+        return {"ok": True, "memory_id": memory_id}
+
+    def run_self_check(self, now=None, sample_size=10):
+        """跑一次每月自检（见 memory/self_check.py 的九项表）。
+        只查、只报告，不直接改库；要改的在报告每项的 actions 里，
+        由调用方决定做不做。第 9 项模型抽查走 organizing_router
+        （判官是大模型，费用记进整理记忆的预算）；路由不可用时
+        第 9 项 skipped。返回自检报告 dict。"""
+        from memory import store_self_check as _store_self_check
+
+        adapter = _store_self_check.build_self_check_adapter(self)
+        router = self.organizing_router()
+        model_judge = None
+        if router is not None:
+            model_judge = _store_self_check.make_model_judge(router)
+        return _self_check.run_self_check(
+            adapter,
+            now=now,
+            model_judge=model_judge,
+            sample_size=sample_size,
+            router_status=router.status() if router is not None else {},
+        )
 
     def sweep_monthly(self, now=None):
         """每月兜底整理（显式调用，不在聊天流程里自动跑）：
@@ -4271,7 +4753,8 @@ class Mem0Store:
             "errors": errors,
         }
 
-    def _dedupe_extraction_results(self, results, before_items, turn_id=None):
+    def _dedupe_extraction_results(self, results, before_items, turn_id=None,
+                                   batch_metadata=None):
         """提取路径去重（46 号）：新提取的记忆里，库里已有同一件事的删掉。
 
         顺序：先精确匹配（完全相同），再近似匹配（向量预筛 + 模型判同一件事）。
@@ -4280,6 +4763,9 @@ class Mem0Store:
         删掉的条数记在 results["dedup_dropped"] 里。判不出来时只做精确匹配，
         近似的照常留（宁漏勿错）。删除失败的（还在库里）留在 results 里，
         不能假装删掉了。
+        batch_metadata：本轮提取共用的那份 metadata（推断来源）——
+        金额同槽位新值要不要顶掉旧条，先拿它跟旧条过一遍
+        _resolve_conflict（补丁 2 两道闸）；不传时按推断来源现拼一份。
         """
         items = (results or {}).get("results") or []
         if not items:
@@ -4289,6 +4775,11 @@ class Mem0Store:
         dropped = []
         kept = []
         superseded_count = 0
+        held_count = 0
+        if batch_metadata is None:
+            batch_metadata = _provenance(
+                SOURCE_INFERRED, CONFIDENCE_INFERRED, False, turn_id=turn_id
+            )
         for item in items:
             mem_text = (item or {}).get("memory") or ""
             mem_id = (item or {}).get("id")
@@ -4317,6 +4808,62 @@ class Mem0Store:
                 dropped.append(item)
                 continue
             if supersede_target is not None:
+                # 补丁 2 两道闸：金额同槽位新值先判可信度，再决定顶不顶。
+                # 守卫已经标过 pending_confirmation 的那条，闸也一样——
+                # 守卫在前、去重在后，去重不能把守卫的决定翻过来。
+                # 新说法可信度比旧条低（提取的推断 vs BOOS 确认过的），
+                # 或两条分不出先后（同一批里先后抽出的两条）时，不顶掉
+                # 旧条：新条挂起来待确认（标待确认 + 冲突待审、跟旧条
+                # 连一条冲突关系），旧条原封不动，等 BOOS 真用上时再定。
+                resolution = None
+                if (item or {}).get("pending_confirmation"):
+                    resolution = {
+                        "action": "pending_new",
+                        "reason": "提取后守卫已标待确认",
+                    }
+                else:
+                    resolution = _resolve_conflict(
+                        (supersede_target or {}).get("metadata") or {},
+                        batch_metadata,
+                    )
+                if resolution.get("action") in ("pending_new", "ask"):
+                    try:
+                        self._memory.update(
+                            memory_id=mem_id,
+                            text=mem_text,
+                            metadata={
+                                **batch_metadata,
+                                "pending_confirmation": True,
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "金额去重：待确认标记没打上，新条照常留着。",
+                            exc_info=True,
+                        )
+                    self._mark_memory_review(mem_id, conflict_for_review=True)
+                    try:
+                        self.relate_memories(
+                            mem_id,
+                            supersede_target.get("id"),
+                            _relations.RELATION_CONFLICT,
+                            note="金额新值可信度不够，盖不掉已确认的旧值，等 BOOS 定。",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "金额去重：冲突关系没连上，新条照常留着。",
+                            exc_info=True,
+                        )
+                    kept.append(
+                        {
+                            **item,
+                            "pending_confirmation": True,
+                            "held_pending": True,
+                        }
+                    )
+                    known.append({"id": mem_id, "text": mem_text})
+                    held_count += 1
+                    continue
                 updated = self._supersede_money_memory(
                     supersede_target, mem_text, new_money
                 )
@@ -4397,7 +4944,13 @@ class Mem0Store:
                 self._mark_memory_review(mem_id, needs_review=True)
             kept.append(item)
             known.append({"id": mem_id, "text": mem_text})
+        if held_count:
+            results["money_held_pending"] = held_count
         if not dropped:
+            # 没删掉任何东西时也别忘了把 kept 写回去：挂起的那条在
+            # kept 里，带了 pending_confirmation / held_pending 标记，
+            # 原样返回 results 的话调用方看不见它被挂起了。
+            results["results"] = kept
             return results
         survivors = self._rollback_new_memories(dropped)
         survivor_ids = {(item or {}).get("id") for item in survivors}
@@ -4408,6 +4961,8 @@ class Mem0Store:
         results["dedup_dropped"] = len(actually_dropped)
         if superseded_count:
             results["money_superseded"] = superseded_count
+        if held_count:
+            results["money_held_pending"] = held_count
         if survivors:
             logger.warning("提取去重：%d 条重复记忆没删掉（仍在库里）。", len(survivors))
         return results
@@ -4715,6 +5270,42 @@ class Mem0Store:
             # （旧条原地改成新说法，id 不变）；不同槽位分别保留，
             # 不拿去给模型判重复（向量相似度分不开“万家纳指”和“沪深300”）。
             new_money = _extract_money_metadata(safe_text)
+            # 27 号：带金额的记忆，把结构化金额字段贴上（金额/币种/周期/对象），
+            # 回答时 _memory_block 标在每条后面，模型分得清两笔钱；没金额
+            # 就不传 money 参数（不往 payload 里写 money=None 的空字段）。
+            # 判断 (b) 号：动态数字事实入库先过门禁——没印证的数只记成
+            # 未核实（可信度封顶 0.35），须确认才当稳定事实用，带有效期。
+            # 用户亲口说的稳定数（定投金额、偏好）不受影响，门禁只拦
+            # 动态数字（收盘价、气温、汇率……）。
+            # 这份 metadata 提前拼好：下面的金额同槽位分支要先拿它跟旧条
+            # 过一遍冲突裁决（补丁 2 两道闸），再决定顶不顶。
+            money = new_money
+            confidence = CONFIDENCE_USER if source == SOURCE_USER else CONFIDENCE_INFERRED
+            verification_status = None
+            requires_confirmation = False
+            expires_at = None
+            verdict = self.verify_numeric_fact(safe_text)
+            if verdict["is_dynamic_numeric"]:
+                confidence = min(confidence, verdict["confidence_cap"])
+                verification_status = verdict["status"]
+                requires_confirmation = verdict["requires_confirmation"]
+                expires_at = verdict["expires_at"]
+            # 补丁 3 语气：本地筛出玩笑/测试/假设的，存的时候就打标；
+            # 筛不出来的（tone 是 None），存好后排队等大模型后台判。
+            tone, tone_evidence = self._local_tone_for(safe_text)
+            metadata = _provenance(
+                source,
+                confidence,
+                source == SOURCE_USER,
+                money=money if money is not None else _MONEY_UNSET,
+                verification_status=verification_status,
+                requires_confirmation=requires_confirmation,
+                expires_at=expires_at,
+                turn_id=turn_id,
+                tone=tone,
+                tone_evidence=tone_evidence,
+                tone_source="local" if tone is not None else None,
+            )
             existing = self.get_all()
             supersede_target = None
             slot_duplicate = None
@@ -4746,6 +5337,59 @@ class Mem0Store:
                     "duplicate": True,
                 }
             if supersede_target is not None:
+                # 补丁 2 两道闸：先判可信度，再决定顶不顶。
+                # BOOS 亲口说的（source=user、已确认）顶掉旧条没问题；
+                # 非用户来源的新说法可信度比旧条低时，不顶掉旧条：新条
+                # 另存一条，标待确认 + 冲突待审，旧条原封不动，等 BOOS
+                # 真用上时再定（见 list_pending_decisions）。
+                resolution = _resolve_conflict(
+                    (supersede_target or {}).get("metadata") or {}, metadata
+                )
+                if resolution.get("action") in ("pending_new", "ask"):
+                    held_metadata = {
+                        **metadata,
+                        "pending_confirmation": True,
+                        "conflict_for_review": True,
+                    }
+                    try:
+                        held = self._add_text_with_metadata(
+                            safe_text, held_metadata, ledger_mode="required"
+                        )
+                    except Exception:
+                        logger.warning(
+                            "手动存记忆：待确认的新说法没存下来。", exc_info=True
+                        )
+                        return {}
+                    held_results = (held or {}).get("results") or []
+                    new_id = (
+                        held_results[0].get("id") if held_results else None
+                    )
+                    if new_id:
+                        try:
+                            self.relate_memories(
+                                new_id,
+                                supersede_target.get("id"),
+                                _relations.RELATION_CONFLICT,
+                                note="手动存的金额新值可信度不够，盖不掉已确认的旧值，等 BOOS 定。",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "手动存记忆：冲突关系没连上，新条照常留着。",
+                                exc_info=True,
+                            )
+                    logger.info(
+                        "手动存记忆：新说法可信度不够，旧条没动，新条已挂待确认。"
+                    )
+                    return {
+                        "results": [
+                            {
+                                "id": new_id,
+                                "memory": safe_text,
+                                "event": "ADD",
+                            }
+                        ],
+                        "held_pending": True,
+                    }
                 updated = self._supersede_money_memory(
                     supersede_target, safe_text, new_money
                 )
@@ -4785,46 +5429,25 @@ class Mem0Store:
                     ],
                     "duplicate": True,
                 }
-            # 27 号：带金额的记忆，把结构化金额字段贴上（金额/币种/周期/对象），
-            # 回答时 _memory_block 标在每条后面，模型分得清两笔钱；没金额
-            # 就不传 money 参数（不往 payload 里写 money=None 的空字段）。
-            # 判断 (b) 号：动态数字事实入库先过门禁——没印证的数只记成
-            # 未核实（可信度封顶 0.35），须确认才当稳定事实用，带有效期。
-            # 用户亲口说的稳定数（定投金额、偏好）不受影响，门禁只拦
-            # 动态数字（收盘价、气温、汇率……）。
-            money = _extract_money_metadata(safe_text)
-            confidence = CONFIDENCE_USER if source == SOURCE_USER else CONFIDENCE_INFERRED
-            verification_status = None
-            requires_confirmation = False
-            expires_at = None
-            verdict = self.verify_numeric_fact(safe_text)
-            if verdict["is_dynamic_numeric"]:
-                confidence = min(confidence, verdict["confidence_cap"])
-                verification_status = verdict["status"]
-                requires_confirmation = verdict["requires_confirmation"]
-                expires_at = verdict["expires_at"]
-            metadata = _provenance(
-                source,
-                confidence,
-                source == SOURCE_USER,
-                money=money if money is not None else _MONEY_UNSET,
-                verification_status=verification_status,
-                requires_confirmation=requires_confirmation,
-                expires_at=expires_at,
-                turn_id=turn_id,
-            )
+            # metadata 已在上面拼好（金额分支要先拿它过冲突裁决）。
             # 先写账本、再写索引（最终方案）：账本是家，mem0 只是索引。
             # 账本写不进去时这次不写索引、返回 {}——写记忆失败不能把
             # 聊天搞崩，但也不能让索引里多一条账本里没有的记忆
             # （对账时认不出来）。记账本在 _add_text_with_metadata 里
             # （ledger_mode="required"，记失败就抛、这里接住返回 {}）。
             try:
-                return self._add_text_with_metadata(
+                stored = self._add_text_with_metadata(
                     safe_text, metadata, ledger_mode="required"
                 )
             except Exception:
                 logger.warning("账本先写失败：本次不写索引。", exc_info=True)
                 return {}
+            # 补丁 3：本地没筛出语气的，排队等大模型后台判。
+            if tone is None and stored:
+                stored_results = (stored or {}).get("results") or []
+                if stored_results and stored_results[0].get("id"):
+                    self._tone_queue_append(stored_results[0]["id"], safe_text)
+            return stored
 
     # ---------- 迁移与种子 ----------
 
@@ -7161,6 +7784,45 @@ class Mem0Store:
     def list_pending_inferences(self):
         """列出待定的推断（问了、还没回的那几条）。"""
         return self.list_inferences(status=_inference.STATUS_PENDING)
+
+    def list_pending_decisions(self):
+        """列出“挂起来等 BOOS 定”的记忆（补丁 2 两道闸的待定清单）。
+
+        两类都算：pending_confirmation（新说法可信度不够、盖不掉已
+        确认的旧条，挂着等确认）和 conflict_for_review（两条说法
+        对着干，等 BOOS 定哪条是对的）。返回列表，每项 {"id", "text",
+        "reason", "metadata"}，按写入序号排（先挂的先问）。
+        面板/聊天层拿它问 BOOS；问完由调用方调 correct_memory /
+        delete_memory / 确认接口处理，这里只列、不改库。
+        读不到库时返回 []，不抛异常。"""
+        try:
+            items = self.get_all()
+        except Exception:
+            logger.warning("待定清单读库失败。", exc_info=True)
+            return []
+        out = []
+        for item in items or []:
+            meta = (item or {}).get("metadata") or {}
+            if meta.get("pending_confirmation"):
+                reason = "新说法可信度不够，盖不掉已确认的旧条，等 BOOS 确认。"
+            elif meta.get("conflict_for_review"):
+                reason = "跟库里另一条说法对着干，等 BOOS 定哪条是对的。"
+            else:
+                continue
+            out.append(
+                {
+                    "id": item.get("id"),
+                    "text": item.get("text") or "",
+                    "reason": reason,
+                    "metadata": meta,
+                }
+            )
+        out.sort(key=lambda entry: (
+            (entry.get("metadata") or {}).get("write_seq")
+            if isinstance((entry.get("metadata") or {}).get("write_seq"), int)
+            else -1
+        ))
+        return out
 
     def _set_inference_status(self, key, status, partial=False):
         """把一条待定推断的状态改掉（确认/否认共用）：账本里追加一笔

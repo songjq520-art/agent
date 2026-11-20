@@ -76,7 +76,8 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
                 created_at_source="written", is_rule=False, money=_MONEY_UNSET,
                 verification_status=None, requires_confirmation=False,
                 expires_at=None, conflict_for_review=False, needs_review=False,
-                turn_id=None):
+                turn_id=None, tone=None, tone_evidence=None, tone_source=None,
+                voided=False):
     """拼一份来源元数据（存记忆时传给 mem0.add 的 metadata 参数）。
 
     source 不是 "user" 时一律按 "inferred" 存（调用方传错也不让它
@@ -167,6 +168,20 @@ def _provenance(source, confidence, user_confirmed, created_at=None, slot=None,
         metadata["conflict_for_review"] = True
     if needs_review:
         metadata["needs_review"] = True
+    # 语气（补丁 3，两段式判语气）：tone 只认 serious（认真）/ joke
+    # （玩笑）/ test（测试）/ hypothesis（假设）四个值；没打标的不写
+    # （读回来默认认真）。tone_source 说明是谁判的：local（本地规则）
+    # 还是 model（大模型后台判）；tone_evidence 是判的证据（命中了哪句
+    # 话），大模型判的必须带证据。voided（补丁 3 撤回）：BOOS 后来说
+    # “那句是开玩笑的”，这条连带升上去的一起作废，只打标、不删原话。
+    if tone in ("serious", "joke", "test", "hypothesis"):
+        metadata["tone"] = tone
+        if isinstance(tone_evidence, str) and tone_evidence:
+            metadata["tone_evidence"] = tone_evidence
+        if tone_source in ("local", "model"):
+            metadata["tone_source"] = tone_source
+    if voided:
+        metadata["voided"] = True
     if money is not _MONEY_UNSET:
         # None 也存：把旧的金额字段清掉（纠正时新说法没金额就清掉，
         # 不然“每天投 5 块”改成“我不投了”，5 块的字段还贴在上面）。
@@ -230,6 +245,12 @@ def _normalize_metadata(raw, item=None):
     conflict_for_review = False
     needs_review = False
     evidence = None
+    # 语气（补丁 3）：没打标的默认认真；只认四个值，别的按认真算。
+    tone = "serious"
+    tone_evidence = None
+    tone_source = None
+    voided = False
+    voided_at = None
     if isinstance(raw, dict):
         raw_source = raw.get("source")
         if raw_source in (SOURCE_USER, SOURCE_INFERRED):
@@ -280,6 +301,21 @@ def _normalize_metadata(raw, item=None):
         raw_evidence = raw.get("evidence")
         if isinstance(raw_evidence, str) and raw_evidence:
             evidence = raw_evidence
+        # 语气（补丁 3）：只认四个值；证据和来源只认非空字符串 /
+        # local / model；作废标记只有明确是 True（布尔值）才算。
+        raw_tone = raw.get("tone")
+        if raw_tone in ("serious", "joke", "test", "hypothesis"):
+            tone = raw_tone
+        raw_tone_evidence = raw.get("tone_evidence")
+        if isinstance(raw_tone_evidence, str) and raw_tone_evidence:
+            tone_evidence = raw_tone_evidence
+        raw_tone_source = raw.get("tone_source")
+        if raw_tone_source in ("local", "model"):
+            tone_source = raw_tone_source
+        voided = raw.get("voided") is True
+        raw_voided_at = raw.get("voided_at")
+        if isinstance(raw_voided_at, str) and raw_voided_at:
+            voided_at = raw_voided_at
     # 第二步衰减：decay_* 字段只认合法值（字符串/数字/布尔要对得上号），
     # 别的按缺失处理。派生默认值（老记忆没有衰减字段时）：
     #   - last_used_at 没有就用 created_at（写时就是最后一次用上）；
@@ -361,6 +397,11 @@ def _normalize_metadata(raw, item=None):
         "conflict_for_review": conflict_for_review,
         "needs_review": needs_review,
         "evidence": evidence,
+        "tone": tone,
+        "tone_evidence": tone_evidence,
+        "tone_source": tone_source,
+        "voided": voided,
+        "voided_at": voided_at,
         "decay_kind": decay_kind,
         "importance": importance,
         "last_used_at": last_used_at,
@@ -453,8 +494,13 @@ def _is_core_memory(metadata):
 # decay.py 的 classify_decay_kind，放 provenance 里会循环引用。
 
 def _memory_order_key(metadata):
-    """一条记忆的新旧排序键：(形成时间, 写入序号)。
+    """一条记忆的新旧排序键：(写入序号, 形成时间)。
 
+    序号是第一顺位：单调递增、单机内一定不会撞，Windows 时钟再粗
+    也不影响序号比大小（2026-11-19，排序键第一步：原来是
+    (created_at, write_seq)，时间戳当第一顺位，时钟是风险源）。
+    时间戳只当第二顺位、同序号时才看（基本撞不上），平时只给人看、
+    写审计日志。
     没时间戳的按最早算：缺时间戳的都是时间戳功能上线之前存的，
     一定比新写的旧——这是时间线本身，不是猜；序号缺失按 -1 算。
     后补的时间戳也按没时间算：backfill 补时间时是按库里随手排的
@@ -467,23 +513,23 @@ def _memory_order_key(metadata):
     """
     meta = _normalize_metadata(metadata)
     if meta.get("created_at_source") == "backfilled":
-        return (datetime.min.replace(tzinfo=timezone.utc), -1)
+        return (-1, datetime.min.replace(tzinfo=timezone.utc))
     when = _parse_created_at(meta.get("created_at"))
     if when is None:
         when = datetime.min.replace(tzinfo=timezone.utc)
     seq = meta.get("write_seq")
     if not isinstance(seq, int) or isinstance(seq, bool):
         seq = -1
-    return (when, seq)
+    return (seq, when)
 
 def _resolve_conflict(old_metadata, new_metadata):
     """新旧两条记忆打架时，时间戳 + 可信度怎么判（纯函数，不动库）。
 
     判法：
-    - 两条都没有时间戳、或时间戳 + 序号全撞：真分不出先后，问 BOOS。
-      （只有一边缺时间戳不问：缺的那条一定是时间戳功能上线之前存的，
-      一定比新写的旧——这是时间线本身，不是猜。后补的时间戳在排序
-      时按没时间算（见 _memory_order_key），所以两条后补的也走问 BOOS。）
+    - 两条的序号 + 时间戳全撞（都没序号、都没时间戳，或都是后补时间戳）：
+      真分不出先后，问 BOOS。（只有一边缺时间戳不问：缺的那条一定是
+      时间戳功能上线之前存的，一定比新写的旧——这是时间线本身，不是猜。
+      序号能比就直接按序号判，不因为缺时间戳就问。）
     - 新的可信度比旧的低：旧的赢，新记忆挂起来“待确认”（pending_new），
       不覆盖——时间戳再新也没用，新旧管不了覆盖资格。
     - 新的可信度比旧的高：新的胜出，旧的标“被取代”（supersede_old）。
@@ -510,17 +556,11 @@ def _resolve_conflict(old_metadata, new_metadata):
     new_rank = _credibility_rank(new)
     old_key = _memory_order_key(old)
     new_key = _memory_order_key(new)
-    if old.get("created_at") is None and new.get("created_at") is None:
-        return {
-            "winner": "ask",
-            "action": "ask",
-            "reason": "两条记忆都没有时间戳，分不出先后，请 BOOS 定。",
-        }
     if old_key == new_key:
         return {
             "winner": "ask",
             "action": "ask",
-            "reason": "两条记忆时间戳和序号都一样，分不出先后，请 BOOS 定。",
+            "reason": "两条记忆序号和时间戳都一样，分不出先后，请 BOOS 定。",
         }
     if new_rank < old_rank:
         return {
