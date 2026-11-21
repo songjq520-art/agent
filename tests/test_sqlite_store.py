@@ -201,7 +201,7 @@ def test_import_from_mem0_idempotent(store):
         ]
     )
     first = store.import_from_mem0(stub)
-    assert first == {"imported": 2, "skipped_existing": 0, "skipped_deleted": 0}
+    assert first == {"imported": 2, "skipped_existing": 0, "skipped_deleted": 0, "skipped_sensitive": 0}
     second = store.import_from_mem0(stub)
     assert second["imported"] == 0
     assert second["skipped_existing"] == 2
@@ -752,3 +752,82 @@ def test_concurrent_search_and_add_no_errors(store):
     assert not any(t.is_alive() for t in threads), "并发线程挂住了"
     assert errors == []
     assert len(_live_texts(store)) == 90
+
+
+# ---------- 11. Gemini 第三轮：串扰 Bug + 正则前缀 + 锁收拢 + 迁移拦截 ----------
+
+
+def test_direct_add_resets_retraction_marker(store):
+    """“记住”直存不走 save_turn：直存后“撤回”只作废直存的那 1 条，
+    上一轮 save_turn 存的 2 条完好（串扰 Bug，2026-11-21 Gemini 第三轮）。"""
+    first = store.save_turn(
+        [{"role": "user", "content": "我今天晚上吃了米线。顺便喝了一杯豆浆。"}],
+        turn_id="t-round3-a",
+    )
+    assert len(first["stored"]) == 2
+    saved = store.add_memory_text("我下周三出差", source="user")
+    assert saved.get("event") == "ADD"
+    assert len(_live_texts(store)) == 3
+
+    retract = store.save_turn(
+        [{"role": "user", "content": "撤回"}],
+        turn_id="t-round3-retract",
+    )
+    assert retract["retracted"] is True
+    assert retract["dropped_count"] == 1
+    assert set(_live_texts(store)) == {"我今天晚上吃了米线", "顺便喝了一杯豆浆"}
+
+
+def test_save_turn_without_turn_id_retracts_whole_turn(store):
+    """没传 turn_id 的多句轮次：内部兜底 ID 让每句带同一个 turn_id，
+    “撤回”整轮作废，不退化成只作废最后 1 条。"""
+    first = store.save_turn(
+        [{"role": "user", "content": "我今天晚上吃了米线。顺便喝了一杯豆浆。"}]
+    )
+    assert len(first["stored"]) == 2
+    assert first["turn_id"].startswith("auto-")
+    assert len(_live_texts(store)) == 2
+
+    retract = store.save_turn([{"role": "user", "content": "撤回"}])
+    assert retract["retracted"] is True
+    assert retract["dropped_count"] == 2
+    assert _live_texts(store) == []
+
+
+def test_correction_with_prefix_is_blocked(store):
+    """“不对/不是”开头的纠错句也被拦下；句中含“记错了”的正常陈述仍存。"""
+    r1 = store.save_turn(
+        [{"role": "user", "content": "不对，你记错了，我住上海"}],
+        turn_id="t-round3-corr1",
+    )
+    assert r1["stored"] == []
+    r2 = store.save_turn(
+        [{"role": "user", "content": "不是，记错了，我住广州"}],
+        turn_id="t-round3-corr2",
+    )
+    assert r2["stored"] == []
+    assert _live_texts(store) == []
+
+    r3 = store.save_turn(
+        [{"role": "user", "content": "我昨天记错了开会时间"}],
+        turn_id="t-round3-corr3",
+    )
+    assert r3["stored"] == ["我昨天记错了开会时间"]
+
+
+def test_import_from_mem0_skips_sensitive(store):
+    """迁移时也拦敏感行：敏感行不在账本、不在 SQLite，正常行正常迁入，
+    返回里 skipped_sensitive == 1（2026-11-21 Gemini 第三轮，BOOS 定）。"""
+    stub = _StubMem0(
+        [
+            {"text": "我的密码是 abc12345", "metadata": {"source": "user"}},
+            {"text": "我喜欢吃火锅", "metadata": {"source": "user"}},
+        ]
+    )
+    out = store.import_from_mem0(stub)
+    assert out["imported"] == 1
+    assert out["skipped_sensitive"] == 1
+    assert out["skipped_existing"] == 0
+    assert out["skipped_deleted"] == 0
+    assert _live_texts(store) == ["我喜欢吃火锅"]
+    assert all("abc12345" not in line for line in _ledger_lines(store))

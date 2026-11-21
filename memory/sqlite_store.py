@@ -150,7 +150,10 @@ def _looks_like_fact(sentence):
         return False, "问句"
     if any(w in s for w in ("忘记这个", "忘掉这个", "删掉这条", "不要记")):
         return False, "删除指令"
-    if re.match(r"^(?:你)?(?:记错了|说错了|搞错了)[，,。！!、\s]?", s):
+    # 纠错前缀（2026-11-21 Gemini 第三轮）：“不对/不是/哎”开头的也是纠错指令，
+    # 同样不存。注意：等 SQLite 纠错正式接线时要移除这一条拦截，否则
+    # “你记错了，我住上海”会把后半句纠错新事实一并丢弃。
+    if re.match(r"^(?:(?:不对|不是|哎)[，,、\s]*)?(?:你)?(?:记错了|说错了|搞错了)[，,。！!、\s]?", s):
         return False, "纠错指令（SQLite 纠错未接线）"
     return True, ""
 
@@ -360,7 +363,7 @@ class SQLiteStore:
         跳过；账本里有同一原文的 delete 事件的跳过（删了的就是删了）；
         其余的先给账本补记一笔 add（删前补记同款做法），再进 SQLite。
         幂等：跑两次也不会重复（原文比对 + 账本 key 去重）。
-        返回 {"imported": n, "skipped_existing": n, "skipped_deleted": n}。
+        返回 {"imported": n, "skipped_existing": n, "skipped_deleted": n, "skipped_sensitive": n}。
         """
         with self._lock:
             deleted_texts = set()
@@ -379,11 +382,16 @@ class SQLiteStore:
                     "SELECT text FROM memories WHERE voided=0 AND deleted=0"
                 ).fetchall()
             }
-            imported = skipped_existing = skipped_deleted = 0
+            imported = skipped_existing = skipped_deleted = skipped_sensitive = 0
             items = mem0_store.get_all(include_sensitive=True) or []
             for item in items:
                 text = ((item or {}).get("memory") or (item or {}).get("text") or "").strip()
                 if not text:
+                    continue
+                if _contains_sensitive(text):
+                    # 迁移时也拦敏感行（2026-11-21 Gemini 第三轮，BOOS 定）：
+                    # 旧库里的密码/卡号不进账本、不进 SQLite。
+                    skipped_sensitive += 1
                     continue
                 if text in existing_texts:
                     skipped_existing += 1
@@ -421,6 +429,7 @@ class SQLiteStore:
                 "imported": imported,
                 "skipped_existing": skipped_existing,
                 "skipped_deleted": skipped_deleted,
+                "skipped_sensitive": skipped_sensitive,
             }
 
     # ---------- 写（原样先存） ----------
@@ -506,6 +515,10 @@ class SQLiteStore:
             except Exception:
                 vec = None
             self._insert_memory_row(key, text, metadata, vec)
+            # 直存不走 save_turn：刚写的新记忆不再属于上一轮，撤回标记清掉，
+            # 否则下一次“撤回”会误作废上一轮（2026-11-21 Gemini 第三轮真 Bug）。
+            # save_turn 内部也调这里，但它在循环结束后才重设标记，顺序不冲突。
+            self._last_stored_turn_id = None
             return {"id": key, "memory": text, "event": "ADD"}
 
     def save_turn(self, messages, turn_id=None):
@@ -517,6 +530,10 @@ class SQLiteStore:
         同一个 turn_id 只存一次（web 的 ask() 和 run_question() 会各调
         一次，第二次直接返回上次的回执，不重复存）。
         """
+        # 没传 turn_id 时生成内部兜底 ID（2026-11-21 Gemini 第三轮）：多句轮次的
+        # 每句都带同一个 turn_id，撤回才能整轮作废，否则退化成只作废最后 1 条。
+        # _next_write_seq() 进程内严格递增，每次调用都不同，去重逻辑不受影响。
+        turn_id = turn_id or f"auto-{_next_write_seq()}"
         if turn_id and turn_id in self._seen_turn_ids:
             return {"turn_id": turn_id, "duplicate_turn": True, "results": []}
         if turn_id:
@@ -574,7 +591,8 @@ class SQLiteStore:
             else:
                 receipt["dropped"].append({"text": sentence, "reason": "账本写失败"})
         if receipt["stored"]:
-            self._last_stored_turn_id = turn_id
+            with self._lock:
+                self._last_stored_turn_id = turn_id
         return receipt
 
     def _void_last_stored(self):
