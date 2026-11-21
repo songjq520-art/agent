@@ -16,6 +16,7 @@
 #   8. 账本是真相源：删库重建后能从账本对账恢复
 
 from datetime import date, timedelta
+import threading
 
 import numpy as np
 import pytest
@@ -583,3 +584,171 @@ def test_save_turn_skips_correction_utterance_before_wired(store):
         turn_id="t-normal",
     )
     assert r2["stored"] == ["我昨天记错了开会时间"]
+# ---------- 10. Gemini 第二轮：敏感信息拦截（#1）+ 单连接多线程锁（#2） ----------
+
+
+def _plant_memory_row(store, text):
+    """绕过 add 入口、直接插一行（模拟迁移带进来的旧敏感记忆）。
+
+    只在单线程测试里用：直接调 _insert_memory_row，不走锁、不记账本。
+    """
+    from memory import ledger as _ledger
+    from memory.timeutil import _now_iso
+
+    created_at = _now_iso()
+    key = _ledger.ledger_event_key(text, created_at)
+    store._insert_memory_row(
+        key,
+        text,
+        {
+            "source": "inferred",
+            "confidence": 0.7,
+            "user_confirmed": False,
+            "created_at": created_at,
+            "write_seq": 1,
+            "turn_id": None,
+            "slot": None,
+            "is_rule": False,
+            "curated": False,
+            "decay_kind": "episodic",
+            "importance": "normal",
+            "event_date": None,
+        },
+        None,
+    )
+    return key
+
+
+def test_add_memory_text_blocks_sensitive_password_sentence(store):
+    """含密码特征的句子不进账本、不进 SQLite，返回写明原因。"""
+    out = store.add_memory_text("我的密码是 abc12345", source="user")
+    assert out.get("event") == "SENSITIVE"
+    assert out.get("reason") == "含敏感信息"
+    assert _live_texts(store) == []
+    assert _ledger_lines(store) == []
+
+
+def test_add_memory_text_blocks_sensitive_card_number(store):
+    """过 Luhn 的卡号同样拦下：根本没存，get_all(True) 里也没有。"""
+    out = store.add_memory_text("我的银行卡号是 4111111111111111", source="user")
+    assert out.get("event") == "SENSITIVE"
+    assert _live_texts(store) == []
+    assert store.get_all(include_sensitive=True) == []
+    assert _ledger_lines(store) == []
+
+
+def test_save_turn_drops_sensitive_sentence_with_reason(store):
+    """save_turn 回执：敏感句进 dropped、写明“含敏感信息”，正常句照存。"""
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我今天晚上吃了米线。我的密码是 abc12345。"}],
+        turn_id="t-sensitive",
+    )
+    assert receipt["stored"] == ["我今天晚上吃了米线"]
+    assert receipt["dropped"] == [{"text": "我的密码是 abc12345", "reason": "含敏感信息"}]
+    assert _live_texts(store) == ["我今天晚上吃了米线"]
+
+
+def test_get_all_filters_sensitive_unless_included(store):
+    """已入库的敏感记忆：get_all() 默认不返回，get_all(True) 才全量。"""
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    _plant_memory_row(store, "我的密码是 abc12345")
+    assert _live_texts(store) == ["我喜欢吃火锅"]
+    assert {it["text"] for it in store.get_all(include_sensitive=True)} == {
+        "我喜欢吃火锅",
+        "我的密码是 abc12345",
+    }
+
+
+def test_search_does_not_return_sensitive_memory(store):
+    """search 不返回已入库的敏感记忆（不注入提示词），正常记忆照常。"""
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    _plant_memory_row(store, "我的密码是 abc12345")
+    hits = store.search("密码", top_k=5)
+    assert all(h["text"] != "我的密码是 abc12345" for h in hits)
+    hits2 = store.search("火锅", top_k=5)
+    assert hits2 and hits2[0]["text"] == "我喜欢吃火锅"
+
+
+def test_search_ledger_fallback_skips_sensitive(store):
+    """账本兜底也不补敏感条目：账本里有、索引里没有的敏感原话不返回。
+
+    直接调 _search_inner：search() 会把异常吞掉返回 []，测不出过滤本身。
+    """
+    from memory import ledger as _ledger
+
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    key = _ledger.ledger_event_key(
+        "我的银行卡号是 4111111111111111，平时用它交水电费",
+        "2026-11-20T00:00:00Z",
+    )
+    _ledger.append_event(
+        store.ledger_path,
+        {
+            "type": _ledger.LEDGER_EVENT_ADD,
+            "key": key,
+            "text": "我的银行卡号是 4111111111111111，平时用它交水电费",
+            "meta": {"source": "inferred", "created_at": "2026-11-20T00:00:00Z"},
+        },
+    )
+    hits = store._search_inner("银行卡号交水电费", top_k=5)
+    assert all("4111111111111111" not in h["text"] for h in hits)
+
+
+def test_add_memory_text_nested_embed_lock_is_reentrant(tmp_path):
+    """RLock 亲手验证：add 持锁时调真实 _embed_text（缓存查库也加锁）。
+
+    不是 RLock 的话这里会死锁：放线程里跑、10 秒超时判失败，不挂住全套。
+    _embedder_failed=True 只走缓存查库那条锁路，不加载模型。
+    """
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    s._embedder_failed = True
+    done = []
+
+    def _run():
+        try:
+            done.append(s.add_memory_text("我喜欢吃火锅", source="inferred"))
+        except Exception as exc:  # noqa: BLE001 - 死锁之外的错也要记下来
+            done.append(exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), "add_memory_text 在 _embed_text 里死锁了"
+    assert len(done) == 1 and isinstance(done[0], dict)
+    assert done[0].get("event") == "ADD"
+
+
+def test_concurrent_search_and_add_no_errors(store):
+    """多线程并发：3 写 × 30 条 add + 3 读 × 100 次检索/列表。
+
+    不抛 OperationalError/InterfaceError，库里 90 条一字不少。
+    读路直接调 _search_inner：search() 会把异常吞掉返回 []，测不出并发错。
+    """
+    errors = []
+
+    def _writer(n):
+        try:
+            for i in range(30):
+                store.add_memory_text(
+                    "我今天晚上吃了第%d号米线第%d碗" % (n, i), source="inferred"
+                )
+        except Exception as exc:  # noqa: BLE001 - 并发错都记下来再断言
+            errors.append(exc)
+
+    def _reader():
+        try:
+            for _ in range(100):
+                store._search_inner("米线", top_k=5)
+                store.get_all()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_writer, args=(w,)) for w in range(3)]
+    threads += [threading.Thread(target=_reader) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads), "并发线程挂住了"
+    assert errors == []
+    assert len(_live_texts(store)) == 90

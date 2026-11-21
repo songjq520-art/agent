@@ -37,6 +37,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from memory import ledger as _ledger
+from memory.redaction import _contains_sensitive
 from memory.timeutil import _now_epoch, _now_iso, _next_write_seq
 
 logger = logging.getLogger(__name__)
@@ -243,9 +244,11 @@ class SQLiteStore:
         那条记忆先以无向量入库，检索时靠原样/关键词兜底。
         """
         key = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
-        row = self._conn.execute(
-            "SELECT embedding FROM vector_cache WHERE sha256=?", (key,)
-        ).fetchone()
+        # 向量缓存是同一单连接上的读写：和写路径一样加锁（#2）。
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT embedding FROM vector_cache WHERE sha256=?", (key,)
+            ).fetchone()
         if row is not None:
             return _blob_to_vector(row[0])
         if self._embedder_failed:
@@ -266,12 +269,13 @@ class SQLiteStore:
                 [text], normalize_embeddings=True, show_progress_bar=False
             )[0]
             vec = np.asarray(vec, dtype="float32")
-            self._conn.execute(
-                "INSERT OR REPLACE INTO vector_cache(sha256, embedding, model, dim)"
-                " VALUES (?, ?, ?, ?)",
-                (key, vec.tobytes(), EMBEDDING_MODEL, int(vec.shape[0])),
-            )
-            self._conn.commit()
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO vector_cache(sha256, embedding, model, dim)"
+                    " VALUES (?, ?, ?, ?)",
+                    (key, vec.tobytes(), EMBEDDING_MODEL, int(vec.shape[0])),
+                )
+                self._conn.commit()
             return vec
         except Exception:
             logger.warning("本地向量模型起不来：本次只存文字、不存向量。", exc_info=True)
@@ -322,28 +326,29 @@ class SQLiteStore:
         key 不进索引（账本里原话留着，索引里不给搜到——和 mem0 那条路
         的投影过滤同一个意思）。
         """
-        state = self.ledger_state()
-        key_states = (state or {}).get("key_states") or {}
-        added = 0
-        for record in (state or {}).get("adds") or []:
-            key = record.get("key")
-            text = record.get("text") or ""
-            meta = record.get("meta") or {}
-            if not key or not text.strip():
-                continue
-            if key_states.get(key) in (
-                _ledger.LEDGER_STATE_SUPERSEDED,
-                _ledger.LEDGER_STATE_DELETED,
-            ):
-                continue
-            if self._conn.execute(
-                "SELECT 1 FROM memories WHERE id=?", (key,)
-            ).fetchone():
-                continue
-            vec = self._embed_text(text)
-            self._insert_memory_row(key, text, meta, vec)
-            added += 1
-        return added
+        with self._lock:
+            state = self.ledger_state()
+            key_states = (state or {}).get("key_states") or {}
+            added = 0
+            for record in (state or {}).get("adds") or []:
+                key = record.get("key")
+                text = record.get("text") or ""
+                meta = record.get("meta") or {}
+                if not key or not text.strip():
+                    continue
+                if key_states.get(key) in (
+                    _ledger.LEDGER_STATE_SUPERSEDED,
+                    _ledger.LEDGER_STATE_DELETED,
+                ):
+                    continue
+                if self._conn.execute(
+                    "SELECT 1 FROM memories WHERE id=?", (key,)
+                ).fetchone():
+                    continue
+                vec = self._embed_text(text)
+                self._insert_memory_row(key, text, meta, vec)
+                added += 1
+            return added
 
     def import_from_mem0(self, mem0_store):
         """一次性迁移：把只活在 Chroma 里的旧记忆搬进来（2026-11-21 核实）。
@@ -357,65 +362,66 @@ class SQLiteStore:
         幂等：跑两次也不会重复（原文比对 + 账本 key 去重）。
         返回 {"imported": n, "skipped_existing": n, "skipped_deleted": n}。
         """
-        deleted_texts = set()
-        try:
-            events, _info = _ledger.read_events(self.ledger_path)
-            for event in events:
-                if event.get("type") == "delete":
-                    text = (event.get("text") or "").strip()
-                    if text:
-                        deleted_texts.add(text)
-        except Exception:
-            logger.warning("读账本删记录失败：迁移时不按删除过滤。", exc_info=True)
-        existing_texts = {
-            (row[0] or "").strip()
-            for row in self._conn.execute(
-                "SELECT text FROM memories WHERE voided=0 AND deleted=0"
-            ).fetchall()
-        }
-        imported = skipped_existing = skipped_deleted = 0
-        items = mem0_store.get_all(include_sensitive=True) or []
-        for item in items:
-            text = ((item or {}).get("memory") or (item or {}).get("text") or "").strip()
-            if not text:
-                continue
-            if text in existing_texts:
-                skipped_existing += 1
-                continue
-            if text in deleted_texts:
-                skipped_deleted += 1
-                continue
-            meta_in = (item or {}).get("metadata") or {}
-            metadata = {
-                "source": meta_in.get("source", "inferred"),
-                "confidence": meta_in.get("confidence", 0.7),
-                "user_confirmed": bool(meta_in.get("user_confirmed", False)),
-                "created_at": meta_in.get("created_at") or _now_iso(),
-                "write_seq": meta_in.get("write_seq") or _next_write_seq(),
-                "turn_id": meta_in.get("turn_id"),
-                "slot": meta_in.get("slot"),
-                "is_rule": bool(meta_in.get("is_rule", False)),
-                "curated": bool(meta_in.get("curated", False)),
-                "decay_kind": meta_in.get("decay_kind", "episodic"),
-                "importance": meta_in.get("importance", "normal"),
-                "event_date": meta_in.get("event_date")
-                or resolve_event_date(text),
-            }
+        with self._lock:
+            deleted_texts = set()
             try:
-                self._ledger_append_add(text, metadata)
+                events, _info = _ledger.read_events(self.ledger_path)
+                for event in events:
+                    if event.get("type") == "delete":
+                        text = (event.get("text") or "").strip()
+                        if text:
+                            deleted_texts.add(text)
             except Exception:
-                logger.warning("迁移补记账本失败：跳过这一条。", exc_info=True)
-                continue
-            vec = self._embed_text(text)
-            key = _ledger.ledger_event_key(text, metadata.get("created_at"))
-            self._insert_memory_row(key, text, metadata, vec)
-            existing_texts.add(text)
-            imported += 1
-        return {
-            "imported": imported,
-            "skipped_existing": skipped_existing,
-            "skipped_deleted": skipped_deleted,
-        }
+                logger.warning("读账本删记录失败：迁移时不按删除过滤。", exc_info=True)
+            existing_texts = {
+                (row[0] or "").strip()
+                for row in self._conn.execute(
+                    "SELECT text FROM memories WHERE voided=0 AND deleted=0"
+                ).fetchall()
+            }
+            imported = skipped_existing = skipped_deleted = 0
+            items = mem0_store.get_all(include_sensitive=True) or []
+            for item in items:
+                text = ((item or {}).get("memory") or (item or {}).get("text") or "").strip()
+                if not text:
+                    continue
+                if text in existing_texts:
+                    skipped_existing += 1
+                    continue
+                if text in deleted_texts:
+                    skipped_deleted += 1
+                    continue
+                meta_in = (item or {}).get("metadata") or {}
+                metadata = {
+                    "source": meta_in.get("source", "inferred"),
+                    "confidence": meta_in.get("confidence", 0.7),
+                    "user_confirmed": bool(meta_in.get("user_confirmed", False)),
+                    "created_at": meta_in.get("created_at") or _now_iso(),
+                    "write_seq": meta_in.get("write_seq") or _next_write_seq(),
+                    "turn_id": meta_in.get("turn_id"),
+                    "slot": meta_in.get("slot"),
+                    "is_rule": bool(meta_in.get("is_rule", False)),
+                    "curated": bool(meta_in.get("curated", False)),
+                    "decay_kind": meta_in.get("decay_kind", "episodic"),
+                    "importance": meta_in.get("importance", "normal"),
+                    "event_date": meta_in.get("event_date")
+                    or resolve_event_date(text),
+                }
+                try:
+                    self._ledger_append_add(text, metadata)
+                except Exception:
+                    logger.warning("迁移补记账本失败：跳过这一条。", exc_info=True)
+                    continue
+                vec = self._embed_text(text)
+                key = _ledger.ledger_event_key(text, metadata.get("created_at"))
+                self._insert_memory_row(key, text, metadata, vec)
+                existing_texts.add(text)
+                imported += 1
+            return {
+                "imported": imported,
+                "skipped_existing": skipped_existing,
+                "skipped_deleted": skipped_deleted,
+            }
 
     # ---------- 写（原样先存） ----------
 
@@ -457,6 +463,16 @@ class SQLiteStore:
         text = (text or "").strip()
         if not text:
             return {}
+        if _contains_sensitive(text):
+            # #1 敏感信息拦截：含密码/卡号/密钥的句子不存——账本和 SQLite
+            # 都不写。返回非空字典（event=SENSITIVE）："记住"直存的调用方
+            # 按"已处理"跳过 add_turn，不让秘密从另一条路再存进去；
+            # save_turn 按 dropped 记回执、写明原因（见下面 SENSITIVE 分支）。
+            return {
+                "event": "SENSITIVE",
+                "memory": text,
+                "reason": "含敏感信息",
+            }
         with self._lock:
             created_at = _now_iso()
             metadata = {
@@ -553,6 +569,8 @@ class SQLiteStore:
                 )
             elif (saved or {}).get("event") == "UNCHANGED":
                 receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
+            elif (saved or {}).get("event") == "SENSITIVE":
+                receipt["dropped"].append({"text": sentence, "reason": "含敏感信息"})
             else:
                 receipt["dropped"].append({"text": sentence, "reason": "账本写失败"})
         if receipt["stored"]:
@@ -616,31 +634,40 @@ class SQLiteStore:
     # ---------- 读 ----------
 
     def _all_live_memories(self):
-        rows = self._conn.execute(
-            "SELECT id, text, metadata_json, created_at, write_seq, slot,"
-            " source, user_confirmed, decay_kind, importance, event_date,"
-            " embedding FROM memories WHERE voided=0 AND deleted=0"
-            " ORDER BY created_at DESC"
-        ).fetchall()
-        out = []
-        for r in rows:
-            meta = _normalize_metadata(json.loads(r[2] or "{}"))
-            out.append({
-                "id": r[0], "text": r[1], "metadata": meta,
-                "created_at": r[3], "write_seq": r[4], "slot": r[5],
-                "source": r[6], "user_confirmed": bool(r[7]),
-                "decay_kind": r[8], "importance": r[9],
-                "event_date": r[10], "embedding": r[11],
-            })
-        return out
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text, metadata_json, created_at, write_seq, slot,"
+                " source, user_confirmed, decay_kind, importance, event_date,"
+                " embedding FROM memories WHERE voided=0 AND deleted=0"
+                " ORDER BY created_at DESC"
+            ).fetchall()
+            out = []
+            for r in rows:
+                meta = _normalize_metadata(json.loads(r[2] or "{}"))
+                out.append({
+                    "id": r[0], "text": r[1], "metadata": meta,
+                    "created_at": r[3], "write_seq": r[4], "slot": r[5],
+                    "source": r[6], "user_confirmed": bool(r[7]),
+                    "decay_kind": r[8], "importance": r[9],
+                    "event_date": r[10], "embedding": r[11],
+                })
+            return out
 
     def get_all(self, include_sensitive=False):
-        return [
+        items = [
             {
                 "id": m["id"], "memory": m["text"], "text": m["text"],
                 "metadata": m["metadata"], "created_at": m["created_at"],
             }
             for m in self._all_live_memories()
+        ]
+        if include_sensitive:
+            return items
+        # #1 默认不返回敏感内容：页面列表/前台展示都不该看到密码/卡号。
+        # include_sensitive=True 只给内部用（纠错归属校验、迁移/删除校验）。
+        return [
+            it for it in items
+            if not _contains_sensitive(it["text"] or "")
         ]
 
     def search(self, query, top_k=5, reinforce=False, include_history=False,
@@ -692,164 +719,172 @@ class SQLiteStore:
           - 图谱路是空列表：融合时等于没这一路（旧逻辑图坏了只丢图这路
             的同款处理）；图上才找得到的记忆（source="graph"）现在没有。
         """
-        import numpy as np
+        with self._lock:
+            import numpy as np
 
-        try:
-            from memory import bm25 as _bm25
-        except Exception:
-            logger.warning("BM25 模块读不到：本次只用语义单路检索。", exc_info=True)
-            _bm25 = None
-
-        live = self._all_live_memories()
-        if not live:
-            return []
-        wide_k = max(top_k * 4, top_k)
-        qvec = self._embed_text(query)
-        candidates = {}
-        semantic_ranked = []
-        bm25_ranked = []
-        seen_texts = set()
-        by_id = {m["id"]: m for m in live}
-
-        def _result_item(m, score, source):
-            meta = dict(m["metadata"] or {})
-            return {
-                "id": m["id"], "text": m["text"], "score": round(score, 4),
-                "source": source, "metadata": meta,
-                "confirmed": bool(m["user_confirmed"]),
-                "decay_weight": _decay_weight(meta), "is_history": False,
-                # 类型权重只进排序键，不进返回字段（返回形状还是 8 个键，
-                # 见 test_search_result_shape_unchanged）；出结果前 pop 掉。
-                "_type_weight": _type_weight(m["text"]),
-            }
-
-        # 语义路：原始余弦分排位，取前 wide_k；原样命中的先放最前面。
-        sem_scored = []
-        verbatim_first = []
-        for m in live:
-            text = m["text"] or ""
-            verbatim = query in text or text in query
-            cos = None
-            if qvec is not None and m["embedding"] is not None:
-                vec = _blob_to_vector(m["embedding"])
-                if vec is not None and vec.shape == qvec.shape:
-                    cos = float(np.dot(qvec, vec))
-            if verbatim:
-                verbatim_first.append(m)
-                continue
-            if cos is None or cos < SEARCH_THRESHOLD:
-                continue
-            kw = _keyword_overlap(query, text)
-            sem_scored.append((cos, 0.6 * cos + 0.4 * kw, m))
-        sem_scored.sort(key=lambda item: -item[0])
-        for m in verbatim_first:
-            if m["text"] in seen_texts:
-                continue
-            seen_texts.add(m["text"])
-            candidates[m["id"]] = _result_item(m, 1.0, "verbatim")
-            semantic_ranked.append(m["id"])
-        for _cos, score, m in sem_scored[:wide_k]:
-            if m["text"] in seen_texts:
-                continue
-            seen_texts.add(m["text"])
-            candidates[m["id"]] = _result_item(m, score, "semantic")
-            semantic_ranked.append(m["id"])
-
-        # BM25 路：全库打分取前 wide_k，和语义平等进 RRF。
-        exact_ids = set()
-        if _bm25 is not None:
             try:
-                docs = [{"id": m["id"], "text": m["text"] or ""} for m in live]
-                exact_ids = set(_bm25.extract_exact_matches(query, docs))
-                for hit in _bm25.bm25_search(query, docs, top_k=wide_k):
-                    doc_id = hit["id"]
-                    m = by_id.get(doc_id)
-                    if m is None:
-                        continue
-                    if doc_id in candidates:
-                        candidates[doc_id]["exact_match"] = doc_id in exact_ids
+                from memory import bm25 as _bm25
+            except Exception:
+                logger.warning("BM25 模块读不到：本次只用语义单路检索。", exc_info=True)
+                _bm25 = None
+
+            # #1 检索是拼进提示词的路：含敏感信息的条目不进候选池——已入库的
+            # 旧敏感记忆（比如迁移带进来的）也不注入。
+            live = [
+                m for m in self._all_live_memories()
+                if not _contains_sensitive(m["text"] or "")
+            ]
+            if not live:
+                return []
+            wide_k = max(top_k * 4, top_k)
+            qvec = self._embed_text(query)
+            candidates = {}
+            semantic_ranked = []
+            bm25_ranked = []
+            seen_texts = set()
+            by_id = {m["id"]: m for m in live}
+
+            def _result_item(m, score, source):
+                meta = dict(m["metadata"] or {})
+                return {
+                    "id": m["id"], "text": m["text"], "score": round(score, 4),
+                    "source": source, "metadata": meta,
+                    "confirmed": bool(m["user_confirmed"]),
+                    "decay_weight": _decay_weight(meta), "is_history": False,
+                    # 类型权重只进排序键，不进返回字段（返回形状还是 8 个键，
+                    # 见 test_search_result_shape_unchanged）；出结果前 pop 掉。
+                    "_type_weight": _type_weight(m["text"]),
+                }
+
+            # 语义路：原始余弦分排位，取前 wide_k；原样命中的先放最前面。
+            sem_scored = []
+            verbatim_first = []
+            for m in live:
+                text = m["text"] or ""
+                verbatim = query in text or text in query
+                cos = None
+                if qvec is not None and m["embedding"] is not None:
+                    vec = _blob_to_vector(m["embedding"])
+                    if vec is not None and vec.shape == qvec.shape:
+                        cos = float(np.dot(qvec, vec))
+                if verbatim:
+                    verbatim_first.append(m)
+                    continue
+                if cos is None or cos < SEARCH_THRESHOLD:
+                    continue
+                kw = _keyword_overlap(query, text)
+                sem_scored.append((cos, 0.6 * cos + 0.4 * kw, m))
+            sem_scored.sort(key=lambda item: -item[0])
+            for m in verbatim_first:
+                if m["text"] in seen_texts:
+                    continue
+                seen_texts.add(m["text"])
+                candidates[m["id"]] = _result_item(m, 1.0, "verbatim")
+                semantic_ranked.append(m["id"])
+            for _cos, score, m in sem_scored[:wide_k]:
+                if m["text"] in seen_texts:
+                    continue
+                seen_texts.add(m["text"])
+                candidates[m["id"]] = _result_item(m, score, "semantic")
+                semantic_ranked.append(m["id"])
+
+            # BM25 路：全库打分取前 wide_k，和语义平等进 RRF。
+            exact_ids = set()
+            if _bm25 is not None:
+                try:
+                    docs = [{"id": m["id"], "text": m["text"] or ""} for m in live]
+                    exact_ids = set(_bm25.extract_exact_matches(query, docs))
+                    for hit in _bm25.bm25_search(query, docs, top_k=wide_k):
+                        doc_id = hit["id"]
+                        m = by_id.get(doc_id)
+                        if m is None:
+                            continue
+                        if doc_id in candidates:
+                            candidates[doc_id]["exact_match"] = doc_id in exact_ids
+                            bm25_ranked.append(doc_id)
+                            continue
+                        if m["text"] in seen_texts:
+                            continue
+                        seen_texts.add(m["text"])
+                        candidates[doc_id] = _result_item(
+                            m, _keyword_overlap(query, m["text"] or ""), "keyword"
+                        )
                         bm25_ranked.append(doc_id)
-                        continue
-                    if m["text"] in seen_texts:
-                        continue
-                    seen_texts.add(m["text"])
-                    candidates[doc_id] = _result_item(
-                        m, _keyword_overlap(query, m["text"] or ""), "keyword"
-                    )
-                    bm25_ranked.append(doc_id)
-            except Exception:
-                logger.warning("BM25 检索失败：本次只用语义路结果。", exc_info=True)
-        for cid, item in candidates.items():
-            item.setdefault("exact_match", cid in exact_ids)
+                except Exception:
+                    logger.warning("BM25 检索失败：本次只用语义路结果。", exc_info=True)
+            for cid, item in candidates.items():
+                item.setdefault("exact_match", cid in exact_ids)
 
-        # 图谱路：还没建（已知缺口），空路进融合等于没这一路。
-        graph_ranked = []
-        if _bm25 is not None:
-            fused = _bm25.reciprocal_rank_fusion(
-                [semantic_ranked, bm25_ranked, graph_ranked], k=60
+            # 图谱路：还没建（已知缺口），空路进融合等于没这一路。
+            graph_ranked = []
+            if _bm25 is not None:
+                fused = _bm25.reciprocal_rank_fusion(
+                    [semantic_ranked, bm25_ranked, graph_ranked], k=60
+                )
+            else:
+                fused = [(doc_id, 0.0) for doc_id in semantic_ranked]
+            fused_items = []
+            for doc_id, rrf in fused:
+                item = candidates.get(doc_id)
+                if item is None:
+                    continue
+                item["_rrf"] = rrf
+                fused_items.append(item)
+            fused_items.sort(
+                key=lambda item: (
+                    1 if item.get("exact_match") else 0,
+                    (item.get("_rrf") or 0) * (item.get("decay_weight") or 0)
+                    * (item.get("_type_weight") or 1.0),
+                ),
+                reverse=True,
             )
-        else:
-            fused = [(doc_id, 0.0) for doc_id in semantic_ranked]
-        fused_items = []
-        for doc_id, rrf in fused:
-            item = candidates.get(doc_id)
-            if item is None:
-                continue
-            item["_rrf"] = rrf
-            fused_items.append(item)
-        fused_items.sort(
-            key=lambda item: (
-                1 if item.get("exact_match") else 0,
-                (item.get("_rrf") or 0) * (item.get("decay_weight") or 0)
-                * (item.get("_type_weight") or 1.0),
-            ),
-            reverse=True,
-        )
-        results = []
-        for item in fused_items:
-            item.pop("_rrf", None)
-            item.pop("_type_weight", None)
-            item.pop("exact_match", None)
-            results.append(item)
-        results = results[:top_k]
-        seen = {r["text"] for r in results}
-        # 账本兜底：不够 top_k 时翻账本原话按关键词找。
-        # 只找当前态的：被取代/删了的不补进来。
-        if len(results) < top_k:
-            try:
-                state = self.ledger_state()
-                key_states = (state or {}).get("key_states") or {}
-                events = []
-                for rec in (state or {}).get("adds") or []:
-                    if key_states.get(rec.get("key")) in (
-                        _ledger.LEDGER_STATE_SUPERSEDED,
-                        _ledger.LEDGER_STATE_DELETED,
+            results = []
+            for item in fused_items:
+                item.pop("_rrf", None)
+                item.pop("_type_weight", None)
+                item.pop("exact_match", None)
+                results.append(item)
+            results = results[:top_k]
+            seen = {r["text"] for r in results}
+            # 账本兜底：不够 top_k 时翻账本原话按关键词找。
+            # 只找当前态的：被取代/删了的不补进来。
+            if len(results) < top_k:
+                try:
+                    state = self.ledger_state()
+                    key_states = (state or {}).get("key_states") or {}
+                    events = []
+                    for rec in (state or {}).get("adds") or []:
+                        if key_states.get(rec.get("key")) in (
+                            _ledger.LEDGER_STATE_SUPERSEDED,
+                            _ledger.LEDGER_STATE_DELETED,
+                        ):
+                            continue
+                        events.append({
+                            "key": rec.get("key"), "text": rec.get("text") or "",
+                            "meta": rec.get("meta") or {},
+                        })
+                    for hit in _ledger.find_in_ledger(
+                        events, query, top_k=top_k - len(results),
+                        exclude_keys={r["id"] for r in results},
                     ):
-                        continue
-                    events.append({
-                        "key": rec.get("key"), "text": rec.get("text") or "",
-                        "meta": rec.get("meta") or {},
-                    })
-                for hit in _ledger.find_in_ledger(
-                    events, query, top_k=top_k - len(results),
-                    exclude_keys={r["id"] for r in results},
-                ):
-                    text = hit.get("text") or ""
-                    if not text or text in seen:
-                        continue
-                    meta = _normalize_metadata(hit.get("meta") or {})
-                    results.append({
-                        "id": None, "text": text,
-                        "score": hit.get("score"), "source": "ledger",
-                        "metadata": meta,
-                        "confirmed": bool(meta.get("user_confirmed")),
-                        "decay_weight": 1.0, "is_history": True,
-                        "ledger_key": hit.get("key"),
-                    })
-                    seen.add(text)
-            except Exception:
-                logger.warning("账本兜底检索失败。", exc_info=True)
-        return results
+                        text = hit.get("text") or ""
+                        if not text or text in seen:
+                            continue
+                        if _contains_sensitive(text):
+                            continue
+                        meta = _normalize_metadata(hit.get("meta") or {})
+                        results.append({
+                            "id": None, "text": text,
+                            "score": hit.get("score"), "source": "ledger",
+                            "metadata": meta,
+                            "confirmed": bool(meta.get("user_confirmed")),
+                            "decay_weight": 1.0, "is_history": True,
+                            "ledger_key": hit.get("key"),
+                        })
+                        seen.add(text)
+                except Exception:
+                    logger.warning("账本兜底检索失败。", exc_info=True)
+            return results
 
     def search_history(self, query, top_k=5):
         return self.search(query, top_k=top_k, include_history=True)
