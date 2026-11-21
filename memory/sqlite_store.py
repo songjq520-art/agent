@@ -19,7 +19,8 @@
 # （账本和 SQLite 里都有）。还没做的（后面几步再做）：
 #   - 纠错 correct_memory（现在只返回明确的 not_yet，不悄悄猜）
 #   - 衰减/晋升/沉底（decay.py 的规则还没接进来，权重先恒为 1.0）
-#   - 图谱边、精选清单、BM25 三路融合检索（今天只有语义 + 原样 + 账本兜底）
+#   - 图谱边、精选清单（检索三路里的图谱路还是空路，精选先查还没接；
+#     BM25 + RRF 融合已接，见 _search_inner；衰减权重仍恒为 1.0，只留了接口）
 #   - 撤回目前只认光秃秃的“不不不/算了”这类整句信号，带后半句的撤回
 #     （要模型判意图）还没接，用时会先存下来、再由 BOOS 删，不悄悄丢。
 
@@ -605,7 +606,9 @@ class SQLiteStore:
 
     def search(self, query, top_k=5, reinforce=False, include_history=False,
                turn_id=None):
-        """搜记忆：原样匹配在前，语义（本地 bge 余弦）在后，账本兜底补位。
+        """搜记忆：宽召回（语义 top_k*4 + BM25 全库 top_k*4）→ RRF k=60
+        融合 → 原样匹配在前 → 截断 top_k，不够再账本兜底（见 _search_inner，
+        旧 mem0 search 的排名逻辑）。
 
         返回和 Mem0Store.search 一样的形状：
         {"id","text","score","source","metadata","confirmed",
@@ -621,46 +624,150 @@ class SQLiteStore:
             return []
 
     def _search_inner(self, query, top_k=5):
+        """宽召回 → RRF 融合 → 先筛后截（旧 mem0 search 的排名逻辑，
+        commit 7a69699“宽召回 + RRF 融合”，mem0_store.py search）。
+
+        三路排名：语义（原始余弦分 ≥ 0.4，取 top_k*4）、BM25（全库打分，
+        取 top_k*4）、图谱（还没建，空路）。标准 RRF k=60 融合，再乘
+        衰减权重；原样匹配（基金代码/数字/整句，见
+        memory/bm25.extract_exact_matches）的排在前面。
+        和旧逻辑的对应关系：
+          - 语义路按原始余弦分排位（旧 mem0 的语义路按向量原始分排，
+            不是 0.6*cos+0.4*kw 的混合分——混合分里的关键词成分现在
+            由 BM25 那路单独出，再混进语义路等于关键词算两遍；实测
+            这么排会把万家那行从语义第 4 挤到第 5、融合后挤出前 5）。
+            资格仍看原始余弦 ≥ 0.4；score 字段仍记混合分（第一部分
+            的返回形状不动）。
+          - 原样整句命中（query 在文本里或文本在 query 里）仍记 1.0 分、
+            source="verbatim"，排在语义路最前面（第一部分的规矩，旧逻辑
+            里对应 exact_match 置顶）。
+          - BM25 命中不是语义分：score 记关键词重合度（旧关键词兜底
+            同款 0–1 分），只做展示、不参与排位；source="keyword"。
+          - 先筛后截：SQLite 索引里只有当前态（_all_live_memories 只取
+            voided=0 AND deleted=0，对账也只重建当前态），投影过滤和
+            档案闸在这里是空操作——被取代/删了的行根本不在候选池里，
+            也没有沉底态（decay_state）可拦；衰减接进来时闸门加在这里、
+            截断之前。精选先查（旧逻辑第 0 步）也没接：库里 curated 行
+            是 0 条，等精选清单那步再接。
+          - 图谱路是空列表：融合时等于没这一路（旧逻辑图坏了只丢图这路
+            的同款处理）；图上才找得到的记忆（source="graph"）现在没有。
+        """
         import numpy as np
 
+        try:
+            from memory import bm25 as _bm25
+        except Exception:
+            logger.warning("BM25 模块读不到：本次只用语义单路检索。", exc_info=True)
+            _bm25 = None
+
         live = self._all_live_memories()
+        if not live:
+            return []
+        wide_k = max(top_k * 4, top_k)
         qvec = self._embed_text(query)
-        scored = []
+        candidates = {}
+        semantic_ranked = []
+        bm25_ranked = []
+        seen_texts = set()
+        by_id = {m["id"]: m for m in live}
+
+        def _result_item(m, score, source):
+            meta = dict(m["metadata"] or {})
+            return {
+                "id": m["id"], "text": m["text"], "score": round(score, 4),
+                "source": source, "metadata": meta,
+                "confirmed": bool(m["user_confirmed"]),
+                "decay_weight": _decay_weight(meta), "is_history": False,
+            }
+
+        # 语义路：原始余弦分排位，取前 wide_k；原样命中的先放最前面。
+        sem_scored = []
+        verbatim_first = []
         for m in live:
             text = m["text"] or ""
             verbatim = query in text or text in query
-            kw = _keyword_overlap(query, text)
             cos = None
             if qvec is not None and m["embedding"] is not None:
                 vec = _blob_to_vector(m["embedding"])
                 if vec is not None and vec.shape == qvec.shape:
                     cos = float(np.dot(qvec, vec))
             if verbatim:
-                score = 1.0
-                source = "verbatim"
-            elif cos is not None and cos >= SEARCH_THRESHOLD:
-                score = 0.6 * cos + 0.4 * kw
-                source = "semantic"
-            elif kw >= 0.5:
-                score = kw
-                source = "keyword"
-            else:
+                verbatim_first.append(m)
                 continue
-            scored.append((score, source, m))
-        scored.sort(key=lambda x: x[0], reverse=True)
+            if cos is None or cos < SEARCH_THRESHOLD:
+                continue
+            kw = _keyword_overlap(query, text)
+            sem_scored.append((cos, 0.6 * cos + 0.4 * kw, m))
+        sem_scored.sort(key=lambda item: -item[0])
+        for m in verbatim_first:
+            if m["text"] in seen_texts:
+                continue
+            seen_texts.add(m["text"])
+            candidates[m["id"]] = _result_item(m, 1.0, "verbatim")
+            semantic_ranked.append(m["id"])
+        for _cos, score, m in sem_scored[:wide_k]:
+            if m["text"] in seen_texts:
+                continue
+            seen_texts.add(m["text"])
+            candidates[m["id"]] = _result_item(m, score, "semantic")
+            semantic_ranked.append(m["id"])
+
+        # BM25 路：全库打分取前 wide_k，和语义平等进 RRF。
+        exact_ids = set()
+        if _bm25 is not None:
+            try:
+                docs = [{"id": m["id"], "text": m["text"] or ""} for m in live]
+                exact_ids = set(_bm25.extract_exact_matches(query, docs))
+                for hit in _bm25.bm25_search(query, docs, top_k=wide_k):
+                    doc_id = hit["id"]
+                    m = by_id.get(doc_id)
+                    if m is None:
+                        continue
+                    if doc_id in candidates:
+                        candidates[doc_id]["exact_match"] = doc_id in exact_ids
+                        bm25_ranked.append(doc_id)
+                        continue
+                    if m["text"] in seen_texts:
+                        continue
+                    seen_texts.add(m["text"])
+                    candidates[doc_id] = _result_item(
+                        m, _keyword_overlap(query, m["text"] or ""), "keyword"
+                    )
+                    bm25_ranked.append(doc_id)
+            except Exception:
+                logger.warning("BM25 检索失败：本次只用语义路结果。", exc_info=True)
+        for cid, item in candidates.items():
+            item.setdefault("exact_match", cid in exact_ids)
+
+        # 图谱路：还没建（已知缺口），空路进融合等于没这一路。
+        graph_ranked = []
+        if _bm25 is not None:
+            fused = _bm25.reciprocal_rank_fusion(
+                [semantic_ranked, bm25_ranked, graph_ranked], k=60
+            )
+        else:
+            fused = [(doc_id, 0.0) for doc_id in semantic_ranked]
+        fused_items = []
+        for doc_id, rrf in fused:
+            item = candidates.get(doc_id)
+            if item is None:
+                continue
+            item["_rrf"] = rrf
+            fused_items.append(item)
+        fused_items.sort(
+            key=lambda item: (
+                1 if item.get("exact_match") else 0,
+                (item.get("_rrf") or 0) * (item.get("decay_weight") or 0),
+            ),
+            reverse=True,
+        )
         results = []
-        seen = set()
-        for score, source, m in scored[:top_k]:
-            if m["text"] in seen:
-                continue
-            seen.add(m["text"])
-            meta = dict(m["metadata"] or {})
-            results.append({
-                "id": m["id"], "text": m["text"], "score": round(score, 4),
-                "source": source, "metadata": meta,
-                "confirmed": bool(m["user_confirmed"]),
-                "decay_weight": 1.0, "is_history": False,
-            })
+        for item in fused_items:
+            item.pop("_rrf", None)
+            item.pop("exact_match", None)
+            results.append(item)
+        results = results[:top_k]
+        seen = {r["text"] for r in results}
         # 账本兜底：不够 top_k 时翻账本原话按关键词找。
         # 只找当前态的：被取代/删了的不补进来。
         if len(results) < top_k:
@@ -802,6 +909,19 @@ class SQLiteStore:
 
 def _default_memory_dir():
     return Path(__file__).resolve().parent
+
+
+def _decay_weight(metadata):
+    """这条记忆现在的衰减权重（0.10–1.0，核心记忆恒为 1.0）。
+
+    现在恒为 1.0：SQLite 行里还没有 decay.py 要的输入（last_used_at、
+    decay_state 都没有，2026-11-21 核实：33 条活记忆里 0 条带这两个键），
+    衰减规则还没接进来。接口留在这里：以后按 memory/decay.py 的
+    decay_weight(kind, last_used_at, now, is_core) 算，算出来直接乘在
+    RRF 融合分上（_search_inner 的排序键）；资格仍只看原始余弦分 ≥ 0.4——
+    和旧 mem0 的规矩一样，权重只管排位、不管能不能搜到。
+    """
+    return 1.0
 
 
 def _keyword_overlap(query, text):

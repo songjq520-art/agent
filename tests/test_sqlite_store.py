@@ -275,3 +275,135 @@ def test_correct_memory_not_yet_implemented(store):
     assert out.get("status") == "failed"
     assert out.get("reason") == "sqlite_correct_not_yet"
     assert "我喜欢吃火锅" in _live_texts(store)
+
+
+# ---------- 7. BM25 + RRF 融合检索（第二步第一段，2026-11-21） ----------
+# 旧逻辑：memory/bm25.py + mem0_store.py search（commit 7a69699）：
+# 宽召回（语义 top_k*4 + BM25 全库 top_k*4）→ 标准 RRF k=60 融合 →
+# 原样匹配在前 → 先筛后截。语义路按原始余弦分排位，不是混合分。
+
+
+def test_bm25_road_recalls_fund_rows_without_vectors(store):
+    """BM25 路：向量全无（模型起不来）时，只靠关键词也能把万家、恒生
+    两行都召进 Q4 前 5——旧 SQLite 单靠语义时恒生掉在第 7。"""
+    store.add_memory_text("2026年11月20日，用户表示之前提到的所有定投计划全部取消，都不再投了。", source="inferred")
+    store.add_memory_text("用户计划从 2026-11-12 起每天定投 5 元，一直投到年底（12 月 31 日）。", source="inferred")
+    store.add_memory_text("用户表示从今天（2026年11月12日）起每天定投5块，一直投到年底（12月31日）。", source="inferred")
+    store.add_memory_text("用户在计算每天5块的定投总额时，要求只按美股交易日计算，不含周末和节假日。", source="inferred")
+    store.add_memory_text("是每天定投 5 块钱买万家纳指。基金代码0194442", source="user")
+    store.add_memory_text("用户表示现在要每天定投5美元的沪深300。", source="inferred")
+    store.add_memory_text("我想每天定投5块恒生", source="user")
+    store.add_memory_text("每月预算 5 美元，到 5 美元提醒，不自动停。", source="inferred")
+    hits = store.search("定投计划怎么样了", top_k=5)
+    texts = [h["text"] for h in hits]
+    assert texts == [
+        "2026年11月20日，用户表示之前提到的所有定投计划全部取消，都不再投了。",
+        "用户计划从 2026-11-12 起每天定投 5 元，一直投到年底（12 月 31 日）。",
+        "我想每天定投5块恒生",
+        "用户表示现在要每天定投5美元的沪深300。",
+        "是每天定投 5 块钱买万家纳指。基金代码0194442",
+    ]
+
+
+def test_rrf_fusion_order_differs_from_each_road(tmp_path, monkeypatch):
+    """RRF 融合顺序：语义路 [冒菜，火锅，饺子]、BM25 路 [火锅，饺子，冒菜]，
+    融合后必须是 [火锅，冒菜，饺子]——跟两路都不一样，跟 RRF 算出来的一样。
+    （BM25 顺序用 memory/bm25.py 的实现当场算过：火锅 0.94、饺子 0.516、
+    冒菜 0.431。）"""
+
+    def _fake_embed(self, text):
+        vectors = {
+            "我爱吃什么": [1.0, 0.0],
+            "我爱吃火锅": [0.8, 0.6],
+            "我爱的是冒菜": [1.0, 0.0],
+            "爱吃饺子": [0.6, 0.8],
+        }
+        return np.array(vectors[text], dtype="float32")
+
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _fake_embed)
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    s.add_memory_text("我爱吃火锅", source="inferred")
+    s.add_memory_text("我爱的是冒菜", source="inferred")
+    s.add_memory_text("爱吃饺子", source="inferred")
+    hits = s.search("我爱吃什么", top_k=3)
+    assert [h["text"] for h in hits] == ["我爱吃火锅", "我爱的是冒菜", "爱吃饺子"]
+    assert all(h["decay_weight"] == 1.0 for h in hits)
+
+
+def test_verbatim_still_first_with_rrf(tmp_path, monkeypatch):
+    """原样仍在前：原样命中的那行余弦只有 0.41、另一行 0.99，
+    原样行也必须排第一，分数 1.0、source="verbatim"。"""
+
+    def _fake_embed(self, text):
+        vectors = {
+            "定投5块恒生": [1.0, 0.0],
+            "我爱吃火锅": [0.99, float(np.sqrt(1 - 0.99 ** 2))],
+            "我想每天定投5块恒生": [0.41, float(np.sqrt(1 - 0.41 ** 2))],
+        }
+        return np.array(vectors[text], dtype="float32")
+
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _fake_embed)
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    s.add_memory_text("我爱吃火锅", source="inferred")
+    s.add_memory_text("我想每天定投5块恒生", source="user")
+    hits = s.search("定投5块恒生", top_k=2)
+    assert hits[0]["text"] == "我想每天定投5块恒生"
+    assert hits[0]["score"] == 1.0
+    assert hits[0]["source"] == "verbatim"
+
+
+# Q4 八行原文 + 2026-11-21 真实 bge 余弦（4 位小数），离线复现线上排名。
+# 注意：万家行原文里的基金代码库里实际存的是 0194442（7 位），不是报告里
+# 写的 019441——这是旧 mem0 提取时就存下的原文，原样不动。
+_Q4_ROWS = [
+    ("2026年11月20日，用户表示之前提到的所有定投计划全部取消，都不再投了。", 0.6192, "inferred"),
+    ("用户计划从 2026-11-12 起每天定投 5 元，一直投到年底（12 月 31 日）。", 0.6415, "inferred"),
+    ("用户表示从今天（2026年11月12日）起每天定投5块，一直投到年底（12月31日）。", 0.6210, "inferred"),
+    ("用户在计算每天5块的定投总额时，要求只按美股交易日计算，不含周末和节假日。", 0.4914, "inferred"),
+    ("是每天定投 5 块钱买万家纳指。基金代码0194442", 0.5665, "user"),
+    ("用户表示现在要每天定投5美元的沪深300。", 0.5551, "inferred"),
+    ("我想每天定投5块恒生", 0.5425, "user"),
+    ("每月预算 5 美元，到 5 美元提醒，不自动停。", 0.4254, "inferred"),
+]
+
+
+def test_q4_both_fund_rows_in_top5(tmp_path, monkeypatch):
+    """Q4 验收：问“定投计划怎么样了”，前 5 必须同时有万家、恒生两行
+    （已确认）。语义路按原始余弦排 + BM25 路 + RRF k=60 融合后的顺序，
+    和线上真实 bge 跑出来的融合顺序一致。"""
+    _cos = {text: cos for text, cos, _ in _Q4_ROWS}
+
+    def _fake_embed(self, text):
+        if text == "定投计划怎么样了":
+            return np.array([1.0, 0.0], dtype="float32")
+        cos = _cos[text]
+        return np.array([cos, float(np.sqrt(1 - cos ** 2))], dtype="float32")
+
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _fake_embed)
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    for text, _cos_value, source in _Q4_ROWS:
+        s.add_memory_text(text, source=source)
+    hits = s.search("定投计划怎么样了", top_k=5)
+    texts = [h["text"] for h in hits]
+    assert texts == [
+        "用户计划从 2026-11-12 起每天定投 5 元，一直投到年底（12 月 31 日）。",
+        "2026年11月20日，用户表示之前提到的所有定投计划全部取消，都不再投了。",
+        "用户表示从今天（2026年11月12日）起每天定投5块，一直投到年底（12月31日）。",
+        "我想每天定投5块恒生",
+        "是每天定投 5 块钱买万家纳指。基金代码0194442",
+    ]
+    assert hits[3]["confirmed"] is True
+    assert hits[4]["confirmed"] is True
+
+
+def test_search_result_shape_unchanged(store):
+    """返回形状不变：还是 {"id","text","score","source","metadata",
+    "confirmed","decay_weight","is_history"} 这 8 个键，decay_weight 是 1.0。"""
+    store.add_memory_text("我今天晚上吃了米线", source="inferred")
+    hit = store.search("米线", top_k=1)[0]
+    assert set(hit.keys()) == {
+        "id", "text", "score", "source", "metadata",
+        "confirmed", "decay_weight", "is_history",
+    }
+    assert hit["decay_weight"] == 1.0
+    assert hit["is_history"] is False
