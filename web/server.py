@@ -1842,9 +1842,19 @@ def main(argv=None):
     # 时返回 None：只警告一句，服务照常启动、不带记忆运行——记忆库出问题
     # 不能把服务搞崩。建失败的具体原因，create_mem0_store 已记进日志。
     tracker = BudgetTracker()
-    mem0_store = create_mem0_store(tracker)
+    # 第二步（2026-11-21）：记忆后端可切换，默认 mem0；
+    # SHIER_MEMORY_BACKEND=sqlite 时走 memory/sqlite_store.py
+    # （JSONL 账本仍是真相源，SQLite WAL 只做索引）。
+    # 切换只看环境变量，不改默认行为；测试服务在启动脚本里设。
+    _backend = os.environ.get("SHIER_MEMORY_BACKEND", "mem0").strip().lower()
+    if _backend == "sqlite":
+        from memory.sqlite_store import create_sqlite_store
+
+        mem0_store = create_sqlite_store(tracker)
+    else:
+        mem0_store = create_mem0_store(tracker)
     if mem0_store is None:
-        print("⚠️ mem0 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
+        print("⚠️ 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
     else:
         # Plan C + 17 号：把十二的名字、SOUL.md 和 BOOS 的电脑配置
         # 以“已确认”种进长期记忆（只加没有的，不覆盖已有的；失败只记日志、不拦启动）。

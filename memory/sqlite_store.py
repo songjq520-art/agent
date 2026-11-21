@@ -1,0 +1,845 @@
+# memory/sqlite_store.py（SQLite 记忆索引，第二步，2026-11-21）
+#
+# 设计（BOOS 2026-11-20 定，2026-11-21 网页测后改走这条路）：
+#   - JSONL 账本（memory_events.jsonl）仍是唯一真相源：先写账本、再写索引。
+#   - SQLite（WAL）只做仓库存取：存原文 + metadata + 向量，不替 BOOS 做决定。
+#   - mem0/Chroma 不再参与这条路的存取；Mem0Store 的外观（search/save_turn/
+#     flush_pending/get_all/add_memory_text/delete_memory）照旧，调用方不用改。
+#
+# 为什么要有这个模块（病根，见 ~/workspace/十二网页测-2026-11-21.md）：
+#   mem0 那条路里，用户亲口说的“一顿饭”要过 DeepSeek 提取 + 价值关卡，
+#   提取提示词第 9 条（“只存有长期价值的，一次性小事不值得存，有疑问就不存”）
+#   会把饺子、豆浆、豆角判成不值得存，提取返回空列表；而提交那层把“空手回来”
+#   当成成功：指纹照样记成已处理、outbox 文件照样删、不留回执、不报错。
+#   事实就这样悄悄丢了，日志里什么都不剩。
+#   所以这条路反过来：用户亲口说的事实先原样落库（账本 + SQLite），
+#   提取/打标只做归类，不再有一票否决不让存的权力；每次提交留回执。
+#
+# 今天第一部分只做到：说一句新的事实，关对话，新开对话问它，能记住
+# （账本和 SQLite 里都有）。还没做的（后面几步再做）：
+#   - 纠错 correct_memory（现在只返回明确的 not_yet，不悄悄猜）
+#   - 衰减/晋升/沉底（decay.py 的规则还没接进来，权重先恒为 1.0）
+#   - 图谱边、精选清单、BM25 三路融合检索（今天只有语义 + 原样 + 账本兜底）
+#   - 撤回目前只认光秃秃的“不不不/算了”这类整句信号，带后半句的撤回
+#     （要模型判意图）还没接，用时会先存下来、再由 BOOS 删，不悄悄丢。
+
+import hashlib
+import json
+import logging
+import os
+import re
+import sqlite3
+import threading
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from memory import ledger as _ledger
+from memory.timeutil import _now_epoch, _now_iso, _next_write_seq
+
+logger = logging.getLogger(__name__)
+
+# 相对日期换算用的基准时区：BOOS 的参考时区（MEMORY.md）。
+_SHANGHAI = timezone(timedelta(hours=8))
+
+# 向量模型：和 mem0 那条路同一个本地模型，离线加载（启动脚本已设
+# HF_HUB_OFFLINE=1 / HF_ENDPOINT=https://hf-mirror.com）。
+EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+EMBEDDING_DIM = 512
+
+# 语义检索的入围线：和 mem0 那条路同一个 0.4（BOOS 定的，留着不动）。
+SEARCH_THRESHOLD = 0.4
+
+# 撤回信号：光秃秃的一整句（Plan C 快捷路同款意思，简化版）。
+_BARE_RETRACTION = {
+    "不", "不不", "不不不", "不是", "没有", "算了", "别", "不要",
+    "不对", "错了", "撤回", "取消", "当我没说",
+}
+
+# 问句不存：以这些结尾的用户话是提问，不是陈述事实。
+_QUESTION_ENDINGS = ("?", "？", "吗", "么", "呢", "吧", "嘛")
+
+# 打招呼/闲聊不存（只有整句是这些时）。
+_SMALL_TALK = {
+    "你好", "您好", "hi", "hello", "嗨", "在吗", "在么", "谢谢",
+    "好的", "好", "嗯", "嗯嗯", "知道了", "收到", "拜拜", "再见",
+}
+
+# 相对日期词 → 和今天（上海）的天数差。
+_RELATIVE_DAY_OFFSETS = {
+    "大前天": -3, "前天": -2, "昨天": -1, "今天": 0, "明天": 1, "后天": 2, "大后天": 3,
+}
+
+
+def _shanghai_today():
+    """今天（Asia/Shanghai 的日期）。"""
+    return datetime.now(_SHANGHAI).date()
+
+
+def resolve_event_date(text, today=None):
+    """把一句话里的相对日期换算成绝对日期（YYYY-MM-DD）。
+
+    找不到日期词时返回 None（不是没有日期，是这句话没提日期）。
+    “昨天”以今天（上海）为基准算，不以任何记忆的日期为基准——
+    饺子记成 11月19日就是因为提示里唯一的日期锚点是牛肉面那天。
+    """
+    today = today or _shanghai_today()
+    for word, offset in _RELATIVE_DAY_OFFSETS.items():
+        if word in (text or ""):
+            return (today + timedelta(days=offset)).isoformat()
+    m = re.search(
+        r"(20\d{2})年(\d{1,2})月(\d{1,2})日", text or ""
+    )
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return None
+    m = re.search(r"(\d{1,2})月(\d{1,2})日", text or "")
+    if m:
+        try:
+            return date(today.year, int(m.group(1)), int(m.group(2))).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _split_sentences(text):
+    """按句号/感叹号/问号/换行切句，句尾标点留着——问句判断要靠它
+    （切掉问号就认不出问句了）；存的时候再把句尾的 。！去掉。"""
+    parts = re.findall(r"[^。！？\n]+[。！？]?", text or "")
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _looks_like_fact(sentence):
+    """一句话像不像用户亲口说的事实（原样先存的候选）。
+
+    不存的：太短的、问句、打招呼、光秃秃的撤回、让删/让忘的指令。
+    其余的都先存下来——值不值得长期留以后靠衰减沉底，不在这一步判死刑。
+    """
+    s = (sentence or "").strip()
+    if len(s) < 4:
+        return False, "太短"
+    if s in _SMALL_TALK:
+        return False, "闲聊"
+    if s in _BARE_RETRACTION:
+        return False, "撤回信号"
+    if s.endswith(_QUESTION_ENDINGS):
+        return False, "问句"
+    # 没打问号的问句：以“怎么样/如何/为什么/谁/哪/多少/怎么办”收尾的，
+    # 几乎都是提问（“我不知道他是谁”这类也只是“不知道”的陈述，
+    # 本来就不值得当事实存）。2026-11-21 回归抽查抓到的：
+    # “定投计划怎么样了”没打问号，被当事实存进去、检索还排第一。
+    if s.endswith(("怎么样", "怎么样了", "如何", "如何了", "怎么了", "为什么",
+                   "怎么办", "是什么", "是不是", "谁", "哪", "多少",
+                   "几个", "几天", "几点")):
+        return False, "问句"
+    if any(w in s for w in ("忘记这个", "忘掉这个", "删掉这条", "不要记")):
+        return False, "删除指令"
+    return True, ""
+
+
+def _normalize_metadata(meta):
+    """读时归一化 metadata：补算 confirmed（mem0 的规矩，见
+    memory/provenance.py _normalize_metadata：confirmed 就是
+    user_confirmed 的短名字，读的时候现算，不是存的时候写）。
+
+    账本/Chroma 来的旧 metadata 里没有 confirmed 这个键——不补算，
+    问答提示词（main.py _memory_block）会把 source=user 的已确认记忆
+    也当成【来源未确认】、问起来只说不知道。只补缺失的键，不覆盖已有的。
+    """
+    meta = dict(meta or {})
+    if "confirmed" not in meta:
+        meta["confirmed"] = bool(meta.get("user_confirmed"))
+    return meta
+
+
+class SQLiteStore:
+    """SQLite 记忆库：账本是真相，SQLite 是索引。
+
+    和 Mem0Store 同样的外观，供 web/server.py、main.py 直接用。
+    """
+
+    def __init__(self, memory_dir=None, budget_tracker=None, **kwargs):
+        self.memory_dir = Path(memory_dir or _default_memory_dir())
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self.ledger_path = self.memory_dir / "memory_events.jsonl"
+        self.snapshot_path = self.memory_dir / "graph_snapshot.json"
+        self.db_path = self.memory_dir / "memories.sqlite3"
+        self.budget_tracker = budget_tracker
+        self.user_id = kwargs.get("user_id", "boos")
+        self._lock = threading.RLock()
+        self._ledger_lock = threading.Lock()
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
+        self._embedder = None
+        self._embedder_failed = False
+        self._seen_turn_ids = set()
+        self._last_context_ids = []
+
+    # ---------- 建库 ----------
+
+    def _init_schema(self):
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                write_seq INTEGER,
+                slot TEXT,
+                source TEXT,
+                user_confirmed INTEGER NOT NULL DEFAULT 0,
+                decay_kind TEXT,
+                importance TEXT,
+                event_date TEXT,
+                embedding BLOB,
+                voided INTEGER NOT NULL DEFAULT 0,
+                deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_memories_created
+                ON memories(created_at);
+            CREATE INDEX IF NOT EXISTS idx_memories_event_date
+                ON memories(event_date);
+            CREATE TABLE IF NOT EXISTS vector_cache (
+                sha256 TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL
+            );
+            """
+        )
+        self._conn.commit()
+
+    def available(self):
+        return True
+
+    # ---------- 向量（本地 bge，带缓存） ----------
+
+    def _embed_text(self, text):
+        """给一句话算向量：先查缓存（key=sha256(text)），没有再调本地模型。
+
+        模型起不来时返回 None——存记忆绝不因为向量失败而失败，
+        那条记忆先以无向量入库，检索时靠原样/关键词兜底。
+        """
+        key = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+        row = self._conn.execute(
+            "SELECT embedding FROM vector_cache WHERE sha256=?", (key,)
+        ).fetchone()
+        if row is not None:
+            return _blob_to_vector(row[0])
+        if self._embedder_failed:
+            return None
+        try:
+            if self._embedder is None:
+                from sentence_transformers import SentenceTransformer
+
+                # 本地加载，不碰 Hub：这台电脑离线也能从缓存起模型；
+                # 不加 local_files_only 时，新版 transformers 会去 Hub 查
+                # chat template，断网时一次次重试、拖几分钟。
+                self._embedder = SentenceTransformer(
+                    EMBEDDING_MODEL, local_files_only=True
+                )
+            import numpy as np
+
+            vec = self._embedder.encode(
+                [text], normalize_embeddings=True, show_progress_bar=False
+            )[0]
+            vec = np.asarray(vec, dtype="float32")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO vector_cache(sha256, embedding, model, dim)"
+                " VALUES (?, ?, ?, ?)",
+                (key, vec.tobytes(), EMBEDDING_MODEL, int(vec.shape[0])),
+            )
+            self._conn.commit()
+            return vec
+        except Exception:
+            logger.warning("本地向量模型起不来：本次只存文字、不存向量。", exc_info=True)
+            self._embedder_failed = True
+            return None
+
+    # ---------- 账本（真相源） ----------
+
+    def _ledger_append_add(self, text, metadata):
+        """先写账本 add 事件（写失败就抛，索引那步也别写）。"""
+        return _ledger.append_event(
+            self.ledger_path,
+            {
+                "type": _ledger.LEDGER_EVENT_ADD,
+                "key": _ledger.ledger_event_key(text, metadata.get("created_at")),
+                "text": text,
+                "meta": {
+                    "source": metadata.get("source"),
+                    "confidence": metadata.get("confidence"),
+                    "user_confirmed": metadata.get("user_confirmed"),
+                    "created_at": metadata.get("created_at"),
+                    "write_seq": metadata.get("write_seq"),
+                    "turn_id": metadata.get("turn_id"),
+                    "slot": metadata.get("slot"),
+                    "is_rule": metadata.get("is_rule", False),
+                    "curated": metadata.get("curated", False),
+                    "decay_kind": metadata.get("decay_kind"),
+                    "importance": metadata.get("importance"),
+                    "event_date": metadata.get("event_date"),
+                },
+            },
+            lock=self._ledger_lock,
+        )
+
+    def ledger_state(self):
+        try:
+            return _ledger.load_ledger_state(self.ledger_path, self.snapshot_path)
+        except Exception:
+            logger.warning("读账本状态失败。", exc_info=True)
+            return {"by_id": {}, "adds": [], "relations": [],
+                    "key_states": {}, "id_to_key": {}, "inferences": {},
+                    "seq_max": 0, "snapshot_seq": None}
+
+    def reconcile_ledger_index(self):
+        """启动对账：账本里有、SQLite 里没有的，按账本重建索引。
+
+        只重建当前态的记忆：被取代（superseded）/删了（deleted）的
+        key 不进索引（账本里原话留着，索引里不给搜到——和 mem0 那条路
+        的投影过滤同一个意思）。
+        """
+        state = self.ledger_state()
+        key_states = (state or {}).get("key_states") or {}
+        added = 0
+        for record in (state or {}).get("adds") or []:
+            key = record.get("key")
+            text = record.get("text") or ""
+            meta = record.get("meta") or {}
+            if not key or not text.strip():
+                continue
+            if key_states.get(key) in (
+                _ledger.LEDGER_STATE_SUPERSEDED,
+                _ledger.LEDGER_STATE_DELETED,
+            ):
+                continue
+            if self._conn.execute(
+                "SELECT 1 FROM memories WHERE id=?", (key,)
+            ).fetchone():
+                continue
+            vec = self._embed_text(text)
+            self._insert_memory_row(key, text, meta, vec)
+            added += 1
+        return added
+
+    def import_from_mem0(self, mem0_store):
+        """一次性迁移：把只活在 Chroma 里的旧记忆搬进来（2026-11-21 核实）。
+
+        沙盒账本只有 5 条当前态，Chroma 里有 31 条——2026-11-07 至
+        11-17 存的 27 条在账本里根本没有 add 记录（那时还没接账本）。
+        只靠账本对账会丢掉 26 条，验收必退化，所以迁移必须多这一步：
+        逐条读 mem0 的 get_all，按原文比对——SQLite 里已有同一原文的
+        跳过；账本里有同一原文的 delete 事件的跳过（删了的就是删了）；
+        其余的先给账本补记一笔 add（删前补记同款做法），再进 SQLite。
+        幂等：跑两次也不会重复（原文比对 + 账本 key 去重）。
+        返回 {"imported": n, "skipped_existing": n, "skipped_deleted": n}。
+        """
+        deleted_texts = set()
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+            for event in events:
+                if event.get("type") == "delete":
+                    text = (event.get("text") or "").strip()
+                    if text:
+                        deleted_texts.add(text)
+        except Exception:
+            logger.warning("读账本删记录失败：迁移时不按删除过滤。", exc_info=True)
+        existing_texts = {
+            (row[0] or "").strip()
+            for row in self._conn.execute(
+                "SELECT text FROM memories WHERE voided=0 AND deleted=0"
+            ).fetchall()
+        }
+        imported = skipped_existing = skipped_deleted = 0
+        items = mem0_store.get_all(include_sensitive=True) or []
+        for item in items:
+            text = ((item or {}).get("memory") or (item or {}).get("text") or "").strip()
+            if not text:
+                continue
+            if text in existing_texts:
+                skipped_existing += 1
+                continue
+            if text in deleted_texts:
+                skipped_deleted += 1
+                continue
+            meta_in = (item or {}).get("metadata") or {}
+            metadata = {
+                "source": meta_in.get("source", "inferred"),
+                "confidence": meta_in.get("confidence", 0.7),
+                "user_confirmed": bool(meta_in.get("user_confirmed", False)),
+                "created_at": meta_in.get("created_at") or _now_iso(),
+                "write_seq": meta_in.get("write_seq") or _next_write_seq(),
+                "turn_id": meta_in.get("turn_id"),
+                "slot": meta_in.get("slot"),
+                "is_rule": bool(meta_in.get("is_rule", False)),
+                "curated": bool(meta_in.get("curated", False)),
+                "decay_kind": meta_in.get("decay_kind", "episodic"),
+                "importance": meta_in.get("importance", "normal"),
+                "event_date": meta_in.get("event_date")
+                or resolve_event_date(text),
+            }
+            try:
+                self._ledger_append_add(text, metadata)
+            except Exception:
+                logger.warning("迁移补记账本失败：跳过这一条。", exc_info=True)
+                continue
+            vec = self._embed_text(text)
+            key = _ledger.ledger_event_key(text, metadata.get("created_at"))
+            self._insert_memory_row(key, text, metadata, vec)
+            existing_texts.add(text)
+            imported += 1
+        return {
+            "imported": imported,
+            "skipped_existing": skipped_existing,
+            "skipped_deleted": skipped_deleted,
+        }
+
+    # ---------- 写（原样先存） ----------
+
+    def _insert_memory_row(self, key, text, metadata, vector):
+        import numpy as np
+
+        blob = None
+        if vector is not None:
+            blob = np.asarray(vector, dtype="float32").tobytes()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO memories"
+            "(id, text, metadata_json, created_at, write_seq, slot, source,"
+            " user_confirmed, decay_kind, importance, event_date, embedding)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                key,
+                text,
+                json.dumps(metadata, ensure_ascii=False),
+                metadata.get("created_at") or _now_iso(),
+                metadata.get("write_seq"),
+                metadata.get("slot"),
+                metadata.get("source"),
+                1 if metadata.get("user_confirmed") else 0,
+                metadata.get("decay_kind"),
+                metadata.get("importance"),
+                metadata.get("event_date"),
+                blob,
+            ),
+        )
+        self._conn.commit()
+
+    def add_memory_text(self, text, layers=None, source="user", turn_id=None,
+                        event_date=None, **kwargs):
+        """原文存一条记忆（“记住”直存、种子、规则都走这里）。
+
+        先写账本、再写 SQLite；账本写不进去就返回 {}、不写索引。
+        库里已有同一 key 时不重复存，返回已有的那条（unchanged）。
+        """
+        text = (text or "").strip()
+        if not text:
+            return {}
+        with self._lock:
+            created_at = _now_iso()
+            metadata = {
+                "source": source,
+                "confidence": 1.0 if source == "user" else 0.7,
+                # confirmed 不存在这里：它是 user_confirmed 的短名字，
+                # 读时由 _normalize_metadata 现算（和 mem0 的规矩一致）；
+                # 存两份以后会打架，只留 user_confirmed 一个真相。
+                "user_confirmed": source == "user",
+                "created_at": created_at,
+                "write_seq": _next_write_seq(),
+                "turn_id": turn_id,
+                "slot": kwargs.get("slot"),
+                "is_rule": bool(kwargs.get("is_rule", False)),
+                "curated": bool(kwargs.get("curated", False)),
+                "decay_kind": kwargs.get("decay_kind", "episodic"),
+                "importance": kwargs.get("importance", "normal"),
+                "event_date": event_date or resolve_event_date(text),
+            }
+            key = _ledger.ledger_event_key(text, created_at)
+            state = self.ledger_state()
+            if key in ((state or {}).get("key_states") or {}):
+                return {"id": key, "memory": text, "event": "UNCHANGED"}
+            try:
+                self._ledger_append_add(text, metadata)
+            except Exception:
+                logger.warning("账本写不进去：本次记忆没存。", exc_info=True)
+                return {}
+            try:
+                vec = self._embed_text(text)
+            except Exception:
+                vec = None
+            self._insert_memory_row(key, text, metadata, vec)
+            return {"id": key, "memory": text, "event": "ADD"}
+
+    def save_turn(self, messages, turn_id=None):
+        """一轮对话的收尾：同步把用户亲口说的事实原样存下来，留回执。
+
+        和 mem0 那条路最大的不同：没有待定区、没有 60 秒定时器、
+        没有“提取返回空就当成功”。调完这个函数，事实要么在账本里、
+        要么在回执里写明为什么没存——绝不悄悄丢。
+        同一个 turn_id 只存一次（web 的 ask() 和 run_question() 会各调
+        一次，第二次直接返回上次的回执，不重复存）。
+        """
+        if turn_id and turn_id in self._seen_turn_ids:
+            return {"turn_id": turn_id, "duplicate_turn": True, "results": []}
+        if turn_id:
+            self._seen_turn_ids.add(turn_id)
+        latest_user = ""
+        for m in reversed(messages or []):
+            if (m or {}).get("role") == "user":
+                latest_user = (m or {}).get("content") or ""
+                break
+        receipt = {
+            "turn_id": turn_id,
+            "considered": [],
+            "stored": [],
+            "dropped": [],
+            "retracted": False,
+            "dropped_count": 0,
+            "results": [],
+        }
+        if not (latest_user or "").strip():
+            return receipt
+        # 撤回：光秃秃的整句信号，把上一轮刚存的那条作废（软删进账本）。
+        if latest_user.strip().rstrip("。！？.!?") in _BARE_RETRACTION:
+            dropped = self._void_last_stored()
+            receipt["retracted"] = True
+            receipt["dropped_count"] = dropped
+            return receipt
+        today = _shanghai_today()
+        for sentence in _split_sentences(latest_user):
+            ok, reason = _looks_like_fact(sentence)
+            receipt["considered"].append(sentence)
+            if not ok:
+                receipt["dropped"].append({"text": sentence, "reason": reason})
+                continue
+            # 存原话：去掉句尾的 。！（？的已经当问句 drop 了，不会到这里）。
+            sentence = sentence.rstrip("。！")
+            event_date = resolve_event_date(sentence, today)
+            # 来源标 inferred（提取所得）：原样存的事实是从对话里提出来的，
+            # 出处完整（turn_id + created_at），和 DeepSeek 提取同一档，
+            # 只是没经过模型改写、保真度更高。unconfirmed 是留给“完全没来源
+            # 信息”的旧记忆的桶（2026-11-09 之前）；标错了问答提示词会把它
+            # 当没来源处理、问起来只说不知道——这就是第一轮验收回答卡住的原因。
+            saved = self.add_memory_text(
+                sentence, source="inferred", turn_id=turn_id,
+                event_date=event_date, decay_kind="episodic",
+            )
+            if (saved or {}).get("event") == "ADD":
+                receipt["stored"].append(sentence)
+                receipt["results"].append(
+                    {"id": saved.get("id"), "memory": sentence, "event": "ADD"}
+                )
+            elif (saved or {}).get("event") == "UNCHANGED":
+                receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
+            else:
+                receipt["dropped"].append({"text": sentence, "reason": "账本写失败"})
+        return receipt
+
+    def _void_last_stored(self):
+        """作废上一条刚存的记忆：账本记 delete，SQLite 标 voided。"""
+        row = self._conn.execute(
+            "SELECT id, text, metadata_json FROM memories"
+            " WHERE voided=0 AND deleted=0 ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return 0
+        meta = json.loads(row[2] or "{}")
+        try:
+            _ledger.append_event(
+                self.ledger_path,
+                {"type": "delete", "memory_id": row[0],
+                 "key": row[0], "text": row[1], "meta": meta},
+                lock=self._ledger_lock,
+            )
+        except Exception:
+            logger.warning("撤回记账失败。", exc_info=True)
+            return 0
+        self._conn.execute(
+            "UPDATE memories SET voided=1 WHERE id=?", (row[0],)
+        )
+        self._conn.commit()
+        return 1
+
+    def flush_pending(self):
+        """同步存的路没有待定区：什么都不用等，直接返回 {}（接口兼容）。"""
+        return {}
+
+    def ensure_outbox_started(self):
+        """同步存的路没有 outbox：什么都不用启动（接口兼容）。"""
+        return None
+
+    # ---------- 读 ----------
+
+    def _all_live_memories(self):
+        rows = self._conn.execute(
+            "SELECT id, text, metadata_json, created_at, write_seq, slot,"
+            " source, user_confirmed, decay_kind, importance, event_date,"
+            " embedding FROM memories WHERE voided=0 AND deleted=0"
+            " ORDER BY created_at DESC"
+        ).fetchall()
+        out = []
+        for r in rows:
+            meta = _normalize_metadata(json.loads(r[2] or "{}"))
+            out.append({
+                "id": r[0], "text": r[1], "metadata": meta,
+                "created_at": r[3], "write_seq": r[4], "slot": r[5],
+                "source": r[6], "user_confirmed": bool(r[7]),
+                "decay_kind": r[8], "importance": r[9],
+                "event_date": r[10], "embedding": r[11],
+            })
+        return out
+
+    def get_all(self, include_sensitive=False):
+        return [
+            {
+                "id": m["id"], "memory": m["text"], "text": m["text"],
+                "metadata": m["metadata"], "created_at": m["created_at"],
+            }
+            for m in self._all_live_memories()
+        ]
+
+    def search(self, query, top_k=5, reinforce=False, include_history=False,
+               turn_id=None):
+        """搜记忆：原样匹配在前，语义（本地 bge 余弦）在后，账本兜底补位。
+
+        返回和 Mem0Store.search 一样的形状：
+        {"id","text","score","source","metadata","confirmed",
+         "decay_weight","is_history"}。阈值 0.4，和原来一样。
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        try:
+            return self._search_inner(query, top_k=top_k)
+        except Exception:
+            logger.warning("SQLite 检索失败。", exc_info=True)
+            return []
+
+    def _search_inner(self, query, top_k=5):
+        import numpy as np
+
+        live = self._all_live_memories()
+        qvec = self._embed_text(query)
+        scored = []
+        for m in live:
+            text = m["text"] or ""
+            verbatim = query in text or text in query
+            kw = _keyword_overlap(query, text)
+            cos = None
+            if qvec is not None and m["embedding"] is not None:
+                vec = _blob_to_vector(m["embedding"])
+                if vec is not None and vec.shape == qvec.shape:
+                    cos = float(np.dot(qvec, vec))
+            if verbatim:
+                score = 1.0
+                source = "verbatim"
+            elif cos is not None and cos >= SEARCH_THRESHOLD:
+                score = 0.6 * cos + 0.4 * kw
+                source = "semantic"
+            elif kw >= 0.5:
+                score = kw
+                source = "keyword"
+            else:
+                continue
+            scored.append((score, source, m))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = []
+        seen = set()
+        for score, source, m in scored[:top_k]:
+            if m["text"] in seen:
+                continue
+            seen.add(m["text"])
+            meta = dict(m["metadata"] or {})
+            results.append({
+                "id": m["id"], "text": m["text"], "score": round(score, 4),
+                "source": source, "metadata": meta,
+                "confirmed": bool(m["user_confirmed"]),
+                "decay_weight": 1.0, "is_history": False,
+            })
+        # 账本兜底：不够 top_k 时翻账本原话按关键词找。
+        # 只找当前态的：被取代/删了的不补进来。
+        if len(results) < top_k:
+            try:
+                state = self.ledger_state()
+                key_states = (state or {}).get("key_states") or {}
+                events = []
+                for rec in (state or {}).get("adds") or []:
+                    if key_states.get(rec.get("key")) in (
+                        _ledger.LEDGER_STATE_SUPERSEDED,
+                        _ledger.LEDGER_STATE_DELETED,
+                    ):
+                        continue
+                    events.append({
+                        "key": rec.get("key"), "text": rec.get("text") or "",
+                        "meta": rec.get("meta") or {},
+                    })
+                for hit in _ledger.find_in_ledger(
+                    events, query, top_k=top_k - len(results),
+                    exclude_keys={r["id"] for r in results},
+                ):
+                    text = hit.get("text") or ""
+                    if not text or text in seen:
+                        continue
+                    meta = _normalize_metadata(hit.get("meta") or {})
+                    results.append({
+                        "id": None, "text": text,
+                        "score": hit.get("score"), "source": "ledger",
+                        "metadata": meta,
+                        "confirmed": bool(meta.get("user_confirmed")),
+                        "decay_weight": 1.0, "is_history": True,
+                        "ledger_key": hit.get("key"),
+                    })
+                    seen.add(text)
+            except Exception:
+                logger.warning("账本兜底检索失败。", exc_info=True)
+        return results
+
+    def search_history(self, query, top_k=5):
+        return self.search(query, top_k=top_k, include_history=True)
+
+    def note_context(self, memories):
+        """记下本轮检索到的记忆 id（只记在内存里，不写回——衰减写回还没接）。"""
+        self._last_context_ids = [
+            (m or {}).get("id") for m in (memories or []) if (m or {}).get("id")
+        ]
+
+    # ---------- 改 / 删（今天只实现删除；纠错后面再做） ----------
+
+    def delete_memory(self, memory_id, approve=False):
+        """删一条记忆：要 BOOS 亲口确认（approve=True）才真删。
+
+        账本记 delete，SQLite 标 deleted；原文留在账本里，可恢复。
+        """
+        if not approve:
+            return {"deleted": False, "reason": "need_approve"}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                # 账本原话没有 SQLite id 时，按 key 找。
+                row = self._conn.execute(
+                    "SELECT id, text, metadata_json FROM memories WHERE id=?",
+                    (memory_id,),
+                ).fetchone()
+                if row is None:
+                    return {"deleted": False, "reason": "not_found"}
+            meta = json.loads(row[2] or "{}")
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": "delete", "memory_id": row[0],
+                     "key": row[0], "text": row[1], "meta": meta},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("删除记账失败。", exc_info=True)
+                return {"deleted": False, "reason": "ledger_failed"}
+            self._conn.execute(
+                "UPDATE memories SET deleted=1 WHERE id=?", (row[0],)
+            )
+            self._conn.commit()
+            return {"deleted": True, "memory_id": row[0]}
+
+    def correct_memory(self, old_text, new_text, exclude_identical_to_new=False):
+        """纠错：SQLite 版还没接（候选检索 + 模型判唯一），现在不猜。
+
+        明确返回 not_yet，不悄悄改、不悄悄存——调用方看到就知道
+        这条路还没通，而不是以为改好了。
+        """
+        return {"status": "failed", "reason": "sqlite_correct_not_yet",
+                "old_text": old_text, "new_text": new_text}
+
+    def confirm_memory(self, memory_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata_json FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                return {"confirmed": False, "reason": "not_found"}
+            meta = json.loads(row[0] or "{}")
+            meta["user_confirmed"] = True
+            self._conn.execute(
+                "UPDATE memories SET user_confirmed=1, metadata_json=? WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False), memory_id),
+            )
+            self._conn.commit()
+            return {"confirmed": True, "memory_id": memory_id}
+
+    def void_joke_memory(self, memory_id):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE memories SET voided=1 WHERE id=?", (memory_id,)
+            )
+            self._conn.commit()
+            return {"voided": True, "memory_id": memory_id}
+
+    def list_protection_events(self, limit=50):
+        return []
+
+    def deletion_scope(self, memory_id):
+        return {"scope": "single", "memory_id": memory_id}
+
+    def pending_notices(self):
+        return []
+
+    # ---------- 启动时要调的（接口兼容，SQLite 版里是空操作） ----------
+
+    def ensure_identity_memories(self):
+        """身份记忆已经在账本里了，SQLite 版启动时不用再种。"""
+        return {}
+
+    def backfill_timestamps(self):
+        """补时间戳是 mem0 索引的事，SQLite 行里本来就有 created_at。"""
+        return 0
+
+
+def _default_memory_dir():
+    return Path(__file__).resolve().parent
+
+
+def _keyword_overlap(query, text):
+    """关键词重合度（0–1）：按字算，简单够用。"""
+    q = set(query or "")
+    t = set(text or "")
+    q = {c for c in q if c.strip() and c not in "，。！？、；：\"'()（）《》"}
+    t = {c for c in t if c.strip() and c not in "，。！？、；：\"'()（）《》"}
+    if not q:
+        return 0.0
+    return len(q & t) / len(q)
+
+
+def _blob_to_vector(blob):
+    if blob is None:
+        return None
+    try:
+        import numpy as np
+
+        return np.frombuffer(blob, dtype="float32")
+    except Exception:
+        return None
+
+
+def create_sqlite_store(budget_tracker=None, **kwargs):
+    """建一个 SQLiteStore；建不好时返回 None（降级成“没有记忆也能聊”）。
+
+    建好后顺手对一次账（reconcile_ledger_index）：账本里有、索引里
+    没有的，按账本重建索引——写索引那步崩了、或索引坏过，重启后
+    靠这一笔把记忆捞回来。对账本身不抛异常、只记日志。
+    """
+    try:
+        store = SQLiteStore(budget_tracker=budget_tracker, **kwargs)
+    except Exception as exc:
+        logger.warning("SQLite 记忆未启用：%s，本次不带记忆运行。", exc)
+        return None
+    try:
+        store.reconcile_ledger_index()
+    except Exception:
+        logger.warning("启动对账失败：本次不对索引补缺。", exc_info=True)
+    return store
