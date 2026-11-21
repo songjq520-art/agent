@@ -497,3 +497,89 @@ def test_event_question_not_swamped_by_preference_boost(tmp_path, monkeypatch):
     hits = s.search("我昨天吃了什么", top_k=3)
     assert hits[0]["text"] == "我昨天中午吃了饺子"
     assert "我爱的是冒菜，不是麻辣烫" in [h["text"] for h in hits]
+
+
+# ---------- 9. 边界修补：整轮撤回 / 玩笑作废落账本 / 兜底删除 / 纠错句隔离 ----------
+
+
+def test_void_joke_memory_persists_to_ledger_and_returns_ok(store):
+    """作废玩笑记忆必须同步写入账本且返回 ok=True；删库重建后不复活。"""
+    saved = store.add_memory_text("我其实是个外星人", source="inferred")
+    mem_id = saved["id"]
+    res = store.void_joke_memory(mem_id)
+    assert res["ok"] is True
+    assert res["voided"] is True
+    assert _live_texts(store) == []
+
+    # 模拟删库后对账重建
+    store._conn.close()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            (store.db_path.parent / (store.db_path.name + suffix)).unlink()
+        except FileNotFoundError:
+            pass
+    rebuilt = SQLiteStore(memory_dir=str(store.memory_dir))
+    rebuilt.reconcile_ledger_index()
+    assert _live_texts(rebuilt) == []
+
+
+def test_bare_retraction_voids_entire_multi_sentence_turn(store):
+    """上一轮包含多句话时，光秃秃撤回必须把整轮存下的条目全部作废。"""
+    first = store.save_turn(
+        [{"role": "user", "content": "我今天晚上吃了米线。顺便喝了一杯豆浆。"}],
+        turn_id="t-multi",
+    )
+    assert len(first["stored"]) == 2
+    assert len(_live_texts(store)) == 2
+
+    retract = store.save_turn(
+        [{"role": "user", "content": "撤回"}],
+        turn_id="t-retract",
+    )
+    assert retract["retracted"] is True
+    assert retract["dropped_count"] == 2
+    assert _live_texts(store) == []
+
+
+def test_delete_memory_supports_ledger_only_key_and_rejects_missing(store):
+    """delete_memory 对不存在/重复删除返回 not_found，对仅在账本中的 key 可正常删除。"""
+    from memory import ledger as _ledger
+
+    assert store.delete_memory("non-existent-id", approve=True) == {
+        "deleted": False,
+        "reason": "not_found",
+    }
+    key = _ledger.ledger_event_key("仅在账本里的旧记录", "2026-11-20T00:00:00Z")
+    _ledger.append_event(
+        store.ledger_path,
+        {
+            "type": _ledger.LEDGER_EVENT_ADD,
+            "key": key,
+            "text": "仅在账本里的旧记录",
+            "meta": {"source": "inferred", "created_at": "2026-11-20T00:00:00Z"},
+        },
+    )
+    assert store.delete_memory(key, approve=True) == {
+        "deleted": True,
+        "memory_id": key,
+    }
+    assert store.delete_memory(key, approve=True) == {
+        "deleted": False,
+        "reason": "not_found",
+    }
+
+
+def test_save_turn_skips_correction_utterance_before_wired(store):
+    """纠错未接线前，'你记错了...' 不当成事实污染进库；句中含'记错了'的正常陈述仍保留。"""
+    r1 = store.save_turn(
+        [{"role": "user", "content": "你记错了，我住上海"}],
+        turn_id="t-corr",
+    )
+    assert r1["stored"] == []
+    assert _live_texts(store) == []
+
+    r2 = store.save_turn(
+        [{"role": "user", "content": "我昨天记错了开会时间"}],
+        turn_id="t-normal",
+    )
+    assert r2["stored"] == ["我昨天记错了开会时间"]

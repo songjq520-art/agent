@@ -149,6 +149,8 @@ def _looks_like_fact(sentence):
         return False, "问句"
     if any(w in s for w in ("忘记这个", "忘掉这个", "删掉这条", "不要记")):
         return False, "删除指令"
+    if re.match(r"^(?:你)?(?:记错了|说错了|搞错了)[，,。！!、\s]?", s):
+        return False, "纠错指令（SQLite 纠错未接线）"
     return True, ""
 
 
@@ -192,6 +194,7 @@ class SQLiteStore:
         self._embedder_failed = False
         self._seen_turn_ids = set()
         self._last_context_ids = []
+        self._last_stored_turn_id = None
 
     # ---------- 建库 ----------
 
@@ -552,32 +555,55 @@ class SQLiteStore:
                 receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
             else:
                 receipt["dropped"].append({"text": sentence, "reason": "账本写失败"})
+        if receipt["stored"]:
+            self._last_stored_turn_id = turn_id
         return receipt
 
     def _void_last_stored(self):
-        """作废上一条刚存的记忆：账本记 delete，SQLite 标 voided。"""
-        row = self._conn.execute(
-            "SELECT id, text, metadata_json FROM memories"
-            " WHERE voided=0 AND deleted=0 ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            return 0
-        meta = json.loads(row[2] or "{}")
-        try:
-            _ledger.append_event(
-                self.ledger_path,
-                {"type": "delete", "memory_id": row[0],
-                 "key": row[0], "text": row[1], "meta": meta},
-                lock=self._ledger_lock,
-            )
-        except Exception:
-            logger.warning("撤回记账失败。", exc_info=True)
-            return 0
-        self._conn.execute(
-            "UPDATE memories SET voided=1 WHERE id=?", (row[0],)
-        )
-        self._conn.commit()
-        return 1
+        """作废上一轮刚存的记忆：账本记 delete，SQLite 标 voided。
+
+        若记录了上一轮的 turn_id（_last_stored_turn_id），则把该轮存下的
+        所有条目整轮作废（同一轮多句话拆条写入时不会只作废一半）；
+        否则退化为作废最新写入的那 1 条（按 write_seq DESC, rowid DESC）。
+        """
+        with self._lock:
+            candidates = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0"
+                " ORDER BY write_seq DESC, rowid DESC"
+            ).fetchall()
+            if not candidates:
+                return 0
+            rows = []
+            if self._last_stored_turn_id:
+                rows = [
+                    r for r in candidates
+                    if json.loads(r[2] or "{}").get("turn_id")
+                    == self._last_stored_turn_id
+                ]
+            if not rows:
+                rows = [candidates[0]]
+            voided_count = 0
+            for row in rows:
+                meta = json.loads(row[2] or "{}")
+                try:
+                    _ledger.append_event(
+                        self.ledger_path,
+                        {"type": "delete", "memory_id": row[0],
+                         "key": row[0], "text": row[1], "meta": meta},
+                        lock=self._ledger_lock,
+                    )
+                except Exception:
+                    logger.warning("撤回记账失败。", exc_info=True)
+                    continue
+                self._conn.execute(
+                    "UPDATE memories SET voided=1 WHERE id=?", (row[0],)
+                )
+                voided_count += 1
+            if voided_count:
+                self._conn.commit()
+                self._last_stored_turn_id = None
+            return voided_count
 
     def flush_pending(self):
         """同步存的路没有待定区：什么都不用等，直接返回 {}（接口兼容）。"""
@@ -840,22 +866,48 @@ class SQLiteStore:
         """删一条记忆：要 BOOS 亲口确认（approve=True）才真删。
 
         账本记 delete，SQLite 标 deleted；原文留在账本里，可恢复。
+        SQLite 里没有但账本里有该 key（账本兜底捞出的条目）时，同样
+        记账删除，防止重启对账或兜底检索再次捞出。
         """
         if not approve:
             return {"deleted": False, "reason": "need_approve"}
+        if not memory_id:
+            return {"deleted": False, "reason": "not_found"}
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, text, metadata_json FROM memories WHERE id=?",
+                "SELECT id, text, metadata_json, deleted FROM memories WHERE id=?",
                 (memory_id,),
             ).fetchone()
             if row is None:
-                # 账本原话没有 SQLite id 时，按 key 找。
-                row = self._conn.execute(
-                    "SELECT id, text, metadata_json FROM memories WHERE id=?",
-                    (memory_id,),
-                ).fetchone()
-                if row is None:
+                state = self.ledger_state()
+                key_states = (state or {}).get("key_states") or {}
+                rec = next(
+                    (
+                        r for r in (state or {}).get("adds") or []
+                        if r.get("key") == memory_id
+                    ),
+                    None,
+                )
+                if rec is None or key_states.get(memory_id) == _ledger.LEDGER_STATE_DELETED:
                     return {"deleted": False, "reason": "not_found"}
+                try:
+                    _ledger.append_event(
+                        self.ledger_path,
+                        {
+                            "type": "delete",
+                            "memory_id": memory_id,
+                            "key": memory_id,
+                            "text": rec.get("text") or "",
+                            "meta": rec.get("meta") or {},
+                        },
+                        lock=self._ledger_lock,
+                    )
+                except Exception:
+                    logger.warning("删除记账失败。", exc_info=True)
+                    return {"deleted": False, "reason": "ledger_failed"}
+                return {"deleted": True, "memory_id": memory_id}
+            if row[3]:
+                return {"deleted": False, "reason": "not_found"}
             meta = json.loads(row[2] or "{}")
             try:
                 _ledger.append_event(
@@ -899,12 +951,52 @@ class SQLiteStore:
             return {"confirmed": True, "memory_id": memory_id}
 
     def void_joke_memory(self, memory_id):
+        """作废一条玩笑记忆：先记账本 delete（标记 voided），再标 SQLite voided=1。
+
+        账本是唯一真相源——不写账本的话，删库对账重建（reconcile_ledger_index）
+        会把作废的玩笑记忆重新复活。返回值同时带 ok 与 voided，对齐 Mem0Store。
+        """
+        if not memory_id:
+            return {"ok": False, "voided": False, "reason": "not_found"}
         with self._lock:
+            row = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {
+                    "ok": False,
+                    "voided": False,
+                    "reason": "not_found",
+                    "memory_id": memory_id,
+                }
+            meta = json.loads(row[2] or "{}")
+            meta["voided"] = True
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {
+                        "type": "delete",
+                        "memory_id": row[0],
+                        "key": row[0],
+                        "text": row[1],
+                        "meta": meta,
+                    },
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("作废玩笑记忆记账失败。", exc_info=True)
+                return {
+                    "ok": False,
+                    "voided": False,
+                    "reason": "ledger_failed",
+                    "memory_id": row[0],
+                }
             self._conn.execute(
-                "UPDATE memories SET voided=1 WHERE id=?", (memory_id,)
+                "UPDATE memories SET voided=1 WHERE id=?", (row[0],)
             )
             self._conn.commit()
-            return {"voided": True, "memory_id": memory_id}
+            return {"ok": True, "voided": True, "memory_id": row[0]}
 
     def list_protection_events(self, limit=50):
         return []
