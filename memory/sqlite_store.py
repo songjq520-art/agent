@@ -19,6 +19,8 @@
 # （账本和 SQLite 里都有）。还没做的（后面几步再做）：
 #   - 纠错 correct_memory（现在只返回明确的 not_yet，不悄悄猜）
 #   - 衰减/晋升/沉底（decay.py 的规则还没接进来，权重先恒为 1.0）
+#   - 类型权重（稳定偏好 > 一次性事件）已接进检索排序（2026-11-21 Q3
+#     修法，见 _type_weight；只管排位、不管 0.4 资格线）
 #   - 图谱边、精选清单（检索三路里的图谱路还是空路，精选先查还没接；
 #     BM25 + RRF 融合已接，见 _search_inner；衰减权重仍恒为 1.0，只留了接口）
 #   - 撤回目前只认光秃秃的“不不不/算了”这类整句信号，带后半句的撤回
@@ -55,6 +57,17 @@ _BARE_RETRACTION = {
     "不", "不不", "不不不", "不是", "没有", "算了", "别", "不要",
     "不对", "错了", "撤回", "取消", "当我没说",
 }
+
+# 稳定偏好在排序时的加权倍数（Q3 修法，2026-11-21，见 _type_weight）：
+# 纠正行 RRF 0.0152、米线 0.0154，一位之差——1.25 倍足够把偏好行
+# 顶回前 5，又小到不会把事件问（“昨天吃了什么”里饺子 RRF 约 0.033，
+# 语义 + BM25 两路）里的偏好行顶到第一。
+_TYPE_WEIGHT_STABLE_PREFERENCE = 1.25
+
+# 偏好句的认法：正文里说喜欢 / 不喜欢 / 爱吃 / 爱喝的句子。
+# 名单故意收得窄：只认这几个动词，不猜“想 / 希望 / 要”（那些是计划，
+# 不是偏好）；“可爱”这类词不含这几个动词，不会误认。
+_PREFERENCE_WORDS = ("喜欢", "爱吃", "爱喝", "爱的是", "不爱", "讨厌")
 
 # 问句不存：以这些结尾的用户话是提问，不是陈述事实。
 _QUESTION_ENDINGS = ("?", "？", "吗", "么", "呢", "吧", "嘛")
@@ -629,7 +642,8 @@ class SQLiteStore:
 
         三路排名：语义（原始余弦分 ≥ 0.4，取 top_k*4）、BM25（全库打分，
         取 top_k*4）、图谱（还没建，空路）。标准 RRF k=60 融合，再乘
-        衰减权重；原样匹配（基金代码/数字/整句，见
+        衰减权重 × 类型权重（稳定偏好 1.25，见 _type_weight，2026-11-21
+        Q3 修法）；原样匹配（基金代码/数字/整句，见
         memory/bm25.extract_exact_matches）的排在前面。
         和旧逻辑的对应关系：
           - 语义路按原始余弦分排位（旧 mem0 的语义路按向量原始分排，
@@ -678,6 +692,9 @@ class SQLiteStore:
                 "source": source, "metadata": meta,
                 "confirmed": bool(m["user_confirmed"]),
                 "decay_weight": _decay_weight(meta), "is_history": False,
+                # 类型权重只进排序键，不进返回字段（返回形状还是 8 个键，
+                # 见 test_search_result_shape_unchanged）；出结果前 pop 掉。
+                "_type_weight": _type_weight(m["text"]),
             }
 
         # 语义路：原始余弦分排位，取前 wide_k；原样命中的先放最前面。
@@ -757,13 +774,15 @@ class SQLiteStore:
         fused_items.sort(
             key=lambda item: (
                 1 if item.get("exact_match") else 0,
-                (item.get("_rrf") or 0) * (item.get("decay_weight") or 0),
+                (item.get("_rrf") or 0) * (item.get("decay_weight") or 0)
+                * (item.get("_type_weight") or 1.0),
             ),
             reverse=True,
         )
         results = []
         for item in fused_items:
             item.pop("_rrf", None)
+            item.pop("_type_weight", None)
             item.pop("exact_match", None)
             results.append(item)
         results = results[:top_k]
@@ -921,6 +940,30 @@ def _decay_weight(metadata):
     RRF 融合分上（_search_inner 的排序键）；资格仍只看原始余弦分 ≥ 0.4——
     和旧 mem0 的规矩一样，权重只管排位、不管能不能搜到。
     """
+    return 1.0
+
+
+def _type_weight(text):
+    """这条记忆的类型权重：稳定偏好 1.25，一次性事件 / 其他 1.0。
+
+    修 Q3 退化（2026-11-21，双写比对 18 问里唯一退化）：
+    问“我爱吃什么”时，纠正行“不太喜欢鸡杂面”被新存的饺子/米线
+    两行按余弦挤出前 5（RRF 0.0152 vs 米线 0.0154，一位之差）。
+    根因不是排序逻辑错——同批旧行的余弦相对顺序新旧一致，是新增的
+    真实行按余弦挤出一位。修法是类型权重（稳定偏好 > 一次性事件），
+    不是改余弦、不是改阈值。
+
+    为什么按正文认，不按 decay_kind：decay.py 的规矩是“BOOS 亲口说
+    的偏好记 stable”，但迁移进来的偏好句在 mem0 里都是 source=inferred，
+    迁移时 decay_kind 一律写成了 episodic（火锅/冒菜是 user 亲口说的，
+    所以是 stable；牛肉面喜、纠正行、鸡杂面喜都是 inferred，全是
+    episodic）。档位没标上，检索时按正文再认一次：说喜欢/不喜欢/
+    爱吃/爱喝的句子就是稳定偏好，不管它当初怎么标的。
+    权重只管排位：资格仍只看原始余弦分 ≥ 0.4（decay.py 坑 1），
+    再低的权重也不会让记忆搜不到，再高的也不会把不够 0.4 的行拉进来。
+    """
+    if any(word in (text or "") for word in _PREFERENCE_WORDS):
+        return _TYPE_WEIGHT_STABLE_PREFERENCE
     return 1.0
 
 

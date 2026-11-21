@@ -407,3 +407,93 @@ def test_search_result_shape_unchanged(store):
     }
     assert hit["decay_weight"] == 1.0
     assert hit["is_history"] is False
+
+
+# ---------- 8. 类型权重：稳定偏好 > 一次性事件（Q3 修法，2026-11-21） ----------
+# 双写比对 18 问里唯一退化：问“我爱吃什么”，纠正行“不太喜欢鸡杂面”
+# 被新存的饺子/米线两行按余弦挤出前 5（RRF 0.0152 vs 米线 0.0154，
+# 一位之差）。修法是类型权重，不是改余弦、不是改阈值、不是精选清单
+# （库里 curated 行是 0 条，精选先查接了也修不了这一问）。
+# 权重只管排位、不管 0.4 资格线（decay.py 坑 1）；返回形状还是 8 个键。
+
+
+def test_type_weight_stable_preference_vs_event():
+    """_type_weight：说喜欢/不喜欢的偏好句 1.25，一次性事件 1.0。"""
+    from memory.sqlite_store import _type_weight
+
+    assert _type_weight("我爱吃火锅") == 1.25
+    assert _type_weight("我爱的是冒菜，不是麻辣烫") == 1.25
+    assert _type_weight("BOOS 喜欢吃牛肉面。") == 1.25
+    assert _type_weight("用户表示其实也不是很喜欢吃鸡杂面，纠正了此前“喜欢吃鸡杂面”的说法。") == 1.25
+    assert _type_weight("BOOS 不喜欢冰美式了，现在喜欢喝美式。") == 1.25
+    assert _type_weight("我昨天中午吃了饺子") == 1.0
+    assert _type_weight("我今天晚上吃了米线") == 1.0
+    assert _type_weight("2026年11月20日，用户表示之前提到的所有定投计划全部取消，都不再投了。") == 1.0
+    assert _type_weight("我想每天定投5块恒生") == 1.0
+    assert _type_weight("") == 1.0
+
+
+# Q3 七行原文 + 2026-11-21 真实 bge 余弦（4 位小数），离线复现线上排名。
+_Q3_ROWS = [
+    ("我爱吃火锅", 0.6558, "user"),
+    ("我爱的是冒菜，不是麻辣烫", 0.5676, "user"),
+    ("我昨天中午吃了饺子", 0.4789, "inferred"),
+    ("BOOS 喜欢吃牛肉面。", 0.4700, "inferred"),
+    ("我今天晚上吃了米线", 0.4624, "inferred"),
+    ("用户表示其实也不是很喜欢吃鸡杂面，纠正了此前“喜欢吃鸡杂面”的说法。", 0.4390, "inferred"),
+    ("BOOS 喜欢吃鸡杂面。", 0.4298, "inferred"),
+]
+
+
+def test_q3_correction_row_back_in_top5(tmp_path, monkeypatch):
+    """Q3 验收：问“我爱吃什么”，前 5 必须有纠正行“不太喜欢鸡杂面”
+    （修前它掉到第 6，被饺子/米线挤出；修后前 5 应和旧 mem0 的前 5
+    一致：火锅、冒菜、牛肉面喜、纠正行、鸡杂面喜）。
+    语义路按原始余弦排 + BM25 路 + RRF k=60 融合，再乘类型权重。"""
+    _cos = {text: cos for text, cos, _ in _Q3_ROWS}
+
+    def _fake_embed(self, text):
+        if text == "我爱吃什么":
+            return np.array([1.0, 0.0], dtype="float32")
+        cos = _cos[text]
+        return np.array([cos, float(np.sqrt(1 - cos ** 2))], dtype="float32")
+
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _fake_embed)
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    for text, _cos_value, source in _Q3_ROWS:
+        s.add_memory_text(text, source=source)
+    hits = s.search("我爱吃什么", top_k=5)
+    texts = [h["text"] for h in hits]
+    assert texts == [
+        "我爱吃火锅",
+        "我爱的是冒菜，不是麻辣烫",
+        "BOOS 喜欢吃牛肉面。",
+        "用户表示其实也不是很喜欢吃鸡杂面，纠正了此前“喜欢吃鸡杂面”的说法。",
+        "BOOS 喜欢吃鸡杂面。",
+    ]
+    assert all(h["decay_weight"] == 1.0 for h in hits)
+
+
+def test_event_question_not_swamped_by_preference_boost(tmp_path, monkeypatch):
+    """类型权重不能喧宾夺主：问“我昨天吃了什么”（事件问），饺子那行
+    余弦 0.9、BM25 也命中，必须还是第 1——被加权的偏好行（冒菜，
+    余弦 0.5）顶不上来。"""
+    _cos = {
+        "我昨天中午吃了饺子": 0.9,
+        "我爱的是冒菜，不是麻辣烫": 0.5,
+        "2026年11月19日晚上，用户在盐湖城吃了一碗牛肉面，觉得特别好吃。": 0.45,
+    }
+
+    def _fake_embed(self, text):
+        if text == "我昨天吃了什么":
+            return np.array([1.0, 0.0], dtype="float32")
+        cos = _cos[text]
+        return np.array([cos, float(np.sqrt(1 - cos ** 2))], dtype="float32")
+
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _fake_embed)
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    for text in _cos:
+        s.add_memory_text(text, source="inferred")
+    hits = s.search("我昨天吃了什么", top_k=3)
+    assert hits[0]["text"] == "我昨天中午吃了饺子"
+    assert "我爱的是冒菜，不是麻辣烫" in [h["text"] for h in hits]
