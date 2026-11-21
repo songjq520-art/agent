@@ -7,7 +7,7 @@
 #   也留着）。修法：规整时 metadata 里没有就到条目顶层找。
 # 全部离线模拟，不调真实 API、不花钱；真调在 /tmp 外面另做。
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from conftest import FakeMemory, make_fake_store
 
@@ -436,3 +436,82 @@ def test_53_live_h_sequence_no_duplicate_without_de(tmp_path):
     assert len(texts) == 2, texts
     assert any("沪深300" in t for t in texts)
     assert sum("沪深300" in t for t in texts) == 1
+
+
+# ---------- 双写比对未解决 #2：_memory_block 渲染 event_date ----------
+
+
+def _shanghai_today():
+    """测试里用的今天（Asia/Shanghai），和 main.py 的锚点同一时区。"""
+    return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+
+
+def test_memory_block_renders_event_date():
+    """饺子案（2026-11-21 双写比对 Q1/Q2）：检索层把饺子（event_date
+    2026-11-20）排第一是对的，但 _memory_block 不渲染 event_date，模型
+    只能拿块里唯一的绝对日期（11 月 19 日牛肉面）当锚，把饺子也归到
+    11 月 19 日、称“日期对不上”。修法：每条后面标上事件日期，块里再给
+    一句今天是几号（上海日期）的锚点。"""
+    block = _memory_block([
+        {
+            "text": "我昨天中午吃了饺子",
+            "metadata": {"source": "inferred", "confirmed": False, "event_date": "2026-11-20"},
+        },
+        {
+            "text": "2026年11月19日晚上在盐湖城吃了一碗牛肉面",
+            "metadata": {"source": "inferred", "confirmed": False, "event_date": "2026-11-19"},
+        },
+    ])
+    assert "我昨天中午吃了饺子（事件日期：2026-11-20）" in block
+    assert "2026年11月19日晚上在盐湖城吃了一碗牛肉面（事件日期：2026-11-19）" in block
+    assert f"今天是 {_shanghai_today()}" in block
+    assert "别把不同日期的事混成同一天" in block
+
+
+def test_memory_block_event_date_top_level_fallback():
+    """33 号同款做法：metadata 里没有就到条目顶层找（SQLite 的
+    _all_live_memories 把 event_date 放顶层，search 的 metadata 也带，
+    但万一哪路只给了顶层也不能丢）。"""
+    block = _memory_block([
+        {"text": "我今天晚上吃了米线", "event_date": "2026-11-21",
+         "metadata": {"source": "inferred", "confirmed": False}},
+    ])
+    assert "我今天晚上吃了米线（事件日期：2026-11-21）" in block
+
+
+def test_memory_block_no_event_date_no_date_sentence():
+    """没事件日期的老记忆（mem0 路）：不标、不猜，块里不出现事件日期
+    那句——老测试和老调用的行为一个字都不变。"""
+    block = _memory_block([
+        {"text": "我喜欢蓝色", "metadata": {"source": "user", "confirmed": True}},
+    ])
+    assert "事件日期" not in block
+    assert "今天是" not in block
+
+
+def test_memory_block_ignores_bad_event_date():
+    """格式不对的 event_date（相对词、不存在的日子、非字符串）不渲染、
+    不报错，别让一条脏 metadata 搅了整块提示。"""
+    block = _memory_block([
+        {"text": "昨天吃了饺子", "metadata": {"source": "inferred", "event_date": "昨天"}},
+        {"text": "明天去游泳", "metadata": {"source": "inferred", "event_date": "2026-13-40"}},
+        {"text": "后天开会", "metadata": {"source": "inferred", "event_date": 20261122}},
+    ])
+    assert "事件日期" not in block
+    assert "昨天吃了饺子" in block
+    assert "明天去游泳" in block
+    assert "后天开会" in block
+
+
+def test_memory_block_money_and_event_date_both_render():
+    """金额后缀和事件日期后缀同在一条上时两个都标，金额在前、日期在后。"""
+    block = _memory_block([
+        {
+            "text": "每天定投 5 块买万家纳指",
+            "metadata": {
+                "source": "user", "confirmed": True, "event_date": "2026-11-12",
+                "money": {"amount": 5, "currency": "CNY", "period": "day", "target": "万家纳指"},
+            },
+        },
+    ])
+    assert "（金额：5 元/天，对象：万家纳指）（事件日期：2026-11-12）" in block
