@@ -763,3 +763,60 @@ def test_served_html_contains_summary_card(monkeypatch, tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+# ---------- 2026-11-21 网页测第二轮 #9、#10 ----------
+
+class BlockingSummarizer:
+    """卡住的摘要器：不放行就不返回，证明 open_conversation 没等它。"""
+
+    def __init__(self):
+        self.calls = []
+        self.release = threading.Event()
+
+    def __call__(self, turns, previous_summary=None):
+        self.calls.append((list(turns), previous_summary))
+        self.release.wait(timeout=30)
+        return "后台总结好了"
+
+
+def test_open_conversation_returns_without_waiting_for_summary(tmp_path):
+    """#9：切对话不等模型总结——上一段的总结放后台算，open_conversation 立刻返回。"""
+    store = _store(tmp_path, summarizer=BlockingSummarizer())
+    msgs_a = _messages(1, topic="饺子")
+    msgs_b = _messages(1, topic="游泳")
+    store.sync(msgs_a)
+    id_a = store.current_id
+    store.begin_conversation()
+    store.sync(msgs_b)
+    id_b = store.current_id
+    store.open_conversation(id_a)
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    state = ChatState(budget_tracker=tracker, summary_store=store)
+    state.messages = list(msgs_a)
+    result_box = {}
+
+    def _call():
+        result_box["result"] = state.open_conversation(id_b)
+
+    worker = threading.Thread(target=_call, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "open_conversation 还在等模型总结，没立刻返回"
+    assert result_box["result"]["id"] == id_b
+    assert state.messages == msgs_b
+    # 后台已经开始总结上一段（还卡着没算完）。
+    assert _wait_until(lambda: len(store.summarizer.calls) == 1)
+    assert store.get_conversation(id_a).get("summary") in (None, "")
+    # 放行后，后台把总结写进上一段。
+    store.summarizer.release.set()
+    assert _wait_until(
+        lambda: store.get_conversation(id_a).get("summary") == "后台总结好了"
+    )
+
+
+def test_make_title_with_password_falls_back_to_default():
+    """#10：第一句用户话里有密码时，标题不露原文，给通用默认标题。"""
+    from memory.conversation_summary import _make_title
+
+    assert _make_title([{"role": "user", "content": "记住，我的密码是 abc12345"}]) == "新对话"
+    assert _make_title([{"role": "user", "content": "今天天气真好"}]) == "今天天气真好"

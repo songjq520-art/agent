@@ -248,7 +248,12 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
         "如果没有可确认的记忆回答这个问题，就说不知道。",
         "回答方式：先说最重要的结论，简短说，别把所有细节和免责都倒出来；"
         "记忆的来源和确认状态不用每次都展开解释——【用户确认】的直接当事实说，"
-        "【提取所得】的简单提一句“之前提到过”就行；不知道就直接说不知道，别绕圈子。"
+        "【提取所得】的简单提一句“之前提到过”就行；不知道就直接说不知道，别绕圈子。",
+        "别念记录：不要说“【用户确认】的一条是……”“有两条记录，各自独立”"
+        "“我不敢把……当成铁结论”这类像在念数据库审计的话；直接用人话说结论，"
+        "比如“你每天投 5 块买万家纳指”。只在真的拿不准时才说一句“不太确定”，"
+        "别每句都加免责。别编造保存、工具之类的说法（比如“工具报错了”“没存进去”）——"
+        "你不知道存没存进去，别猜；只按上面给你的记忆回答。"
         "还没联网核实过的信息（比如店名、价格、排名、哪家店怎么样）都是凭脑子里"
         "原有的知识说的，要顺带说明一句是凭已有知识说的、没现查核实，别让人以为是查过的。",
     ]
@@ -298,12 +303,17 @@ def _looks_like_money(text):
 # REMEMBER_PREFIX（记记忆命令）：连续对话里输入 "记住……" 就原文存一条记忆，
 # 不用确认（mem0 的 add_memory_text 直接存原文，不经过提取）。
 # 格式：记住：内容 或 记住 内容。
+# “记住”类前缀（2026-11-21 网页测第二轮 #8）：“帮我记住/请记住”也是
+# 记住命令；顺序按最长优先。memory/sqlite_store.py 里有同一份名单
+# （REMEMBER_PREFIXES / _strip_remember_prefix），两边改了要同步。
+REMEMBER_PREFIXES = ("帮我记住", "请记住", "记住")
 REMEMBER_PREFIX = "记住"
 
 
 def is_remember_command(text):
     """判断输入是不是“记住……”命令（记一条新记忆）。"""
-    return str(text or "").strip().startswith(REMEMBER_PREFIX)
+    s = str(text or "").strip()
+    return any(s.startswith(prefix) for prefix in REMEMBER_PREFIXES)
 
 
 def remember_content(text):
@@ -314,9 +324,13 @@ def remember_content(text):
     """
     if not is_remember_command(text):
         return ""
-    # “记住”后面常跟的分隔符都剥掉：冒号、逗号（中英文）、空格。
-    # 不剥的话“记住，我喜欢喝冰美式”会存成“，我喜欢喝冰美式”。
-    return str(text or "").strip()[len(REMEMBER_PREFIX):].lstrip("：:，, ").strip()
+    s = str(text or "").strip()
+    for prefix in REMEMBER_PREFIXES:
+        if s.startswith(prefix):
+            # “记住”后面常跟的分隔符都剥掉：冒号、逗号（中英文）、空格。
+            # 不剥的话“记住，我喜欢喝冰美式”会存成“，我喜欢喝冰美式”。
+            return s[len(prefix):].lstrip("：:、，, ").strip()
+    return "" 
 
 
 def handle_remember(budget_tracker, text):
@@ -340,6 +354,58 @@ def handle_remember(budget_tracker, text):
         print("已记住。")
     else:
         print("没记住：保存失败，记忆库可能出了问题，稍后再试。")
+
+
+# 揣摩提示词（2026-11-17，BOOS定；2026-11-21 网页测第二轮 #4 收紧触发）：
+# 原文照搬——模型正常聊天就行，不用特意猜；只有 BOOS 话里有个很明显、
+# 没说出口的想法或想要的东西时，才在回话里顺带提一句。猜的时候用问句，
+# 别下结论，别把猜的当成他已经说了的。
+_MIND_READ_HINT = (
+    "你是十二，BOOS的个人助理。正常聊天就行，不用特意猜；"
+    "只有 BOOS 话里有个很明显、没说出口的想法或想要的东西时，才在回话里"
+    "顺带提一句：用大白话说你猜了什么、为什么这么猜（从他以前说过的话出发），"
+    "然后问他一句'对吗？'。别把观察到的规律当成猜，别猜他下一步要干嘛；"
+    "他交代你做事（比如恢复、删除、查东西）的时候不猜；'可以'、'好'、"
+    "'对'、'不对'这种简单的回话也不猜。不确定就别猜，没东西可猜就正常回。"
+    "猜的时候用问句，别下结论，别把猜的当成他已经说了的。"
+)
+
+# 简单回话（整句就是这几个词的，直接跳过猜）。
+_MIND_READ_SIMPLE_REPLIES = {
+    "可以", "好", "对", "不对", "嗯", "哦", "行", "知道了", "谢谢",
+    "没事", "好的", "是的", "不是", "对啊", "嗯嗯", "收到", "好吧",
+}
+
+# 交代做事的标志词：出现这些词就是在交代十二做事，不猜。
+_MIND_READ_INSTRUCTION_WORDS = (
+    "帮我", "请", "忘记", "忘掉", "删除", "删掉", "记住", "查", "告诉",
+    "取消", "恢复", "打开", "设置", "发给", "算一下", "帮我算",
+)
+
+# 没说出口的想要的信号：只有话里带了这些词，才可能藏着一个没说出口的想法。
+_MIND_READ_WANT_WORDS = (
+    "想", "馋", "好久没", "很久没", "累", "困", "渴", "饿",
+    "冷", "热", "没电", "快没", "想要", "想吃", "想去", "想买", "想喝", "想看",
+)
+
+
+def _should_offer_mind_read(prompt):
+    """这句话值不值得给模型递揣摩提示（2026-11-21 网页测第二轮 #4）。
+
+    简单表态、交代做事，一律不递；只有话里带了想要的信号
+    （想/馋/好久没/累/没电……）时才递。揣摩是“没猜也要找个猜”的口子，
+    flash 在这条边界上判断得差，不递比在提示词里写“别猜”更管用。
+    “我喜欢喝茶”“周末去爬山”这类随口一提的喜好/安排没有想要的信号，
+    不递；“好久没吃火锅了”“手机快没电了”有信号，递。
+    """
+    text = str(prompt or "").strip()
+    if not text:
+        return False
+    if text.rstrip("。！？.!?") in _MIND_READ_SIMPLE_REPLIES:
+        return False
+    if any(w in text for w in _MIND_READ_INSTRUCTION_WORDS):
+        return False
+    return any(w in text for w in _MIND_READ_WANT_WORDS)
 
 
 def _print_correction_result(saved):
@@ -651,18 +717,31 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             summary_text = ""
         if summary_text:
             model_prompt = summary_text + "\n\n" + model_prompt
+    # 算数题先算再答（2026-11-21 网页测第二轮 #11）：本地计算器算好的
+    # 结果直接拼进提示，模型照着用，不自己心算、不编数字。算不出来
+    # （没识别到算式）时不拼，提示词里那句“算不出来就说算不出来”兜底。
+    try:
+        from memory.calculator import calculator_block
+        _calc = calculator_block(prompt)
+    except Exception:
+        logger.warning("本地计算器失败，本次不带计算结果继续。", exc_info=True)
+        _calc = ""
+    if _calc:
+        model_prompt = _calc + "\n\n" + model_prompt
     # 揣摩（2026-11-17，BOOS定）：不固定每轮问一次，也不主动找东西猜。
     # 模型正常聊天就行；只有 BOOS 话里有个很明显、没说出口的想法时，
     # 才在回话里顺带提一句。别把观察到的规律当成猜，别在交代做事
     # （恢复/删除/查东西）和简单回话（“可以”“好”“对”“不对”）上猜。
     # 不确定就别猜。BOOS 2026-11-17 说：不是要跟十一一模一样，十二就是十二。
+    # 揣摩提示词只在可能有没说出口的想法时才递（#4：_should_offer_mind_read
+    # 把简单表态、交代做事、随口一提的喜好/安排直接拦在程序层）；数字规则
+    # 常驻（#11）：给了本地计算结果就直接用，没给、不会算就说算不出来。
+    _mind_read_hint = _MIND_READ_HINT if _should_offer_mind_read(prompt) else ""
     model_prompt = (
-        "【给十二的提示】你是十二，BOOS的个人助理。正常聊天就行，不用特意猜；"
-        "只有 BOOS 话里有个很明显、没说出口的想法或想要的东西时，才在回话里"
-        "顺带提一句：用大白话说你猜了什么、为什么这么猜（从他以前说过的话出发），"
-        "然后问他一句'对吗？'。别把观察到的规律当成猜，别猜他下一步要干嘛；"
-        "他交代你做事（比如恢复、删除、查东西）的时候不猜；'可以'、'好'、"
-        "'对'、'不对'这种简单的回话也不猜。不确定就别猜，没东西可猜就正常回。\n\n" + model_prompt
+        "【给十二的提示】" + _mind_read_hint
+        + "数字题先算再答：上面给了本地计算结果就直接用那个数，别自己再算；"
+        "没给、你也不会算时就说算不出来，别编数字、别编“工具到上限”"
+        "“没存进去”这类借口。\n\n" + model_prompt
     )
     # 按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型），
     # 并把路由算出的模型名传给 Provider——路由说用哪个模型就用哪个，
@@ -769,8 +848,15 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         correction = _print_correction_result(saved)
         _print_protection_result(saved)
         # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
-        # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
-        if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
+        # 告诉 BOOS 一声（dropped 为空且 dropped_count 是 0 时什么都没丢，不用多说）。
+        # 撤回后回消息崩（2026-11-21 网页测第二轮 #1）：dropped 是句子列表，
+        # list > 0 直接抛 TypeError → 500；撤回那条路的回执里 dropped 恒为
+        # []、真正记数的是 dropped_count，所以两边都算上。只按 len(dropped)
+        # 判断会让这句提示永远打不出来（撤回时 dropped 本来就是空的）。
+        if (saved or {}).get("retracted") and (
+            (saved or {}).get("dropped_count", 0) > 0
+            or len((saved or {}).get("dropped") or []) > 0
+        ):
             print("刚说的那句已经撤回，不记了。")
         # 揣摩改成跟十一一样（2026-11-17，BOOS定）：不再固定每轮调
         # infer_from_turn 追加一句正式的猜——猜由模型自己在回话里

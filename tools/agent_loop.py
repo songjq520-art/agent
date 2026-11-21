@@ -833,6 +833,50 @@ class AgentLoop:
         return self._finish(task, messages, final_text,
                             tool_calls_made, total_cost, cost_unknown, timer)
 
+    @staticmethod
+    def _delete_target_key(tool_name, args):
+        """一次删除的目标键（2026-11-21 网页测第二轮 #5）：同记忆的
+        删除确认卡去重用。单条删按核对过的 memory_id 认；批量删按
+        一组 id（排过序）认。认不出来时返回 None（不去重）。"""
+        args = args or {}
+        if tool_name == "delete_memory":
+            mid = (args.get("memory_id") or "").strip()
+            return ("delete_memory", mid) if mid else None
+        if tool_name == "delete_memories":
+            items = args.get("items") or []
+            if not isinstance(items, list):
+                return None
+            ids = sorted(
+                {(item or {}).get("memory_id") or "" for item in items
+                 if isinstance(item, dict)}
+            )
+            ids = [i for i in ids if i]
+            return ("delete_memories", tuple(ids)) if ids else None
+        return None
+
+    def _find_waiting_delete_approval(self, tool_name, args):
+        """找一张等确认中的、同一个删除目标的确认卡（#5）。
+
+        只在 delete_memory、delete_memories 上找；别的工具不去重。
+        读不到等确认列表时返回 None（不拦路，该建卡照样建）。
+        """
+        target = self._delete_target_key(tool_name, args)
+        if target is None:
+            return None
+        try:
+            waiting = self.task_store.list_waiting()
+        except Exception:
+            return None
+        for task in waiting or []:
+            approval = (task or {}).get("approval") or {}
+            if approval.get("tool") != tool_name:
+                continue
+            if self._delete_target_key(
+                tool_name, approval.get("args") or {}
+            ) == target:
+                return approval
+        return None
+
     def _run_tool_call(self, task, call, failures):
         """跑一次工具调用（只算、不改共享状态）。
 
@@ -955,6 +999,39 @@ class AgentLoop:
             run_id=task.get("run_id"),
         )
         if outcome["decision"] == "needs_approval":
+            # 2026-11-21 网页测第二轮 #5：同一次删除只弹一张卡——
+            # 同一个记忆的删除确认卡已经在等 BOOS 点了（别的轮次建的，
+            # 还没点），模型又调一次同样的删除时，不再建一张新卡：
+            # 新 approval 直接丢掉（还没存盘，不留痕），告诉模型等
+            # 那张旧卡就行。旧卡点了就删，不用再问一次。
+            # 只认等确认中的卡（list_waiting）：已经点过/取消/过期的
+            # 不算；同任务内刚确认完的也不算（那张卡已经执行过了，
+            # 再调同样的删除时 precheck 会按“库里没找到”拦下来）。
+            existing = self._find_waiting_delete_approval(
+                tool_name, (outcome.get("approval") or {}).get("args") or {}
+            )
+            if existing is not None:
+                _new_args = (outcome.get("approval") or {}).get("args") or {}
+                _target_text = (
+                    _new_args.get("text") or _new_args.get("anchor_text") or ""
+                )
+                return {
+                    "outcome": "skipped",
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "content": (
+                        "删除"
+                        + (f"“{_target_text}”" if _target_text else "这条记忆")
+                        + "的确认卡已经在等 BOOS 确认了，不用再建一张，"
+                        "等他点了那张卡就删。"
+                    ),
+                    "record": None,
+                    "approval": None,
+                    "failure_key": None,
+                    "failure_increment": 0,
+                    "search_args": None,
+                    "search_result": None,
+                }
             # 在等确认：先把确认记录存进任务（调用方 _wait_approval 会存盘），
             # 本轮的 tool 消息先不补——恢复时再按确认结果补。
             return {

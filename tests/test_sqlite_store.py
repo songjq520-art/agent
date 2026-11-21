@@ -831,3 +831,182 @@ def test_import_from_mem0_skips_sensitive(store):
     assert out["skipped_deleted"] == 0
     assert _live_texts(store) == ["我喜欢吃火锅"]
     assert all("abc12345" not in line for line in _ledger_lines(store))
+
+
+# ---------- 12. 网页测第二轮：确认版优先（#2）+ 删除范围真查库（#6）
+#       + “忘记…”指令句不存（#7）+ “记住”前缀剥掉再存（#8） ----------
+
+
+def test_search_prefers_confirmed_copy_over_inferred(store):
+    """包子两条同文本：已确认版赢过推断版，search 只返回确认版（#2）。
+
+    生产现状：seq 117 是 BOOS 确认过的“我今天早上吃了俩包子”，
+    另有一行同文本的推断版；以前先到先得，推断版抢了名额，
+    问起来还加一句“没逐条确认过”。
+    """
+    saved = store.add_memory_text("我今天早上吃了俩包子", source="user")
+    store.confirm_memory(saved["id"])
+    store.save_turn(
+        [{"role": "user", "content": "我今天早上吃了俩包子"}],
+        turn_id="t-baozi-dup",
+    )
+    assert len(_live_texts(store)) == 2  # 两行都在库里，只在检索层聚合
+    results = store.search("我今天早上吃了什么", top_k=5)
+    assert results, "包子该搜得到"
+    assert results[0]["text"] == "我今天早上吃了俩包子"
+    assert results[0]["confirmed"] is True
+    assert len([r for r in results if r["text"] == "我今天早上吃了俩包子"]) == 1
+
+
+def test_search_confirmed_beats_identical_unconfirmed(store):
+    """确认优先（#2）：关键词重合完全相同、分也完全相同时，确认版排在未确认版前面。
+
+    两行除了基金名以外一字不差、等长，BM25 分数相等，排位只由确认
+    优先（平局裁决）决定——万家（确认）必须在恒生（未确认）前面。
+    """
+    saved = store.add_memory_text("我每天定投 5 块买万家纳指", source="user")
+    store.confirm_memory(saved["id"])
+    store.save_turn(
+        [{"role": "user", "content": "我每天定投 5 块买恒生指数"}],
+        turn_id="t-hs-ding",
+    )
+    results = store.search("我每天定投 5 块买什么", top_k=5)
+    assert [r["text"] for r in results] == [
+        "我每天定投 5 块买万家纳指",
+        "我每天定投 5 块买恒生指数",
+    ]
+
+
+def test_deletion_scope_finds_live_memory(store):
+    """删除范围真查库（#6）：在库的记忆 found=True，带原文和范围。"""
+    saved = store.add_memory_text("我喜欢喝茶", source="user")
+    assert saved.get("event") == "ADD"
+    scope = store.deletion_scope(saved["id"])
+    assert scope["found"] is True
+    assert scope["memory"]["text"] == "我喜欢喝茶"
+    assert scope["memory"]["id"] == saved["id"]
+    assert scope["in_scope"] == [scope["memory"]]
+    assert scope["out_of_scope"] == []
+    assert isinstance(scope["history_entries"], list)
+    assert scope["history_count"] == len(scope["history_entries"])
+
+
+def test_deletion_scope_missing_returns_not_found(store):
+    """删除范围真查库（#6）：不存在的 id 和空 id 都返回 found=False。"""
+    assert store.deletion_scope("不存在的id")["found"] is False
+    assert store.deletion_scope("")["found"] is False
+
+
+def test_deletion_scope_after_delete_returns_not_found(store):
+    """删除范围真查库（#6）：删了的记忆不再出现在删除范围里。"""
+    saved = store.add_memory_text("我喜欢喝茶", source="user")
+    deleted = store.delete_memory(saved["id"], approve=True)
+    assert deleted.get("deleted") is True
+    assert store.deletion_scope(saved["id"])["found"] is False
+
+
+def test_deletion_scope_finds_by_ledger_key(store):
+    """删除范围真查库（#6）：传账本 key 也能找到（delete_memory 同款两路查找）。"""
+    saved = store.add_memory_text("我喜欢喝茶", source="user")
+    assert saved.get("event") == "ADD"
+    state = store.ledger_state()
+    key = (state or {}).get("adds", [{}])[0].get("key")
+    assert key
+    scope = store.deletion_scope(key)
+    assert scope["found"] is True
+    assert scope["memory"]["text"] == "我喜欢喝茶"
+
+
+def test_forget_instruction_sentences_not_stored(store):
+    """“忘记…”指令句不存成记忆（#7）：句首和句中的删除指令都拦下。"""
+    cases = [
+        "忘记我喜欢喝茶",
+        "帮我忘记我喜欢喝茶",
+        "请忘记我喜欢喝茶",
+        "忘记这个",
+        "删掉这条",
+        "你能不能忘记这个",
+        "删除这条记忆",
+    ]
+    for i, text in enumerate(cases):
+        receipt = store.save_turn(
+            [{"role": "user", "content": text}],
+            turn_id="t-forget-%d" % i,
+        )
+        assert receipt["stored"] == [], text
+    assert _live_texts(store) == []
+
+
+def test_recollection_sentences_still_stored(store):
+    """回忆句照常存（#7）：句尾带“了”的“忘记带钥匙了”不是删除指令。"""
+    for i, text in enumerate(["忘记带钥匙了", "我昨天忘记带钥匙了", "忘记了带钥匙"]):
+        receipt = store.save_turn(
+            [{"role": "user", "content": text}],
+            turn_id="t-recall-%d" % i,
+        )
+        assert receipt["stored"] == [text], text
+    assert len(_live_texts(store)) == 3
+
+
+def test_strip_remember_prefix():
+    """剥“记住”前缀（#8）：只剥句首，句中的“记住”不动。"""
+    from memory.sqlite_store import _strip_remember_prefix
+
+    assert _strip_remember_prefix("记住后天要去体检") == "后天要去体检"
+    assert _strip_remember_prefix("帮我记住后天要去体检") == "后天要去体检"
+    assert _strip_remember_prefix("请记住：后天要去体检") == "后天要去体检"
+    assert _strip_remember_prefix("记住：后天要去体检") == "后天要去体检"
+    assert _strip_remember_prefix("记住") == ""
+    assert _strip_remember_prefix("我记住这件事了") == "我记住这件事了"
+
+
+def test_remember_prefix_stripped_before_store(store):
+    """“记住”两字不进记忆（#8）：“记住后天要去体检”只存“后天要去体检”。"""
+    receipt = store.save_turn(
+        [{"role": "user", "content": "记住后天要去体检"}],
+        turn_id="t-remember-strip",
+    )
+    assert receipt["stored"] == ["后天要去体检"]
+    assert _live_texts(store) == ["后天要去体检"]
+
+
+def test_remember_prefix_variants_stripped(store):
+    """“记住”前缀变体（#8）：“帮我记住/请记住/记住：/记住，”都剥掉再存。"""
+    cases = [
+        ("帮我记住后天要去体检", "后天要去体检"),
+        ("请记住明天要开会", "明天要开会"),
+        ("记住：下周三出差", "下周三出差"),
+        ("记住，大后天要去游泳", "大后天要去游泳"),
+    ]
+    for i, (text, expected) in enumerate(cases):
+        receipt = store.save_turn(
+            [{"role": "user", "content": text}],
+            turn_id="t-remember-var-%d" % i,
+        )
+        assert receipt["stored"] == [expected], text
+    assert set(_live_texts(store)) == {expected for _text, expected in cases}
+
+
+def test_remember_command_not_stored_twice_when_direct_path_already_saved(store):
+    """直接路径已存过同一句时，save_turn 不再存第二遍（#8）。
+
+    “记住……”命令走直接路径先存一条（确认版），同一轮收尾的 save_turn
+    剥完前缀发现已在库里就跳过——同一文本不该在账本里多一条 ADD。
+    """
+    store.add_memory_text("后天要去体检", source="user")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "记住后天要去体检"}],
+        turn_id="t-remember-dup",
+    )
+    assert receipt["stored"] == []
+    assert _live_texts(store) == ["后天要去体检"]
+
+
+def test_bare_remember_command_dropped(store):
+    """光秃秃一句“记住”不存（#8）：剥完没内容，直接丢掉。"""
+    receipt = store.save_turn(
+        [{"role": "user", "content": "记住"}],
+        turn_id="t-remember-bare",
+    )
+    assert receipt["stored"] == []
+    assert _live_texts(store) == []

@@ -47,6 +47,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from memory.mem0_store import _redact_sensitive
+from memory.redaction import _contains_sensitive
 
 logger = logging.getLogger("agent")
 
@@ -307,6 +308,11 @@ def _make_title(messages, summary=None):
     else:
         title = _first_sentence(summary or "")
     if not title:
+        return "新对话"
+    if _contains_sensitive(title):
+        # 2026-11-21 网页测第二轮 #10：标题是对话第一句用户话原样截的，
+        # 敏感内容（比如密码）会直接露在侧边栏标题上——命中脱敏规则
+        # 时给通用默认标题，不暴露原文、也不暴露打码后的形状。
         return "新对话"
     if len(title) > TITLE_MAX_CHARS:
         title = title[:TITLE_MAX_CHARS] + "…"

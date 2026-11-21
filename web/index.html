@@ -1341,7 +1341,21 @@
   }
 
   async function openConversation(convId) {
-    if (busy) return;
+    // 2026-11-21 网页测第二轮 #9：切换时别静默吞点击——忙的时候先显示
+    // “切换中”，等上一轮忙完再切；等超过 10 秒还没空就提示稍后再点。
+    // 后端切换本身也不再等模型总结（总结放后台），正常一点就回来。
+    // 另外原来失败那条 return 会跳过 busy 复位，失败一次页面就一直忙，
+    // 再点什么都没反应——改成 finally 里复位。
+    const waitWrap = addMsg('ai', '正在切换对话，请稍等…');
+    const waitStart = Date.now();
+    while (busy && Date.now() - waitStart < 10000) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    if (busy) {
+      waitWrap.remove();
+      addMsg('ai', '还在忙（上一轮没回完），等一下再点切换。');
+      return;
+    }
     busy = true;
     sendBtn.disabled = true;
     try {
@@ -1369,10 +1383,14 @@
       refreshRecent();
     } catch (e) {
       addMsg('ai', '回不去了：连不上服务，请确认服务还在运行。');
+    } finally {
+      // 成功时上面已经清掉了全部 .msg（“切换中”那条也在里面），
+      // 这里再 remove 一次是 no-op；失败时靠它清掉“切换中”。
+      waitWrap.remove();
+      busy = false;
+      sendBtn.disabled = false;
+      inputEl.focus();
     }
-    busy = false;
-    sendBtn.disabled = false;
-    inputEl.focus();
   }
 
   // ---------- 原来的聊天逻辑 ----------

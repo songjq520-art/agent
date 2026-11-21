@@ -337,6 +337,38 @@ def _check_delete_anchor(args):
         )
     norm_anchor = _norm_anchor_text(anchor)
     matches = _find_anchor_matches(store, anchor)
+    # 2026-11-21 网页测第二轮 #6：id 和原文由程序带，不靠模型现抄——
+    # 模型只要给 anchor（用户原话里的删除目标），id 和原文程序按库里
+    # 的原文现找、现填进 augment，网关会把填好的这份存进确认卡，
+    # 确认后执行用的也是它。模型抄错/抄漏 id 就再也不会删失败。
+    # 只在“能唯一认出是哪条”时才填：模型给的原文恰好对上一条候选
+    # 时按原文认（id 抄错了也能纠回来）；id 和原文都没给、anchor
+    # 恰好只有一个字面命中时按 anchor 认。多条对得上、或模型给的
+    # id/原文指向一条已经不在库里的条目时，不替它猜——走原来的报错，
+    # 让模型/BOOS 挑（57 号锚点校验原样保留）。
+    filled = {}
+    filled_how = ""
+    direct = [
+        (mid, cand_text)
+        for mid, cand_text in matches
+        if norm_anchor in _norm_anchor_text(cand_text)
+    ]
+    text_hits = [
+        (mid, cand_text)
+        for mid, cand_text in matches
+        if _same_text(cand_text, text)
+    ]
+    if len(text_hits) == 1:
+        target_id, target_text = text_hits[0]
+        if memory_id != target_id or not _same_text(text, target_text):
+            filled = {"memory_id": target_id, "text": target_text}
+            filled_how = "text"
+            memory_id, text = target_id, target_text
+    elif not memory_id and not (text or "").strip() and len(direct) == 1:
+        target_id, target_text = direct[0]
+        filled = {"memory_id": target_id, "text": target_text}
+        filled_how = "anchor"
+        memory_id, text = target_id, target_text
     guard = guard_memory_target("delete", memory_id, anchor, matches)
     if not guard["ok"]:
         if not matches:
@@ -390,7 +422,12 @@ def _check_delete_anchor(args):
             f"另外还有 {len(copies)} 条同一句话的副本：{shown}{more}"
             "确认后会和这一条一起删掉。"
         )
-    return None, {"_anchor_match": note}
+    if filled:
+        if filled_how == "text":
+            note += "（你给的 id 对不上这条，程序按原文把它补上了。）"
+        else:
+            note += "（id 和原文都没给，程序按 anchor 找到唯一的一条补上了。）"
+    return None, {**filled, "_anchor_match": note}
 
 
 def _check_update_anchor(args):
@@ -606,6 +643,17 @@ def _run_delete_memory(args):
     store, error = _store_or_error()
     if error is not None:
         return error
+    # 57 号：执行前再验一次 anchor（确认卡建好后库可能变了，防卡上的
+    # 条目在确认前被改掉/删掉）。precheck 已经验过一次，这里是第二道。
+    # 2026-11-21 网页测第二轮 #6：precheck 可能把程序核对过的 id/原文
+    # 填进了 augment（模型抄错/没给时）——先验、再拿填好的这份去查
+    # 范围、验原文，别再用模型原来那份。缺 id/原文的检查也放验后：
+    # anchor 唯一命中时 precheck 会填上，验前拦就把这条路堵死了。
+    anchor_error, _augment = _check_delete_anchor(args)
+    if anchor_error:
+        return {"ok": False, "data": None, "error": anchor_error}
+    if _augment:
+        args = {**args, **_augment}
     memory_id = (args or {}).get("memory_id") or ""
     text = (args or {}).get("text") or ""
     if not memory_id or not text.strip():
@@ -614,11 +662,6 @@ def _run_delete_memory(args):
             "data": None,
             "error": "删记忆要传 memory_id 和 text（列出来的原文），缺了没法删。",
         }
-    # 57 号：执行前再验一次 anchor（确认卡建好后库可能变了，防卡上的
-    # 条目在确认前被改掉/删掉）。precheck 已经验过一次，这里是第二道。
-    anchor_error, _augment = _check_delete_anchor(args)
-    if anchor_error:
-        return {"ok": False, "data": None, "error": anchor_error}
     try:
         scope = store.deletion_scope(memory_id)
     except Exception as exc:  # noqa: BLE001 - 读范围失败也算执行失败
@@ -1150,7 +1193,9 @@ def register_memory_tools():
             "删一条长期记忆。先调 list_memories 列出全部，找到要删的那条，"
             "把 memory_id、text（列出来的原文，一字不差地抄）和 anchor_text"
             "（用户原话里的删除目标，比如 BOOS 说“删掉鸡杂面”时 anchor_text"
-            "就是“鸡杂面”）一起传来；原文对不上库里的就不删。"
+            "就是“鸡杂面”）一起传来；id 和原文不填也行——程序按 anchor_text"
+            "在库里找唯一的一条自动填，填错了程序按库里的原文纠正，"
+            "不用重新抄；原文对不上库里的就不删。"
             "程序会先核对 anchor：挑的这条原文里含 anchor 才建确认卡，"
             "对不上、没找到时直接拒绝、不建卡；库里还有别的提到 anchor 的，"
             "卡上会注明，确认删的是这一条；"
@@ -1165,13 +1210,11 @@ def register_memory_tools():
             "properties": {
                 "memory_id": {
                     "type": "string",
-                    "description": "要删的那条记忆的 id（list_memories 里拿到的）",
-                    "minLength": 1,
+                    "description": "要删的那条记忆的 id（list_memories 里拿到的）；不填也行，程序按 anchor_text 找唯一的一条填；填错了程序按原文纠正",
                 },
                 "text": {
                     "type": "string",
-                    "description": "列出来的原文，一字不差地抄",
-                    "minLength": 1,
+                    "description": "列出来的原文，一字不差地抄；不填也行，程序按 anchor_text 找唯一的一条填；填错了程序按库里的原文纠正",
                     "maxLength": 1000,
                 },
                 "anchor_text": {
@@ -1186,7 +1229,7 @@ def register_memory_tools():
                     "maxLength": 500,
                 },
             },
-            "required": ["memory_id", "text", "anchor_text"],
+            "required": ["anchor_text"],
         },
         output=(
             "成功时 data 是 {memory_id, text, history_cleared}；"

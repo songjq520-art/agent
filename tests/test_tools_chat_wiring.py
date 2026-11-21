@@ -2088,3 +2088,46 @@ def test_loop_records_search_date_range(store, gateway):
     assert search_service.date_ranges == [
         {"start": "2026-11-10", "end": "2026-11-10"}
     ]
+
+# ---------- 2026-11-21 网页测第二轮 #5：同一次删除只弹一张卡 ----------
+
+def test_delete_same_memory_reuses_waiting_card(store, gateway, tmp_path):
+    """#5：同一个记忆的删除确认卡已经在等 BOOS 点了，模型又调一次同样的
+    删除时，不再建一张新卡——告诉模型等那张旧卡就行；等确认列表里始终只有一张卡。"""
+    from conftest import make_fake_store
+    from tools.memory_tool import bound_memory_store
+
+    mem_store = make_fake_store(tmp_path)
+    mem_store.add_memory_text("我喜欢喝茶", source="user")
+    tea_id = next(
+        item["id"] for item in mem_store.get_all(include_sensitive=True)
+        if item["text"] == "我喜欢喝茶"
+    )
+    delete_args = {"memory_id": tea_id, "text": "我喜欢喝茶", "anchor_text": "喝茶"}
+    with bound_memory_store(mem_store):
+        provider1 = ScriptedProvider(
+            script=[_tool_response(tool_calls=[_tool_call("call_del", "delete_memory", delete_args)])]
+        )
+        loop1 = AgentLoop(provider1, gateway=gateway, task_store=store,
+                          search_service=FakeSearchService())
+        first = loop1.run("忘记我喜欢喝茶")
+    assert first["mode"] == "waiting_approval"
+    assert first["approval"]["tool"] == "delete_memory"
+    assert len(store.list_waiting()) == 1
+    # 第二轮（新任务）：模型又调一次同样的删除。
+    with bound_memory_store(mem_store):
+        provider2 = ScriptedProvider(
+            script=[_tool_response(tool_calls=[_tool_call("call_del2", "delete_memory", delete_args)])]
+        )
+        loop2 = AgentLoop(provider2, gateway=gateway, task_store=store,
+                          search_service=FakeSearchService())
+        second = loop2.run("忘记我喜欢喝茶")
+    assert second["mode"] == "done"
+    # 告诉模型的那句“等旧卡”已经喂进去了（最后回答那轮的消息里有）。
+    final_messages = provider2.final_calls_log[0]["messages"]
+    tool_notes = [m for m in final_messages if m.get("role") == "tool"]
+    assert tool_notes, "第二轮应该有一条 tool 消息告诉模型旧卡在等确认"
+    assert "已经在等" in tool_notes[-1]["content"]
+    # 始终只有第一张卡在等确认，没多建一张；那条记忆也还没删。
+    assert len(store.list_waiting()) == 1
+    assert "我喜欢喝茶" in [i["text"] for i in mem_store.get_all(include_sensitive=True)]

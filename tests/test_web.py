@@ -1639,3 +1639,44 @@ def test_ask_real_store_reinforces_once_per_turn(tmp_path, monkeypatch):
     assert meta is not None
     assert meta["decay_seen_sessions"] == [turn_id]
     assert len(meta["decay_seen_dates"]) == 1
+
+# ---------- 2026-11-21 网页测第二轮 #6：forget_memory 结果归一化 ----------
+
+class _DictDeleteStore:
+    """delete_memory 返回字典的假记忆库（SQLite 版的形状）。"""
+
+    def __init__(self, deleted):
+        self.deleted = deleted
+
+    def delete_memory(self, memory_id, approve=False):
+        return {"deleted": self.deleted, "memory_id": memory_id}
+
+
+class _BoolDeleteStore:
+    """delete_memory 返回布尔的假记忆库（mem0 版的形状）。"""
+
+    def __init__(self, deleted):
+        self.deleted = deleted
+
+    def delete_memory(self, memory_id, approve=False):
+        return self.deleted
+
+
+def test_forget_memory_normalizes_dict_return(tmp_path):
+    """#6：SQLite 版 delete_memory 返回 {"deleted": False} 字典时，
+    forget_memory 必须返回严格的 False——以前字典恒为真，
+    “没删掉”也被页面报成删掉了。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    state = ChatState(budget_tracker=tracker, mem0_store=_DictDeleteStore(False))
+    assert state.forget_memory("some-id", confirmed=True) is False
+    state2 = ChatState(budget_tracker=tracker, mem0_store=_DictDeleteStore(True))
+    assert state2.forget_memory("some-id", confirmed=True) is True
+
+
+def test_forget_memory_normalizes_bool_return(tmp_path):
+    """#6：mem0 版 delete_memory 返回布尔时，forget_memory 原样返回布尔。"""
+    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
+    state = ChatState(budget_tracker=tracker, mem0_store=_BoolDeleteStore(False))
+    assert state.forget_memory("some-id", confirmed=True) is False
+    state2 = ChatState(budget_tracker=tracker, mem0_store=_BoolDeleteStore(True))
+    assert state2.forget_memory("some-id", confirmed=True) is True

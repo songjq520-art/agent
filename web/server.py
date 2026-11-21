@@ -364,7 +364,7 @@ class ChatState:
                 return None
 
     def open_conversation(self, conv_id):
-        """回到一段旧对话：先把当前对话收尾（总结保存），再恢复那段的摘要 + 最近几轮。
+        """回到一段旧对话：立刻恢复那段的摘要 + 最近几轮，上一段的总结放后台做。
 
         返回 {"id", "title", "summary", "messages", "transcript_status"}：
         messages 是恢复的最近几轮（原样），页面按它重画
@@ -373,11 +373,32 @@ class ChatState:
         变摘要时，messages 仍是最近几轮，transcript_status 告诉页面
         “全文已转成摘要”，页面可以提一句。
         摘要没启用时也返回 None（没有可回的对话）。
+        2026-11-21 网页测第二轮 #9：以前这里拿着锁同步调模型把当前
+        对话总结完（几秒）才加载旧对话，切对话就卡住。改成照 reset()
+        的做法：锁里只做快事（记当前对话、恢复目标对话、立刻返回），
+        上一段的总结在后台线程里跑，算好了按 id 写回上一段的记录，
+        不写串到刚恢复的这段里。点的是当前这段时不用总结。
         """
         with self._lock:
             if self.summary_store is None:
                 return None
-            self._flush_summary_locked()
+            # 先把当前对话记进列表（只记标题、不调模型），拿到当前 id——
+            # 和 reset() 一样的顺序：没 sync 过的对话先 sync 才有 id，
+            # 后台 flush 按 id 才能找到它。
+            snapshot = [dict(m) for m in self.messages]
+            if snapshot:
+                try:
+                    self.summary_store.sync(snapshot)
+                except Exception:
+                    logger.warning("切换对话时记当前对话失败。", exc_info=True)
+            prev_id = None
+            prev_summary = ""
+            try:
+                prev_id = self.summary_store.current_id
+                prev_record = self.summary_store.current_record() or {}
+                prev_summary = prev_record.get("summary") or ""
+            except Exception:
+                prev_id = None
             try:
                 record = self.summary_store.open_conversation(conv_id)
             except Exception:
@@ -396,13 +417,44 @@ class ChatState:
                 # 38 号：全文还在，恢复全文，不只最近 5 轮。
                 self.messages = [dict(m) for m in transcript.get("messages") or []]
             transcript_status = (transcript or {}).get("status")
-            return {
+            result = {
                 "id": record["id"],
                 "title": record.get("title") or "新对话",
                 "summary": record.get("summary") or "",
                 "messages": [dict(m) for m in self.messages],
                 "transcript_status": transcript_status,
             }
+        # 锁外再开后台线程：上一段对话的总结慢慢做（照 reset() 的做法）。
+        # 只有确实换了一段、上一段有话要总结、总结器配了才总结。
+        if (
+            prev_id
+            and prev_id != conv_id
+            and snapshot
+            and self.summary_store is not None
+            and self.summary_store.summarizer is not None
+        ):
+            store = self.summary_store
+            lock = self._lock
+            summarizer = store.summarizer
+
+            def _flush_prev():
+                # 调模型总结是纯函数（只读快照 + 旧摘要），不用拿锁；
+                # 算好了再拿锁写回去，不卡切换。
+                try:
+                    summary_text = summarizer(list(snapshot), prev_summary or None)
+                except Exception:
+                    logger.warning("后台总结上一段对话失败。", exc_info=True)
+                    return
+                try:
+                    with lock:
+                        store.flush(
+                            snapshot, record_id=prev_id, summary_text=summary_text
+                        )
+                except Exception:
+                    logger.warning("后台总结上一段对话失败。", exc_info=True)
+
+            threading.Thread(target=_flush_prev, daemon=True).start()
+        return result
 
     def current_conversation(self):
         """当前正在聊的对话（41 号：刷新后恢复用）。
@@ -1293,7 +1345,14 @@ class ChatState:
                 raise PermissionError("删除记忆需要先确认删除范围。")
             if self.mem0_store is None:
                 raise RuntimeError("记忆未启用。")
-            return self.mem0_store.delete_memory(memory_id, approve=True)
+            deleted = self.mem0_store.delete_memory(memory_id, approve=True)
+            # 归一化（2026-11-21 网页测第二轮 #6）：SQLite 版
+            # delete_memory 返回 {"deleted": bool, ...} 字典，mem0 版
+            # 返回布尔——调用方（/api/memories/<id>/forget）只认布尔，
+            # 字典恒为真会把“没删掉”也报成删掉了。这里统一成严格布尔。
+            if isinstance(deleted, dict):
+                return deleted.get("deleted") is True
+            return bool(deleted)
 
     def correct_memory(self, old_text, new_text, memory_id=None):
         """纠正一条记忆（返回 correct_memory 的状态字典）。
@@ -1630,8 +1689,9 @@ def make_handler(state, authenticator=None):
                 return
             if path == "/api/conversations/open":
                 # 回到一段旧对话：请求 {"id": 对话 id}。
-                # 先把当前对话总结保存（state.open_conversation 里做），
-                # 再恢复那段的最近几轮；找不到回 404。
+                # 立刻恢复那段的最近几轮；上一段的总结在后台做
+                # （state.open_conversation 里做，不卡住页面）；
+                # 找不到回 404。
                 payload, error, status = self._read_json_body()
                 if error is not None:
                     self._send_json({"error": error}, status=status)

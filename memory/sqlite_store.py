@@ -65,6 +65,12 @@ _BARE_RETRACTION = {
 # 语义 + BM25 两路）里的偏好行顶到第一。
 _TYPE_WEIGHT_STABLE_PREFERENCE = 1.25
 
+# 已确认记忆在检索排序里只当平局裁决，不做乘法加权（#2，2026-11-22 修）：
+# 同文本聚合已保证确认版赢下自己的槽位；排序里再乘 1.25 会把确认行
+# 顶到分更高的未确认行前面，Q4/BM25 钉死的融合顺序就乱了
+# （目标测试回归验出）。所以排序键只在 RRF×衰减×类型权重完全相等时，
+# 用 confirmed 裁决先后。
+
 # 偏好句的认法：正文里说喜欢 / 不喜欢 / 爱吃 / 爱喝的句子。
 # 名单故意收得窄：只认这几个动词，不猜“想 / 希望 / 要”（那些是计划，
 # 不是偏好）；“可爱”这类词不含这几个动词，不会误认。
@@ -125,6 +131,22 @@ def _split_sentences(text):
     return [p.strip() for p in parts if p.strip()]
 
 
+# “记住”类前缀（2026-11-21 网页测第二轮 #8）：save_turn 逐句循环里
+# 先剥掉再存——“记住后天要去体检”要存成“后天要去体检”，不能把
+# “记住”两个字也存进记忆。顺序按最长优先；main.py 的
+# is_remember_command / remember_content 用同一份名单（两边改了要同步）。
+REMEMBER_PREFIXES = ("帮我记住", "请记住", "记住")
+
+
+def _strip_remember_prefix(sentence):
+    """剥掉句首的“记住”类前缀，返回剩下的内容；没有前缀时原样返回。"""
+    s = (sentence or "").strip()
+    for prefix in REMEMBER_PREFIXES:
+        if s.startswith(prefix):
+            return s[len(prefix):].lstrip("：:、，, ").strip()
+    return s
+
+
 def _looks_like_fact(sentence):
     """一句话像不像用户亲口说的事实（原样先存的候选）。
 
@@ -148,7 +170,19 @@ def _looks_like_fact(sentence):
                    "怎么办", "是什么", "是不是", "谁", "哪", "多少",
                    "几个", "几天", "几点")):
         return False, "问句"
-    if any(w in s for w in ("忘记这个", "忘掉这个", "删掉这条", "不要记")):
+    if "不要记" in s:
+        return False, "删除指令"
+    # “忘记…”指令句（2026-11-21 网页测第二轮 #7）：“忘记我喜欢喝茶”
+    # 是删记忆的指令，不能当事实存。只认句首的忘记/忘掉/删掉/删除
+    # （“我昨天忘记带钥匙了”不在句首，不受影响）；句尾带“了”的是
+    # 回忆句（“忘记带钥匙了”），不是指令，照常存；“忘记了…”（过去时）
+    # 也是回忆，照常存。没带“了”的“忘记带钥匙”会被当成指令丢掉——
+    # 故意的取舍：删指令绝不能进库，丢一句含糊的回忆可以再说一遍。
+    if re.match(r"^(?:请帮我|帮我|请)?(?:忘记|忘掉|删掉|删除)(?!了)", s) and not s.endswith("了"):
+        return False, "删除指令"
+    # 句中的“忘记这个/忘掉这个/删掉这条”（比如“你能不能忘记这个”）
+    # 同样是指令；句尾带“了”的回忆句除外。
+    if any(w in s for w in ("忘记这个", "忘掉这个", "删掉这条")) and not s.endswith("了"):
         return False, "删除指令"
     # 纠错前缀（2026-11-21 Gemini 第三轮）：“不对/不是/哎”开头的也是纠错指令，
     # 同样不存。注意：等 SQLite 纠错正式接线时要移除这一条拦截，否则
@@ -561,9 +595,29 @@ class SQLiteStore:
             receipt["dropped_count"] = dropped
             return receipt
         today = _shanghai_today()
+        live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
         for sentence in _split_sentences(latest_user):
-            ok, reason = _looks_like_fact(sentence)
             receipt["considered"].append(sentence)
+            # “记住”前缀先剥（#8）：剥完再判事实、再算日期——“记住”两字
+            # 本身不是记忆内容。剥完为空（光秃秃一句“记住”）直接丢掉。
+            stripped = _strip_remember_prefix(sentence)
+            stripped_remember = stripped != sentence
+            sentence = stripped
+            if not sentence:
+                receipt["dropped"].append(
+                    {"text": receipt["considered"][-1], "reason": "记住指令本身，无内容"}
+                )
+                continue
+            if stripped_remember:
+                # 直接路径（“记住……”命令）已经存过同一句时不再存第二遍：
+                # 同一文本两行是重复根（2026-11-20 根治过），检索层虽会
+                # 按文本聚合，账本里也不该多一条 ADD。
+                if live_texts is None:
+                    live_texts = {m["text"] for m in self._all_live_memories()}
+                if sentence in live_texts:
+                    receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
+                    continue
+            ok, reason = _looks_like_fact(sentence)
             if not ok:
                 receipt["dropped"].append({"text": sentence, "reason": reason})
                 continue
@@ -580,6 +634,8 @@ class SQLiteStore:
                 event_date=event_date, decay_kind="episodic",
             )
             if (saved or {}).get("event") == "ADD":
+                if live_texts is not None:
+                    live_texts.add(sentence)
                 receipt["stored"].append(sentence)
                 receipt["results"].append(
                     {"id": saved.get("id"), "memory": sentence, "event": "ADD"}
@@ -754,6 +810,19 @@ class SQLiteStore:
             ]
             if not live:
                 return []
+            # 同一文本多行时（比如“包子”既有 BOOS 确认版、又有推断版），
+            # 只留一行进检索：确认版优先、再按最新；未确认版不再占名额
+            # （2026-11-21 网页测第二轮 #2：确认过的记忆不能输给推断版）。
+            # live 已按 created_at 倒序：同文本先出现的是最新的。
+            _by_text = {}
+            for m in live:
+                key = m["text"] or ""
+                prev = _by_text.get(key)
+                if prev is None:
+                    _by_text[key] = m
+                elif m["user_confirmed"] and not prev["user_confirmed"]:
+                    _by_text[key] = m
+            live = list(_by_text.values())
             wide_k = max(top_k * 4, top_k)
             qvec = self._embed_text(query)
             candidates = {}
@@ -792,7 +861,8 @@ class SQLiteStore:
                     continue
                 kw = _keyword_overlap(query, text)
                 sem_scored.append((cos, 0.6 * cos + 0.4 * kw, m))
-            sem_scored.sort(key=lambda item: -item[0])
+            # 同分时确认优先（#2）：余弦相等时确认行在语义路里先占位。
+            sem_scored.sort(key=lambda item: (-item[0], 0 if item[2]["user_confirmed"] else 1))
             for m in verbatim_first:
                 if m["text"] in seen_texts:
                     continue
@@ -812,7 +882,13 @@ class SQLiteStore:
                 try:
                     docs = [{"id": m["id"], "text": m["text"] or ""} for m in live]
                     exact_ids = set(_bm25.extract_exact_matches(query, docs))
-                    for hit in _bm25.bm25_search(query, docs, top_k=wide_k):
+                    # 同分时确认优先（#2）：BM25 分完全相等时确认行在路里先占位，
+                    # 否则 RRF 会把后加的推断行排到确认行前面（live 是倒序）。
+                    _bm25_hits = sorted(
+                        _bm25.bm25_search(query, docs, top_k=wide_k),
+                        key=lambda h: (-h["score"], 0 if (by_id.get(h["id"]) or {}).get("user_confirmed") else 1),
+                    )
+                    for hit in _bm25_hits:
                         doc_id = hit["id"]
                         m = by_id.get(doc_id)
                         if m is None:
@@ -853,6 +929,8 @@ class SQLiteStore:
                     1 if item.get("exact_match") else 0,
                     (item.get("_rrf") or 0) * (item.get("decay_weight") or 0)
                     * (item.get("_type_weight") or 1.0),
+                    # 确认优先只当平局裁决（#2）：同分时确认过的排前面。
+                    1 if item.get("confirmed") else 0,
                 ),
                 reverse=True,
             )
@@ -1055,7 +1133,60 @@ class SQLiteStore:
         return []
 
     def deletion_scope(self, memory_id):
-        return {"scope": "single", "memory_id": memory_id}
+        """删除范围预览（2026-11-21 网页测第二轮 #6）：真查库，不是桩。
+
+        和 mem0_store.deletion_scope 一样的形状：found、memory{id,text,metadata}、
+        history_entries/history_count（该条的账本事件）、in_scope/out_of_scope。
+        找不到时 found=False（调用方按 404 处理，见 web/server.py）。
+        memory_id 既可以是 SQLite 的 id，也可以是账本 key（delete_memory
+        同款两路查找）。
+        """
+        if not memory_id:
+            return {"scope": "single", "memory_id": memory_id, "found": False}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, text, metadata_json, created_at FROM memories"
+                " WHERE id=? AND voided=0 AND deleted=0",
+                (memory_id,),
+            ).fetchone()
+            key = memory_id
+            if row is None:
+                state = self.ledger_state()
+                rec = next(
+                    (r for r in (state or {}).get("adds") or [] if r.get("key") == memory_id),
+                    None,
+                )
+                key_states = (state or {}).get("key_states") or {}
+                if rec is None or key_states.get(memory_id) == _ledger.LEDGER_STATE_DELETED:
+                    return {"scope": "single", "memory_id": memory_id, "found": False}
+                memory = {
+                    "id": memory_id,
+                    "text": rec.get("text") or "",
+                    "metadata": rec.get("meta") or {},
+                }
+            else:
+                memory = {
+                    "id": row[0],
+                    "text": row[1],
+                    "metadata": json.loads(row[2] or "{}"),
+                }
+            history = []
+            try:
+                for event in _ledger.read_events(self.ledger_path):
+                    if (event or {}).get("key") == key or (event or {}).get("memory_id") == key:
+                        history.append(event)
+            except Exception:
+                logger.warning("删除范围读账本历史失败。", exc_info=True)
+            return {
+                "scope": "single",
+                "memory_id": memory_id,
+                "found": True,
+                "memory": memory,
+                "history_entries": history,
+                "history_count": len(history),
+                "in_scope": [memory],
+                "out_of_scope": [],
+            }
 
     def pending_notices(self):
         return []
