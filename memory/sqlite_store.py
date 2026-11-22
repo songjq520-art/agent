@@ -1106,25 +1106,39 @@ class SQLiteStore:
             # verbatim；_supersede_row 的目标就是这条已有记录。
             existing_id = None
             existing_meta = None
+            existing_text = None
             for _row in self._conn.execute(
                 "SELECT id, text, metadata_json FROM memories WHERE voided=0"
-                " AND deleted=0 AND superseded=0"
+                " AND deleted=0 AND superseded=0 AND id != ?",
+                (old_id,),
             ).fetchall():
                 if _normalize_memory_text(_row[1] or "") == _normalize_memory_text(new_fact):
                     existing_id = _row[0]
+                    existing_text = _row[1] or ""
                     existing_meta = json.loads(_row[2] or "{}")
                     break
             if existing_id is not None:
-                existing_meta["last_used_at"] = _now_iso()
-                if existing_meta.get("decay_state") in (
+                revived = existing_meta.get("decay_state") in (
                     _decay.DECAY_STATE_DORMANT, _decay.DECAY_STATE_DELETE_DUE,
-                ):
+                )
+                existing_meta["last_used_at"] = _now_iso()
+                if revived:
                     existing_meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
                 self._conn.execute(
                     "UPDATE memories SET metadata_json=? WHERE id=?",
                     (json.dumps(existing_meta, ensure_ascii=False), existing_id),
                 )
-                self._conn.commit()
+                if revived:
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {"type": _ledger.LEDGER_EVENT_REVIVE,
+                             "memory_id": existing_id, "key": existing_id,
+                             "text": existing_text},
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning("复活记账失败。", exc_info=True)
                 new_key = existing_id
             else:
                 created_at = _now_iso()
