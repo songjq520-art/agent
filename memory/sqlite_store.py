@@ -1082,6 +1082,8 @@ class SQLiteStore:
         回执。纠错是追加式——旧记忆不改原文、不删：新说法当一条新记忆
         存（来源 user、已确认），账本记 supersede，旧行标 superseded=1。
         same_text 时新说法和旧的一样，不用重存：只记一笔出现。
+        库里已有和新说法相同的活记忆时直接复用那条（刷新 last_used_at，
+        dormant / delete_due 改回 verbatim），不再新插，防重复行。
         layer 哪一层定的（mem0 同款词）：exact（原样对上）/ single
         （单候选过安全网）；调用方显式传，不从 same_text 推。
         """
@@ -1098,50 +1100,77 @@ class SQLiteStore:
                     "layer": layer, "resolution": resolution or "exact",
                     "audit": audit or {"source": "user", "method": "unchanged"},
                 }
-            created_at = _now_iso()
-            write_seq = _next_write_seq()
-            today = _shanghai_today().isoformat()
-            metadata = {
-                "source": source,
-                "confidence": 1.0,
-                "user_confirmed": True,
-                "created_at": created_at,
-                "write_seq": write_seq,
-                "turn_id": None,
-                "slot": (old_meta or {}).get("slot"),
-                "is_rule": bool((old_meta or {}).get("is_rule")),
-                "curated": bool((old_meta or {}).get("curated")),
-                "decay_kind": _decay.classify_decay_kind(
-                    source, False, bool((old_meta or {}).get("is_rule"))
-                ),
-                "importance": (old_meta or {}).get("importance", "normal"),
-                "event_date": resolve_event_date(new_fact),
-                "last_used_at": created_at,
-                "decay_state": _decay.DECAY_STATE_VERBATIM,
-            }
-            dates, sessions, _added = _decay.record_seen_occurrence(None, None, today, None)
-            metadata["seen_dates"] = _decay._dump_seen_list(dates)
-            metadata["seen_sessions"] = _decay._dump_seen_list(sessions)
-            try:
-                new_key = self._append_new_memory(new_fact, metadata)
-            except Exception:
-                return {
-                    "status": "failed", "memory_id": old_id,
-                    "old_text": old_text, "new_text": new_fact,
-                    "candidates": candidates or [],
-                    "reason": "新记忆写入失败", "layer": "none",
-                    "resolution": resolution or "failed",
-                    "audit": audit or {"source": source, "method": "correct_memory"},
+            # 库里已有和新说法相同的活记忆时直接复用，不再新插一条
+            #（否则新旧说法同时在库里时会留下两条一样的活记录）。
+            # 复用时刷新 last_used_at，dormant / delete_due 顺便改回
+            # verbatim；_supersede_row 的目标就是这条已有记录。
+            existing_id = None
+            existing_meta = None
+            for _row in self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories WHERE voided=0"
+                " AND deleted=0 AND superseded=0"
+            ).fetchall():
+                if _normalize_memory_text(_row[1] or "") == _normalize_memory_text(new_fact):
+                    existing_id = _row[0]
+                    existing_meta = json.loads(_row[2] or "{}")
+                    break
+            if existing_id is not None:
+                existing_meta["last_used_at"] = _now_iso()
+                if existing_meta.get("decay_state") in (
+                    _decay.DECAY_STATE_DORMANT, _decay.DECAY_STATE_DELETE_DUE,
+                ):
+                    existing_meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
+                self._conn.execute(
+                    "UPDATE memories SET metadata_json=? WHERE id=?",
+                    (json.dumps(existing_meta, ensure_ascii=False), existing_id),
+                )
+                self._conn.commit()
+                new_key = existing_id
+            else:
+                created_at = _now_iso()
+                write_seq = _next_write_seq()
+                today = _shanghai_today().isoformat()
+                metadata = {
+                    "source": source,
+                    "confidence": 1.0,
+                    "user_confirmed": True,
+                    "created_at": created_at,
+                    "write_seq": write_seq,
+                    "turn_id": None,
+                    "slot": (old_meta or {}).get("slot"),
+                    "is_rule": bool((old_meta or {}).get("is_rule")),
+                    "curated": bool((old_meta or {}).get("curated")),
+                    "decay_kind": _decay.classify_decay_kind(
+                        source, False, bool((old_meta or {}).get("is_rule"))
+                    ),
+                    "importance": (old_meta or {}).get("importance", "normal"),
+                    "event_date": resolve_event_date(new_fact),
+                    "last_used_at": created_at,
+                    "decay_state": _decay.DECAY_STATE_VERBATIM,
                 }
-            if new_key is None:
-                return {
-                    "status": "failed", "memory_id": old_id,
-                    "old_text": old_text, "new_text": new_fact,
-                    "candidates": candidates or [],
-                    "reason": "账本写失败", "layer": "none",
-                    "resolution": resolution or "failed",
-                    "audit": audit or {"source": source, "method": "correct_memory"},
-                }
+                dates, sessions, _added = _decay.record_seen_occurrence(None, None, today, None)
+                metadata["seen_dates"] = _decay._dump_seen_list(dates)
+                metadata["seen_sessions"] = _decay._dump_seen_list(sessions)
+                try:
+                    new_key = self._append_new_memory(new_fact, metadata)
+                except Exception:
+                    return {
+                        "status": "failed", "memory_id": old_id,
+                        "old_text": old_text, "new_text": new_fact,
+                        "candidates": candidates or [],
+                        "reason": "新记忆写入失败", "layer": "none",
+                        "resolution": resolution or "failed",
+                        "audit": audit or {"source": source, "method": "correct_memory"},
+                    }
+                if new_key is None:
+                    return {
+                        "status": "failed", "memory_id": old_id,
+                        "old_text": old_text, "new_text": new_fact,
+                        "candidates": candidates or [],
+                        "reason": "账本写失败", "layer": "none",
+                        "resolution": resolution or "failed",
+                        "audit": audit or {"source": source, "method": "correct_memory"},
+                    }
             try:
                 self._supersede_row(old_id, old_text, old_meta, new_key, new_fact)
             except Exception:
@@ -1184,19 +1213,19 @@ class SQLiteStore:
         with self._lock:
             new_fact = (new_fact or "").strip()
             old_fact = (old_fact or "").strip()
-            candidates = self._find_correction_candidates(
-                old_fact, new_fact=new_fact,
-                exclude_identical_to_new=exclude_identical_to_new,
-            )
             if _contains_sensitive(new_fact):
                 return {
                     "status": "failed", "memory_id": None,
                     "old_text": old_fact, "new_text": new_fact,
-                    "candidates": candidates,
+                    "candidates": [],
                     "reason": "新说法含敏感信息", "layer": "none",
                     "resolution": "blocked",
                     "audit": {"source": "user", "method": "correct_memory"},
                 }
+            candidates = self._find_correction_candidates(
+                old_fact, new_fact=new_fact,
+                exclude_identical_to_new=exclude_identical_to_new,
+            )
             if not candidates:
                 if _normalize_memory_text(old_fact) == _normalize_memory_text(new_fact):
                     # 新旧说法相同：候选过滤已跳过与新说法相同的条目；库里
@@ -1794,6 +1823,16 @@ class SQLiteStore:
                         "UPDATE memories SET metadata_json=? WHERE id=?",
                         (json.dumps(meta, ensure_ascii=False), row[0]),
                     )
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {"type": _ledger.LEDGER_EVENT_REVIVE,
+                             "memory_id": row[0], "key": row[0],
+                             "text": row[1] or ""},
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning("复活记账失败。", exc_info=True)
             self._conn.commit()
         return {"dormant": dormant, "delete_due": delete_due}
 
