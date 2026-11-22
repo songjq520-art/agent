@@ -341,6 +341,76 @@ def test_save_turn_correction_not_found_saves_new_fact(store):
     assert _live_texts(store) == ["我住上海"]
 
 
+def test_save_turn_same_turn_id_returns_cached_receipt_with_correction(store):
+    """根因 a（2026-11-22）：同一 turn_id 调两次 save_turn，第二次返回
+    上次的回执（含 correction），不重复存、纠正结果不丢。"""
+    store.save_turn(
+        [{"role": "user", "content": "我住北京"}], turn_id="t-dup-corr-1",
+    )
+    first = store.save_turn(
+        [{"role": "user", "content": "你记错了，我住上海"}],
+        turn_id="t-dup-corr-2",
+    )
+    assert (first.get("correction") or {}).get("status") == "updated"
+    second = store.save_turn(
+        [{"role": "user", "content": "你记错了，我住上海"}],
+        turn_id="t-dup-corr-2",
+    )
+    assert second.get("duplicate_turn") is True
+    assert (second.get("correction") or {}).get("status") == "updated"
+    assert _live_texts(store) == ["我住上海"]
+
+
+def test_save_turn_ambiguous_correction_still_stores_new_fact(store):
+    """根因 c（2026-11-22）：纠正判 ambiguous 时，新说法仍当新事实存下来，
+    回执里 correction 状态照实是 ambiguous（不是 updated，也不是丢了）。"""
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    store.add_memory_text("我喜欢吃冒菜", source="inferred")
+    r = store.save_turn(
+        [{"role": "user", "content": "不对，我喜欢吃米线"}],
+        turn_id="t-amb-new",
+    )
+    assert (r.get("correction") or {}).get("status") == "ambiguous"
+    assert "我喜欢吃米线" in _live_texts(store)
+    assert "我喜欢吃火锅" in _live_texts(store)
+    assert "我喜欢吃冒菜" in _live_texts(store)
+
+
+def _tea_fake_embed(self, text):
+    """测试用假向量：茶类（红/绿/花）同向，其余正交。"""
+    if any(word in (text or "") for word in ("红茶", "绿茶", "花茶")):
+        return [1.0, 0.1]
+    return [0.0, 1.0]
+
+
+def test_correct_memory_multi_candidate_filters_by_similarity(store, monkeypatch):
+    """根因 b（2026-11-22）：多候选时按相似度筛——只留 ≥0.70 的；
+    筛后剩 1 条就取代它，不再一刀切判 ambiguous。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _tea_fake_embed)
+    store.add_memory_text("我喜欢喝红茶", source="inferred")
+    store.add_memory_text("我喜欢喝咖啡", source="inferred")
+    store.add_memory_text("我喜欢吃包子", source="inferred")
+    store.add_memory_text("我喜欢去爬山", source="inferred")
+    out = store.correct_memory("我喜欢喝绿茶", "我喜欢喝绿茶")
+    assert out.get("status") == "updated"
+    assert out.get("old_text") == "我喜欢喝红茶"
+    assert len(out.get("candidates") or []) >= 2  # 确实走了多候选那条路
+    assert "我喜欢喝绿茶" in _live_texts(store)
+    assert "我喜欢喝红茶" not in _live_texts(store)
+    assert "我喜欢喝咖啡" in _live_texts(store)
+
+
+def test_correct_memory_multi_candidate_all_high_similarity_is_ambiguous(store, monkeypatch):
+    """根因 b：多条候选都 ≥0.70 时仍判 ambiguous，不猜改哪条。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _tea_fake_embed)
+    store.add_memory_text("我喜欢喝红茶", source="inferred")
+    store.add_memory_text("我喜欢喝花茶", source="inferred")
+    out = store.correct_memory("我喜欢喝绿茶", "我喜欢喝绿茶")
+    assert out.get("status") == "ambiguous"
+    assert len(out.get("candidates") or []) == 2
+    assert set(_live_texts(store)) == {"我喜欢喝红茶", "我喜欢喝花茶"}
+
+
 # ---------- 7. BM25 + RRF 融合检索（第二步第一段，2026-11-21） ----------
 # 旧逻辑：memory/bm25.py + mem0_store.py search（commit 7a69699）：
 # 宽召回（语义 top_k*4 + BM25 全库 top_k*4）→ 标准 RRF k=60 融合 →
@@ -633,6 +703,25 @@ def test_delete_memory_supports_ledger_only_key_and_rejects_missing(store):
         "deleted": False,
         "reason": "not_found",
     }
+
+
+def test_revive_memory_restores_superseded_row(store):
+    """被错取代的记忆能恢复：revive 后行重新变活，账本里有一笔 REVIVE 事件。"""
+    added = store.add_memory_text("我住广州", source="user")
+    gid = added.get("id")
+    assert gid
+    out = store.correct_memory("我住广州", "我住杭州")
+    assert out.get("status") == "updated"
+    assert "我住广州" not in _live_texts(store)
+    revived = store.revive_memory(gid)
+    assert revived.get("status") == "revived"
+    assert revived.get("seq") is not None
+    assert "我住广州" in _live_texts(store)
+    assert "我住杭州" in _live_texts(store)
+    lines = _ledger_lines(store)
+    assert any('"type": "revive"' in line for line in lines)
+    assert store.revive_memory(gid).get("status") == "unchanged"
+    assert store.revive_memory("no-such-id").get("status") == "not_found"
 
 
 def test_save_turn_correction_utterance_goes_through_correction(store):

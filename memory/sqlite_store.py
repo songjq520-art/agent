@@ -26,6 +26,7 @@
 #   - 撤回目前只认光秃秃的“不不不/算了”这类整句信号，带后半句的撤回
 #     （要模型判意图）还没接，用时会先存下来、再由 BOOS 删，不悄悄丢。
 
+import copy
 import hashlib
 import json
 import logging
@@ -338,6 +339,7 @@ class SQLiteStore:
         self._embedder = None
         self._embedder_failed = False
         self._seen_turn_ids = set()
+        self._turn_receipts = {}
         self._last_context_ids = []
         self._last_stored_turn_id = None
 
@@ -1092,13 +1094,21 @@ class SQLiteStore:
         没有“提取返回空就当成功”。调完这个函数，事实要么在账本里、
         要么在回执里写明为什么没存——绝不悄悄丢。
         同一个 turn_id 只存一次（web 的 ask() 和 run_question() 会各调
-        一次，第二次直接返回上次的回执，不重复存）。
+        一次，第二次直接返回上次的回执（含 correction），不重复存）。
         """
         # 没传 turn_id 时生成内部兜底 ID（2026-11-21 Gemini 第三轮）：多句轮次的
         # 每句都带同一个 turn_id，撤回才能整轮作废，否则退化成只作废最后 1 条。
         # _next_write_seq() 进程内严格递增，每次调用都不同，去重逻辑不受影响。
         turn_id = turn_id or f"auto-{_next_write_seq()}"
         if turn_id and turn_id in self._seen_turn_ids:
+            # 根因 a（2026-11-22）：第二次调用不能只回一个空去重回执——
+            # 上次的回执（含 correction）要原样还给调用方，否则纠正结果
+            # 在第二次调用里丢了，页面拿不到 correction 键。
+            cached = self._turn_receipts.get(turn_id)
+            if cached is not None:
+                receipt = copy.deepcopy(cached)
+                receipt["duplicate_turn"] = True
+                return receipt
             return {"turn_id": turn_id, "duplicate_turn": True, "results": []}
         if turn_id:
             self._seen_turn_ids.add(turn_id)
@@ -1117,21 +1127,25 @@ class SQLiteStore:
             "results": [],
         }
         if not (latest_user or "").strip():
+            self._turn_receipts[turn_id] = copy.deepcopy(receipt)
             return receipt
         # 撤回：光秃秃的整句信号，把上一轮刚存的那条作废（软删进账本）。
         if latest_user.strip().rstrip("。！？.!?") in _BARE_RETRACTION:
             dropped = self._void_last_stored()
             receipt["retracted"] = True
             receipt["dropped_count"] = dropped
+            self._turn_receipts[turn_id] = copy.deepcopy(receipt)
             return receipt
         today = _shanghai_today()
         # 聊天纠错（2026-11-22 correct_memory 接线）：本轮最后一条 user 消息
         # 里有明确纠错说法时（见 correction_text._detect_correction），先调
         # correct_memory 改旧记忆，结果放进回执的 "correction" 键（web 层
         # 已经在读这个键，供页面展示，见 web/server.py）。
-        #   updated/unchanged/ambiguous/failed：纠错已处理，新说法不再当
-        #     事实重存，只处理纠错句之外的部分；
-        #   not_found：没找到要改的旧记忆，新说法当新记忆存下来。
+        #   updated/unchanged/failed：纠错已处理，新说法不再当事实重存，
+        #     只处理纠错句之外的部分；
+        #   not_found/ambiguous：没找着旧记忆、或分不清改哪条时，新说法
+        #     不能丢——当新事实存下来（根因 c，2026-11-22）；ambiguous
+        #     的状态照实留在回执里，旧的没被取代。
         # 没纠错时走正常逐句循环，原来的键不动。
         correction = None
         sentences = _split_sentences(latest_user)
@@ -1174,8 +1188,10 @@ class SQLiteStore:
                                 (correction or {}).get("memory_id"), slot
                             )
                     kept = _strip_correction_sentences(latest_user)
-                    if (correction or {}).get("status") == "not_found":
-                        # 没找到旧记忆：新说法当新记忆存（带上纠错句之外的部分）。
+                    if (correction or {}).get("status") in ("not_found", "ambiguous"):
+                        # 没找到旧记忆 / 分不清改哪条：新说法当新记忆存
+                        # （带上纠错句之外的部分）。根因 c：ambiguous 时
+                        # 以前这里直接丢了新说法，S4 的摩托车就是这么丢的。
                         # 逐句循环里的槽位更新还会再拦一次（同槽位旧值在时
                         # 替它走 correct_memory，不并存两条）。
                         sentences = kept + [fact]
@@ -1284,6 +1300,7 @@ class SQLiteStore:
                 # 下一句“撤回”作废的是这条新记忆，不是上一轮的。
                 with self._lock:
                     self._last_stored_turn_id = turn_id
+        self._turn_receipts[turn_id] = copy.deepcopy(receipt)
         return receipt
 
     def _find_correction_candidates(self, old_fact, new_fact=None, top_k=10,
@@ -1406,6 +1423,25 @@ class SQLiteStore:
             else:
                 out.append({"id": cand, "text": str(cand)})
         return out
+
+    def _candidate_similarity(self, memory_id, new_fact):
+        """一条候选旧记忆和新说法的余弦相似度（根因 b 的筛子）。
+
+        优先用库里存着的向量，没有再现算；算不出来返回 None（调用方
+        按“算不出来”处理，不当 0 分用——0 分会把候选错误地筛掉）。
+        """
+        row = self._conn.execute(
+            "SELECT text, embedding FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            old_vec = _blob_to_vector(row[1])
+            if old_vec is None:
+                old_vec = self._embed_text(row[0])
+            return _cosine(old_vec, self._embed_text(new_fact))
+        except Exception:
+            return None
 
     def _apply_correction_result(self, new_fact, old_id, old_text, old_meta,
                                  *, same_text, candidates, status="updated",
@@ -1553,7 +1589,10 @@ class SQLiteStore:
         旧说法原样在库里 → 直接改那条；
         只有一条候选 → 过相似度安全网（余弦 ≥ 0.70 才改，否则 ambiguous，
         免得改错不相干的记忆；向量算不出来时跳过安全网，交由调用方兜底）；
-        多条候选、没有原样 → ambiguous（不猜，留给调用方问）；
+        多条候选、没有原样 → 先按相似度筛（根因 b，2026-11-22）：只留
+        与新说法相似度 ≥ 0.70 的；筛后剩 1 条就按单候选走，剩 0 条报
+        not_found，仍剩多条再报 ambiguous；向量算不出来时不筛，直接
+        ambiguous（不猜，留给调用方问）；
         一条没有 → not_found（调用方按新记忆存）；
         新说法和旧的一样 → unchanged；新说法含敏感信息 → failed。
         纠错是追加式（整合方案）：旧记忆不改原文、不删，记 supersede，
@@ -1629,17 +1668,56 @@ class SQLiteStore:
                     resolution="exact", layer="exact",
                     audit={"source": "user", "method": "exact_match"},
                 )
+            # 多条候选、没有原样：先按相似度筛（根因 b，2026-11-22）——
+            # 0.4 的召回线太宽，“我喜欢…”这种短句会召回一堆无关行；
+            # 只留与新说法相似度 ≥ 0.70 的（沿用已有的安全网标准）。
+            # 向量算不出来（sim 是 None）时不筛：宁可 ambiguous 问
+            # BOOS，也不凭空猜。
+            chosen = None
             if len(candidates) > 1:
-                return {
-                    "status": "ambiguous", "memory_id": None,
-                    "old_text": old_fact, "new_text": new_fact,
-                    "candidates": self._candidates_with_text(candidates),
-                    "reason": "多条候选，无法确定改哪一条",
-                    "layer": "none", "resolution": "ambiguous",
-                    "audit": {"source": "user", "method": "correct_memory"},
-                }
-            # 只有一条候选：过相似度安全网。
-            mid = candidates[0]
+                scored = [
+                    (mid, self._candidate_similarity(mid, new_fact))
+                    for mid in candidates
+                ]
+                high = [
+                    mid for mid, sim in scored
+                    if sim is not None and sim >= _CORRECTION_TOPIC_MIN_SIMILARITY
+                ]
+                unknown = [mid for mid, sim in scored if sim is None]
+                if len(high) >= 2:
+                    return {
+                        "status": "ambiguous", "memory_id": None,
+                        "old_text": old_fact, "new_text": new_fact,
+                        "candidates": self._candidates_with_text(high),
+                        "reason": "多条候选与新说法相似度都 ≥ 0.70，无法确定改哪一条",
+                        "layer": "none", "resolution": "ambiguous",
+                        "audit": {"source": "user", "method": "correct_memory"},
+                    }
+                if len(high) == 1 and not unknown:
+                    chosen = high[0]
+                elif len(high) == 0 and not unknown:
+                    best = max(sim for _mid, sim in scored)
+                    return {
+                        "status": "not_found", "memory_id": None,
+                        "old_text": old_fact, "new_text": new_fact,
+                        "candidates": self._candidates_with_text(candidates),
+                        "reason": "候选与新说法相似度均低于 0.70（最高 %.2f），未找到可纠正的记忆" % best,
+                        "layer": "none", "resolution": "not_found",
+                        "audit": {"source": "user", "method": "correct_memory"},
+                    }
+                else:
+                    return {
+                        "status": "ambiguous", "memory_id": None,
+                        "old_text": old_fact, "new_text": new_fact,
+                        "candidates": self._candidates_with_text(candidates),
+                        "reason": "多条候选，无法确定改哪一条",
+                        "layer": "none", "resolution": "ambiguous",
+                        "audit": {"source": "user", "method": "correct_memory"},
+                    }
+            else:
+                chosen = candidates[0]
+            # 单条候选（或多候选筛后只剩 1 条）：过相似度安全网。
+            mid = chosen
             row = self._conn.execute(
                 "SELECT text, metadata_json, embedding FROM memories WHERE id=?", (mid,)
             ).fetchone()
@@ -2253,6 +2331,55 @@ class SQLiteStore:
             )
             self._conn.commit()
             return {"deleted": True, "memory_id": row[0]}
+
+    def revive_memory(self, memory_id):
+        """恢复一条被取代的记忆（2026-11-22，广州行被杭州错取代后恢复用）。
+
+        只恢复 superseded=1 的行：SQLite 取消取代标记，账本记一笔 REVIVE
+        事件（账本是真相源；只改 SQLite 会被对账逻辑弄乱——对账按账本
+        的 key_states 认，REVIVE 事件把该 key 拨回 current）。
+        已经是活记忆时报 unchanged；行不存在、或已删除/已作废时报
+        not_found（删了的恢复走别的路，不在这里顺手复活）。
+        账本写失败时把 SQLite 的标记撤回来再报 failed，两边保持一致。
+        """
+        if not memory_id:
+            return {"status": "not_found", "memory_id": memory_id}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, text, superseded, voided, deleted FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"status": "not_found", "memory_id": memory_id}
+            if row[3] or row[4]:
+                return {"status": "not_found", "memory_id": memory_id,
+                        "reason": "已作废或已删除的记忆不能这样恢复"}
+            if not row[2]:
+                return {"status": "unchanged", "memory_id": row[0],
+                        "text": row[1] or ""}
+            self._conn.execute(
+                "UPDATE memories SET superseded=0 WHERE id=?", (row[0],)
+            )
+            self._conn.commit()
+            try:
+                event = _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_REVIVE,
+                     "memory_id": row[0], "key": row[0],
+                     "text": row[1] or ""},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                self._conn.execute(
+                    "UPDATE memories SET superseded=1 WHERE id=?", (row[0],)
+                )
+                self._conn.commit()
+                logger.warning("恢复记账失败：取代标记已撤回。", exc_info=True)
+                return {"status": "failed", "memory_id": row[0],
+                        "reason": "账本写失败"}
+            return {"status": "revived", "memory_id": row[0],
+                    "text": row[1] or "",
+                    "seq": (event or {}).get("seq")}
 
     def confirm_memory(self, memory_id):
         with self._lock:

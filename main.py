@@ -909,8 +909,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # （save_turn 内部已把异常吞掉，只记日志；后台线程里的失败也一样）。
     # 26 号：save_turn 是后台存——回答先回、记忆后存；纠错/撤回的轮次
     # 在 save_turn 里自动走同步（结果要立刻告诉 BOOS）。
-    # 注意：这是每轮唯一一次 save_turn——chat_loop 和网页服务都不再
-    # 另外调（run_question 已存过，重复调等于每轮多付几次提取费用）。
+    # 注意：网页服务那条路每轮会调两次 save_turn——run_question 这里一次、
+    # ask() 收尾一次，同一 turn_id；第二次直接返回上次的回执（含
+    # correction），不重复存。chat_loop 不再另外调（run_question 已存过，
+    # 重复调等于每轮多付几次提取费用）。
     # 只带最近 6 条（约 3 轮）：每轮都把全部历史发去提取又贵又慢，
     # 最近的就够提取理解本轮了；和网页服务（web/server.py）一致。
     # 聊天纠错：add_turn 里已经改好/问好了，这里只把结果用人话告诉
