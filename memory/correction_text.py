@@ -12,17 +12,61 @@ from memory.redaction import _normalize_memory_text
 # “我不是”后面必须跟一个替换说法（“而是/其实是/，新说法”），
 # 否则不触发（见 _detect_correction）。
 
-# _CORRECTION_PHRASES（纠错说法）：只认这六个明确的说法。
-# “记错了”不带“你”也认（“不是，记错了，我住广州”）；分隔符规则会
-# 拦住“我昨天记错了开会时间”这种正常陈述（“记错了”前面是“天”，
-# 不是分隔符，不触发）。
-_CORRECTION_PHRASES = ("你记错了", "记错了", "不对", "纠正一下", "其实是", "我不是")
+# _CORRECTION_PHRASES（纠错说法，2026-11-22 通用纠正）：认“用户在说之前
+# 那个说法不对、现在改成这样”这个意思，不只认“不对”两个字。
+# 分三档——
+# - 否定句式（“不是/我不是”）：新说法在“而是/其实是”后面，或第一个
+#   逗号后面；句中（“我住深圳，不是北京”）时新说法在“不是”前面；
+# - 指令式（“改一下/更正/纠正一下”）：后面必须跟一个像事实的新说法，
+#   光秃秃一个短名词（“改一下名字”）是指令，不是纠正；
+# - 其余：说法后面那句就是新说法（“我现在住深圳了”里“住深圳了”前面
+#   补一个“我”，拼回整句；“不对，应该是深圳”里先剥掉“应该是”）。
+_CORRECTION_PHRASES = (
+    "你记错了", "我之前说错了", "之前说错了", "我之前记错了", "之前记错了",
+    "刚才说错了", "刚才记错了", "记错了", "说错了", "搞错了",
+    "纠正一下", "更正一下", "更正", "改一下",
+    "不对", "错了", "我不是", "不是", "其实是", "其实", "应该是",
+    "我现在", "搬到", "搬去", "换成",
+)
+
+# _CORRECTION_NEGATION（否定句式）：见上。
+_CORRECTION_NEGATION = ("不是", "我不是")
+
+# _CORRECTION_INSTRUCTION（指令式说法）：后面跟的新说法必须像事实
+# （够长，或带一个事实动词），不然只是个指令对象（“改一下名字”）。
+_CORRECTION_INSTRUCTION = ("改一下", "更正一下", "更正", "纠正一下")
+
+# _CORRECTION_FACT_VERBS（事实动词）：指令式说法后面认新说法时用。
+_CORRECTION_FACT_VERBS = (
+    "住", "在", "是", "喜欢", "爱", "叫", "吃", "喝", "去", "有",
+    "会", "能", "要", "想", "做", "买", "定", "看", "听", "玩",
+    "用", "开", "回", "来",
+)
+
+# _CORRECTION_WEAK（弱信号说法）：“其实/其实是/应该是/我现在/搬到/
+# 搬去/换成”本身也常出现在普通陈述里（“其实我喜欢用 Go 写代码”只是
+# 在说一个新喜好，不是在改旧说法），所以多两道收紧：
+# - “我现在”只认“……了”（状态变了），不认“现在喜欢……”这种现状陈述；
+# - 弱信号后面跟的新说法不能以否定/让步开头（“也不是很喜欢吃”只是在
+#   否定，不是在给替换说法），强信号（“不对/不是/错了……”）不受这条限。
+_CORRECTION_WEAK = ("其实", "其实是", "应该是", "我现在", "搬到", "搬去", "换成")
+
+# _CORRECTION_FACT_PREFIXES（新说法句首的引导词）：“不对，应该是深圳”
+# 里新说法是“应该是深圳”——引导词剥掉剩“深圳”，再由调用方按槽位
+# 补成整句（见 sqlite_store._complete_correction_fragment）。
+_CORRECTION_FACT_PREFIXES = ("应该是", "其实是", "其实")
 
 # _CORRECTION_SEPARATORS（纠错说法前面能跟的分隔符）：纠错说法必须在
 # 句首，或在句号/逗号/换行之后——比如“我喜欢科幻电影。不对，我喜欢
 # 纪录片。”这种一句里先肯定后纠正的也认；但“我觉得不对劲”里的
 # “不对”前面是“得”，不是分隔符，不认。
 _CORRECTION_SEPARATORS = set("。！？；\n，、： ")
+
+# _CORRECTION_ALLOWED_BEFORE（纠错说法前面能跟的字）：分隔符，或人称
+# 代词——“我记错了，我住深圳”里“记错了”前面是“我”，以前的分隔符
+# 规则把它拦掉了（只认句首或分隔符之后）；“我昨天记错了开会时间”
+# 里“记错了”前面是“天”，还是不认。
+_CORRECTION_ALLOWED_BEFORE = _CORRECTION_SEPARATORS | set("我你他她它这那")
 
 # _BUDUI_BOUNDARY（“不对”后面能跟的字）：“不对”后面必须是个边界，
 # 不然可能是“不对劲/不对头”这种词的一部分——“不对劲，我先走了”
@@ -37,18 +81,92 @@ _CHINESE_NUMERALS = {
     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
 }
 
+# 单值属性槽（2026-11-22 通用纠正 · 隐式更新）：一句话里只能有一个值的
+# 属性——住处、名字。同一槽位出现不同值时，新值取代旧值；没说纠正词
+# 只是直接说了新事实时也一样（“我住北京”在库、“我住深圳”新说 →
+# 深圳取代北京，不并存）。故意收得窄：只认这三个槽，喜欢/爱吃这类
+# 能同时是真的偏好不算槽位冲突（“喜欢喝茶”和“喜欢喝咖啡”可以并存）。
+# 放在这里（而不是 sqlite_store.py）是因为 _detect_correction 也要用它
+# 给“我现在”划界：纯正则，不引别的模块，不循环依赖。
+_SLOT_PATTERNS = (
+    ("residence", re.compile(r"我住(?:在)?([^，。！？、\s]+)")),
+    ("residence", re.compile(r"我家在([^，。！？、\s]+)")),
+    ("residence", re.compile(r"住在([^，。！？、\s]+)")),
+    ("residence", re.compile(r"搬到([^，。！？、\s]+)")),
+    ("residence", re.compile(r"搬去([^，。！？、\s]+)")),
+    ("user_name", re.compile(r"我叫([^，。！？、\s]+)")),
+    ("user_name", re.compile(r"我的名字是([^，。！？、\s]+)")),
+    ("user_name", re.compile(r"我的名字叫([^，。！？、\s]+)")),
+    ("agent_name", re.compile(r"你叫(?!我)([^，。！？、\s]+)")),
+    ("agent_name", re.compile(r"助手叫([^，。！？、\s]+)")),
+)
+# 槽位值末尾的语气词/助词（“深圳了”→“深圳”）。
+_SLOT_VALUE_TRAILING = "了呢啊吧哦嘛"
+# 名字值最多 12 字（和身份陈述同一条规矩）；名字值里不能有的字：带了
+# 这些就是一句动宾短语（“我叫他去买菜”），不是在起名。
+_SLOT_NAME_MAX_LEN = 12
+_SLOT_NAME_BANNED = set("去来买做吃喝看听说玩想要会能是在有和或但若如果因为所以")
+
+
+def _clean_slot_value(slot, raw):
+    """槽位值收尾：去末尾语气词；名字值再拦动宾短语、限长。
+    不合格返回 None。"""
+    value = (raw or "").strip().rstrip(_SLOT_VALUE_TRAILING).strip()
+    if not value:
+        return None
+    if value[0] in "的这那很":
+        return None
+    if slot in ("user_name", "agent_name"):
+        if len(value) > _SLOT_NAME_MAX_LEN:
+            return None
+        if any(ch in _SLOT_NAME_BANNED for ch in value):
+            return None
+    elif slot == "residence":
+        if len(value) > 20:
+            return None
+    return value
+
+
+def _infer_fact_slot(text):
+    """从一句话里认出单值属性槽（slot, value）；认不出返回 (None, None)。
+    只看句式，不猜意思——“我住 X”就是住处，“我叫 X”就是名字。"""
+    if not isinstance(text, str) or not text.strip():
+        return None, None
+    for slot, pattern in _SLOT_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        value = _clean_slot_value(slot, match.group(1))
+        if value is not None:
+            return slot, value
+    return None, None
+
+
 def _detect_correction(text):
     """从一句话里认出“纠错意图 + 新说法”。
 
     返回 {"phrase": 触发的说法, "fact": 新说法}，不是纠错时返回 None。
-    认法（保守，只认明确的）：
-    - 说法必须在句首，或在句号/逗号/换行等分隔符之后；
+    认法（2026-11-22 通用纠正：看意图，不只看“不对”两个字）：
+    - 说法必须在句首，或在分隔符/人称代词之后——“我记错了，我住深圳”
+      里“记错了”前面是“我”，以前的分隔符规则把它拦掉了；“我昨天
+      记错了开会时间”里“记错了”前面是“天”，还是不认；
     - “不对”后面必须是个边界（标点/语气词/人称），排除“不对劲”这种词；
+    - 多个说法同时出现时取最早的，同一位置取最长的（“更正一下”赢过
+      “更正”，“其实是”赢过“其实”）；
     - 新说法 = 说法后面那一句的话（到第一个句号为止），同一轮里
-      后面的句子是别的内容，不算进新说法里；
-    - “我不是 X，Y”这种否定句式：Y 才是新说法——先看“而是/其实是”，
-      没有就取第一个逗号后面的；两个都没有（比如“我不是很确定”）
-      就不是纠错，返回 None；
+      后面的句子是别的内容，不算进新说法里；句尾挂着的否定截掉
+      （“我住深圳，不是北京”→“我住深圳”）；
+    - “我不是 X，Y”/“不是 X，Y”这种否定句式：Y 才是新说法——先看
+      “而是/其实是”，没有就取第一个逗号后面的；两个都没有（比如
+      “我不是很确定”）就不是纠错，返回 None；
+    - “我住深圳，不是北京”这种句中的“不是”：新说法在“不是”前面；
+    - “我现在住深圳了”：后面是谓语，前面补“我”拼回整句；还要求
+      新说法带单值槽位（住处/名字），不带槽位的“现在……”走正常保存；
+    - “不对，应该是深圳”：新说法先剥掉“应该是”剩“深圳”，再由
+      调用方按槽位补成整句（见 sqlite_store._complete_correction_fragment）；
+    - 指令式说法（“改一下/更正/纠正一下”）后面必须跟一个像事实的新
+      说法——够长，或带一个事实动词；光秃秃一个短名词（“改一下名字”）
+      是指令，不是纠正；
     - 新说法太短（只剩一个字或空）不算纠错，走正常保存。
     例子：
     - “不对，我喜欢看纪录片。”→ fact “我喜欢看纪录片。”
@@ -56,13 +174,19 @@ def _detect_correction(text):
     - “我不是喜欢科幻电影，我喜欢纪录片。”→ fact “我喜欢纪录片。”
     - “我不是很确定”→ None（只是犹豫，没有替换说法）
     - “我觉得不对劲”→ None（“不对”是词的一部分）
+    - “我之前说错了，我住深圳”→ fact “我住深圳”
+    - “其实我住深圳”→ fact “我住深圳”
+    - “不对，应该是深圳”→ fact “深圳”
+    - “我住深圳，不是北京”→ fact “我住深圳”
+    - “我现在住深圳了”→ fact “我住深圳了”
+    - “改一下名字”→ None（指令，没有替换事实）
     """
     if not isinstance(text, str):
         return None
     text = text.strip()
     if not text:
         return None
-    best = None  # (出现位置, 说法)：多个说法同时出现时取最早的。
+    best = None  # (出现位置, -说法长度, 说法, 新说法)
     for phrase in _CORRECTION_PHRASES:
         start = 0
         while True:
@@ -70,45 +194,116 @@ def _detect_correction(text):
             if idx < 0:
                 break
             start = idx + 1
-            if idx != 0 and text[idx - 1] not in _CORRECTION_SEPARATORS:
+            if idx != 0 and text[idx - 1] not in _CORRECTION_ALLOWED_BEFORE:
                 continue
             if phrase == "不对":
                 after = text[idx + len(phrase):idx + len(phrase) + 1]
                 if after and after not in _BUDUI_BOUNDARY:
                     continue
-            if best is None or idx < best[0]:
-                best = (idx, phrase)
+            fact = _correction_fact_after(text, idx, phrase)
+            if fact is None:
+                continue
+            key = (idx, -len(phrase))
+            if best is None or key < (best[0], best[1]):
+                best = (idx, -len(phrase), phrase, fact)
             break  # 同一个说法只取第一次出现。
     if best is None:
         return None
-    idx, phrase = best
-    fact = text[idx + len(phrase):].lstrip("，,：:、；; \t")
-    if phrase == "我不是":
-        # 否定句式：新说法在“而是/其实是”后面，或在第一个逗号后面。
-        for marker in ("而是", "其实是"):
-            pos = fact.find(marker)
-            if pos >= 0:
-                fact = fact[pos + len(marker):].lstrip("，,：:、；; \t")
-                break
-        else:
-            comma = fact.find("，")
+    _idx, _neglen, phrase, fact = best
+    return {"phrase": phrase, "fact": fact}
+
+
+def _correction_fact_after(text, idx, phrase):
+    """纠错说法后面（或前面，见句中的“不是”）的那句新说法。
+
+    拿不准、没有替换说法时返回 None（调用方找下一个出现位置、或换
+    下一个说法试）。"""
+    after = text[idx + len(phrase):]
+    if phrase in _CORRECTION_NEGATION:
+        if idx == 0:
+            # 否定句式：新说法在“而是/其实是”后面，或在第一个逗号后面。
+            for marker in ("而是", "其实是"):
+                pos = after.find(marker)
+                if pos >= 0:
+                    return _clean_correction_fact(after[pos + len(marker):])
+            comma = after.find("，")
             if comma < 0:
-                comma = fact.find(",")
+                comma = after.find(",")
             if comma >= 0:
-                fact = fact[comma + 1:].lstrip(" \t")
-            else:
-                return None
+                return _clean_correction_fact(after[comma + 1:])
+            return None
+        # 句中（“我住深圳，不是北京”）：新说法在“不是”前面，取前面
+        # 最后一小句（“不对，我住深圳，不是北京”里是“我住深圳”）；
+        # 前面只是光秃秃的纠错信号（“不对，不是北京”）或又是否定时不认。
+        before = text[:idx].rstrip("，,：:、；; \t")
+        segment = re.split(r"[，,：:、；;]", before)[-1].strip()
+        if not segment or segment in ("不对", "不是", "错了", "没有", "不", "算了"):
+            return None
+        if segment.startswith(_CORRECTION_NEGATION):
+            return None
+        return _clean_correction_fact(segment) if len(segment) >= 2 else None
+    if phrase == "我现在":
+        # “我现在住深圳了”：后面是谓语（“住深圳了”），前面补“我”拼回整句。
+        # 只认“……了”（状态变了）：“我现在喜欢用 Go 写代码”只是现状陈述，
+        # 不是在改旧说法，不触发；还要求新说法带单值槽位（住处/名字）——
+        # “我现在把数据库改成 PostgreSQL 了”不是槽位事实，是模型推断的
+        # 新说法，得走待确认守卫（旧的已确认记忆不能被推断直接覆盖），
+        # 不能短路进纠正分支。
+        fact = _clean_correction_fact("我" + after)
+        if fact is None:
+            return None
+        if not fact.rstrip("。！？；，、.!?;,").endswith("了"):
+            return None
+        if _infer_fact_slot(fact)[0] is None:
+            return None
+        return fact
+    fact = _clean_correction_fact(after)
+    if fact is None:
+        return None
+    if phrase in _CORRECTION_WEAK and fact[0] in "不没也还别":
+        # 弱信号 + 否定/让步开头的新说法（“其实也不是很喜欢吃”）：
+        # 只是在否定，不是在给替换说法，不触发。
+        return None
+    if phrase in _CORRECTION_INSTRUCTION:
+        # 指令式说法：后面必须跟一个像事实的新说法——够长，或带事实动词。
+        if len(fact) < 4 and not any(v in fact for v in _CORRECTION_FACT_VERBS):
+            return None
+    return fact
+
+
+def _clean_correction_fact(raw):
+    """把纠错说法后面那截收成一句新说法：剥引导词和句首的“是”，只取
+    同一句，截掉句尾挂着的否定（“我住深圳，不是北京”→“我住深圳”）。
+    太短（只剩一个字或空）时返回 None。"""
+    fact = (raw or "").lstrip("，,：:、；; \t")
+    for prefix in _CORRECTION_FACT_PREFIXES:
+        if fact.startswith(prefix):
+            fact = fact[len(prefix):].lstrip("，,：:、；; \t")
+            break
+    if fact.startswith(("不是", "不", "没")) and "，" in fact:
+        # “不是北京，我住深圳”：否定只是陪衬，真正的新说法在逗号后面。
+        fact = fact.split("，", 1)[1].lstrip("，,：:、；; \t")
+    if fact.startswith("是") and len(fact) > 1 and fact[1] not in "的吗吧呢啊？?":
+        fact = fact[1:]
     fact = fact.strip()
-    # 新说法只取纠错说法所在的那一句——同一轮里后面的句子是别的内容，
-    # 不该被纠正的新文本吞进去（2 号：不然“我喜欢喝咖啡”会被存进
-    # 名字记忆里，后面待定区提交时又存一条，重复且文本被污染）。
     term = re.search(r"[。！？\n]", fact)
     if term:
         fact = fact[:term.end()].strip()
-    # 新说法太短（去掉句末标点只剩一个字、或空）不算纠错，走正常保存。
+    for tail in ("，不是", "，不对"):
+        if tail in fact:
+            fact = fact.split(tail)[0].strip()
+    if any(w in fact for w in ("不算", "不作数", "当我没说", "撤回", "取消",
+                               "别记", "不要记", "删掉", "忘掉", "收回")):
+        # 新说法本身是撤回指令（“说错了，前面那句不算”）：那是撤回，
+        # 不是纠正，不触发（调用方走撤回那条路）。
+        return None
+    if fact.startswith("不是"):
+        # 光秃秃的“不是北京”（没给替换）只是否认，不是在纠正。
+        return None
     if len(fact.rstrip("。！？；，、.!?;,")) < 2:
         return None
-    return {"phrase": phrase, "fact": fact}
+    return fact
+
 
 def _latest_user_content(messages):
     """取消息列表里最后一条 user 消息的内容（本轮用户刚说的那句）。

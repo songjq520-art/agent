@@ -913,11 +913,13 @@ def test_import_from_mem0_skips_sensitive(store):
 
 
 def test_search_prefers_confirmed_copy_over_inferred(store):
-    """包子两条同文本：已确认版赢过推断版，search 只返回确认版（#2）。
+    """包子同文本：已确认版赢过推断版，search 只返回确认版（#2）。
 
     生产现状：seq 117 是 BOOS 确认过的“我今天早上吃了俩包子”，
     另有一行同文本的推断版；以前先到先得，推断版抢了名额，
     问起来还加一句“没逐条确认过”。
+    2026-11-22 Bug 2 去重改了行为：同文只留一行（确认版），不再两行
+    并存、只在检索层聚合——断言改成 1 行。
     """
     saved = store.add_memory_text("我今天早上吃了俩包子", source="user")
     store.confirm_memory(saved["id"])
@@ -925,7 +927,7 @@ def test_search_prefers_confirmed_copy_over_inferred(store):
         [{"role": "user", "content": "我今天早上吃了俩包子"}],
         turn_id="t-baozi-dup",
     )
-    assert len(_live_texts(store)) == 2  # 两行都在库里，只在检索层聚合
+    assert len(_live_texts(store)) == 1  # Bug 2 去重：同文只留一行（确认版）
     results = store.search("我今天早上吃了什么", top_k=5)
     assert results, "包子该搜得到"
     assert results[0]["text"] == "我今天早上吃了俩包子"
@@ -1129,12 +1131,14 @@ def test_add_same_text_same_source_returns_unchanged(store):
     assert len(_ledger_lines(store)) == 1
 
 
-def test_add_same_text_different_source_keeps_both_rows(store):
-    """同文、来源不同（已确认版 vs 推断版）时两行并存（#2 的规矩）：
-    检索层聚合、确认版优先。"""
+def test_add_same_text_different_source_keeps_one_row(store):
+    """同文、来源不同（已确认版 vs 推断版）时只留一行（2026-11-22
+    Bug 2 去重改了行为：同文去重只看归一化文本，不看来源；以前两行
+    并存的旧断言已作废）：检索层只剩确认版那一行。"""
     store.add_memory_text("我喜欢吃火锅", source="user")
-    store.add_memory_text("我喜欢吃火锅", source="inferred")
-    assert len(_live_texts(store)) == 2
+    second = store.add_memory_text("我喜欢吃火锅", source="inferred")
+    assert second.get("event") == "UNCHANGED"
+    assert len(_live_texts(store)) == 1
     results = store.search("我喜欢吃什么", top_k=5)
     assert [r["text"] for r in results] == ["我喜欢吃火锅"]
     assert results[0]["confirmed"] is True
@@ -1397,3 +1401,197 @@ def test_add_same_text_inferred_then_user_upgrades_to_confirmed(store):
     assert meta.get("source") == "user"
     assert meta.get("decay_kind") == "stable"
     assert len(_ledger_lines(store)) == 1  # 升级不另记账本，只有最初一笔 add
+
+
+# ---------- 16. 通用纠正（2026-11-22）：纠正检测扩到所有常见说法，
+#       save_turn 纠错路由走通，同槽位隐式更新也取代 ----------
+
+
+def test_detect_correction_general_phrases():
+    """纠正检测通用：任务清单里的每种说法都要认出来，并取对新说法；
+    不是纠正的（犹豫/词的一部分/过去时叙述/光秃秃指令）不认。"""
+    from memory.correction_text import _detect_correction
+
+    cases = [
+        ("不对，我住深圳", "我住深圳"),
+        ("错了，我住深圳", "我住深圳"),
+        ("不是北京，我住深圳", "我住深圳"),
+        ("我住深圳，不是北京", "我住深圳"),
+        ("不是北京，是深圳", "深圳"),
+        ("记错了，我住深圳", "我住深圳"),
+        ("我之前说错了，我住深圳", "我住深圳"),
+        ("我记错了，我住深圳", "我住深圳"),
+        ("说错了，我住深圳", "我住深圳"),
+        ("改一下，我住深圳", "我住深圳"),
+        ("纠正一下，我住深圳", "我住深圳"),
+        ("更正，我住深圳", "我住深圳"),
+        ("其实我住深圳", "我住深圳"),
+        ("其实是深圳", "深圳"),
+        ("应该是深圳", "深圳"),
+        ("不对，应该是深圳", "深圳"),
+        ("我现在住深圳了", "我住深圳了"),
+        ("搬到深圳了", "深圳了"),
+        ("换成深圳了", "深圳了"),
+        ("我不是住北京，我住深圳", "我住深圳"),
+        ("其实不是北京，我住深圳", "我住深圳"),
+        ("不对，不是北京，我住深圳", "我住深圳"),
+        ("你记错了，我住深圳", "我住深圳"),
+        ("不对，我喜欢喝茶", "我喜欢喝茶"),
+    ]
+    for message, expected in cases:
+        detected = _detect_correction(message)
+        assert detected is not None, message
+        assert detected["fact"] == expected, message
+    negatives = [
+        "我不是很确定",
+        "我觉得不对劲",
+        "我昨天记错了开会时间",
+        "我昨天说错了开会时间",
+        "改一下名字",
+        "你记错了",
+        "不对",
+        "我之前说错了",
+        "我现在喜欢用 Go 写代码。",
+        "其实也不是很喜欢吃。",
+        "不对，不是北京",
+        # “我现在”只认带单值槽位的“……了”：数据库改配置不是槽位事实，
+        # 得走待确认守卫，不能短路进纠正分支。
+        "我现在把数据库改成 PostgreSQL 了。",
+        # 新说法本身是撤回指令时不算纠正（撤回那条路处理）。
+        "说错了，前面那句不算",
+    ]
+    for message in negatives:
+        assert _detect_correction(message) is None, message
+
+
+def _correction_store(tmp_path, monkeypatch):
+    """一块干净的 SQLiteStore（向量打桩，和 store fixture 同款）。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
+    return SQLiteStore(memory_dir=str(tmp_path / "memory"))
+
+
+def test_save_turn_correction_e2e_shenzhen(tmp_path, monkeypatch):
+    """端到端：库里有“我住北京”，说“不对，我住深圳”→ 回复带
+    correction（updated）、账本有 supersede、新事实入库、旧事实被取代。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我住北京", source="inferred")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "不对，我住深圳"}],
+        turn_id="t-corr-e2e",
+    )
+    correction = receipt.get("correction") or {}
+    assert correction.get("status") == "updated", receipt
+    assert correction.get("old_text") == "我住北京"
+    assert correction.get("new_text") == "我住深圳"
+    assert _live_texts(store) == ["我住深圳"]
+    lines = _ledger_lines(store)
+    assert sum(1 for line in lines if '"type": "add"' in line) == 2
+    assert any('"type": "supersede"' in line for line in lines)
+
+
+def test_save_turn_correction_general_phrases_e2e(tmp_path, monkeypatch):
+    """端到端：每种纠正说法走 save_turn 都要真换掉旧记忆（不只“不对”）。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
+    cases = [
+        ("我之前说错了，我住深圳", "我住深圳"),
+        ("其实我住深圳", "我住深圳"),
+        ("我住深圳，不是北京", "我住深圳"),
+        ("不是北京，我住深圳", "我住深圳"),
+        ("改一下，我住深圳", "我住深圳"),
+        ("说错了，我住深圳", "我住深圳"),
+        ("我现在住深圳了", "我住深圳了"),
+        ("搬到深圳了", "我住深圳"),
+        ("换成深圳了", "我住深圳"),
+        ("不对，应该是深圳", "我住深圳"),
+    ]
+    for i, (message, expected_live) in enumerate(cases):
+        store = SQLiteStore(memory_dir=str(tmp_path / ("m%d" % i)))
+        store.add_memory_text("我住北京", source="inferred")
+        receipt = store.save_turn(
+            [{"role": "user", "content": message}],
+            turn_id="t-corr-gen-%d" % i,
+        )
+        correction = receipt.get("correction") or {}
+        assert correction.get("status") == "updated", (message, receipt)
+        assert _live_texts(store) == [expected_live], message
+        assert any(
+            '"type": "supersede"' in line for line in _ledger_lines(store)
+        ), message
+
+
+def test_save_turn_implicit_update_supersedes_same_slot(tmp_path, monkeypatch):
+    """隐式更新：没说纠正词，直接说新事实“我住深圳”，库里“我住北京”
+    照样被取代（同槽位不同值）；不相关的“我喜欢喝咖啡”不动。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我住北京", source="inferred")
+    store.add_memory_text("我喜欢喝咖啡", source="inferred")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我住深圳"}],
+        turn_id="t-implicit-1",
+    )
+    assert set(_live_texts(store)) == {"我住深圳", "我喜欢喝咖啡"}
+    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert (receipt.get("correction") or {}).get("status") == "updated"
+    assert receipt["stored"] == ["我住深圳"]
+
+
+def test_save_turn_implicit_update_name_slot(tmp_path, monkeypatch):
+    """隐式更新（名字槽）：库里“我叫小宋”，新说“我叫大明”→ 大明
+    取代小宋；不同槽位（喝咖啡）不互相取代。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我叫小宋", source="inferred")
+    store.add_memory_text("我喜欢喝咖啡", source="inferred")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我叫大明"}],
+        turn_id="t-implicit-name",
+    )
+    assert set(_live_texts(store)) == {"我叫大明", "我喜欢喝咖啡"}
+    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert (receipt.get("correction") or {}).get("status") == "updated"
+
+
+def test_save_turn_implicit_update_pending_when_old_confirmed(tmp_path, monkeypatch):
+    """隐式更新不误伤已确认的旧记忆：库里“我叫小宋”是已确认版，
+    推断口吻的新说“我叫大明”可信度不够，挂起、不存、不覆盖。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我叫小宋", source="user")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我叫大明"}],
+        turn_id="t-implicit-pending",
+    )
+    assert _live_texts(store) == ["我叫小宋"]
+    assert receipt["stored"] == []
+    assert not any(
+        '"type": "supersede"' in line for line in _ledger_lines(store)
+    )
+
+
+def test_save_turn_correction_ambiguous_slot_retry(tmp_path, monkeypatch):
+    """纠错分不清改哪条时按槽位再筛：候选有“我住北京”（住处）和
+    “我喜欢深圳菜”（偏好），新说法“我住深圳”带住处槽位，恰好只有
+    北京同槽，就改北京那条，不用问 BOOS；深圳菜不动。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我住北京", source="inferred")
+    store.add_memory_text("我喜欢深圳菜", source="inferred")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "不对，我住深圳"}],
+        turn_id="t-corr-slot-retry",
+    )
+    correction = receipt.get("correction") or {}
+    assert correction.get("status") == "updated", receipt
+    assert correction.get("old_text") == "我住北京"
+    assert set(_live_texts(store)) == {"我住深圳", "我喜欢深圳菜"}
+
+
+def test_bare_new_correction_signals_still_dropped(tmp_path, monkeypatch):
+    """光秃秃的新纠错信号（后面没跟新说法）仍不是事实，不存：
+    “我之前说错了”“改一下”单独说时不进库。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    for i, message in enumerate(["我之前说错了", "改一下", "说错了"]):
+        receipt = store.save_turn(
+            [{"role": "user", "content": message}],
+            turn_id="t-bare-new-%d" % i,
+        )
+        assert receipt["stored"] == [], message
+    assert _live_texts(store) == []
+    assert _ledger_lines(store) == []

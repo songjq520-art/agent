@@ -39,7 +39,11 @@ from pathlib import Path
 from memory import decay as _decay
 from memory import ledger as _ledger
 from memory import provenance as _provenance
-from memory.correction_text import _detect_correction, _strip_correction_sentences
+from memory.correction_text import (
+    _detect_correction, _strip_correction_sentences,
+    _detect_correction_fragment, _VAGUE_FRAGMENT_VALUES,
+    _infer_fact_slot,
+)
 from memory.money_slots import extract_core_slots
 from memory.redaction import _contains_sensitive, _normalize_memory_text
 from memory.timeutil import _now_epoch, _now_iso, _next_write_seq
@@ -287,9 +291,12 @@ def _looks_like_fact(sentence):
     # 纠错信号（“你记错了”后面没跟新说法），那不是一条事实。
     # 原来的宽拦截（句首是纠错说法就整句丢）已随接线移除，否则
     # “你记错了，我住上海”会把后半句纠错新事实一并丢弃。
-    if re.match(r"^(?:(?:不对|不是|哎)[，,、\s]*)?(?:你)?(?:记错了|说错了|搞错了)[，,。！!、\s]*$", s):
+    if re.match(r"^(?:(?:不对|不是|哎)[，,、\s]*)?(?:你|我)?(?:之前|刚才)?(?:记错了|说错了|搞错了)[，,。！!、\s]*$", s):
+        return False, "纠错指令"
+    if re.match(r"^(?:纠正一下|更正一下|更正|改一下|不对|错了|不是)[，,。！!、\s]*$", s):
         return False, "纠错指令"
     return True, ""
+
 
 
 def _normalize_metadata(meta):
@@ -856,6 +863,228 @@ class SQLiteStore:
         self._conn.commit()
         return promoted
 
+    def _find_same_slot_conflicts(self, slot, value):
+        """找同槽位、不同值的活记忆：[(id, text, metadata)]。
+        按每条原文重新认槽位（老行存的时候还没打 slot 标，只能从文本认）。"""
+        with self._lock:
+            norm_value = _normalize_memory_text(value or "")
+            out = []
+            for row in self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall():
+                old_slot, old_value = _infer_fact_slot(row[1] or "")
+                if old_slot != slot or old_value is None:
+                    continue
+                if _normalize_memory_text(old_value) == norm_value:
+                    continue
+                try:
+                    old_meta = json.loads(row[2] or "{}")
+                except Exception:
+                    old_meta = {}
+                out.append((row[0], row[1] or "", old_meta))
+            return out
+
+    def _set_memory_slot(self, memory_id, slot):
+        """给一条记忆补槽位标（列 + metadata_json 里都写），以后按槽位
+        找它就不用再从文本现认。找不到行、或已有槽位标时什么都不做，不抛异常。"""
+        if not memory_id or not slot:
+            return
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata_json FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                meta = json.loads(row[0] or "{}")
+            except Exception:
+                meta = {}
+            if meta.get("slot"):
+                return
+            meta["slot"] = slot
+            self._conn.execute(
+                "UPDATE memories SET slot=?, metadata_json=? WHERE id=?",
+                (slot, json.dumps(meta, ensure_ascii=False), memory_id),
+            )
+            self._conn.commit()
+
+    def _complete_correction_fragment(self, fact):
+        """碎片纠正补句（确定性版，不调模型）：新说法是个碎片值（“深圳”）
+        时，看库里是不是恰好只有一条单值属性记忆——是就把它的旧值换
+        成碎片值拼回整句（“我住北京”+“深圳”→“我住深圳”）；不是
+        （没有、或有多条、或值含糊）就原样返回，调用方走老路，绝不硬编。
+        只认 residence / user_name / agent_name 三个槽。"""
+        if not isinstance(fact, str) or not fact.strip():
+            return fact
+        value = _detect_correction_fragment(fact)
+        if value is None:
+            return fact
+        # 碎片值收尾：去句首的引导词/住/在（“应该是深圳”→“深圳”，
+        # “住深圳了”→“深圳了”）、去句尾语气词；带事实动词的不是值
+        # （“喜欢喝茶”），不补。
+        value = (value or "").strip()
+        for prefix in ("应该是", "其实是", "其实"):
+            if value.startswith(prefix):
+                value = value[len(prefix):].strip()
+                break
+        if value[:1] in ("住", "在", "是"):
+            value = value[1:].strip()
+        value = value.rstrip("了呢啊吧哦嘛").strip()
+        if not value or value in _VAGUE_FRAGMENT_VALUES:
+            return fact
+        if len(value) > 20:
+            return fact
+        if any(ch in value for ch in ("喜", "欢", "爱", "吃", "喝", "叫",
+                                       "去", "做", "买", "看", "听", "玩",
+                                       "想", "要", "会", "能")):
+            return fact
+        with self._lock:
+            cands = []
+            for row in self._conn.execute(
+                "SELECT id, text FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall():
+                slot, old_value = _infer_fact_slot(row[1] or "")
+                if slot is None or old_value is None:
+                    continue
+                if _normalize_memory_text(old_value) == _normalize_memory_text(value):
+                    continue
+                cands.append((row[1] or "", old_value))
+        if len(cands) != 1:
+            return fact
+        old_text, old_value = cands[0]
+        if old_value not in old_text:
+            return fact
+        return old_text.replace(old_value, value, 1)
+
+    def _retry_correction_by_slot(self, correction, fact):
+        """纠错分不清改哪条（ambiguous）时，按单值槽位再筛一次：新说法
+        带槽位、且候选里恰好只有一条同槽位（值不同）时，就改那条。
+        筛不出来返回 None（调用方保留 ambiguous，等 BOOS 挑）。"""
+        slot, value = _infer_fact_slot(fact)
+        if slot is None or value is None:
+            return None
+        cands = (correction or {}).get("candidates") or []
+        same_slot = []
+        for cand in cands:
+            text = (cand or {}).get("text") if isinstance(cand, dict) else None
+            if not text:
+                continue
+            cand_slot, cand_value = _infer_fact_slot(text)
+            if cand_slot != slot or cand_value is None:
+                continue
+            if _normalize_memory_text(cand_value) == _normalize_memory_text(value):
+                continue
+            same_slot.append(cand)
+        if len(same_slot) != 1:
+            return None
+        old_text = same_slot[0].get("text") or ""
+        if not old_text:
+            return None
+        retry = self.correct_memory(old_text, fact, exclude_identical_to_new=True)
+        if (retry or {}).get("status") == "updated":
+            return retry
+        return None
+
+    def _apply_same_slot_update(self, sentence, slot, value, receipt,
+                                turn_id, event_date):
+        """同槽位新值进库前的裁决（save_turn 逐句循环里调）：
+        - 没同槽位旧值 → 返回 False，调用方照常存；
+        - 有旧值：逐条按 provenance._resolve_conflict 裁决；只要有一条
+          不是 supersede_old，就不存新句（挂起/留旧），返回 True；
+        - 全是 supersede_old → 逐条调 correct_memory 取代；都换好了
+          返回 True（回执记 stored + correction）；correct_memory 没换
+          成的那条，改走直存 + _supersede_row 兜底（裁决已说该换，
+          不能因为候选检索没找着就并存两条）。
+        """
+        conflicts = self._find_same_slot_conflicts(slot, value)
+        if not conflicts:
+            return False
+        new_probe = {
+            "source": "inferred",
+            "user_confirmed": False,
+            "confidence": 0.7,
+            "created_at": _now_iso(),
+            "write_seq": _next_write_seq(),
+            "slot": slot,
+        }
+        to_supersede = []
+        for old_id, old_text, old_meta in conflicts:
+            verdict = _provenance._resolve_conflict(old_meta, new_probe)
+            action = (verdict or {}).get("action")
+            if action == "supersede_old":
+                to_supersede.append((old_id, old_text, old_meta))
+            elif action == "pending_new":
+                receipt["dropped"].append(
+                    {"text": sentence, "reason": "槽位冲突待确认"}
+                )
+                return True
+            else:  # keep_old / ask：新说法不存，旧的留着。
+                receipt["dropped"].append(
+                    {"text": sentence, "reason": "槽位冲突未裁决"}
+                )
+                return True
+        # 全是 supersede_old：逐条取代。
+        first_outcome = None
+        new_key = None
+        remaining = []
+        for old_id, old_text, old_meta in to_supersede:
+            outcome = self.correct_memory(
+                old_text, sentence, exclude_identical_to_new=True
+            )
+            if (outcome or {}).get("status") == "updated":
+                if first_outcome is None:
+                    first_outcome = outcome
+                new_key = (outcome or {}).get("memory_id") or new_key
+            else:
+                remaining.append((old_id, old_text, old_meta))
+        if remaining:
+            # correct_memory 没换成的（候选检索没找着旧条等）：新说法先
+            # 直存，再按裁决直接取代旧行——裁决已说该换，不并存两条。
+            if new_key is None:
+                saved = self.add_memory_text(
+                    sentence, source="inferred", turn_id=turn_id,
+                    event_date=event_date, decay_kind="episodic", slot=slot,
+                )
+                if (saved or {}).get("event") != "ADD":
+                    receipt["dropped"].append(
+                        {"text": sentence, "reason": "账本写失败"}
+                    )
+                    return True
+                new_key = saved.get("id")
+            for old_id, old_text, old_meta in remaining:
+                try:
+                    self._supersede_row(old_id, old_text, old_meta, new_key, sentence)
+                except Exception:
+                    logger.warning("槽位取代记账失败：旧行未取代。", exc_info=True)
+            if first_outcome is None:
+                first_outcome = {
+                    "status": "updated", "memory_id": new_key,
+                    "old_text": remaining[0][1], "new_text": sentence,
+                    "candidates": [
+                        {"id": oid, "text": ot} for oid, ot, _m in remaining
+                    ],
+                    "reason": "已更正", "layer": "slot",
+                    "resolution": "updated",
+                    "audit": {"source": "user", "method": "slot_conflict"},
+                }
+        if first_outcome is not None:
+            slot2, _v = _infer_fact_slot(sentence)
+            if slot2:
+                self._set_memory_slot(first_outcome.get("memory_id"), slot2)
+            receipt["stored"].append(sentence)
+            receipt["results"].append(
+                {"id": first_outcome.get("memory_id"), "memory": sentence,
+                 "event": "SUPERSEDE",
+                 "old_text": first_outcome.get("old_text"),
+                 "supersedes_id": ((first_outcome.get("candidates") or [{}])[0] or {}).get("id")}
+            )
+            if "correction" not in receipt:
+                receipt["correction"] = first_outcome
+            return True
+        return False
+
     def save_turn(self, messages, turn_id=None):
         """一轮对话的收尾：同步把用户亲口说的事实原样存下来，留回执。
 
@@ -921,15 +1150,37 @@ class SQLiteStore:
                     break
                 fact = inner_fact
             if fact:
-                correction = self.correct_memory(
-                    fact, fact, exclude_identical_to_new=True
-                )
-                kept = _strip_correction_sentences(latest_user)
-                if (correction or {}).get("status") == "not_found":
-                    # 没找到旧记忆：新说法当新记忆存（带上纠错句之外的部分）。
-                    sentences = kept + [fact]
-                else:
-                    sentences = kept
+                # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
+                # 补不出来就原样走 correct_memory（找不到旧记忆时当新记忆存）。
+                fact = self._complete_correction_fragment(fact)
+                # 当下的想法/问句不纠正（“我现在想喝茶了”不是在改一条记忆）：
+                # 检测到了也不走纠正分支，留给下面的正常循环按老规矩处理
+                # （当下的想法会被 _looks_like_fact 拦下、不存）。
+                if _looks_like_fact(fact)[0]:
+                    correction = self.correct_memory(
+                        fact, fact, exclude_identical_to_new=True
+                    )
+                    if (correction or {}).get("status") == "ambiguous":
+                        # 分不清改哪条时按槽位再筛一次：新说法带单值槽位、
+                        # 且候选里恰好只有一条同槽位时，就改那条，不用问。
+                        retry = self._retry_correction_by_slot(correction, fact)
+                        if retry is not None:
+                            correction = retry
+                    if (correction or {}).get("status") == "updated":
+                        # 纠正换来的新记忆带上槽位标（以后按槽位找得到它）。
+                        slot, _value = _infer_fact_slot(fact)
+                        if slot:
+                            self._set_memory_slot(
+                                (correction or {}).get("memory_id"), slot
+                            )
+                    kept = _strip_correction_sentences(latest_user)
+                    if (correction or {}).get("status") == "not_found":
+                        # 没找到旧记忆：新说法当新记忆存（带上纠错句之外的部分）。
+                        # 逐句循环里的槽位更新还会再拦一次（同槽位旧值在时
+                        # 替它走 correct_memory，不并存两条）。
+                        sentences = kept + [fact]
+                    else:
+                        sentences = kept
         live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
         for sentence in sentences:
             receipt["considered"].append(sentence)
@@ -971,6 +1222,24 @@ class SQLiteStore:
             # 存原话：去掉句尾的 。！（？的已经当问句 drop 了，不会到这里）。
             sentence = sentence.rstrip("。！")
             event_date = resolve_event_date(sentence, today)
+            # 刚被纠正取代的旧说法（同一轮里先肯定、后纠正）不再重存。
+            if (
+                correction is not None
+                and (correction or {}).get("status") == "updated"
+                and (correction or {}).get("old_text")
+                and _normalize_memory_text(sentence)
+                == _normalize_memory_text((correction or {}).get("old_text") or "")
+            ):
+                receipt["dropped"].append({"text": sentence, "reason": "已被纠正取代"})
+                continue
+            # 同槽位隐式更新（2026-11-22 通用纠正）：新事实带单值槽位、
+            # 库里已有同槽位不同值时，按 _resolve_conflict 裁决、走
+            # correct_memory 取代旧的；没冲突时照常存，顺手把槽位标上。
+            slot, slot_value = _infer_fact_slot(sentence)
+            if slot is not None and self._apply_same_slot_update(
+                sentence, slot, slot_value, receipt, turn_id, event_date
+            ):
+                continue
             # 来源标 inferred（提取所得）：原样存的事实是从对话里提出来的，
             # 出处完整（turn_id + created_at），和 DeepSeek 提取同一档，
             # 只是没经过模型改写、保真度更高。unconfirmed 是留给“完全没来源
@@ -979,6 +1248,7 @@ class SQLiteStore:
             saved = self.add_memory_text(
                 sentence, source="inferred", turn_id=turn_id,
                 event_date=event_date, decay_kind="episodic",
+                **({"slot": slot} if slot else {}),
             )
             if (saved or {}).get("event") == "ADD":
                 if live_texts is not None:
@@ -1002,7 +1272,12 @@ class SQLiteStore:
         if receipt["stored"]:
             with self._lock:
                 self._last_stored_turn_id = turn_id
-        if correction is not None:
+        if correction is not None and (
+            "correction" not in receipt
+            or (correction or {}).get("status") != "not_found"
+        ):
+            # 显式纠错优先；但它报 not_found、而逐句循环里的槽位更新已经
+            # 真换了旧记忆时，留循环那边的 updated，不拿 not_found 盖掉它。
             receipt["correction"] = correction
             if (correction or {}).get("status") == "updated":
                 # 纠错存的新记忆属于本轮：撤回标记拨到本轮，
