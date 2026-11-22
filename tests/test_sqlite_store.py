@@ -1251,3 +1251,117 @@ def test_note_context_revives_dormant_memory(store):
     store.note_context([{"id": saved["id"]}])
     assert _meta_of(store, saved["id"])["decay_state"] == "verbatim"
     assert any('"type": "revive"' in line for line in _ledger_lines(store))
+
+
+# ---------- 14. 待补测试（2026-11-22，第二轮 review） ----------
+# 待补清单见 ~/workspace/十二correct-memory-decay-待补测试-2026-11-22.md。
+# 第 4 条按 BOOS 已定行为断言：取代失败时返回 failed、新记忆保留、
+# 旧记忆仍活着（不回滚删新行）。
+
+
+def test_correction_repeat_same_fact_is_unchanged_no_dup(store):
+    """待补 1a：库里只有“我住广州”，再说“不对，我住广州”，
+    报 unchanged，不产生重复行（账本只有最初那一笔 add）。"""
+    store.add_memory_text("我住广州", source="inferred")
+    r = store.save_turn(
+        [{"role": "user", "content": "不对，我住广州"}],
+        turn_id="t-corr-repeat-1",
+    )
+    assert (r.get("correction") or {}).get("status") == "unchanged"
+    assert r["stored"] == []
+    assert _live_texts(store) == ["我住广州"]
+    assert len(_ledger_lines(store)) == 1
+
+
+def test_correction_to_existing_fact_reuses_row(store):
+    """待补 1b：库里同时有“我住上海”和“我住广州”，说“不对，我住广州”，
+    最终只有 1 条“我住广州”：复用已有行、不新插，旧的上海被取代。"""
+    store.add_memory_text("我住上海", source="inferred")
+    store.add_memory_text("我住广州", source="inferred")
+    r = store.save_turn(
+        [{"role": "user", "content": "不对，我住广州"}],
+        turn_id="t-corr-reuse-1",
+    )
+    assert (r.get("correction") or {}).get("status") == "updated"
+    assert r["stored"] == []
+    assert _live_texts(store) == ["我住广州"]
+    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert len([t for t in _live_texts(store) if t == "我住广州"]) == 1
+
+
+def test_correction_safety_net_blocks_cross_topic_supersede(tmp_path, monkeypatch):
+    """待补 2：库里只有“我喜欢科幻电影”，用户说“不对，我住广州”
+    （save_turn 走 correct_memory(fact, fact)），安全网用库里旧向量
+    old_vec 算相似度：科幻 [1, 0] vs 广州 [0.6, 0.8] 相似度 0.6 < 0.70，
+    拦截误取代，报 ambiguous，库里原样不动。"""
+    def _fake_embed(self, text):
+        if "科幻" in (text or ""):
+            return np.array([1.0, 0.0], dtype="float32")
+        if "广州" in (text or ""):
+            return np.array([0.6, 0.8], dtype="float32")
+        return np.array([0.0, 1.0], dtype="float32")
+
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _fake_embed)
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    s.add_memory_text("我喜欢科幻电影", source="inferred")
+    r = s.save_turn(
+        [{"role": "user", "content": "不对，我住广州"}],
+        turn_id="t-corr-safetynet-1",
+    )
+    correction = r.get("correction") or {}
+    assert correction.get("status") == "ambiguous"
+    assert (correction.get("audit") or {}).get("method") == "safety_net"
+    assert (correction.get("audit") or {}).get("similarity") == pytest.approx(0.6)
+    assert r["stored"] == []
+    assert _live_texts(s) == ["我喜欢科幻电影"]
+    assert len(_ledger_lines(s)) == 1  # 只有最初一笔 add，没多写 supersede
+
+
+def test_decay_delete_due_revive_and_double_sweep_idempotent(store):
+    """待补 3：decay_delete_due 的记忆被用上就复活回 verbatim；
+    已是 delete_due 的记忆再扫两次也不重复改写、不重复记账。"""
+    revive = store.add_memory_text("我去年去了一趟广州出差", source="inferred")
+    stale = store.add_memory_text("我去年去了一趟深圳出差", source="inferred")
+    _age_memory(store, revive["id"], 200)
+    _age_memory(store, stale["id"], 200)
+    out1 = store.sweep_decay()
+    assert out1 == {"dormant": 0, "delete_due": 2}
+    assert _meta_of(store, revive["id"])["decay_state"] == "decay_delete_due"
+    assert _meta_of(store, stale["id"])["decay_state"] == "decay_delete_due"
+    # 复活：note_context 后回 verbatim，账本记一笔 REVIVE。
+    store.note_context([{"id": revive["id"]}])
+    assert _meta_of(store, revive["id"])["decay_state"] == "verbatim"
+    assert sum(1 for line in _ledger_lines(store) if '"type": "revive"' in line) == 1
+    # 再扫两次：已是 delete_due 的那条不再改写、不再记账；
+    # 复活过的那条刚被用过，也不再动。
+    before = _ledger_lines(store)
+    out2 = store.sweep_decay()
+    out3 = store.sweep_decay()
+    assert out2 == {"dormant": 0, "delete_due": 0}
+    assert out3 == {"dormant": 0, "delete_due": 0}
+    assert _ledger_lines(store) == before
+    assert _meta_of(store, stale["id"])["decay_state"] == "decay_delete_due"
+    assert _meta_of(store, revive["id"])["decay_state"] == "verbatim"
+    assert len(_live_texts(store)) == 2
+
+
+def test_correction_supersede_failure_keeps_new_and_old_alive(store, monkeypatch):
+    """待补 4（按 BOOS 已定行为断言）：mock _supersede_row 抛异常，
+    _apply_correction_result 返回 failed；取代失败时保留新记忆、
+    诚实报 failed（新记忆已进账本，不删），旧记忆仍活着。"""
+    store.add_memory_text("我住北京", source="inferred")
+
+    def _boom(self, *args, **kwargs):
+        raise RuntimeError("supersede 记账炸了")
+
+    monkeypatch.setattr(SQLiteStore, "_supersede_row", _boom)
+    out = store.correct_memory("我住北京", "我住上海")
+    assert out.get("status") == "failed"
+    assert out.get("reason") == "新记忆已存，但旧记忆未被取代"
+    assert out.get("memory_id") is not None
+    # 新记忆保留：活记忆里新旧两条都在（不回滚删新行）。
+    assert set(_live_texts(store)) == {"我住北京", "我住上海"}
+    # 新记忆已进账本；旧记忆仍活着：没有 supersede 事件。
+    lines = _ledger_lines(store)
+    assert any('"type": "add"' in line and "我住上海" in line for line in lines)
+    assert not any('"type": "supersede"' in line for line in lines)
