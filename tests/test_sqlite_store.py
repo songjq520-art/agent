@@ -875,11 +875,12 @@ def test_correction_with_prefix_goes_through_correction(store):
         [{"role": "user", "content": "不是，记错了，我住广州"}],
         turn_id="t-round3-corr2",
     )
-    # 裸“记错了”（没带“你”）不在 _detect_correction 的 5 个说法里，
-    # 不认作纠错——这是共享 helper 的已有缺口（mem0 同款），按原话存。
-    assert "correction" not in r2
-    assert r2["stored"] == ["不是，记错了，我住广州"]
-    assert set(_live_texts(store)) == {"我住上海", "不是，记错了，我住广州"}
+    # “记错了”已补进 _detect_correction 的说法里：裸“记错了”也认作纠错，
+    # 新说法“我住广州”走 correct_memory，取代“我住上海”。
+    assert "correction" in r2
+    assert (r2.get("correction") or {}).get("status") == "updated"
+    assert r2["stored"] == []
+    assert set(_live_texts(store)) == {"我住广州"}
 
     r3 = store.save_turn(
         [{"role": "user", "content": "我昨天记错了开会时间"}],

@@ -759,28 +759,29 @@ class SQLiteStore:
         账本写失败时把 SQLite 的标记撤回来再抛——两边要一致，账本是真相。
         old_id 就是旧 key（SQLite id 就是账本 key）；new_key 是新记忆的 key。
         """
-        self._conn.execute(
-            "UPDATE memories SET superseded=1 WHERE id=?", (old_id,)
-        )
-        self._conn.commit()
-        try:
-            _ledger.append_event(
-                self.ledger_path,
-                {"type": _ledger.LEDGER_EVENT_SUPERSEDE,
-                 "memory_id": new_key,
-                 "supersedes_id": old_id,
-                 "old_text": old_text,
-                 "text": new_text,
-                 "key": old_id,
-                 "current_key": new_key},
-                lock=self._ledger_lock,
-            )
-        except Exception:
+        with self._lock:
             self._conn.execute(
-                "UPDATE memories SET superseded=0 WHERE id=?", (old_id,)
+                "UPDATE memories SET superseded=1 WHERE id=?", (old_id,)
             )
             self._conn.commit()
-            raise
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_SUPERSEDE,
+                     "memory_id": new_key,
+                     "supersedes_id": old_id,
+                     "old_text": old_text,
+                     "text": new_text,
+                     "key": old_id,
+                     "current_key": new_key},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                self._conn.execute(
+                    "UPDATE memories SET superseded=0 WHERE id=?", (old_id,)
+                )
+                self._conn.commit()
+                raise
 
     def _record_occurrence(self, memory_id, metadata, today, turn_id, text=None):
         """同一条事实又出现一次：记进出现集合（不同天、不同会话），
@@ -985,7 +986,8 @@ class SQLiteStore:
                     self._last_stored_turn_id = turn_id
         return receipt
 
-    def _find_correction_candidates(self, old_fact, new_fact=None, top_k=10):
+    def _find_correction_candidates(self, old_fact, new_fact=None, top_k=10,
+                                        exclude_identical_to_new=False):
         """找纠错候选：要改的旧记忆（和 mem0_store._find_correction_candidates
         同款两路 + 兜底）。
 
@@ -996,62 +998,81 @@ class SQLiteStore:
            vs“住北京”余弦低、关键词不撞时，靠这条兜底找着旧条
            （mem0 的 Bug 6 场景）。
         返回活记忆的 id 列表（已确认在前、同类里新的在前）。
+        exclude_identical_to_new 时跳过与 new_fact 相同的条目：纠错是来
+        取代旧说法的，库里已有的新说法本身不是目标；不跳过的话，exact
+        会先命中它而直接返回 unchanged，漏掉真正该被取代的旧说法。
         """
-        old_fact = (old_fact or "").strip()
-        if not old_fact:
-            return []
-        found = []
-        seen = set()
-        try:
-            for hit in self._search_inner(old_fact, top_k=top_k * 4):
-                mid = hit.get("id")
-                if mid and mid not in seen:
-                    seen.add(mid)
-                    found.append(mid)
-        except Exception:
-            logger.warning("纠错：语义找候选失败。", exc_info=True)
-        if not found:
-            # 兜底：最近上下文 + 同核心槽位。
+        with self._lock:
+            old_fact = (old_fact or "").strip()
+            if not old_fact:
+                return []
+            found = []
+            seen = set()
             try:
-                for mid in list(getattr(self, "_last_context_ids", []) or []):
+                for hit in self._search_inner(old_fact, top_k=top_k * 4):
+                    mid = hit.get("id")
                     if mid and mid not in seen:
-                        row = self._conn.execute(
-                            "SELECT id FROM memories WHERE id=? AND voided=0"
-                            " AND deleted=0 AND superseded=0",
-                            (mid,),
-                        ).fetchone()
-                        if row is not None:
-                            seen.add(mid)
-                            found.append(mid)
+                        seen.add(mid)
+                        found.append(mid)
             except Exception:
-                pass
+                logger.warning("纠错：语义找候选失败。", exc_info=True)
+            if not found:
+                # 兜底：最近上下文 + 同核心槽位。
+                try:
+                    for mid in list(getattr(self, "_last_context_ids", []) or []):
+                        if mid and mid not in seen:
+                            row = self._conn.execute(
+                                "SELECT id FROM memories WHERE id=? AND voided=0"
+                                " AND deleted=0 AND superseded=0",
+                                (mid,),
+                            ).fetchone()
+                            if row is not None:
+                                seen.add(mid)
+                                found.append(mid)
+                except Exception:
+                    pass
+                try:
+                    slots = extract_core_slots(new_fact or old_fact)
+                    if slots:
+                        for row in self._conn.execute(
+                            "SELECT id, text FROM memories"
+                            " WHERE voided=0 AND deleted=0 AND superseded=0"
+                        ).fetchall():
+                            if row[0] in seen:
+                                continue
+                            if extract_core_slots(row[1] or "") & slots:
+                                seen.add(row[0])
+                                found.append(row[0])
+                except Exception:
+                    pass
+            if exclude_identical_to_new and new_fact:
+                # 跳过与新说法相同的条目（见 docstring）：纠错是来取代旧
+                # 说法的，库里已有的新说法本身不是目标。
+                norm_new = _normalize_memory_text(new_fact)
+                kept = []
+                for mid in found:
+                    row = self._conn.execute(
+                        "SELECT text FROM memories WHERE id=?", (mid,)
+                    ).fetchone()
+                    if row is not None and _normalize_memory_text(
+                        row[0] or ""
+                    ) == norm_new:
+                        continue
+                    kept.append(mid)
+                found = kept
+            # 排：已确认的在前，同类里新的在前。
+            def _cand_key(mid):
+                row = self._conn.execute(
+                    "SELECT metadata_json, created_at FROM memories WHERE id=?", (mid,)
+                ).fetchone()
+                meta = json.loads((row or [None, None])[0] or "{}")
+                confirmed = 1 if meta.get("user_confirmed") else 0
+                return (-confirmed, -(row[1] or ""))
             try:
-                slots = extract_core_slots(new_fact or old_fact)
-                if slots:
-                    for row in self._conn.execute(
-                        "SELECT id, text FROM memories"
-                        " WHERE voided=0 AND deleted=0 AND superseded=0"
-                    ).fetchall():
-                        if row[0] in seen:
-                            continue
-                        if extract_core_slots(row[1] or "") & slots:
-                            seen.add(row[0])
-                            found.append(row[0])
+                found.sort(key=_cand_key)
             except Exception:
                 pass
-        # 排：已确认的在前，同类里新的在前。
-        def _cand_key(mid):
-            row = self._conn.execute(
-                "SELECT metadata_json, created_at FROM memories WHERE id=?", (mid,)
-            ).fetchone()
-            meta = json.loads((row or [None, None])[0] or "{}")
-            confirmed = 1 if meta.get("user_confirmed") else 0
-            return (-confirmed, -(row[1] or ""))
-        try:
-            found.sort(key=_cand_key)
-        except Exception:
-            pass
-        return found
+            return found
 
     def _apply_correction_result(self, new_fact, old_id, old_text, old_meta,
                                  *, same_text, candidates, status="updated",
@@ -1064,73 +1085,85 @@ class SQLiteStore:
         layer 哪一层定的（mem0 同款词）：exact（原样对上）/ single
         （单候选过安全网）；调用方显式传，不从 same_text 推。
         """
-        if status == "unchanged":
-            self._record_occurrence(
-                old_id, old_meta, _shanghai_today().isoformat(), None, old_text
-            )
-            return {
-                "status": "unchanged", "memory_id": old_id,
-                "old_text": old_text, "new_text": new_fact,
-                "candidates": candidates or [],
-                "reason": "已是该内容，无需修改",
-                "layer": layer, "resolution": resolution or "exact",
-                "audit": audit or {"source": "user", "method": "unchanged"},
+        with self._lock:
+            if status == "unchanged":
+                self._record_occurrence(
+                    old_id, old_meta, _shanghai_today().isoformat(), None, old_text
+                )
+                return {
+                    "status": "unchanged", "memory_id": old_id,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "已是该内容，无需修改",
+                    "layer": layer, "resolution": resolution or "exact",
+                    "audit": audit or {"source": "user", "method": "unchanged"},
+                }
+            created_at = _now_iso()
+            write_seq = _next_write_seq()
+            today = _shanghai_today().isoformat()
+            metadata = {
+                "source": source,
+                "confidence": 1.0,
+                "user_confirmed": True,
+                "created_at": created_at,
+                "write_seq": write_seq,
+                "turn_id": None,
+                "slot": (old_meta or {}).get("slot"),
+                "is_rule": bool((old_meta or {}).get("is_rule")),
+                "curated": bool((old_meta or {}).get("curated")),
+                "decay_kind": _decay.classify_decay_kind(
+                    source, False, bool((old_meta or {}).get("is_rule"))
+                ),
+                "importance": (old_meta or {}).get("importance", "normal"),
+                "event_date": resolve_event_date(new_fact),
+                "last_used_at": created_at,
+                "decay_state": _decay.DECAY_STATE_VERBATIM,
             }
-        created_at = _now_iso()
-        write_seq = _next_write_seq()
-        today = _shanghai_today().isoformat()
-        metadata = {
-            "source": source,
-            "confidence": 1.0,
-            "user_confirmed": True,
-            "created_at": created_at,
-            "write_seq": write_seq,
-            "turn_id": None,
-            "slot": (old_meta or {}).get("slot"),
-            "is_rule": bool((old_meta or {}).get("is_rule")),
-            "curated": bool((old_meta or {}).get("curated")),
-            "decay_kind": (old_meta or {}).get("decay_kind") or _decay.DECAY_KIND_EPISODIC,
-            "importance": (old_meta or {}).get("importance", "normal"),
-            "event_date": resolve_event_date(new_fact),
-            "last_used_at": created_at,
-            "decay_state": _decay.DECAY_STATE_VERBATIM,
-        }
-        dates, sessions, _added = _decay.record_seen_occurrence(None, None, today, None)
-        metadata["seen_dates"] = _decay._dump_seen_list(dates)
-        metadata["seen_sessions"] = _decay._dump_seen_list(sessions)
-        try:
-            new_key = self._append_new_memory(new_fact, metadata)
-        except Exception:
+            dates, sessions, _added = _decay.record_seen_occurrence(None, None, today, None)
+            metadata["seen_dates"] = _decay._dump_seen_list(dates)
+            metadata["seen_sessions"] = _decay._dump_seen_list(sessions)
+            try:
+                new_key = self._append_new_memory(new_fact, metadata)
+            except Exception:
+                return {
+                    "status": "failed", "memory_id": old_id,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "新记忆写入失败", "layer": "none",
+                    "resolution": resolution or "failed",
+                    "audit": audit or {"source": source, "method": "correct_memory"},
+                }
+            if new_key is None:
+                return {
+                    "status": "failed", "memory_id": old_id,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "账本写失败", "layer": "none",
+                    "resolution": resolution or "failed",
+                    "audit": audit or {"source": source, "method": "correct_memory"},
+                }
+            try:
+                self._supersede_row(old_id, old_text, old_meta, new_key, new_fact)
+            except Exception:
+                logger.warning("纠错取代记账失败：旧行未取代。", exc_info=True)
+                return {
+                    "status": "failed", "memory_id": new_key,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "新记忆已存，但旧记忆未被取代",
+                    "layer": "none",
+                    "resolution": "failed",
+                    "audit": audit or {"source": source, "method": "correct_memory"},
+                }
             return {
-                "status": "failed", "memory_id": old_id,
+                "status": status, "memory_id": new_key,
                 "old_text": old_text, "new_text": new_fact,
                 "candidates": candidates or [],
-                "reason": "新记忆写入失败", "layer": "none",
-                "resolution": resolution or "failed",
+                "reason": "已更正",
+                "layer": layer,
+                "resolution": resolution or "updated",
                 "audit": audit or {"source": source, "method": "correct_memory"},
             }
-        if new_key is None:
-            return {
-                "status": "failed", "memory_id": old_id,
-                "old_text": old_text, "new_text": new_fact,
-                "candidates": candidates or [],
-                "reason": "账本写失败", "layer": "none",
-                "resolution": resolution or "failed",
-                "audit": audit or {"source": source, "method": "correct_memory"},
-            }
-        try:
-            self._supersede_row(old_id, old_text, old_meta, new_key, new_fact)
-        except Exception:
-            logger.warning("纠错取代记账失败：旧行未取代。", exc_info=True)
-        return {
-            "status": status, "memory_id": new_key,
-            "old_text": old_text, "new_text": new_fact,
-            "candidates": candidates or [],
-            "reason": "已更正",
-            "layer": layer,
-            "resolution": resolution or "updated",
-            "audit": audit or {"source": source, "method": "correct_memory"},
-        }
 
     def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True):
         """纠错：把 old_fact 指的那条记忆改成 new_fact（整合方案 §6.3）。
@@ -1148,114 +1181,131 @@ class SQLiteStore:
         {status, memory_id, old_text, new_text, candidates, reason,
          layer, resolution, audit}。
         """
-        new_fact = (new_fact or "").strip()
-        old_fact = (old_fact or "").strip()
-        candidates = self._find_correction_candidates(old_fact, new_fact=new_fact)
-        if _contains_sensitive(new_fact):
-            return {
-                "status": "failed", "memory_id": None,
-                "old_text": old_fact, "new_text": new_fact,
-                "candidates": candidates,
-                "reason": "新说法含敏感信息", "layer": "none",
-                "resolution": "blocked",
-                "audit": {"source": "user", "method": "correct_memory"},
-            }
-        if not candidates:
-            return {
-                "status": "not_found", "memory_id": None,
-                "old_text": old_fact, "new_text": new_fact,
-                "candidates": [],
-                "reason": "未找到可纠正的记忆", "layer": "none",
-                "resolution": "not_found",
-                "audit": {"source": "user", "method": "correct_memory"},
-            }
-        # 原样匹配：旧说法原样在库里，直接改那条（不用过安全网）。
-        exact = None
-        for mid in candidates:
+        with self._lock:
+            new_fact = (new_fact or "").strip()
+            old_fact = (old_fact or "").strip()
+            candidates = self._find_correction_candidates(
+                old_fact, new_fact=new_fact,
+                exclude_identical_to_new=exclude_identical_to_new,
+            )
+            if _contains_sensitive(new_fact):
+                return {
+                    "status": "failed", "memory_id": None,
+                    "old_text": old_fact, "new_text": new_fact,
+                    "candidates": candidates,
+                    "reason": "新说法含敏感信息", "layer": "none",
+                    "resolution": "blocked",
+                    "audit": {"source": "user", "method": "correct_memory"},
+                }
+            if not candidates:
+                if _normalize_memory_text(old_fact) == _normalize_memory_text(new_fact):
+                    # 新旧说法相同：候选过滤已跳过与新说法相同的条目；库里
+                    # 已是这句、又没有别的冲突记忆时，无事可做，报 unchanged
+                    #（而不是 not_found——“已经是对的”不是“找不到”）。
+                    for _row in self._conn.execute(
+                        "SELECT id, text, metadata_json FROM memories WHERE voided=0"
+                        " AND deleted=0 AND superseded=0"
+                    ).fetchall():
+                        if _normalize_memory_text(_row[1] or "") == _normalize_memory_text(new_fact):
+                            return self._apply_correction_result(
+                                new_fact, _row[0], _row[1],
+                                json.loads(_row[2] or "{}"),
+                                same_text=True, candidates=[], status="unchanged",
+                                resolution="exact", layer="exact",
+                                audit={"source": "user", "method": "exact_match"},
+                            )
+                return {
+                    "status": "not_found", "memory_id": None,
+                    "old_text": old_fact, "new_text": new_fact,
+                    "candidates": [],
+                    "reason": "未找到可纠正的记忆", "layer": "none",
+                    "resolution": "not_found",
+                    "audit": {"source": "user", "method": "correct_memory"},
+                }
+            # 原样匹配：旧说法原样在库里，直接改那条（不用过安全网）。
+            exact = None
+            for mid in candidates:
+                row = self._conn.execute(
+                    "SELECT text, metadata_json FROM memories WHERE id=?", (mid,)
+                ).fetchone()
+                if row and (row[0] or "").strip() == old_fact:
+                    exact = (mid, row[0], json.loads(row[1] or "{}"))
+                    break
+            if exact is not None:
+                mid, old_text, old_meta = exact
+                same = _normalize_memory_text(new_fact) == _normalize_memory_text(old_text)
+                if same:
+                    return self._apply_correction_result(
+                        new_fact, mid, old_text, old_meta, same_text=True,
+                        candidates=candidates, status="unchanged",
+                        resolution="exact", layer="exact",
+                        audit={"source": "user", "method": "exact_match"},
+                    )
+                return self._apply_correction_result(
+                    new_fact, mid, old_text, old_meta, same_text=False,
+                    candidates=candidates, status="updated",
+                    resolution="exact", layer="exact",
+                    audit={"source": "user", "method": "exact_match"},
+                )
+            if len(candidates) > 1:
+                return {
+                    "status": "ambiguous", "memory_id": None,
+                    "old_text": old_fact, "new_text": new_fact,
+                    "candidates": candidates,
+                    "reason": "多条候选，无法确定改哪一条",
+                    "layer": "none", "resolution": "ambiguous",
+                    "audit": {"source": "user", "method": "correct_memory"},
+                }
+            # 只有一条候选：过相似度安全网。
+            mid = candidates[0]
             row = self._conn.execute(
-                "SELECT text, metadata_json FROM memories WHERE id=?", (mid,)
+                "SELECT text, metadata_json, embedding FROM memories WHERE id=?", (mid,)
             ).fetchone()
-            if row and (row[0] or "").strip() == old_fact:
-                exact = (mid, row[0], json.loads(row[1] or "{}"))
-                break
-        if exact is not None:
-            mid, old_text, old_meta = exact
+            if row is None:
+                return {
+                    "status": "not_found", "memory_id": None,
+                    "old_text": old_fact, "new_text": new_fact,
+                    "candidates": candidates,
+                    "reason": "候选记忆已不在库里", "layer": "none",
+                    "resolution": "not_found",
+                    "audit": {"source": "user", "method": "correct_memory"},
+                }
+            old_text, old_meta = row[0], json.loads(row[1] or "{}")
             same = _normalize_memory_text(new_fact) == _normalize_memory_text(old_text)
             if same:
                 return self._apply_correction_result(
                     new_fact, mid, old_text, old_meta, same_text=True,
                     candidates=candidates, status="unchanged",
-                    resolution="exact", layer="exact",
-                    audit={"source": "user", "method": "exact_match"},
+                    resolution="semantic", layer="single",
+                    audit={"source": "user", "method": "single_candidate"},
                 )
+            try:
+                # 安全网比的是候选旧记忆和新说法的话题相似度，不是两个入参
+                #（save_turn 传的是 correct_memory(fact, fact)，拿入参比
+                # 永远是 1.0）。优先用库里存着的向量，没有再现算。
+                old_vec = _blob_to_vector(row[2])
+                if old_vec is None:
+                    old_vec = self._embed_text(old_text)
+                sim = _cosine(old_vec, self._embed_text(new_fact))
+            except Exception:
+                sim = None
+            if sim is not None and sim < _CORRECTION_TOPIC_MIN_SIMILARITY:
+                return {
+                    "status": "ambiguous", "memory_id": None,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates,
+                    "reason": "与候选记忆相似度过低（%.2f），不敢改" % sim,
+                    "layer": "none", "resolution": "ambiguous",
+                    "audit": {"source": "user", "method": "safety_net",
+                              "similarity": sim},
+                }
             return self._apply_correction_result(
                 new_fact, mid, old_text, old_meta, same_text=False,
                 candidates=candidates, status="updated",
-                resolution="exact", layer="exact",
-                audit={"source": "user", "method": "exact_match"},
-            )
-        if len(candidates) > 1:
-            return {
-                "status": "ambiguous", "memory_id": None,
-                "old_text": old_fact, "new_text": new_fact,
-                "candidates": candidates,
-                "reason": "多条候选，无法确定改哪一条",
-                "layer": "none", "resolution": "ambiguous",
-                "audit": {"source": "user", "method": "correct_memory"},
-            }
-        # 只有一条候选：过相似度安全网。
-        mid = candidates[0]
-        row = self._conn.execute(
-            "SELECT text, metadata_json, embedding FROM memories WHERE id=?", (mid,)
-        ).fetchone()
-        if row is None:
-            return {
-                "status": "not_found", "memory_id": None,
-                "old_text": old_fact, "new_text": new_fact,
-                "candidates": candidates,
-                "reason": "候选记忆已不在库里", "layer": "none",
-                "resolution": "not_found",
-                "audit": {"source": "user", "method": "correct_memory"},
-            }
-        old_text, old_meta = row[0], json.loads(row[1] or "{}")
-        same = _normalize_memory_text(new_fact) == _normalize_memory_text(old_text)
-        if same:
-            return self._apply_correction_result(
-                new_fact, mid, old_text, old_meta, same_text=True,
-                candidates=candidates, status="unchanged",
                 resolution="semantic", layer="single",
-                audit={"source": "user", "method": "single_candidate"},
+                audit={"source": "user", "method": "single_candidate",
+                       "similarity": sim},
             )
-        if exclude_identical_to_new and _normalize_memory_text(old_text) == _normalize_memory_text(new_fact):
-            return self._apply_correction_result(
-                new_fact, mid, old_text, old_meta, same_text=True,
-                candidates=candidates, status="unchanged",
-                resolution="semantic", layer="single",
-                audit={"source": "user", "method": "single_candidate"},
-            )
-        try:
-            sim = _cosine(
-                self._embed_text(old_fact), self._embed_text(new_fact)
-            )
-        except Exception:
-            sim = None
-        if sim is not None and sim < _CORRECTION_TOPIC_MIN_SIMILARITY:
-            return {
-                "status": "ambiguous", "memory_id": None,
-                "old_text": old_text, "new_text": new_fact,
-                "candidates": candidates,
-                "reason": "与候选记忆相似度过低（%.2f），不敢改" % sim,
-                "layer": "none", "resolution": "ambiguous",
-                "audit": {"source": "user", "method": "safety_net",
-                          "similarity": sim},
-            }
-        return self._apply_correction_result(
-            new_fact, mid, old_text, old_meta, same_text=False,
-            candidates=candidates, status="updated",
-            resolution="semantic", layer="single",
-            audit={"source": "user", "method": "single_candidate",
-                   "similarity": sim},
-        )
 
     def _void_last_stored(self):
         """作废上一轮刚存的记忆：账本记 delete，SQLite 标 voided。
@@ -1636,44 +1686,47 @@ class SQLiteStore:
 
     def note_context(self, memories):
         """记下本轮检索到的记忆 id，并写回 last_used_at（刚被用上）：
-        沉底的（decay_state=dormant）复活回 verbatim，账本记 REVIVE
-        （2026-11-22 decay 接线）。
+        沉底的（dormant）和待删的（decay_delete_due）都复活回 verbatim，
+        账本记 REVIVE（2026-11-22 decay 接线）。
         """
-        self._last_context_ids = [
-            (m or {}).get("id") for m in (memories or []) if (m or {}).get("id")
-        ]
-        for mid in self._last_context_ids:
-            try:
-                row = self._conn.execute(
-                    "SELECT text, metadata_json FROM memories WHERE id=? AND voided=0"
-                    " AND deleted=0 AND superseded=0",
-                    (mid,),
-                ).fetchone()
-                if row is None:
-                    continue
-                meta = json.loads(row[1] or "{}")
-                was_dormant = meta.get("decay_state") == _decay.DECAY_STATE_DORMANT
-                meta["last_used_at"] = _now_iso()
-                if was_dormant:
-                    meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
-                self._conn.execute(
-                    "UPDATE memories SET metadata_json=? WHERE id=?",
-                    (json.dumps(meta, ensure_ascii=False), mid),
-                )
-                self._conn.commit()
-                if was_dormant:
-                    try:
-                        _ledger.append_event(
-                            self.ledger_path,
-                            {"type": _ledger.LEDGER_EVENT_REVIVE,
-                             "memory_id": mid, "key": mid,
-                             "text": row[0] or ""},
-                            lock=self._ledger_lock,
-                        )
-                    except Exception:
-                        logger.warning("复活记账失败。", exc_info=True)
-            except Exception:
-                logger.warning("note_context 写回失败。", exc_info=True)
+        with self._lock:
+            self._last_context_ids = [
+                (m or {}).get("id") for m in (memories or []) if (m or {}).get("id")
+            ]
+            for mid in self._last_context_ids:
+                try:
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json FROM memories WHERE id=? AND voided=0"
+                        " AND deleted=0 AND superseded=0",
+                        (mid,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    meta = json.loads(row[1] or "{}")
+                    was_dormant = meta.get("decay_state") in (
+                        _decay.DECAY_STATE_DORMANT, _decay.DECAY_STATE_DELETE_DUE,
+                    )
+                    meta["last_used_at"] = _now_iso()
+                    if was_dormant:
+                        meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), mid),
+                    )
+                    self._conn.commit()
+                    if was_dormant:
+                        try:
+                            _ledger.append_event(
+                                self.ledger_path,
+                                {"type": _ledger.LEDGER_EVENT_REVIVE,
+                                 "memory_id": mid, "key": mid,
+                                 "text": row[0] or ""},
+                                lock=self._ledger_lock,
+                            )
+                        except Exception:
+                            logger.warning("复活记账失败。", exc_info=True)
+                except Exception:
+                    logger.warning("note_context 写回失败。", exc_info=True)
 
     def sweep_decay(self, now=None):
         """衰减扫一遍（2026-11-22 decay 接线）：按 decay.py 的规矩，
@@ -1700,7 +1753,9 @@ class SQLiteStore:
                     is_core=bool(_provenance._is_core_memory(meta)),
                     is_curated=bool(meta.get("curated")),
                 )
-                if state == _decay.DECAY_STATE_DELETE_DUE:
+                if state == _decay.DECAY_STATE_DELETE_DUE and meta.get(
+                    "decay_state"
+                ) != _decay.DECAY_STATE_DELETE_DUE:
                     meta["decay_state"] = state
                     self._conn.execute(
                         "UPDATE memories SET metadata_json=? WHERE id=?",
@@ -1726,6 +1781,19 @@ class SQLiteStore:
                         )
                     except Exception:
                         logger.warning("沉底记账失败。", exc_info=True)
+                elif state == _decay.DECAY_STATE_VERBATIM and meta.get(
+                    "decay_state"
+                ) in (
+                    _decay.DECAY_STATE_DORMANT,
+                    _decay.DECAY_STATE_DELETE_DUE,
+                ):
+                    # 复活过的记忆：算出来已是原话态，把库里还顶着的旧
+                    # 牌子改回 verbatim，别让它一直挂着 dormant / delete_due。
+                    meta["decay_state"] = state
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), row[0]),
+                    )
             self._conn.commit()
         return {"dormant": dormant, "delete_due": delete_due}
 

@@ -12,8 +12,11 @@ from memory.redaction import _normalize_memory_text
 # “我不是”后面必须跟一个替换说法（“而是/其实是/，新说法”），
 # 否则不触发（见 _detect_correction）。
 
-# _CORRECTION_PHRASES（纠错说法）：只认这五个明确的说法。
-_CORRECTION_PHRASES = ("你记错了", "不对", "纠正一下", "其实是", "我不是")
+# _CORRECTION_PHRASES（纠错说法）：只认这六个明确的说法。
+# “记错了”不带“你”也认（“不是，记错了，我住广州”）；分隔符规则会
+# 拦住“我昨天记错了开会时间”这种正常陈述（“记错了”前面是“天”，
+# 不是分隔符，不触发）。
+_CORRECTION_PHRASES = ("你记错了", "记错了", "不对", "纠正一下", "其实是", "我不是")
 
 # _CORRECTION_SEPARATORS（纠错说法前面能跟的分隔符）：纠错说法必须在
 # 句首，或在句号/逗号/换行之后——比如“我喜欢科幻电影。不对，我喜欢
