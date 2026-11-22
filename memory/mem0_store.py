@@ -5943,8 +5943,13 @@ class Mem0Store:
             "consensus": False,
         }
 
-    def add_memory_text(self, text, layers=None, source="user", turn_id=None):
+    def add_memory_text(self, text, layers=None, source="user", turn_id=None,
+                        **kwargs):
         """手动存一条记忆原文（CLI“记住：内容”用，不经过提取）。
+
+        semantic_judge（kwargs 里）：调用方传进来时这里只接受、不处理——
+        混合语义判断只接在 SQLite 那条路（见 memory/sqlite_store.py），
+        mem0 这条路保持自己的提取流程，不在这里调模型。
 
         参数 text：记忆内容原文；layers：保留给以后用；
         turn_id：这条记忆是哪一轮里写进去的（add_turn 传进来；

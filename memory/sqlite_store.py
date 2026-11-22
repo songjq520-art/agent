@@ -41,6 +41,7 @@ from memory import decay as _decay
 from memory import ledger as _ledger
 from memory import provenance as _provenance
 from memory.correction_text import (
+    _CORRECTION_PHRASES,
     _detect_correction, _strip_correction_sentences,
     _detect_correction_fragment, _VAGUE_FRAGMENT_VALUES,
     _infer_fact_slot,
@@ -84,6 +85,14 @@ _TYPE_WEIGHT_STABLE_PREFERENCE = 1.25
 # 名单故意收得窄：只认这几个动词，不猜“想 / 希望 / 要”（那些是计划，
 # 不是偏好）；“可爱”这类词不含这几个动词，不会误认。
 _PREFERENCE_WORDS = ("喜欢", "爱吃", "爱喝", "爱的是", "不爱", "讨厌")
+
+# 语义判断的触发标记（2026-11-22 混合法）：程序推不出槽位的偏好句式。
+# “喜欢”已覆盖“喜欢吃/喝/看”，“爱看/爱听/爱玩”补“爱……”系的其余动词。
+_JUDGE_PREFERENCE_MARKERS = (
+    "喜欢", "爱吃", "爱喝", "爱看", "爱听", "爱玩", "不爱", "讨厌",
+)
+# 一次判断最多带几条旧偏好候选（提示词要短，超了只带最近的）。
+_JUDGE_MAX_CANDIDATES = 10
 
 # 问句不存：以这些结尾的用户话是提问，不是陈述事实。
 _QUESTION_ENDINGS = ("?", "？", "吗", "么", "呢", "吧", "嘛")
@@ -321,13 +330,17 @@ class SQLiteStore:
     和 Mem0Store 同样的外观，供 web/server.py、main.py 直接用。
     """
 
-    def __init__(self, memory_dir=None, budget_tracker=None, **kwargs):
+    def __init__(self, memory_dir=None, budget_tracker=None,
+                 judge_provider=None, **kwargs):
         self.memory_dir = Path(memory_dir or _default_memory_dir())
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.ledger_path = self.memory_dir / "memory_events.jsonl"
         self.snapshot_path = self.memory_dir / "graph_snapshot.json"
         self.db_path = self.memory_dir / "memories.sqlite3"
         self.budget_tracker = budget_tracker
+        # 语义判官对象（2026-11-22 混合法）：测试注入 mock 用；
+        # None 时每次判断按 config.py 的 SEMANTIC_JUDGE 解析（默认 DeepSeek flash）。
+        self._judge_provider = judge_provider
         self.user_id = kwargs.get("user_id", "boos")
         self._lock = threading.RLock()
         self._ledger_lock = threading.Lock()
@@ -771,6 +784,21 @@ class SQLiteStore:
                         return {"event": "ASK", "memory": text,
                                 "reason": (verdict or {}).get("reason", ""),
                                 "supersedes_id": row[0]}
+            # 混合判断（2026-11-22，BOOS 定）：程序推不出槽位（slot 为 None）
+            # 的偏好句，工具直存路也可以问大模型判官——该取代就把目标加进
+            # to_supersede（下面存好新行再统一取代）；模型断了/说不取代
+            # 就照常直存。默认不开（opt-in，semantic_judge=True 才问）：
+            # add_memory_text 是存储原语，测试/迁移/种子直存都要确定、
+            # 不花钱——默认调模型会把 Q3 排名测坏（2026-11-23 真回归：
+            # 直存“BOOS 喜欢吃鸡杂面。”时模型取代了纠正行，前 5 乱了）。
+            # 用户当面让记的两个位置显式打开（见 tools/memory_tool.py
+            # 的 add_memory、web/server.py 的“记住”直存）；save_turn
+            # 逐句循环里已经判过了，调这里时传 semantic_judge=False，
+            # 不重复问。
+            if not slot and kwargs.get("semantic_judge", False):
+                _judged, _verdict, _trig = self._judge_preference_supersede(text)
+                if _judged is not None:
+                    to_supersede.append(_judged)
             metadata = {
                 "source": source,
                 "confidence": 1.0 if source == "user" else 0.7,
@@ -1130,6 +1158,196 @@ class SQLiteStore:
             return True
         return False
 
+    # ---------- 混合语义判断（2026-11-22，BOOS 定） ----------
+    # 主控是十二自己（本地程序）：下面的 _needs_semantic_judge 只做分流，
+    # 用程序能直接算出来的触发条件（slot 是不是 None、句式是不是偏好、
+    # 库里有没有同类活记忆、含不含纠错说法），不调模型、不让模型决定
+    # “要不要问模型”。大模型是判官：只在触发后被调来做语义判断。
+    # 程序能判定的路（住处/名字/Agent 名）不动，仍走程序，不变慢、不变贵。
+
+    def _preference_judge_candidates(self, text):
+        """程序算的判官候选：活记忆里同类偏好句（同文的除外），最近的在前。
+
+        只看句式里含不含偏好标记，不猜意思；同文（归一化后相同）的不算
+        候选——那是去重的活，判官不用判。
+        """
+        norm = _normalize_memory_text(text)
+        out = []
+        for m in self._all_live_memories():
+            cand_text = m["text"] or ""
+            if _normalize_memory_text(cand_text) == norm:
+                continue
+            if not any(marker in cand_text for marker in _JUDGE_PREFERENCE_MARKERS):
+                continue
+            out.append({"id": m["id"], "text": cand_text,
+                        "meta": m["metadata"]})
+            if len(out) >= _JUDGE_MAX_CANDIDATES:
+                break
+        return out
+
+    def _needs_semantic_judge(self, sentence, slot):
+        """主控分流（纯程序逻辑，不调模型）：该不该问大模型判官。
+
+        返回 (trigger, reason, candidates)，trigger 为 True 才问。
+        触发条件（至少满足一条，且都要有候选可判）：
+        (a) slot 是 None + 偏好句式 + 库里有同类偏好活记忆；
+        (c) 含纠错说法、但 _detect_correction 没认出来 + 偏好句式 + 有候选
+            （比如“我现在喜欢喝豆奶了”：“我现在”那条认纠正要求带单值
+            槽位，偏好句没槽位就认不出来，程序判不定，交给判官）。
+        slot 能推出来时走程序路，这里永远返回不触发。
+        (b) 纠正候选多条分不清不在这里——那是 correct_memory 报 ambiguous
+        之后的事，见 _judge_ambiguous_correction。
+        """
+        if slot is not None:
+            return False, None, []
+        if not any(marker in sentence for marker in _JUDGE_PREFERENCE_MARKERS):
+            return False, None, []
+        cands = self._preference_judge_candidates(sentence)
+        if not cands:
+            return False, None, []
+        if _detect_correction(sentence) is None and any(
+            phrase in sentence for phrase in _CORRECTION_PHRASES
+        ):
+            return True, "correction_uncertain", cands
+        return True, "slot_none_preference", cands
+
+    def _ask_semantic_judge(self, text, candidates):
+        """调大模型判官（只在触发后调）。返回 verdict dict。
+
+        模型断了（超时、API 报错、没 Key、没接好）或回的格式不对时
+        返回 None——调用方按程序 fallback 走（照常存、不崩、不丢事实），
+        失败记一条 warning 日志，方便查。
+        判官对象：self._judge_provider（测试注入）或配置解析
+        （默认 DeepSeek flash，见 memory/semantic_judge.py）。
+        """
+        try:
+            from memory import semantic_judge as _sj
+            return _sj.judge_semantic(
+                text, candidates, provider=self._judge_provider,
+                budget_tracker=self.budget_tracker,
+            )
+        except Exception as exc:
+            logger.warning("语义判断失败，降级走程序：%s", exc)
+            return None
+
+    def _judge_preference_supersede(self, text):
+        """问判官：这句偏好新事实该不该取代某条同类活偏好。
+
+        返回 ((old_id, old_text, old_meta), verdict, trigger)；不取代/
+        模型断了/没候选/目标不在候选里时返回 (None, None, None)。
+        trigger 是触发原因（slot_none_preference / correction_uncertain）。
+        目标校验在判官解析层已做过一次（target_id 必须在候选里），
+        这里再按 id 对一次候选，对不上就不取代，不猜。
+        """
+        _trigger, _reason, cands = self._needs_semantic_judge(text, None)
+        if not _trigger:
+            return None, None, None
+        verdict = self._ask_semantic_judge(text, cands)
+        if not verdict or not verdict.get("should_supersede"):
+            return None, None, None
+        target = next(
+            (c for c in cands if c["id"] == verdict.get("target_id")), None
+        )
+        if target is None:
+            logger.warning("语义判断目标不在候选里，不取代。")
+            return None, None, None
+        return (target["id"], target["text"], target["meta"]), verdict, _reason
+
+    def _apply_semantic_judge_update(self, sentence, receipt, turn_id, event_date):
+        """save_turn 逐句循环里的模型判官路：触发后问模型，该取代就走
+        correct_memory 同款落盘（_apply_correction_result：新说法存一条，
+        账本记 supersede，旧行标 superseded=1）。
+
+        回执记 stored + SUPERSEDE 结果（route="model"）+ correction
+        （route="model"，带判官的 provider/model/用量/成本），页面和
+        /api/chat 的返回里能看到走了模型。返回 True=已处理，
+        False=没处理（调用方照常走 add_memory_text 直存，不丢事实）。
+        """
+        target, verdict, trigger = self._judge_preference_supersede(sentence)
+        if target is None:
+            return False
+        old_id, old_text, old_meta = target
+        outcome = self._apply_correction_result(
+            sentence, old_id, old_text, old_meta, same_text=False,
+            candidates=[old_id], status="updated",
+            resolution="semantic_judge",
+            audit={"source": "user", "method": "semantic_judge",
+                   "provider": verdict.get("provider"),
+                   "model": verdict.get("model"),
+                   "judge_slot": verdict.get("slot")},
+            layer="judge",
+        )
+        if (outcome or {}).get("status") != "updated":
+            return False
+        outcome = dict(outcome)
+        outcome["route"] = "model"
+        outcome["judge"] = {
+            key: verdict.get(key)
+            for key in ("provider", "model", "slot", "reason",
+                        "cost_usd", "usage")
+            if verdict.get(key) is not None
+        }
+        outcome["judge"]["trigger"] = trigger
+        receipt["stored"].append(sentence)
+        receipt["results"].append(
+            {"id": outcome.get("memory_id"), "memory": sentence,
+             "event": "SUPERSEDE", "old_text": old_text,
+             "supersedes_id": old_id, "route": "model"}
+        )
+        if "correction" not in receipt:
+            receipt["correction"] = outcome
+        receipt.setdefault("judge_calls", []).append(outcome["judge"])
+        return True
+
+    def _judge_ambiguous_correction(self, correction, fact):
+        """触发条件 (b)：correct_memory 报 ambiguous 后，再问大模型判官挑一条。
+
+        挑出来就按那条落盘（_apply_correction_result，route="model"）；
+        挑不出来（判官说不取代/目标不在候选里）或模型断了时返回 None——
+        调用方保持 ambiguous，不猜（新说法照常当新记忆存）。
+        """
+        cands = (correction or {}).get("candidates") or []
+        cand_list = [
+            {"id": c.get("id"), "text": c.get("text")}
+            for c in cands if c.get("id") and c.get("text")
+        ]
+        if len(cand_list) < 2:
+            return None
+        verdict = self._ask_semantic_judge(fact, cand_list)
+        if not verdict or not verdict.get("should_supersede"):
+            return None
+        target = next(
+            (c for c in cand_list if c["id"] == verdict.get("target_id")), None
+        )
+        if target is None:
+            return None
+        row = self._conn.execute(
+            "SELECT metadata_json FROM memories WHERE id=?", (target["id"],)
+        ).fetchone()
+        old_meta = json.loads((row or [None])[0] or "{}")
+        outcome = self._apply_correction_result(
+            fact, target["id"], target["text"], old_meta, same_text=False,
+            candidates=[target["id"]], status="updated",
+            resolution="semantic_judge",
+            audit={"source": "user", "method": "semantic_judge",
+                   "provider": verdict.get("provider"),
+                   "model": verdict.get("model"),
+                   "judge_slot": verdict.get("slot")},
+            layer="judge",
+        )
+        if (outcome or {}).get("status") != "updated":
+            return None
+        outcome = dict(outcome)
+        outcome["route"] = "model"
+        outcome["judge"] = {
+            key: verdict.get(key)
+            for key in ("provider", "model", "slot", "reason",
+                        "cost_usd", "usage")
+            if verdict.get(key) is not None
+        }
+        outcome["judge"]["trigger"] = "ambiguous_candidates"
+        return outcome
+
     def save_turn(self, messages, turn_id=None):
         """一轮对话的收尾：同步把用户亲口说的事实原样存下来，留回执。
 
@@ -1223,6 +1441,13 @@ class SQLiteStore:
                         retry = self._retry_correction_by_slot(correction, fact)
                         if retry is not None:
                             correction = retry
+                    if (correction or {}).get("status") == "ambiguous":
+                        # 触发条件 (b)：纠正候选多条、相似度都过线，程序筛不出来——
+                        # 再问大模型判官挑一条；挑不出来/模型断了就保持 ambiguous，
+                        # 不猜（下面照常把新说法当新记忆存）。
+                        judged = self._judge_ambiguous_correction(correction, fact)
+                        if judged is not None:
+                            correction = judged
                     if (correction or {}).get("status") == "updated":
                         # 纠正换来的新记忆带上槽位标（以后按槽位找得到它）。
                         slot, _value = _infer_fact_slot(fact)
@@ -1299,6 +1524,14 @@ class SQLiteStore:
                 sentence, slot, slot_value, receipt, turn_id, event_date
             ):
                 continue
+            # 混合判断（2026-11-22，BOOS 定）：程序推不出槽位的偏好句，
+            # 主控（十二本地程序）按程序算出的触发条件决定问不问大模型
+            # （见 _needs_semantic_judge：slot 为 None + 偏好句式 + 库里
+            # 有同类偏好活记忆）；大模型只当判官，不做分流。
+            if slot is None and self._apply_semantic_judge_update(
+                sentence, receipt, turn_id, event_date
+            ):
+                continue
             # 来源标 user（已确认）：save_turn 只存用户本轮直接说的话，
             # 不是模型推断——2026-11-22 BOOS 定选 A：用户亲口说的新事实
             # 直接算已确认（可信度 1.0），能取代已确认的旧事实。unconfirmed
@@ -1308,6 +1541,7 @@ class SQLiteStore:
             saved = self.add_memory_text(
                 sentence, source="user", turn_id=turn_id,
                 event_date=event_date, decay_kind="episodic",
+                semantic_judge=False,
                 **({"slot": slot} if slot else {}),
             )
             if (saved or {}).get("event") == "ADD":

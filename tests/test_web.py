@@ -63,7 +63,7 @@ class FakeMem0Store:
         self.search_turn_ids = []
         self.saved_turn_ids = []
 
-    def add_memory_text(self, text, source="user", turn_id=None):
+    def add_memory_text(self, text, source="user", turn_id=None, **kwargs):
         """25 号直存：记下来，放进 memories 里让下一轮 search() 能找到
         （和真实库“存完下一句就能查到”一致），返回非空表示存成了。
         turn_id（2026-11-19）：本轮的 id，另记在 direct_turn_ids 里，

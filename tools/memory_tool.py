@@ -570,7 +570,8 @@ def _run_add_memory(args):
             "error": None,
         }
     try:
-        result = store.add_memory_text(text, source="user")
+        result = store.add_memory_text(text, source="user",
+                                       semantic_judge=True)
     except Exception as exc:  # noqa: BLE001 - 存失败也算执行失败
         return {"ok": False, "data": None, "error": f"存记忆失败：{exc}"}
     # mem0 那条路的旧形状（{"results": [...]}）还留着兼容。

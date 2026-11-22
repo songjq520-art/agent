@@ -704,7 +704,8 @@ class ChatState:
                 if content:
                     try:
                         result = self.mem0_store.add_memory_text(
-                            content, source="user", turn_id=turn_id
+                            content, source="user", turn_id=turn_id,
+                            semantic_judge=True,
                         )
                         remember_stored = bool(result)
                     except Exception:

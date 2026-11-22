@@ -70,7 +70,7 @@ class _MiniMem0Store:
         self.direct_stored = []
         self.memories = []
 
-    def add_memory_text(self, text, source="user", turn_id=None):
+    def add_memory_text(self, text, source="user", turn_id=None, **kwargs):
         self.direct_stored.append({"text": text, "source": source})
         if text not in self.memories:
             self.memories.append(text)
