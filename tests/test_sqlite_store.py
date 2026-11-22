@@ -1411,7 +1411,8 @@ def test_correction_safety_net_blocks_cross_topic_supersede(tmp_path, monkeypatc
     """待补 2：库里只有“我喜欢科幻电影”，用户说“不对，我住广州”
     （save_turn 走 correct_memory(fact, fact)），安全网用库里旧向量
     old_vec 算相似度：科幻 [1, 0] vs 广州 [0.6, 0.8] 相似度 0.6 < 0.70，
-    拦截误取代，报 ambiguous，库里原样不动。"""
+    拦截误取代，报 ambiguous，旧行原样不动、不被取代。2026-11-22
+    修复 3 之后：ambiguous 时新说法不再丢，当新事实存下来。"""
     def _fake_embed(self, text):
         if "科幻" in (text or ""):
             return np.array([1.0, 0.0], dtype="float32")
@@ -1430,9 +1431,12 @@ def test_correction_safety_net_blocks_cross_topic_supersede(tmp_path, monkeypatc
     assert correction.get("status") == "ambiguous"
     assert (correction.get("audit") or {}).get("method") == "safety_net"
     assert (correction.get("audit") or {}).get("similarity") == pytest.approx(0.6)
-    assert r["stored"] == []
-    assert _live_texts(s) == ["我喜欢科幻电影"]
-    assert len(_ledger_lines(s)) == 1  # 只有最初一笔 add，没多写 supersede
+    # 修复 3：ambiguous 时新说法当新事实存下来，不再丢。
+    assert r["stored"] == ["我住广州"]
+    assert set(_live_texts(s)) == {"我喜欢科幻电影", "我住广州"}
+    # 安全网的本职还在：旧行没被取代，账本里没多写 supersede。
+    assert len(_ledger_lines(s)) == 2  # 科幻 add + 广州 add
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(s))
 
 
 def test_decay_delete_due_revive_and_double_sweep_idempotent(store):
