@@ -193,16 +193,21 @@ def _dca_block(text):
     yearly_pmt = daily * TRADING_DAYS_PER_YEAR
     fv_yearly = _fv_annuity(yearly_pmt, annual_rate, years, 1)
     principal_yearly = yearly_pmt * int(round(years))
+    fv_daily = _fv_annuity(daily, annual_rate, years, 365)
+    principal_daily = daily * int(round(years * 365))
     return (
         "【本地计算结果（已算好，直接用这个数回答，别自己再算）】\n"
         f"每天定投 {daily:g} {unit}、年化 {rate:g}%、{years:g} 年：\n"
+        f"- 按每天投 {daily:g} {unit}算（每天投一次，按日复利，日利率 年化/365）："
+        f"{years:g} 年后约 {_fmt_wan(fv_daily)}"
+        f"（{fv_daily:,.0f} {unit}，本金 {_fmt_wan(principal_daily, 2)}）\n"
         f"- 按每月投 {monthly_pmt:g} {unit}算（每月投一次，月末）："
         f"{years:g} 年后约 {_fmt_wan(fv_monthly)}"
         f"（{fv_monthly:,.0f} {unit}，本金 {_fmt_wan(principal_monthly, 2)}）\n"
         f"- 按每年 {TRADING_DAYS_PER_YEAR} 个交易日、每年投 {yearly_pmt:g} {unit}算"
         f"（每年投一次，年末）：{years:g} 年后约 {_fmt_wan(fv_yearly)}"
         f"（{fv_yearly:,.0f} {unit}，本金 {_fmt_wan(principal_yearly, 2)}）\n"
-        "单位和口径都按问题里说的来：问题说每天定投就按每天投算，"
+        "问题说每天定投，优先用上面每天投（按日复利）的数，直接抄，别自己再算；"
         "别说成每月月初定投，也别自己编别的口径；单位是块就按块算，"
         "是美元就按美元算，不要自己换算。年化是假设，实际收益有波动。"
     )

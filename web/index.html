@@ -487,6 +487,17 @@
     chatEl.scrollTop = chatEl.scrollHeight;
     return wrap;
   }
+  // 第四轮 #4：恢复对话时也要显示模型/成本行（和刚收到回复时一样）。
+  // 老消息没有 model/cost_usd 时不显示，不编一个“成本未知”出来。
+  function metaForMessage(m) {
+    if (!m || m.role === 'user') return undefined;
+    if (!m.model && (m.cost_usd === null || m.cost_usd === undefined)) return undefined;
+    const cost = m.cost_usd === null || m.cost_usd === undefined
+      ? '成本未知'
+      : ('本次 $' + Number(m.cost_usd).toFixed(6));
+    return (m.model || '') + ' · ' + cost;
+  }
+
 
   async function refreshStatus() {
     try {
@@ -840,7 +851,7 @@
       const summaryCard = renderSummaryCard(data.summary);
       if (summaryCard) chatEl.appendChild(summaryCard);
       messages.forEach((m) => {
-        addMsg(m.role === 'user' ? 'user' : 'ai', m.content || '');
+        addMsg(m.role === 'user' ? 'user' : 'ai', m.content || '', metaForMessage(m));
       });
       if (data.transcript_status && data.transcript_status !== 'full') {
         addMsg('ai', '这段对话的全文已按保留期转成摘要，上面只显示摘要和最近几轮。');
@@ -1373,7 +1384,7 @@
       const summaryCard = renderSummaryCard(data.summary);
       if (summaryCard) chatEl.appendChild(summaryCard);
       (data.messages || []).forEach((m) => {
-        addMsg(m.role === 'user' ? 'user' : 'ai', m.content || '');
+        addMsg(m.role === 'user' ? 'user' : 'ai', m.content || '', metaForMessage(m));
       });
       addMsg('ai', '已回到之前的对话《' + (data.title || '新对话') + '》，摘要和最近几轮已恢复，接着聊吧。');
       refreshRecent();

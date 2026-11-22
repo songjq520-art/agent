@@ -70,12 +70,26 @@ def _parse_time(value):
 
 
 def _copy_messages(messages):
-    """复制一段消息列表（只留 role/content，调用方改了原列表也不影响存档）。"""
-    return [
-        {"role": (msg or {}).get("role"), "content": (msg or {}).get("content") or ""}
-        for msg in (messages or [])
-        if (msg or {}).get("role") in ("user", "assistant")
-    ]
+    """复制一段消息列表（只留 role/content，assistant 再带 model/cost_usd，
+    调用方改了原列表也不影响存档）。
+
+    model/cost_usd 只作展示用（第四轮 #4：恢复对话时模型/成本行要能显示）：
+    发给模型前 providers/deepseek.py 的 _normalize_messages 会把它们剥掉，
+    不会漏进 API；指纹只算 role+content，不受影响。
+    """
+    copied = []
+    for msg in (messages or []):
+        msg = msg or {}
+        if msg.get("role") not in ("user", "assistant"):
+            continue
+        item = {"role": msg.get("role"), "content": msg.get("content") or ""}
+        if msg.get("role") == "assistant":
+            if msg.get("model") is not None:
+                item["model"] = msg.get("model")
+            if msg.get("cost_usd") is not None:
+                item["cost_usd"] = msg.get("cost_usd")
+        copied.append(item)
+    return copied
 
 
 class TranscriptStore:

@@ -104,6 +104,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+from datetime import date
 
 # 让直接运行 python web/server.py 也能找到项目根目录的 main.py、config.py。
 # 用 python -m web.server 运行时本来就不需要这一行，加上也不影响。
@@ -127,6 +128,7 @@ from memory.conversation_transcript import (  # noqa: E402
 )
 from memory.mem0_store import create_mem0_store  # noqa: E402
 from memory.redaction import _redact_sensitive  # noqa: E402
+from memory.sqlite_store import resolve_event_date  # noqa: E402
 
 logger = logging.getLogger("agent")
 
@@ -168,11 +170,46 @@ class ServerConfig:
         return cls(host=host, port=port)
 
 
+def _summarize_delete_texts(texts):
+    """删除确认卡里列出全部要删的记忆（第四轮 #5）：相同原文只列一次、
+    后面标 ×N；太长时把过长的原文截短，实在放不下才用“等 N 条”收尾。"""
+    counts = []
+    seen = {}
+    for text in texts:
+        if text in seen:
+            counts[seen[text]][1] += 1
+        else:
+            seen[text] = len(counts)
+            counts.append([text, 1])
+
+    def _piece(text, n, limit=None):
+        shown = text if limit is None or len(text) <= limit else text[:limit] + "…"
+        return f"「{shown}」" if n == 1 else f"「{shown}」×{n}"
+
+    joined = "、".join(_piece(t, n) for t, n in counts)
+    if len(joined) <= 60:
+        return joined
+    joined = "、".join(_piece(t, n, 12) for t, n in counts)
+    if len(joined) <= 60:
+        return joined
+    kept = []
+    hidden = 0
+    for text, n in counts:
+        piece = _piece(text, n, 12)
+        if kept and len("、".join(kept)) + 1 + len(piece) > 55:
+            hidden += n
+            continue
+        kept.append(piece)
+    if hidden:
+        kept.append(f"等 {hidden} 条")
+    return "、".join(kept)
+
+
 def _human_approval_summary(tool, args):
     """确认卡上的人话摘要（第三轮 #5）：卡上只显示一句话，不贴 JSON。
 
     delete_memory：删除记忆「{text}」；delete_memories：删除 N 条记忆
-    （第一条原文 + 等 N 条）；update_memory：把「old」改成「new」；
+    （全部原文列出来，相同原文标 ×N，太长了再精简）；update_memory：把「old」改成「new」；
     revive_memory：恢复记忆「{text}」。不认的工具给一句通用话。
     """
     args = args or {}
@@ -183,10 +220,13 @@ def _human_approval_summary(tool, args):
         items = args.get("items") or []
         if not items:
             return "删除多条记忆"
-        first = ((items[0] or {}).get("text") or "").strip()
-        if len(items) == 1:
-            return f"删除记忆「{first}」"
-        return f"删除 {len(items)} 条记忆：{first} 等"
+        texts = [((item or {}).get("text") or "").strip() for item in items]
+        texts = [t for t in texts if t]
+        if not texts:
+            return f"删除 {len(items)} 条记忆"
+        if len(texts) == 1:
+            return f"删除记忆「{texts[0]}」"
+        return f"删除 {len(texts)} 条记忆：{_summarize_delete_texts(texts)}"
     if tool == "update_memory":
         old = (args.get("old_text") or "").strip()
         new = (args.get("new_text") or "").strip()
@@ -692,11 +732,29 @@ class ChatState:
                 if block:
                     model_prompt = block + "\n\n" + prompt
             if remember_stored:
-                # 第三轮 #8：这条“记住”已经由程序直接存进长期记忆了，
-                # 模型不用再调 add_memory 工具——调了会存第二遍。
-                model_prompt += (
-                    "\n\n【已存】这条“记住”已经由程序直接存进长期记忆了，"
-                    "不用再调 add_memory 工具，直接回一句“记下了”就行。"
+                # 第四轮 #8：这条“记住”已经由程序直接存进长期记忆了，
+                # 回执只说记下了就行，不再调模型——模型会多嘴补一段无关内容。
+                content = remember_content(prompt)
+                receipt = f"记下了：{content}。"
+                event_date = resolve_event_date(content)
+                if event_date:
+                    try:
+                        d = date.fromisoformat(event_date)
+                        weekday = "一二三四五六日"[d.weekday()]
+                        receipt = (
+                            f"记下了：{content}（{d.month}月{d.day}日，周{weekday}）。"
+                        )
+                    except ValueError:
+                        pass
+                return self._finish_turn_locked(
+                    prompt,
+                    receipt,
+                    "程序直存",
+                    0.0,
+                    None,
+                    timer=timer,
+                    skip_memory_save=True,
+                    turn_id=turn_id,
                 )
             # 45 号：记忆工具要用的记忆库绑到当前上下文（循环里调
             # 记忆工具时能读到；没启用记忆库时等于没绑，工具会报
@@ -813,7 +871,12 @@ class ChatState:
         if timer is None:
             timer = Timer()
         user_msg = {"role": "user", "content": prompt}
-        assistant_msg = {"role": "assistant", "content": reply_text}
+        assistant_msg = {
+            "role": "assistant",
+            "content": reply_text,
+            "model": model_name,
+            "cost_usd": cost_usd,
+        }
         if isinstance(insert_at, bool) or not isinstance(insert_at, int):
             insert_at = None
         if insert_at is None:

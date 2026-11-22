@@ -256,7 +256,7 @@ def test_chat_success_appends_history(running_server, monkeypatch):
     assert data["cost_usd"] == 0.0001
     assert state.messages == [
         {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "假回答"},
+        {"role": "assistant", "content": "假回答", "model": "deepseek-flash", "cost_usd": 0.0001},
     ]
 
 
@@ -346,7 +346,7 @@ def test_ask_without_mem0_store_chats_normally(tmp_path, monkeypatch):
     assert seen["prompt"] == "你好"
     assert state.messages == [
         {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "假回答"},
+        {"role": "assistant", "content": "假回答", "model": "deepseek-flash", "cost_usd": 0.0001},
     ]
 
 
@@ -376,7 +376,7 @@ def test_ask_with_mem0_injects_memory_and_saves_turn(tmp_path, monkeypatch):
     # 历史里记的是原话，不带记忆块。
     assert state.messages == [
         {"role": "user", "content": "你记得我叫什么吗？"},
-        {"role": "assistant", "content": "假回答"},
+        {"role": "assistant", "content": "假回答", "model": "deepseek-flash", "cost_usd": 0.0001},
     ]
     # 回答成功后调了一次 add_turn，带上了刚追加的新问答。
     assert len(mem0_store.saved_turns) == 1
@@ -408,7 +408,9 @@ def test_ask_with_mem0_but_no_results_asks_plainly(tmp_path, monkeypatch):
 
 def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatch):
     """25 号：网页说“记住……”要立刻直存（不用等下一轮），收尾跳过
-    add_turn（别让提取再存一条推断版）；下一句问起来就能查到。"""
+    add_turn（别让提取再存一条推断版）；下一句问起来就能查到。
+    第四轮 #8：直存后回执由程序直接给（“记下了：……”），不再调模型——
+    模型会多嘴补一段无关内容。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     mem0_store = FakeMem0Store(memories=[])
     state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
@@ -421,18 +423,25 @@ def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatc
     monkeypatch.setattr("web.server.run_question", _capturing_fake)
     result = state.ask("记住，我喜欢喝冰美式")
     assert result["mode"] == "real"
-    assert result["reply"] == "假回答"
+    # 第四轮 #8：回执只说记下了，不调模型（seen 还是空的）。
+    assert result["reply"] == "记下了：我喜欢喝冰美式。"
+    assert result["model"] == "程序直存"
+    assert result["cost_usd"] == 0.0
+    assert seen == {}
     # 直存了：内容是“记住”后面的文字，来源是 user（已确认）。
     assert mem0_store.direct_stored == [
         {"text": "我喜欢喝冰美式", "source": "user"}
     ]
-    # 直存那轮不调 add_turn（已经在库里了，再提取会重复存）。
+    # 直存的那轮不调 add_turn（已经在库里了，再提取会重复存）。
     assert len(mem0_store.saved_turns) == 0
-    # 直存的记忆在当轮搜记忆时就已经能找到，发给模型的提示块里有它。
-    assert "我喜欢喝冰美式" in seen["prompt"]
+    # 历史里那轮的 assistant 消息带上 model/cost_usd（第四轮 #4）。
+    assert state.messages[-1]["content"] == "记下了：我喜欢喝冰美式。"
+    assert state.messages[-1]["model"] == "程序直存"
+    assert state.messages[-1]["cost_usd"] == 0.0
     # 下一句马上问，搜到的记忆块里有这条（不用等一轮）。
     result = state.ask("你记不记得我喜欢喝什么")
     assert result["mode"] == "real"
+    assert result["reply"] == "假回答"
     assert "我喜欢喝冰美式" in seen["prompt"]
     # 普通那轮照常走 add_turn（只跳过“记住”那轮）。
     assert len(mem0_store.saved_turns) == 1
@@ -474,7 +483,7 @@ def test_ask_with_real_mem0_store_searches_and_saves(tmp_path, monkeypatch):
     # 历史里记的是用户原话，不带记忆块。
     assert state.messages == [
         {"role": "user", "content": "我叫小宋。"},
-        {"role": "assistant", "content": "你好，我是 DeepSeek。"},
+        {"role": "assistant", "content": "你好，我是 DeepSeek。", "model": "deepseek-flash", "cost_usd": 4.5e-05},
     ]
     # 回答后本轮对话先待定（Plan C），flush 时才提交：
     # “我叫小宋”说的就是种下的那条名字记忆（同一槽位、同一值），
@@ -1548,23 +1557,26 @@ def test_ask_threads_same_turn_id_through_search_run_question_and_save(tmp_path,
 
 
 def test_ask_remember_passes_turn_id_to_direct_store(tmp_path, monkeypatch):
-    """“记住……”那轮：直存、检索强化、run_question 用的也是同一个 turn_id；
-    收尾照旧跳过 add_turn。"""
+    """“记住……”那轮：直存、检索强化用的是同一个 turn_id；
+    收尾照旧跳过 add_turn。第四轮 #8：这轮不再调模型
+    （回执由程序直接给），所以 run_question 不应被调用——
+    turn_id 从直存记录里取。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     mem0_store = FakeMem0Store(memories=[])
     state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
     seen = {}
 
     def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
-        seen["turn_id"] = kwargs.get("turn_id")
+        seen["called"] = True
         return _fake_success_run_question(prompt, budget_tracker, messages, **kwargs)
 
     monkeypatch.setattr("web.server.run_question", _capturing_fake)
     result = state.ask("记住，我喜欢喝冰美式")
     assert result["mode"] == "real"
-    turn_id = seen["turn_id"]
+    assert "called" not in seen  # 第四轮 #8：记住回执不调模型
+    assert mem0_store.direct_turn_ids
+    turn_id = mem0_store.direct_turn_ids[0]
     assert turn_id
-    assert mem0_store.direct_turn_ids == [turn_id]
     assert mem0_store.search_turn_ids == [turn_id]
     assert mem0_store.saved_turn_ids == []
 

@@ -734,7 +734,7 @@ def test_chat_state_done_appends_only_original_and_final(monkeypatch, store, gat
     assert reply["mode"] == "real"
     assert state.messages == [
         {"role": "user", "content": "广州今天天气怎么样？"},
-        {"role": "assistant", "content": "广州今天晴，23度。"},
+        {"role": "assistant", "content": "广州今天晴，23度。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 
@@ -792,7 +792,7 @@ def test_chat_state_resolve_approval_resumes_and_finishes(monkeypatch, tmp_path,
     assert seen["resume_task"]["status"] == "RUNNING"
     assert state.messages == [
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 
@@ -1059,7 +1059,7 @@ def test_chat_state_resolve_approval_inserts_before_newer_message(monkeypatch, s
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
     # 再点 Q1 的确认卡：恢复的那轮插回位置 2，Q2 那轮不动。
     monkeypatch.setattr(
@@ -1074,9 +1074,9 @@ def test_chat_state_resolve_approval_inserts_before_newer_message(monkeypatch, s
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 
@@ -1120,13 +1120,13 @@ def test_chat_state_resumed_turn_still_saved_to_memory(monkeypatch, store, gatew
     assert reply["mode"] == "real"
     assert state.messages[2:4] == [
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
     # 存记忆的最后一次窗口里有恢复的那轮（最近 6 条已挤不下它）。
     # 26 号：网页服务走 save_turn 存记忆，看 save_turn 的调用记录。
     window = mem0.save_turn.call_args_list[-1].args[0]
     assert {"role": "user", "content": "帮我写个文件"} in window
-    assert {"role": "assistant", "content": "写好了。"} in window
+    assert {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001} in window
     assert len(window) == 6
 
 
@@ -1203,7 +1203,7 @@ def test_chat_state_chained_approval_keeps_original_position(monkeypatch, store,
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
     # 点第二张卡：回答插回位置 2。
     monkeypatch.setattr(
@@ -1217,9 +1217,9 @@ def test_chat_state_chained_approval_keeps_original_position(monkeypatch, store,
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 

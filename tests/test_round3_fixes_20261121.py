@@ -532,7 +532,7 @@ def test_human_approval_summary():
         {"items": [{"memory_id": "a", "text": "第一条"},
                    {"memory_id": "b", "text": "第二条"}],
          "anchor_text": "定投"},
-    ) == "删除 2 条记忆：第一条 等"
+    ) == "删除 2 条记忆：「第一条」、「第二条」"
     assert _human_approval_summary(
         "update_memory", {"old_text": "我爱吃拉面", "new_text": "我爱吃米线"}
     ) == "把记忆「我爱吃拉面」改成「我爱吃米线」"

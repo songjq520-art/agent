@@ -92,6 +92,31 @@ _RELATIVE_DAY_OFFSETS = {
 }
 
 
+# 中文星期 → 周一为 0 的序号（和 datetime.weekday() 一致）。
+_WEEKDAY_CN_TO_NUM = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+
+
+def _resolve_weekday(text, today):
+    """“下周三/本周三/这周三/上周三”这类带星期的相对日期 → 绝对日期。
+
+    周一是一周的开始：本周 = 今天所在周，下周 = 下一周，上周 = 上一周。
+    找不到带星期的表达时返回 None。
+    """
+    m = re.search(r"(下周|本周|这周|上周)(?:星期|周|礼拜)?([一二三四五六日天])", text or "")
+    if not m:
+        return None
+    qualifier, wd = m.group(1), m.group(2)
+    target = _WEEKDAY_CN_TO_NUM[wd]
+    monday = today - timedelta(days=today.weekday())
+    if qualifier == "下周":
+        base = monday + timedelta(days=7)
+    elif qualifier in ("本周", "这周"):
+        base = monday
+    else:  # 上周
+        base = monday - timedelta(days=7)
+    return (base + timedelta(days=target)).isoformat()
+
+
 def _shanghai_today():
     """今天（Asia/Shanghai 的日期）。"""
     return datetime.now(_SHANGHAI).date()
@@ -108,6 +133,9 @@ def resolve_event_date(text, today=None):
     for word, offset in _RELATIVE_DAY_OFFSETS.items():
         if word in (text or ""):
             return (today + timedelta(days=offset)).isoformat()
+    wd = _resolve_weekday(text, today)
+    if wd:
+        return wd
     m = re.search(
         r"(20\d{2})年(\d{1,2})月(\d{1,2})日", text or ""
     )
