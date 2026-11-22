@@ -614,10 +614,11 @@ class SQLiteStore:
         """原文存一条记忆（“记住”直存、种子、规则都走这里）。
 
         先写账本、再写 SQLite；账本写不进去就返回 {}、不写索引。
-        同文去重（2026-11-22，Gemini #4）：同一原文、同一来源/确认状态
-        的活记忆已在库里时，不再存第二行，返回 UNCHANGED，并记一笔
-        “又出现一次”（出现集合 + 晋升检查）；来源不同（已确认版 vs
-        推断版）时两行并存，检索层聚合、确认版优先（#2 的规矩）。
+        同文去重（2026-11-22，Bug 2 治本）：同一归一化文本的活记忆
+        已在库里时，不再存第二行，返回 UNCHANGED，并记一笔“又出现一次”
+        （出现集合 + 晋升检查）；来源不看——已确认版和推断版是同一事实，
+        确认状态只往上提（推断版在库、已确认版后到时，把已有行升级成
+        已确认；已确认版在库、推断版后到时，只记出现，不降级）。
         同槽位（2026-11-22，Gemini #4）：slot 相同、文本不同的活记忆
         是同一件事的新版本，按 provenance._resolve_conflict 裁决：
         supersede_old 就取代旧行再存新行；pending_new/keep_old/ask
@@ -647,19 +648,43 @@ class SQLiteStore:
             decay_kind = kwargs.get("decay_kind") or _decay.classify_decay_kind(
                 source, False, is_rule
             )
-            # 同文去重：同一原文、同一来源/确认状态的活记忆已在库里。
-            for row in self._conn.execute(
-                "SELECT id, metadata_json FROM memories"
-                " WHERE text=? AND voided=0 AND deleted=0 AND superseded=0",
-                (text,),
-            ).fetchall():
-                try:
-                    old_meta = json.loads(row[1] or "{}")
-                except Exception:
-                    old_meta = {}
-                if old_meta.get("source") == source and bool(
-                    old_meta.get("user_confirmed")
-                ) == user_confirmed:
+            # 同文去重（2026-11-22 Bug 2 治本）：只看归一化文本，不看来源——
+            # 模型工具写 source="user"（已确认）、save_turn 写 source="inferred"
+            # （未确认），来源不同不是两条事实。归一化比对要在 Python 里做
+            # （_normalize_memory_text 剥标点/空白/主语，SQL 精确匹配认不出
+            # “我住广州。”和“我住广州”是同一句），所以扫一遍活行逐条比。
+            norm_text = _normalize_memory_text(text)
+            if norm_text:
+                for row in self._conn.execute(
+                    "SELECT id, text, metadata_json FROM memories"
+                    " WHERE voided=0 AND deleted=0 AND superseded=0"
+                ).fetchall():
+                    if _normalize_memory_text(row[1] or "") != norm_text:
+                        continue
+                    try:
+                        old_meta = json.loads(row[2] or "{}")
+                    except Exception:
+                        old_meta = {}
+                    if user_confirmed and not old_meta.get("user_confirmed"):
+                        # 确认状态只往上提：推断版在库、已确认版后到时，
+                        # 把已有行升级成已确认（source 改 "user"、确认位
+                        # 置 1、decay_kind 改 stable——用户亲口确认的事实
+                        # 应该是稳定的）。升级不记账本：复用那条路
+                        # （_apply_correction_result）也没给复用记账本，
+                        # 只在 decay_state 复活时记一笔 REVIVE，这里不复活，
+                        # 不自作主张加新事件类型。
+                        new_meta = dict(old_meta)
+                        new_meta["source"] = "user"
+                        new_meta["user_confirmed"] = True
+                        new_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                        self._conn.execute(
+                            "UPDATE memories SET metadata_json=?, source=?,"
+                            " user_confirmed=1, decay_kind=? WHERE id=?",
+                            (json.dumps(new_meta, ensure_ascii=False), "user",
+                             _decay.DECAY_KIND_STABLE, row[0]),
+                        )
+                        self._conn.commit()
+                        old_meta = new_meta
                     # 同一条事实又出现一次：记出现集合，够 3 天 + 3 会就晋升。
                     self._record_occurrence(row[0], old_meta, today, turn_id, text)
                     return {"id": row[0], "memory": text, "event": "UNCHANGED"}
@@ -1074,6 +1099,39 @@ class SQLiteStore:
                 pass
             return found
 
+    def _candidate_text(self, memory_id):
+        """按 ID 查一条记忆的原文；查不到返回 None（调用方兜底，不抛异常）。"""
+        try:
+            row = self._conn.execute(
+                "SELECT text FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+        except Exception:
+            return None
+        return (row or [None])[0] if row else None
+
+    def _candidates_with_text(self, candidates):
+        """把纠错候选统一成 [{"id", "text"}]（2026-11-22 Bug 1 治本）。
+
+        _find_correction_candidates 内部返回的是内存 ID（字符串）列表，
+        调用方（main.py 的打印、网页的候选列表）要的是带文本的字典——
+        以前直接把 ID 串交出去，打印层按字典 .get('text') 就崩成 500。
+        字典候选原样过（缺 text 时按 ID 补查）；字符串候选按 ID 查库
+        补文本，查不到就把 ID 本身当 text；绝不抛异常。
+        """
+        out = []
+        for cand in candidates or []:
+            if isinstance(cand, dict):
+                cid = cand.get("id")
+                text = cand.get("text")
+                if not text and cid:
+                    text = self._candidate_text(cid)
+                out.append({"id": cid, "text": text or (cid or "")})
+            elif isinstance(cand, str):
+                out.append({"id": cand, "text": self._candidate_text(cand) or cand})
+            else:
+                out.append({"id": cand, "text": str(cand)})
+        return out
+
     def _apply_correction_result(self, new_fact, old_id, old_text, old_meta,
                                  *, same_text, candidates, status="updated",
                                  resolution=None, audit=None, source="user",
@@ -1088,6 +1146,10 @@ class SQLiteStore:
         （单候选过安全网）；调用方显式传，不从 same_text 推。
         """
         with self._lock:
+            # 回执里的 candidates 统一成带文本的字典（2026-11-22 Bug 1）：
+            # 传进来的是 _find_correction_candidates 给的 ID 串列表，
+            # 这里转完再返回，调用方不用再猜格式。
+            candidates = self._candidates_with_text(candidates)
             if status == "unchanged":
                 self._record_occurrence(
                     old_id, old_meta, _shanghai_today().isoformat(), None, old_text
@@ -1223,6 +1285,8 @@ class SQLiteStore:
         新说法另存一条。返回 mem0 同款回执：
         {status, memory_id, old_text, new_text, candidates, reason,
          layer, resolution, audit}。
+        candidates 是带 id 和 text 的字典列表（2026-11-22 Bug 1：以前是
+        光秃秃的 ID 串，打印层按字典取 text 就崩成 500）。
         """
         with self._lock:
             new_fact = (new_fact or "").strip()
@@ -1294,7 +1358,7 @@ class SQLiteStore:
                 return {
                     "status": "ambiguous", "memory_id": None,
                     "old_text": old_fact, "new_text": new_fact,
-                    "candidates": candidates,
+                    "candidates": self._candidates_with_text(candidates),
                     "reason": "多条候选，无法确定改哪一条",
                     "layer": "none", "resolution": "ambiguous",
                     "audit": {"source": "user", "method": "correct_memory"},
@@ -1308,7 +1372,7 @@ class SQLiteStore:
                 return {
                     "status": "not_found", "memory_id": None,
                     "old_text": old_fact, "new_text": new_fact,
-                    "candidates": candidates,
+                    "candidates": self._candidates_with_text(candidates),
                     "reason": "候选记忆已不在库里", "layer": "none",
                     "resolution": "not_found",
                     "audit": {"source": "user", "method": "correct_memory"},
@@ -1336,7 +1400,7 @@ class SQLiteStore:
                 return {
                     "status": "ambiguous", "memory_id": None,
                     "old_text": old_text, "new_text": new_fact,
-                    "candidates": candidates,
+                    "candidates": self._candidates_with_text(candidates),
                     "reason": "与候选记忆相似度过低（%.2f），不敢改" % sim,
                     "layer": "none", "resolution": "ambiguous",
                     "audit": {"source": "user", "method": "safety_net",

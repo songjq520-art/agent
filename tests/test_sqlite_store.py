@@ -1365,3 +1365,35 @@ def test_correction_supersede_failure_keeps_new_and_old_alive(store, monkeypatch
     lines = _ledger_lines(store)
     assert any('"type": "add"' in line and "我住上海" in line for line in lines)
     assert not any('"type": "supersede"' in line for line in lines)
+
+
+# ---------- 15. Bug 2 回归（2026-11-22）：去重只看归一化文本，不看来源 ----------
+
+
+def test_add_same_text_user_then_inferred_is_one_row(store):
+    """同一文本先 user（已确认）再 inferred 存：只留一条活行，仍是已确认。"""
+    r1 = store.add_memory_text("我住广州", source="user")
+    assert r1.get("event") == "ADD"
+    r2 = store.add_memory_text("我住广州", source="inferred")
+    assert r2.get("event") == "UNCHANGED"
+    assert r2.get("id") == r1["id"]
+    assert _live_texts(store) == ["我住广州"]
+    assert _meta_of(store, r1["id"]).get("user_confirmed") is True
+    assert len(_ledger_lines(store)) == 1  # 没多写 add
+
+
+def test_add_same_text_inferred_then_user_upgrades_to_confirmed(store):
+    """同一文本先 inferred 再 user 存：只留一条活行，且升级成已确认
+    （source 改 user、decay_kind 改 stable）；升级不另记账本。"""
+    r1 = store.add_memory_text("我住广州", source="inferred")
+    assert r1.get("event") == "ADD"
+    assert _meta_of(store, r1["id"]).get("user_confirmed") is False
+    r2 = store.add_memory_text("我住广州", source="user")
+    assert r2.get("event") == "UNCHANGED"
+    assert r2.get("id") == r1["id"]
+    assert _live_texts(store) == ["我住广州"]
+    meta = _meta_of(store, r1["id"])
+    assert meta.get("user_confirmed") is True
+    assert meta.get("source") == "user"
+    assert meta.get("decay_kind") == "stable"
+    assert len(_ledger_lines(store)) == 1  # 升级不另记账本，只有最初一笔 add

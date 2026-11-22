@@ -489,7 +489,11 @@ def _print_correction_result(saved):
     - failed：说清楚改失败了、原记忆没动；
     - not_found：新说法已经当新记忆正常存了，不用多说。
     """
-    correction = (saved or {}).get("correction") or {}
+    if not isinstance(saved, dict):
+        return None
+    correction = saved.get("correction") or {}
+    if not isinstance(correction, dict):
+        return None
     status = correction.get("status")
     if not status:
         return None
@@ -503,7 +507,16 @@ def _print_correction_result(saved):
         candidates = correction.get("candidates") or []
         print(f"有 {len(candidates)} 条相似的记忆，分不清改哪条：")
         for i, cand in enumerate(candidates, 1):
-            print(f"  {i}. {(cand or {}).get('text')}")
+            # 候选两种形状都认（2026-11-22 Bug 1）：字典取 text，
+            # 字符串是内存 ID（老数据/别的 store 交过来的），这里拿不到
+            # store 查文本，直接印 ID 本身，绝不崩。
+            if isinstance(cand, dict):
+                text = cand.get("text") or cand.get("id") or ""
+            elif isinstance(cand, str):
+                text = cand
+            else:
+                text = str(cand)
+            print(f"  {i}. {text}")
         print("请回复第几条（比如“第 1 条”），我再帮你改。")
     elif status == "failed":
         print(
@@ -916,8 +929,17 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         )[-6:]
         with timer.measure("memory_save_ms"):
             saved = mem0_store.save_turn(recent, turn_id=turn_id)
-        correction = _print_correction_result(saved)
-        _print_protection_result(saved)
+        try:
+            correction = _print_correction_result(saved)
+        except Exception:
+            # 显示步骤绝不能把一次聊天变成 500（2026-11-22 Bug 1）：
+            # 打印崩了只记日志，纠错结果本身照常放进返回。
+            logger.warning("打印纠错结果失败。", exc_info=True)
+            correction = (saved or {}).get("correction")
+        try:
+            _print_protection_result(saved)
+        except Exception:
+            logger.warning("打印保护结果失败。", exc_info=True)
         # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
         # 告诉 BOOS 一声（dropped 为空且 dropped_count 是 0 时什么都没丢，不用多说）。
         # 撤回后回消息崩（2026-11-21 网页测第二轮 #1）：dropped 是句子列表，
