@@ -664,6 +664,12 @@ class SQLiteStore:
             created_at = _now_iso()
             today = _shanghai_today().isoformat()
             slot = kwargs.get("slot")
+            # S10（2026-11-22，BOOS 定选 A）：没传 slot 时按文本推断——
+            # 模型调 add_memory 只传文本、不传 slot，不推断就走不到下面
+            # 的槽位裁决，工具路会直存出两条活住址（西安 + 长沙案）。
+            inferred_slot, inferred_value = _infer_fact_slot(text)
+            if not slot:
+                slot = inferred_slot
             is_rule = bool(kwargs.get("is_rule", False))
             curated = bool(kwargs.get("curated", False))
             user_confirmed = source == "user"
@@ -672,8 +678,9 @@ class SQLiteStore:
                 source, False, is_rule
             )
             # 同文去重（2026-11-22 Bug 2 治本）：只看归一化文本，不看来源——
-            # 模型工具写 source="user"（已确认）、save_turn 写 source="inferred"
-            # （未确认），来源不同不是两条事实。归一化比对要在 Python 里做
+            # 用户亲口说的（工具直存、save_turn）都记 source="user"（已确认），
+            # 模型推断直存的才记 source="inferred"，来源不同不是两条事实。
+            # 归一化比对要在 Python 里做
             # （_normalize_memory_text 剥标点/空白/主语，SQL 精确匹配认不出
             # “我住广州。”和“我住广州”是同一句），所以扫一遍活行逐条比。
             norm_text = _normalize_memory_text(text)
@@ -717,12 +724,28 @@ class SQLiteStore:
             # 先存在，supersede 事件的 current_key 才有东西可指）。
             to_supersede = []
             if slot:
-                for row in self._conn.execute(
+                # 槽位裁决的候选：slot 列上打过标的行（SQL 查）+ 按文本
+                # 现认槽位的行（_find_same_slot_conflicts 扫全部活行）——
+                # 修复前工具路存的行没打 slot 标（西安案），只查 SQL 会
+                # 漏掉它们，两条活住址就并存了。两边按 id 去重；扫描行
+                # 的 metadata 是字典，先转回 JSON 串再进同一条裁决循环。
+                conflict_rows = list(self._conn.execute(
                     "SELECT id, text, metadata_json FROM memories"
                     " WHERE slot=? AND voided=0 AND deleted=0 AND superseded=0"
                     " AND text!=?",
                     (slot, text),
-                ).fetchall():
+                ).fetchall())
+                if inferred_value is not None:
+                    seen_ids = {row[0] for row in conflict_rows}
+                    for row in self._find_same_slot_conflicts(
+                        slot, inferred_value
+                    ):
+                        if row[0] not in seen_ids and row[1] != text:
+                            conflict_rows.append(
+                                (row[0], row[1],
+                                 json.dumps(row[2] or {}, ensure_ascii=False))
+                            )
+                for row in conflict_rows:
                     old_meta = json.loads(row[2] or "{}")
                     new_meta_probe = {
                         "source": source,
@@ -1017,10 +1040,16 @@ class SQLiteStore:
         conflicts = self._find_same_slot_conflicts(slot, value)
         if not conflicts:
             return False
+        # S10（2026-11-22，BOOS 定选 A）：_apply_same_slot_update 只在
+        # save_turn 的逐句循环里调，句子都来自用户本轮直接说的话——新事实
+        # 按已确认算（user/1.0），不再按推断（inferred/0.7）。推断赢不了
+        # 已确认的旧行，新事实会被 pending_new 拦掉、进 dropped（郑州案）。
+        # 模型自己推断的事实不走这里，仍按 inferred/0.7 直存
+        # （add_memory_text(source="inferred")，见低可信度挂起的回归测试）。
         new_probe = {
-            "source": "inferred",
-            "user_confirmed": False,
-            "confidence": 0.7,
+            "source": "user",
+            "user_confirmed": True,
+            "confidence": 1.0,
             "created_at": _now_iso(),
             "write_seq": _next_write_seq(),
             "slot": slot,
@@ -1060,7 +1089,7 @@ class SQLiteStore:
             # 直存，再按裁决直接取代旧行——裁决已说该换，不并存两条。
             if new_key is None:
                 saved = self.add_memory_text(
-                    sentence, source="inferred", turn_id=turn_id,
+                    sentence, source="user", turn_id=turn_id,
                     event_date=event_date, decay_kind="episodic", slot=slot,
                 )
                 if (saved or {}).get("event") != "ADD":
@@ -1270,13 +1299,14 @@ class SQLiteStore:
                 sentence, slot, slot_value, receipt, turn_id, event_date
             ):
                 continue
-            # 来源标 inferred（提取所得）：原样存的事实是从对话里提出来的，
-            # 出处完整（turn_id + created_at），和 DeepSeek 提取同一档，
-            # 只是没经过模型改写、保真度更高。unconfirmed 是留给“完全没来源
-            # 信息”的旧记忆的桶（2026-11-09 之前）；标错了问答提示词会把它
-            # 当没来源处理、问起来只说不知道——这就是第一轮验收回答卡住的原因。
+            # 来源标 user（已确认）：save_turn 只存用户本轮直接说的话，
+            # 不是模型推断——2026-11-22 BOOS 定选 A：用户亲口说的新事实
+            # 直接算已确认（可信度 1.0），能取代已确认的旧事实。unconfirmed
+            # 是留给“完全没来源信息”的旧记忆的桶（2026-11-09 之前）。
+            # 模型自己推断的事实不走这里，仍按 inferred/0.7 直存
+            # （add_memory_text(source="inferred")，见低可信度挂起的回归测试）。
             saved = self.add_memory_text(
-                sentence, source="inferred", turn_id=turn_id,
+                sentence, source="user", turn_id=turn_id,
                 event_date=event_date, decay_kind="episodic",
                 **({"slot": slot} if slot else {}),
             )
