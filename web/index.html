@@ -280,7 +280,7 @@
   /* ---------- 工具确认卡 ---------- */
   /* 后端 /api/chat 返回 waiting_approval 时在这里展示：样式和纠错提示
      保持一致（白底、细边框），左边一条醒目的竖线，标明这是“等你确认
-     才执行”的工具调用。参数用等宽字体原样显示，不渲染 Markdown。 */
+     才执行”的工具调用。卡上只显示人话摘要（第三轮 #5），不贴 JSON。 */
   .approval {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -291,15 +291,7 @@
     word-break: break-word;
   }
   .approval.err { border-left-color: var(--danger); }
-  .approval pre {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 8px 10px;
-    font-size: 13px; line-height: 1.6;
-    white-space: pre-wrap; word-break: break-word;
-    margin: 8px 0;
-  }
+  .approval-summary { font-weight: 600; margin: 4px 0; }
   .approval-actions { display: flex; gap: 8px; margin-top: 10px; }
   .approval-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
 
@@ -723,7 +715,8 @@
 
   // ---------- 工具确认卡 ----------
   // 后端 /api/chat 返回 waiting_approval 时，needs_approval 里是
-  // {task_id, approval_id, tool, args, risk_level, expires_at}；
+  // {task_id, approval_id, tool, args, summary, risk_level, expires_at}；
+  // 卡上只显示 summary 那句人话（第三轮 #5），args 里的内部字段不显示。
   // 点“确认执行”或“取消”调 /api/chat/confirm，确认了就执行存着的
   // 参数、把停住的那轮跑完，取消了也跑完（模型按“用户没同意”继续答）。
   // 卡片只按 approval_id 显示一次；刷新页面后没点的卡会从
@@ -751,11 +744,14 @@
     const wrap = el('div', 'msg ai');
     const box = el('div', 'approval');
     box.appendChild(el('div', '', 'Agent 想用工具，需要你确认一下：'));
-    box.appendChild(el('div', '', '工具：' + (needs.tool || '')));
-    const pre = document.createElement('pre');
-    pre.textContent = JSON.stringify(needs.args || {}, null, 2);
-    box.appendChild(pre);
-    box.appendChild(el('div', '', '风险：' + (needs.risk_level || '')));
+    // 第三轮 #5：卡上只显示人话摘要（后端给的 summary），不贴 JSON——
+    // memory_id、anchor_text、_anchor_match 这些内部字段不给用户看；
+    // 老版本没给 summary 时用一句通用话兜底。风险也翻译成人话。
+    const summary = (needs || {}).summary || '确认执行这个操作';
+    box.appendChild(el('div', 'approval-summary', summary));
+    const riskText = { low: '低', medium: '中', high: '高' }[(needs || {}).risk_level]
+      || (needs || {}).risk_level || '';
+    box.appendChild(el('div', '', '风险：' + riskText));
     if (needs.expires_at) {
       box.appendChild(el('div', 'approval-hint', '10 分钟内没点就按取消处理（到 ' + needs.expires_at + ' 过期）。'));
     }

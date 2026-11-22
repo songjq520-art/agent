@@ -23,6 +23,7 @@
 #       绑传进来的库；没绑时工具报“记忆库没启用”，不崩、不瞎编。
 
 import contextvars
+import re
 
 from memory.money_slots import extract_core_slots
 from memory.redaction import _normalize_memory_text
@@ -522,37 +523,107 @@ def _run_list_memories(args):
     }
 
 
+# “记住”直存时模型可能在句尾补一个日期标注（第三轮 #8）：
+# “后天要去体检（2026-11-24，周二）”——剥掉它再存，存的是原文本身。
+_ADD_DATE_ANNOTATION_RE = re.compile(
+    r"[（(]\d{4}-\d{2}-\d{2}[，,、\s]*周[一二三四五六日][）)]\s*$"
+)
+
+
 def _run_add_memory(args):
     """往长期记忆里加一条 BOOS 明确让记的事（add_memory_text 直存，
-    来源记 user、已确认，自带去重）。返回 {memory_id, text, duplicate}
-    （duplicate 表示库里已经有同一条，没重复存）。"""
+    来源记 user、已确认）。返回 {memory_id, text, duplicate}
+    （duplicate 表示库里已经有同一条，没重复存）。
+
+    2026-11-21 网页测第三轮 #8：原来这里读 (result).get("results")，
+    但 SQLite 的 add_memory_text 返回 {"id", "memory", "event"}，
+    根本没有 "results"——于是每次存成功都谎报“没存进去”。
+    现在按 event 读：ADD 是真存了，UNCHANGED 是库里已有的同一条
+    （不重复存），SENSITIVE 是含敏感信息被拦了，{} 才是真失败。
+    另外两道安全网：句尾的日期标注先剥掉再存；同文已在库里时
+    直接报 duplicate，不重复存（add_memory_text 的去重只认 key，
+    不认同文——同一句话换个时间存，key 就不一样）。
+    """
     store, error = _store_or_error()
     if error is not None:
         return error
     text = ((args or {}).get("text") or "").strip()
     if not text:
         return {"ok": False, "data": None, "error": "要记的内容是空的，没法记。"}
+    text = _ADD_DATE_ANNOTATION_RE.sub("", text).strip()
+    if not text:
+        return {"ok": False, "data": None, "error": "要记的内容是空的，没法记。"}
+    # 同文已在库里：直接报 duplicate，不重复存。
+    try:
+        copies = _live_copies_of_text(store, text)
+    except Exception:  # noqa: BLE001 - 读库失败不拦路，交给下面的直存
+        copies = []
+    if copies:
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": copies[0][0],
+                "text": text,
+                "duplicate": True,
+            },
+            "error": None,
+        }
     try:
         result = store.add_memory_text(text, source="user")
     except Exception as exc:  # noqa: BLE001 - 存失败也算执行失败
         return {"ok": False, "data": None, "error": f"存记忆失败：{exc}"}
-    results = (result or {}).get("results") or []
-    if not results:
+    # mem0 那条路的旧形状（{"results": [...]}）还留着兼容。
+    if isinstance((result or {}).get("results"), list):
+        results = result.get("results") or []
+        if not results:
+            return {
+                "ok": False,
+                "data": None,
+                "error": "没存进去（可能内容脱敏后什么都不剩，或存的时候出了问题）。",
+            }
+        first = results[0] or {}
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": first.get("id"),
+                "text": text,
+                "duplicate": bool((result or {}).get("duplicate")),
+            },
+            "error": None,
+        }
+    event = (result or {}).get("event")
+    if event == "ADD":
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": (result or {}).get("id"),
+                "text": text,
+                "duplicate": False,
+            },
+            "error": None,
+        }
+    if event == "UNCHANGED":
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": (result or {}).get("id"),
+                "text": text,
+                "duplicate": True,
+            },
+            "error": None,
+        }
+    if event == "SENSITIVE":
         return {
             "ok": False,
             "data": None,
-            "error": "没存进去（可能内容脱敏后什么都不剩，或存的时候出了问题）。",
+            "error": "这条含敏感信息（密码/卡号/密钥之类），没存。",
         }
-    first = results[0] or {}
     return {
-        "ok": True,
-        "data": {
-            "memory_id": first.get("id"),
-            "text": text,
-            "duplicate": bool((result or {}).get("duplicate")),
-        },
-        "error": None,
+        "ok": False,
+        "data": None,
+        "error": "没存进去（可能内容脱敏后什么都不剩，或存的时候出了问题）。",
     }
+
 
 
 def _run_update_memory(args):
@@ -630,6 +701,25 @@ def _run_update_memory(args):
     return {"ok": False, "data": None, "error": reason}
 
 
+def _remaining_after_delete(store, anchor_text, deleted_text):
+    """删完后，库里还剩多少条和这次删除目标相关的记忆。
+
+    2026-11-21 网页测第三轮 #7：模型说“都清干净了”，其实 seq 137
+    “我的定投现在是什么情况”还剩着——删除工具没把剩余数告诉模型，
+    它只能凭空猜。anchor（比如“定投”）优先；没有 anchor 时按删掉的
+    那条原文认（同文副本）。返回 {"count": N, "texts": [前 5 条原文]}，
+    读库失败返回 0 条（不拦路，调用方照常报删完的数量）。
+    """
+    try:
+        if _norm_anchor_text(anchor_text):
+            texts = [t for _i, t in _find_anchor_matches(store, anchor_text)]
+        else:
+            texts = [t for _i, t in _live_copies_of_text(store, deleted_text)]
+    except Exception:  # noqa: BLE001 - 读库失败不拦路
+        return {"count": 0, "texts": []}
+    return {"count": len(texts), "texts": texts[:5]}
+
+
 def _run_delete_memory(args):
     """删一条长期记忆（深度删除：向量 + history 审计行都清掉）。
 
@@ -705,6 +795,11 @@ def _run_delete_memory(args):
     # 用批量删 delete_memories，把每条 id 都列在确认卡上。
     extra_deleted = []
     extra_failed = []
+    # 第三轮 #7：删完核对一次还剩多少条同目标的，写进结果里，
+    # 模型才能照实报“还剩几条”，不能凭空说“都清干净了”。
+    remaining = _remaining_after_delete(
+        store, (args or {}).get("anchor_text") or "", stored_text
+    )
     return {
         "ok": True,
         "data": {
@@ -713,6 +808,8 @@ def _run_delete_memory(args):
             "history_cleared": (scope or {}).get("history_count") or 0,
             "extra_deleted": extra_deleted,
             "extra_failed": extra_failed,
+            "remaining_count": remaining["count"],
+            "remaining_texts": remaining["texts"],
         },
         "error": None,
     }
@@ -1028,10 +1125,19 @@ def _run_delete_memories(args):
             )
             continue
         deleted.append({"memory_id": memory_id, "text": stored_text})
+    # 第三轮 #7：同单删，删完核对一次还剩多少条同目标的。
+    remaining = _remaining_after_delete(
+        store, (args or {}).get("anchor_text") or "", ""
+    )
     if failed:
         return {
             "ok": False,
-            "data": {"deleted": deleted, "failed": failed},
+            "data": {
+                "deleted": deleted,
+                "failed": failed,
+                "remaining_count": remaining["count"],
+                "remaining_texts": remaining["texts"],
+            },
             "error": (
                 f"删了 {len(deleted)} 条，还有 {len(failed)} 条没删成："
                 + "；".join(
@@ -1042,7 +1148,12 @@ def _run_delete_memories(args):
         }
     return {
         "ok": True,
-        "data": {"deleted": deleted, "failed": []},
+        "data": {
+            "deleted": deleted,
+            "failed": [],
+            "remaining_count": remaining["count"],
+            "remaining_texts": remaining["texts"],
+        },
         "error": None,
     }
 

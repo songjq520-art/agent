@@ -126,6 +126,7 @@ from memory.conversation_transcript import (  # noqa: E402
     message_fingerprint,
 )
 from memory.mem0_store import create_mem0_store  # noqa: E402
+from memory.redaction import _redact_sensitive  # noqa: E402
 
 logger = logging.getLogger("agent")
 
@@ -165,6 +166,73 @@ class ServerConfig:
         except ValueError:
             port = cls.port
         return cls(host=host, port=port)
+
+
+def _human_approval_summary(tool, args):
+    """确认卡上的人话摘要（第三轮 #5）：卡上只显示一句话，不贴 JSON。
+
+    delete_memory：删除记忆「{text}」；delete_memories：删除 N 条记忆
+    （第一条原文 + 等 N 条）；update_memory：把「old」改成「new」；
+    revive_memory：恢复记忆「{text}」。不认的工具给一句通用话。
+    """
+    args = args or {}
+    if tool == "delete_memory":
+        text = (args.get("text") or "").strip()
+        return f"删除记忆「{text}」" if text else "删除一条记忆"
+    if tool == "delete_memories":
+        items = args.get("items") or []
+        if not items:
+            return "删除多条记忆"
+        first = ((items[0] or {}).get("text") or "").strip()
+        if len(items) == 1:
+            return f"删除记忆「{first}」"
+        return f"删除 {len(items)} 条记忆：{first} 等"
+    if tool == "update_memory":
+        old = (args.get("old_text") or "").strip()
+        new = (args.get("new_text") or "").strip()
+        if old and new:
+            return f"把记忆「{old}」改成「{new}」"
+        return "修改一条记忆"
+    if tool == "revive_memory":
+        text = (args.get("text") or "").strip()
+        return f"恢复记忆「{text}」" if text else "恢复一条已删记忆"
+    return "确认执行这个操作"
+
+
+def _clean_approval_args(args):
+    """确认卡上能给用户看的参数：去掉内部键（_ 开头）和 memory_id，
+    只留人能看懂的原文。确认执行时后端用存着的任务参数，不靠前端
+    传回来的这份，所以这里只做展示、不影响执行。items 里每条的
+    memory_id 也去掉。"""
+    if not isinstance(args, dict):
+        return args
+    out = {}
+    for key, value in args.items():
+        if str(key).startswith("_") or key == "memory_id":
+            continue
+        if isinstance(value, list):
+            value = [
+                {k: v for k, v in item.items() if k != "memory_id"}
+                if isinstance(item, dict)
+                else item
+                for item in value
+            ]
+        out[key] = value
+    return out
+
+
+def _redacted_messages(messages):
+    """显示层脱敏（第三轮 #9）：返回给页面的消息副本里，密码/卡号/
+    密钥这类敏感内容替换成“【已隐藏敏感信息】”，只改返回的副本，
+    不改内存里的历史和存着的记录。摘要卡本来就是脱敏过的，
+    气泡一直是明文——这里把气泡也补上。"""
+    out = []
+    for item in messages or []:
+        item = dict(item or {})
+        if isinstance(item.get("content"), str):
+            item["content"] = _redact_sensitive(item["content"])
+        out.append(item)
+    return out
 
 
 class ChatState:
@@ -358,10 +426,16 @@ class ChatState:
             if self.summary_store is None:
                 return None
             try:
-                return self.summary_store.get_conversation(conv_id)
+                record = self.summary_store.get_conversation(conv_id)
             except Exception:
                 logger.warning("读对话记录失败：id=%s。", conv_id, exc_info=True)
                 return None
+            # 第三轮 #9：记录里的 recent 消息也要脱敏再返回（只改副本，
+            # 不改存着的记录）。
+            if record is not None and record.get("recent"):
+                record = dict(record)
+                record["recent"] = _redacted_messages(record["recent"])
+            return record
 
     def open_conversation(self, conv_id):
         """回到一段旧对话：立刻恢复那段的摘要 + 最近几轮，上一段的总结放后台做。
@@ -421,7 +495,7 @@ class ChatState:
                 "id": record["id"],
                 "title": record.get("title") or "新对话",
                 "summary": record.get("summary") or "",
-                "messages": [dict(m) for m in self.messages],
+                "messages": _redacted_messages([dict(m) for m in self.messages]),
                 "transcript_status": transcript_status,
             }
         # 锁外再开后台线程：上一段对话的总结慢慢做（照 reset() 的做法）。
@@ -477,7 +551,7 @@ class ChatState:
                     "id": None,
                     "title": "新对话",
                     "summary": "",
-                    "messages": [dict(m) for m in self.messages],
+                    "messages": _redacted_messages([dict(m) for m in self.messages]),
                     "transcript_status": None,
                 }
             record = self.summary_store.current_record() or {}
@@ -497,7 +571,7 @@ class ChatState:
                 "id": conv_id,
                 "title": record.get("title") or "新对话",
                 "summary": record.get("summary") or "",
-                "messages": messages,
+                "messages": _redacted_messages(messages),
                 "transcript_status": (transcript or {}).get("status"),
             }
 
@@ -617,6 +691,13 @@ class ChatState:
                 block = _memory_block(memories)
                 if block:
                     model_prompt = block + "\n\n" + prompt
+            if remember_stored:
+                # 第三轮 #8：这条“记住”已经由程序直接存进长期记忆了，
+                # 模型不用再调 add_memory 工具——调了会存第二遍。
+                model_prompt += (
+                    "\n\n【已存】这条“记住”已经由程序直接存进长期记忆了，"
+                    "不用再调 add_memory 工具，直接回一句“记下了”就行。"
+                )
             # 45 号：记忆工具要用的记忆库绑到当前上下文（循环里调
             # 记忆工具时能读到；没启用记忆库时等于没绑，工具会报
             # “记忆库没启用”。出块就恢复，不串到别的请求。）
@@ -685,7 +766,10 @@ class ChatState:
                         "run_id": waiting_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
-                        "args": approval.get("args"),
+                        "args": _clean_approval_args(approval.get("args")),
+                        "summary": _human_approval_summary(
+                            approval.get("tool"), approval.get("args")
+                        ),
                         "risk_level": approval.get("risk_level"),
                         "expires_at": approval.get("expires_at"),
                     },
@@ -878,7 +962,10 @@ class ChatState:
                         "approval": {
                             "approval_id": approval.get("approval_id"),
                             "tool": approval.get("tool"),
-                            "args": approval.get("args"),
+                            "args": _clean_approval_args(approval.get("args")),
+                            "summary": _human_approval_summary(
+                                approval.get("tool"), approval.get("args")
+                            ),
                             "risk_level": approval.get("risk_level"),
                             "expires_at": approval.get("expires_at"),
                             "task_id": approval.get("task_id") or task.get("task_id"),
@@ -998,7 +1085,10 @@ class ChatState:
                         "run_id": next_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
-                        "args": approval.get("args"),
+                        "args": _clean_approval_args(approval.get("args")),
+                        "summary": _human_approval_summary(
+                            approval.get("tool"), approval.get("args")
+                        ),
                         "risk_level": approval.get("risk_level"),
                         "expires_at": approval.get("expires_at"),
                     },
@@ -1174,7 +1264,10 @@ class ChatState:
                         "run_id": next_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
-                        "args": approval.get("args"),
+                        "args": _clean_approval_args(approval.get("args")),
+                        "summary": _human_approval_summary(
+                            approval.get("tool"), approval.get("args")
+                        ),
                         "risk_level": approval.get("risk_level"),
                         "expires_at": approval.get("expires_at"),
                     },

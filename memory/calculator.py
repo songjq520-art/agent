@@ -149,17 +149,31 @@ def _fmt_number(value):
 
 
 def _dca_block(text):
-    """定投复利：每天 X 块、年化 Y%、N 年 → 两种口径的终值。
+    """定投复利：每天 X 块/美元、年化 Y%、N 年 → 两种口径的终值。
 
     按每月投 30X 块算，和按每年 252 个交易日、每年投 252X 块算——
     BOOS 那道题的核实结论是 14.3 万（交易日）到 22.4 万（按月），
     两种都给，模型不用自己选口径、不用心算。
+    单位跟问题走（第三轮 #11，Rule 13）：问题说块就按块算，
+    说美元就按美元算，不换算；两种口径的算法也写清（每月投一次是
+    月末、每年投一次是年末），模型别自己编“每月月初定投”。
+    精确数也给出来（万后面的括号里），模型直接抄，不用自己换算。
     """
     if "定投" not in text and "基金" not in text:
         return None
-    m_amt = re.search(r"每天\s*(?:定投)?\s*(\d+(?:\.\d+)?)\s*(?:块|元)", text)
-    if not m_amt:
-        return None
+    m_amt = re.search(
+        r"每天\s*(?:定投)?\s*(\d+(?:\.\d+)?)\s*(块|元|美元|美金|\$)", text
+    )
+    if m_amt:
+        unit = "美元" if m_amt.group(2) in ("美元", "美金", "$") else "块"
+        daily = float(m_amt.group(1))
+    else:
+        # “每天定投 $5”这种单位在数字前面的写法。
+        m_amt = re.search(r"每天\s*(?:定投)?\s*\$\s*(\d+(?:\.\d+)?)", text)
+        if not m_amt:
+            return None
+        unit = "美元"
+        daily = float(m_amt.group(1))
     m_rate = re.search(r"年化(?:百分之)?\s*([零一二三四五六七八九十百点\d\.]+)", text)
     if not m_rate:
         return None
@@ -172,7 +186,6 @@ def _dca_block(text):
     years = float(years_matches[-1])
     if not (0 < years <= 60):
         return None
-    daily = float(m_amt.group(1))
     annual_rate = rate / 100.0
     monthly_pmt = daily * 30
     fv_monthly = _fv_annuity(monthly_pmt, annual_rate, years, 12)
@@ -182,12 +195,16 @@ def _dca_block(text):
     principal_yearly = yearly_pmt * int(round(years))
     return (
         "【本地计算结果（已算好，直接用这个数回答，别自己再算）】\n"
-        f"每天定投 {daily:g} 块、年化 {rate:g}%、{years:g} 年：\n"
-        f"- 按每月投 {monthly_pmt:g} 块算：{years:g} 年后约 {_fmt_wan(fv_monthly)}"
-        f"（本金 {_fmt_wan(principal_monthly, 2)}）\n"
-        f"- 按每年 {TRADING_DAYS_PER_YEAR} 个交易日、每年投 {yearly_pmt:g} 块算："
-        f"{years:g} 年后约 {_fmt_wan(fv_yearly)}（本金 {_fmt_wan(principal_yearly, 2)}）\n"
-        "年化是假设，实际收益有波动。"
+        f"每天定投 {daily:g} {unit}、年化 {rate:g}%、{years:g} 年：\n"
+        f"- 按每月投 {monthly_pmt:g} {unit}算（每月投一次，月末）："
+        f"{years:g} 年后约 {_fmt_wan(fv_monthly)}"
+        f"（{fv_monthly:,.0f} {unit}，本金 {_fmt_wan(principal_monthly, 2)}）\n"
+        f"- 按每年 {TRADING_DAYS_PER_YEAR} 个交易日、每年投 {yearly_pmt:g} {unit}算"
+        f"（每年投一次，年末）：{years:g} 年后约 {_fmt_wan(fv_yearly)}"
+        f"（{fv_yearly:,.0f} {unit}，本金 {_fmt_wan(principal_yearly, 2)}）\n"
+        "单位和口径都按问题里说的来：问题说每天定投就按每天投算，"
+        "别说成每月月初定投，也别自己编别的口径；单位是块就按块算，"
+        "是美元就按美元算，不要自己换算。年化是假设，实际收益有波动。"
     )
 
 

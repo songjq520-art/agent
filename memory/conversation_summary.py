@@ -617,16 +617,26 @@ class ConversationSummaryStore:
 
         只记元数据和最近几轮，不总结（总结是 maybe_compact / flush 的事）。
         新对话第一轮后它自动出现在列表顶部。空消息时什么都不做。
+        第三轮 #4：只看不说话时间不该变——消息没变时（比如切对话时
+        对当前对话再 sync 一次、或双击同一段对话）只确保记录在列表里，
+        不碰 updated_at；只有消息真的多了才更新时间。时间是最后一条
+        消息的时间，不是最后一次打开/总结的时间。
         """
         if not messages:
             return False
         record = self._ensure_current()
+        tail = messages[-self.keep_last_rounds * 2 :]
+        if self._fingerprint(tail) == self._fingerprint(record.get("recent") or []):
+            # 消息没变：只确保记录在列表里，不更新时间、不重写 recent。
+            self._ensure_current_in_list(record)
+            self.save()
+            return True
         if not record.get("started_at"):
             record["started_at"] = _now_iso()
         if not (record.get("title") or "").strip() or record.get("title") == "新对话":
             record["title"] = _make_title(messages, record.get("summary"))
         record["updated_at"] = _now_iso()
-        record["recent"] = _copy_messages(messages[-self.keep_last_rounds * 2 :])
+        record["recent"] = _copy_messages(tail)
         self._ensure_current_in_list(record)
         self.save()
         return True
@@ -659,7 +669,11 @@ class ConversationSummaryStore:
             return False
         record["summary"] = _truncate_summary(new_summary.strip())
         record["turns_summarized"] += len(old_turns)
-        record["updated_at"] = _now_iso()
+        # 第三轮 #4：总结不加消息，已有 updated_at 的不碰（时间是最后一条
+        # 消息的时间，不是总结的时间）；新记录还没有时间时才补一个
+        # （这就是它第一批消息的时间，不然它在列表里排不到前面）。
+        if not record.get("updated_at"):
+            record["updated_at"] = _now_iso()
         if not record.get("started_at"):
             record["started_at"] = record["updated_at"]
         if not (record.get("title") or "").strip() or record.get("title") == "新对话":
@@ -711,7 +725,10 @@ class ConversationSummaryStore:
             return False
         record["summary"] = _truncate_summary(new_summary.strip())
         record["turns_summarized"] += len(messages)
-        record["updated_at"] = _now_iso()
+        # 第三轮 #4：同上，总结不加消息，已有 updated_at 的不碰；
+        # 新记录还没有时间时才补一个（第一批消息的时间）。
+        if not record.get("updated_at"):
+            record["updated_at"] = _now_iso()
         if not record.get("started_at"):
             record["started_at"] = record["updated_at"]
         if not (record.get("title") or "").strip() or record.get("title") == "新对话":

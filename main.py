@@ -98,6 +98,25 @@ def _shanghai_today_str():
     return datetime.now(_SHANGHAI_TZ).date().isoformat()
 
 
+_WEEKDAY_CN = ("一", "二", "三", "四", "五", "六", "日")
+
+
+def _week_hint_str():
+    """未来 7 天的星期对照（第三轮 #1）：模型把 11 月 25 日说成“本周三”，
+    其实今天 11 月 22 日是周日、25 日是下周三。周一是一周的开始；
+    和今天同一周的叫“本周”，下一周的叫“下周”。格式：
+    “2026-11-22（本周日）；2026-11-23（下周一）；……”。
+    格式里“本周”后面直接跟“日/一/二……”——“本周日”不是“本周周日”。"""
+    today = datetime.now(_SHANGHAI_TZ).date()
+    monday = today - timedelta(days=today.weekday())
+    parts = []
+    for offset in range(7):
+        day = today + timedelta(days=offset)
+        week = "本周" if monday <= day < monday + timedelta(days=7) else "下周"
+        parts.append(f"{day.isoformat()}（{week}{_WEEKDAY_CN[day.weekday()]}）")
+    return "；".join(parts)
+
+
 def _estimate_tokens(text):
     """估算一段文本的 Token 数（保守估计，供记忆注入预算用）。
 
@@ -250,7 +269,9 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
         "记忆的来源和确认状态不用每次都展开解释——【用户确认】的直接当事实说，"
         "【提取所得】的简单提一句“之前提到过”就行；不知道就直接说不知道，别绕圈子。",
         "别念记录：不要说“【用户确认】的一条是……”“有两条记录，各自独立”"
-        "“我不敢把……当成铁结论”这类像在念数据库审计的话；直接用人话说结论，"
+        "“我不敢把……当成铁结论”“我不敢当成确定的结论”“根据我这边记录的信息”"
+        "“这两条都只是背景参考”“按这条线索看”这类像在念数据库审计的话；"
+        "先说结论再说依据，结论只说一句、别绕圈子；直接用人话说结论，"
         "比如“你每天投 5 块买万家纳指”。只在真的拿不准时才说一句“不太确定”，"
         "别每句都加免责。别编造保存、工具之类的说法（比如“工具报错了”“没存进去”）——"
         "你不知道存没存进去，别猜；只按上面给你的记忆回答。"
@@ -273,6 +294,8 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
             "事件日期：每条记忆后面括号里的事件日期是这件事发生的日期；"
             f"今天是 {_shanghai_today_str()}，回答“昨天/今天/某月某日”这类问题时，"
             "先按事件日期对上今天是几号再回答，别把不同日期的事混成同一天。"
+            "星期对照（周一是一周的开始，和今天同一周的叫“本周”，下一周的叫“下周”）："
+            f"{_week_hint_str()}。"
         )
     for item, event_suffix in kept:
         metadata = (item or {}).get("metadata") or {}
@@ -286,6 +309,7 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
         lines.append(
             f"- {rule_prefix}{label}{item['text']}"
             f"{_money_suffix(metadata.get('money'))}{event_suffix}"
+            f"{_budget_setting_suffix(item['text'])}"
         )
     return "\n".join(lines)
 
@@ -298,6 +322,22 @@ def _looks_like_money(text):
 
     只认“数字 + 金额单位”这种明白写法，不猜。"""
     return bool(_MONEY_TEXT_RE.search(text or ""))
+
+
+# 工具预算设置的认法（第三轮 #11）：页面底下固定的预算说明
+# （“每月预算 5 美元，到 5 美元提醒，不自动停”）是一条工具调用的
+# 预算设置，不是投资/定投计划。认法收得紧：必须同时有“预算”+
+# “美元”+“提醒/不自动停”——“每月预算 5 美元买基金”这种投资
+# 计划没有“提醒/不自动停”，不会误标。
+_BUDGET_SETTING_RE = re.compile(r"预算.*美元.*(提醒|不自动停|永不自动停)")
+
+
+def _budget_setting_suffix(text):
+    """预算设置记忆的标注：是工具预算设置时返回一句说明，
+    让模型回答投资问题时别把它当成一条定投记录引用；不是时返回 ""。"""
+    if _BUDGET_SETTING_RE.search(text or ""):
+        return "（这是工具调用的预算设置，不是投资/定投计划）"
+    return ""
 
 
 # REMEMBER_PREFIX（记记忆命令）：连续对话里输入 "记住……" 就原文存一条记忆，
@@ -722,7 +762,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # （没识别到算式）时不拼，提示词里那句“算不出来就说算不出来”兜底。
     try:
         from memory.calculator import calculator_block
-        _calc = calculator_block(prompt)
+        # 第三轮 #11：网页调进来时 prompt 已经是拼了记忆提示块的
+        # model_prompt，块里的记忆也可能含“年化/定投”——用原话算，
+        # 不然第一个“年化”可能来自某条记忆、不是问题本身。
+        _calc = calculator_block(original_prompt or prompt)
     except Exception:
         logger.warning("本地计算器失败，本次不带计算结果继续。", exc_info=True)
         _calc = ""
