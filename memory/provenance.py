@@ -592,8 +592,8 @@ def _resolve_conflict(old_metadata, new_metadata):
     - 新的可信度比旧的低：旧的赢，新记忆挂起来“待确认”（pending_new），
       不覆盖——时间戳再新也没用，新旧管不了覆盖资格。
     - 新的可信度比旧的高：新的胜出，旧的标“被取代”（supersede_old）。
-    - 同级：新的胜出，旧的标“被取代”；但新记忆比旧的还早（迟到的
-      旧写入）时不覆盖，旧的留着（keep_old）。
+    - 同级：新的胜出，旧的标“被取代”（2026-11-22，BOOS 定：最新说的
+      算数，不再按写入序号比先后）。
     - 核心记忆钉住不动：核心记忆都是用户已确认的（见 _is_core_memory），
       可信度最高，模型推断（最低档）永远判成 pending_new——上面
       “新低旧高”那条已经盖住了，这里不用再单列。
@@ -633,16 +633,12 @@ def _resolve_conflict(old_metadata, new_metadata):
             "action": "supersede_old",
             "reason": "新记忆可信度比旧的高，新的胜出，旧的标被取代。",
         }
-    if new_key > old_key:
-        return {
-            "winner": "new",
-            "action": "supersede_old",
-            "reason": "同一级别，新的胜出，旧的标被取代。",
-        }
+    # 同可信度时新的赢（2026-11-22，BOOS 定：最新说的算数）：
+    # 不再按写入序号比先后——后到的说法就是用户最新的意思，直接取代旧的。
     return {
-        "winner": "old",
-        "action": "keep_old",
-        "reason": "同一级别，但新记忆比旧的还早，不覆盖。",
+        "winner": "new",
+        "action": "supersede_old",
+        "reason": "同一级别，新的胜出，旧的标被取代。",
     }
 
 # 保护失败时结果里附带的列表字段：没恢复回来的旧记忆 id、回滚删不掉

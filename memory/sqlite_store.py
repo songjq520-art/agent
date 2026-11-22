@@ -47,7 +47,7 @@ from memory.correction_text import (
 )
 from memory.money_slots import extract_core_slots
 from memory.redaction import _contains_sensitive, _normalize_memory_text
-from memory.timeutil import _now_epoch, _now_iso, _next_write_seq
+from memory.timeutil import _now_epoch, _now_iso, _next_write_seq, _seed_write_seq
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +336,20 @@ class SQLiteStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        # 写序号播种（2026-11-22，S1 根因）：_WRITE_SEQ 是进程内自增、重启
+        # 归零；不播种时新说法拿到的序号比旧行还小，同级裁决会误判成
+        # “迟到的旧写入”而 keep_old。启动时抬到库里最大的 write_seq。
+        try:
+            max_seq = 0
+            for (seq,) in self._conn.execute(
+                "SELECT write_seq FROM memories"
+            ).fetchall():
+                if isinstance(seq, int) and not isinstance(seq, bool) and seq > max_seq:
+                    max_seq = seq
+            if max_seq:
+                _seed_write_seq(max_seq)
+        except Exception:
+            logger.warning("写序号播种失败：本次不播种。", exc_info=True)
         self._embedder = None
         self._embedder_failed = False
         self._seen_turn_ids = set()

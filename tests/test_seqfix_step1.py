@@ -109,12 +109,13 @@ def test_bug5_judged_retraction_drops_outbox_file(tmp_path):
     assert outbox.turn_status("turn-1") == "dropped"
 
 
-# ---------- Bug 2：keep_old 分支（旧条赢，新条当证据，不并存） ----------
+# ---------- Bug 2：同级 stale 写入（2026-11-22 新规则：新的赢） ----------
 
 
 def _bug2_old_money_memory(store):
     """种一条同槽位旧金额记忆：推断来源、写序号故意给得很大（比新批
-    的还晚），让 _resolve_conflict 判 keep_old。返回旧条 id。"""
+    的还晚）。2026-11-22 之前这会让 _resolve_conflict 判 keep_old；
+    新规则下同级新的照样赢。返回旧条 id。"""
     from memory.mem0_store import (
         _provenance,
         CONFIDENCE_INFERRED,
@@ -138,9 +139,10 @@ def _bug2_evidence_texts(store, memory_id):
     return []
 
 
-def test_bug2_dedupe_keep_old_appends_evidence(tmp_path):
-    """Bug 2（提取路）：同槽位新金额判成 keep_old 时，旧条不动、新条
-    当证据挂到旧条下、不并存两条。修之前新条照常留下来，新旧并存。"""
+def test_bug2_dedupe_same_level_now_supersedes(tmp_path):
+    """Bug 2（提取路，2026-11-22 新规则）：同级同可信度时新的赢——
+    旧条写序号再大也不留了，新金额直接取代旧条（BOOS 定：最新说的算数）。
+    原来的 keep_old 挂证据只在可信度不同时才走。"""
     store = make_fake_store(tmp_path)
     old_id = _bug2_old_money_memory(store)
     before = store.get_all()
@@ -156,21 +158,20 @@ def test_bug2_dedupe_keep_old_appends_evidence(tmp_path):
         before,
         turn_id="t1",
     )
-    assert out.get("money_kept_old") == 1
-    assert store._memory.all_texts() == ["每天定投5块买万家纳指"]
-    assert "每天定投10块买万家纳指" in _bug2_evidence_texts(store, old_id)
+    assert out.get("money_superseded") == 1
+    assert out.get("money_kept_old") is None
+    assert store._memory.all_texts() == ["每天定投10块买万家纳指"]
 
 
-def test_bug2_add_memory_text_keep_old_appends_evidence(tmp_path):
-    """Bug 2（手动存路）：同槽位新金额判成 keep_old 时，旧条不动、
-    新说法当证据挂到旧条下、返回已有那条，不并存两条。"""
+def test_bug2_add_memory_text_same_level_now_supersedes(tmp_path):
+    """Bug 2（手动存路，2026-11-22 新规则）：同级同可信度时新的赢——
+    新金额直接取代旧条，不再挂证据（BOOS 定：最新说的算数）。"""
     store = make_fake_store(tmp_path)
     old_id = _bug2_old_money_memory(store)
     result = store.add_memory_text("每天定投10块买万家纳指", source="inferred")
-    assert result.get("duplicate") is True
-    assert (result.get("results") or [{}])[0].get("id") == old_id
-    assert store._memory.all_texts() == ["每天定投5块买万家纳指"]
-    assert "每天定投10块买万家纳指" in _bug2_evidence_texts(store, old_id)
+    assert result.get("superseded") is True
+    assert result.get("held_pending") is None
+    assert store._memory.all_texts() == ["每天定投10块买万家纳指"]
 
 
 # ---------- Bug 6：纠错候选池（上下文 + 同槽位，排除新说法自己） ----------

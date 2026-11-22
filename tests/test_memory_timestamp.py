@@ -129,13 +129,14 @@ def test_resolve_conflict_same_level_newer_wins():
     assert result["action"] == "supersede_old"
 
 
-def test_resolve_conflict_same_level_stale_write_does_not_win():
-    """同级但新记忆比旧的还早（迟到的旧写入）：不覆盖，旧的留着。"""
+def test_resolve_conflict_same_level_new_wins_even_if_stale_write():
+    """同级时新的赢（2026-11-22，BOOS 定：最新说的算数）：新记忆就算
+    比旧的还早（迟到的旧写入），也取代旧的，不再 keep_old。"""
     old = _inferred_meta("2026-11-10T10:00:00.000002Z", 2)
     new = _inferred_meta("2026-11-10T10:00:00.000001Z", 1)
     result = _resolve_conflict(old, new)
-    assert result["winner"] == "old"
-    assert result["action"] == "keep_old"
+    assert result["winner"] == "new"
+    assert result["action"] == "supersede_old"
 
 
 def test_resolve_conflict_inferred_cannot_overwrite_confirmed():

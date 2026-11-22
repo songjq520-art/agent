@@ -16,6 +16,7 @@
 #   8. 账本是真相源：删库重建后能从账本对账恢复
 
 from datetime import date, timedelta
+import json
 import threading
 
 import numpy as np
@@ -722,6 +723,30 @@ def test_revive_memory_restores_superseded_row(store):
     assert any('"type": "revive"' in line for line in lines)
     assert store.revive_memory(gid).get("status") == "unchanged"
     assert store.revive_memory("no-such-id").get("status") == "not_found"
+
+
+def test_slot_conflict_same_credibility_new_wins_even_with_smaller_seq(store):
+    """S1（2026-11-22，BOOS 定：同可信度时新的赢，最新说的算数）：
+    旧行写序号比新探测大（服务重启后 _WRITE_SEQ 归零的真实情形），
+    新说法仍取代旧的，不再 keep_old 丢掉。"""
+    store.add_memory_text("我住在南京", source="inferred")
+    row = store._conn.execute(
+        "SELECT id, metadata_json FROM memories WHERE text=?", ("我住在南京",)
+    ).fetchone()
+    meta = json.loads(row[1] or "{}")
+    meta["write_seq"] = 10 ** 9
+    store._conn.execute(
+        "UPDATE memories SET metadata_json=? WHERE id=?",
+        (json.dumps(meta, ensure_ascii=False), row[0]),
+    )
+    store._conn.commit()
+    r = store.save_turn(
+        [{"role": "user", "content": "我住在苏州"}], turn_id="t-slot-s1",
+    )
+    assert "我住在苏州" in _live_texts(store)
+    assert "我住在南京" not in _live_texts(store)
+    assert r["stored"] == ["我住在苏州"]
+    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
 def test_save_turn_correction_utterance_goes_through_correction(store):
