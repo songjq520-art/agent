@@ -49,6 +49,7 @@ DECAY_PROMOTION_DAYS = 3
 DECAY_PROMOTION_SESSIONS = 3  # 晋升要的会话数：和天数一样，3 个不同会话
 DECAY_STATE_VERBATIM = "verbatim"
 DECAY_STATE_DORMANT = "dormant"
+DECAY_STATE_DELETE_DUE = "decay_delete_due"
 DECAY_DELETE_BACKUP_PREFIX = "decay-delete-backup-"
 # 未确认权重封顶（补丁 4，第二层）：没经过 BOOS 确认的记忆权重
 # 升不到最高——错的也爬不上去。初始值 0.80，以后按回测调（BOOS 定：
@@ -174,6 +175,20 @@ def decay_should_go_dormant(kind, last_used_at, now=None, is_core=False,
     if idle is None or idle < DECAY_DORMANT_IDLE_DAYS:
         return False
     return decay_weight(kind, last_used_at, now, is_core=False) < DECAY_DORMANT_WEIGHT
+
+
+def decay_state(kind, last_used_at, now=None, is_core=False, is_curated=False):
+    """这条记忆现在该是什么状态（2026-11-22 接线用）：
+    decay_delete_due（180 天没人找）> dormant（30 天没人找且权重 < 0.30）
+    > verbatim（原话态）。只判状态、不删不改——核心记忆和精选记忆
+    永远是 verbatim（见 decay_should_delete / decay_should_go_dormant）。
+    180 天的先判：它同时也满足沉底条件，待删优先。"""
+    if decay_should_delete(last_used_at, now=now, is_core=is_core):
+        return DECAY_STATE_DELETE_DUE
+    if decay_should_go_dormant(kind, last_used_at, now=now, is_core=is_core,
+                                is_curated=is_curated):
+        return DECAY_STATE_DORMANT
+    return DECAY_STATE_VERBATIM
 
 
 def decay_should_delete(last_used_at, now=None, is_core=False):
