@@ -3474,9 +3474,39 @@ class SQLiteStore:
                             lock=self._ledger_lock,
                         )
                     except Exception:
-                        logger.warning("复活记账失败。", exc_info=True)
+                        logger.warning("复活记账失败：本条先不改状态。", exc_info=True)
+                        continue
+                    meta["decay_state"] = state
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), row[0]),
+                    )
             self._conn.commit()
         return {"dormant": dormant, "delete_due": delete_due}
+
+    def organizing_router(self):
+        """整理记忆的大模型路由（懒建，和 Mem0Store.organizing_router
+        同款）：主力 deepseek-v4-pro，备选 flash，本地降级；每月
+        3 美元上限超了只提醒、不断服务（见 memory/model_router.py）。
+        状态文件在账本同目录。建不出来（比如没配 DeepSeek Key）时
+        返回 None——调用方走本地降级，不抛异常。"""
+        router = getattr(self, "_organizing_router", None)
+        if router is not None:
+            return router
+        try:
+            from memory import model_router as _model_router
+
+            router = _model_router.OrganizingModelRouter(
+                state_path=str(
+                    self.ledger_path.parent / "organizing_router_state.json"
+                ),
+                budget_tracker=self.budget_tracker,
+            )
+        except Exception:
+            logger.warning("整理记忆路由建不起来：本次走本地降级。", exc_info=True)
+            return None
+        self._organizing_router = router
+        return router
 
     def run_self_check(self, now=None, sample_size=10):
         """跑一次每月自检（SQLite 版，2026-11-24 3b）：先扫一遍衰减
@@ -3485,9 +3515,10 @@ class SQLiteStore:
         返回自检报告 dict，多带一个 "decay_sweep" 键记这次衰减扫的
         结果。不在服务启动时自动跑（启动会变慢）：由每月定时任务
         调，和 Mem0Store.run_self_check 同名同节奏，调用方不用分
-        后端。模型抽查（第 9/10 项）要整理路由，SQLite 这边还没接
-        路由时 model_judge 为 None、两项 skipped——和 mem0 路由
-        不可用时一样，判不出来就不猜。"""
+        后端。模型抽查（第 9/10 项）走整理路由的判官（R-6，
+        2026-11-24，和 mem0 同款接法）；路由建不起来时 model_judge
+        为 None、判官判不出来时 verdict 为 None，两项都如实
+        skipped——判不出来就不猜。"""
         sweep_now = None
         if isinstance(now, bool):
             sweep_now = None
@@ -3531,12 +3562,19 @@ class SQLiteStore:
                     "mismatched_ids": sorted(live_ids ^ ledger_ids),
                 }
 
+        # R-6（2026-11-24）：把整理路由的判官接进来（make_model_judge
+        # 和 mem0 同款），第 9/10 项在 SQLite 后端也真跑；路由不可用
+        # 时 model_judge=None，两项 skipped，和 mem0 路由不可用时一样。
+        router = self.organizing_router()
+        model_judge = None
+        if router is not None:
+            model_judge = _store_self_check.make_model_judge(router)
         report = _self_check_module.run_self_check(
             _SQLiteAdapter(self),
             now=now,
-            model_judge=None,
+            model_judge=model_judge,
             sample_size=sample_size,
-            router_status={},
+            router_status=router.status() if router is not None else {},
         )
         report["decay_sweep"] = sweep
         return report

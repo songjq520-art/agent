@@ -134,8 +134,12 @@ def test_sweep_delete_due_writes_ledger_and_survives_rebuild(store):
     assert _meta_of(store, "我去爬了玉龙雪山")["decay_state"] == _decay.DECAY_STATE_DELETE_DUE
 
 
-def test_run_self_check_runs_and_sweeps(store):
+def test_run_self_check_runs_and_sweeps(store, monkeypatch):
     _aged_store(store)
+    # R-6（2026-11-24）后 run_self_check 接了整理路由的判官；本测测的
+    # 是没判官时的口径（第 9/10 项 skipped），把路由打桩成不可用
+    # （和 test_self_check_store.py 同款：笔记本有真 Key，不拦会真调）。
+    monkeypatch.setattr(store, "organizing_router", lambda: None)
     report = store.run_self_check()
     assert set(report["items"].keys()) == set(range(1, 11))
     # 先扫衰减：那条老记忆这次被标待删。
