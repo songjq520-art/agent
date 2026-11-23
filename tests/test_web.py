@@ -1241,7 +1241,9 @@ def test_chat_response_carries_correction_updated(
     )
     assert status == 200
     assert data["mode"] == "real"
-    assert data["reply"] == "假回答"
+    # 2026-11-23 model fix #3（BOOS 定）：纠正执行完直接说“已经改好了”，
+    # 不再原样返回模型那句“假回答”。
+    assert data["reply"] == "已经改好了：把“我喜欢喝咖啡。”改成了“我喜欢喝茶。”。"
     corr = data["correction"]
     assert corr["status"] == "updated"
     assert corr["memory_id"] == "fake-1"

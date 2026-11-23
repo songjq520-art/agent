@@ -2026,10 +2026,14 @@ class SQLiteStore:
                 self._last_stored_turn_id = turn_id
         if correction is not None and (
             "correction" not in receipt
-            or (correction or {}).get("status") != "not_found"
+            or (correction or {}).get("status") == "updated"
+            or (receipt.get("correction") or {}).get("status") != "updated"
         ):
-            # 显式纠错优先；但它报 not_found、而逐句循环里的槽位更新已经
-            # 真换了旧记忆时，留循环那边的 updated，不拿 not_found 盖掉它。
+            # 显式纠错优先；但它报 not_found/ambiguous、而逐句循环里的槽位
+            # 更新已经真换了旧记忆时，留循环那边的 updated，不拿
+            # not_found/ambiguous 盖掉它（2026-11-23 回归修：纠正分支先报
+            # ambiguous 时，循环兜底顶掉最新那条后回执仍要是 updated，
+            # 回复才说得出“已经改好了”）。
             receipt["correction"] = correction
             if (correction or {}).get("status") == "updated":
                 # 纠错存的新记忆属于本轮：撤回标记拨到本轮，
@@ -2347,11 +2351,16 @@ class SQLiteStore:
         """带明确纠正词时按槽位找要改的那条（2026-11-23 model fix #2）：
         新说法和候选的 _correction_topic_slot 相同（住处/名字/喜欢吃……）
         时，取候选顺序里的第一条（候选已按已确认在前、同类里新的在前
-        排过）；没有同槽位候选时返回 None（调用方走老路，不硬猜）。"""
+        排过）；没有同槽位候选时返回 None（调用方走老路，不硬猜）。
+        同槽位候选有两条以上时也返回 None——分不清改哪条，走老路
+        （相似度筛→ambiguous→判官），不猜一条改掉（2026-11-23 回归修：
+        “不对，我喜欢吃米线”对火锅/冒菜两条同槽旧行时必须报 ambiguous，
+        不能直选第一条就 updated）。"""
         slot_key = _correction_topic_slot(new_fact)
         if slot_key is None:
             return None
         norm_new = _normalize_memory_text(new_fact)
+        same_slot = []
         for mid in candidates or []:
             text = self._candidate_text(mid)
             if text is None:
@@ -2359,8 +2368,10 @@ class SQLiteStore:
             if _normalize_memory_text(text) == norm_new:
                 continue
             if _correction_topic_slot(text) == slot_key:
-                return mid
-        return None
+                same_slot.append(mid)
+        if len(same_slot) != 1:
+            return None
+        return same_slot[0]
 
     def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True,
                        explicit_correction=False):
