@@ -343,6 +343,11 @@ def test_correction_rescue_ambiguous_stays_not_found(store, monkeypatch):
     t2 = store.add_memory_text("我喜欢吃米线", source="user")
     store.add_memory_text("我开货车", source="user")
     store.add_memory_text("今天去公园散步", source="user")
+    # 2026-11-24 适配：本测管的是同槽兜底的含糊判定；第 5 条跨槽
+    # 安全网（Round A 后加）不在本测范围——它会真调在线判官，
+    # 裁决有随机性、还会让本测违背文件头“全部离线”的前提。
+    # 安全网有它自己的专项测试，这里把它打桩关掉。
+    monkeypatch.setattr(store, "_cross_slot_net_target", lambda *a, **k: None)
     _rig_bad_recall(
         store, monkeypatch, {t1["id"], t2["id"]},
         {t1["id"]: 0.85, t2["id"]: 0.85},

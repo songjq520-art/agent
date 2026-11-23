@@ -183,6 +183,13 @@ def test_ledger_is_truth_source_rebuild_after_db_deleted(store, tmp_path):
         [{"role": "user", "content": "我今天晚上吃了米线"}],
         turn_id="t-rebuild",
     )
+    # 2026-11-24 适配：save_turn 现在会起后台实时整理线程（第 8
+    # 条），它另开连接读同一个库文件；模拟删库前先等它跑完关掉
+    # 连接，不然 Windows 不让删正被打开的库文件。生产里删库也
+    # 得先停后台工作，同理。
+    _org = getattr(store, "_turn_organize_thread", None)
+    if _org is not None:
+        _org.join(timeout=30)
     store._conn.close()
     for suffix in ("", "-wal", "-shm"):
         try:
@@ -286,8 +293,11 @@ def test_search_semantic_with_fake_vectors(tmp_path, monkeypatch):
 
 def test_correct_memory_updates_exact_match(store):
     """纠错已接线（2026-11-22）：原样在库里时直接改那条。
-    追加式：旧行标被取代、新说法另存一条，原话留在账本里。"""
-    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    追加式：旧行标被取代、新说法另存一条，原话留在账本里。
+    （2026-11-24 适配：旧行改用亲口来源播种——推断未确认的旧行
+    按 BOOS 新裁决要先问、回执是 pending_question，不再立即顶；
+    那条路有 fx8prot 专项测试管，本测只管纠正机制本身。）"""
+    store.add_memory_text("我喜欢吃火锅", source="user")
     out = store.correct_memory("我喜欢吃火锅", "我喜欢吃冒菜")
     assert out.get("status") == "updated"
     assert out.get("old_text") == "我喜欢吃火锅"
@@ -402,10 +412,12 @@ def test_correct_memory_multi_candidate_filters_by_similarity(store, monkeypatch
     """根因 b（2026-11-22）：多候选时按相似度筛——只留 ≥0.70 的；
     筛后剩 1 条就取代它，不再一刀切判 ambiguous。"""
     monkeypatch.setattr(SQLiteStore, "_embed_text", _tea_fake_embed)
-    store.add_memory_text("我喜欢喝红茶", source="inferred")
-    store.add_memory_text("我喜欢喝咖啡", source="inferred")
-    store.add_memory_text("我喜欢吃包子", source="inferred")
-    store.add_memory_text("我喜欢去爬山", source="inferred")
+    # 2026-11-24 适配：播种改亲口来源（推断旧行按新裁决先问再顶，
+    # 见 test_correct_memory_updates_exact_match 的注释）。
+    store.add_memory_text("我喜欢喝红茶", source="user")
+    store.add_memory_text("我喜欢喝咖啡", source="user")
+    store.add_memory_text("我喜欢吃包子", source="user")
+    store.add_memory_text("我喜欢去爬山", source="user")
     out = store.correct_memory("我喜欢喝绿茶", "我喜欢喝绿茶")
     assert out.get("status") == "updated"
     assert out.get("old_text") == "我喜欢喝红茶"
@@ -1295,7 +1307,8 @@ def test_add_same_slot_lower_credibility_stores_new_row(store):
 def test_search_history_returns_superseded_versions(store):
     """Gemini #5 历史查询：默认只返回活记忆；include_history=True 时，
     在活记忆后面补账本里被取代的旧版本（is_history=True）。"""
-    store.add_memory_text("我住北京", source="inferred")
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
     store.correct_memory("我住北京", "我住上海")
     live = store.search("我住", top_k=5)
     assert [h["text"] for h in live] == ["我住上海"]
@@ -1313,7 +1326,8 @@ def test_search_history_returns_superseded_versions(store):
 def test_deletion_scope_history_after_correction(store):
     """修 bug：deletion_scope 的账本历史不再报 AttributeError，
     纠错后能看到 add + supersede 两笔事件。"""
-    store.add_memory_text("我住北京", source="inferred")
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
     out = store.correct_memory("我住北京", "我住上海")
     scope = store.deletion_scope(out.get("memory_id"))
     assert scope["found"] is True
@@ -1415,6 +1429,22 @@ def test_correction_to_existing_fact_reuses_row(store):
     # 工具路直存留下的旧数据）。测的是 correct_memory 的复用逻辑本身。
     _plant_memory_row(store, "我住上海")
     _plant_memory_row(store, "我住广州")
+    # 2026-11-24 适配：_plant_memory_row 播的是推断未确认行，按
+    # BOOS 新裁决纠正它要先问（pending_question）；本测管的是
+    # 复用行机制，前置态改成两条已确认行（推断版有 fx8prot
+    # 专项测试管）。直接把两行的来源标成亲口已确认。
+    for _t in ("我住上海", "我住广州"):
+        _m = json.loads(
+            store._conn.execute(
+                "SELECT metadata_json FROM memories WHERE text=?", (_t,)
+            ).fetchone()[0] or "{}"
+        )
+        _m.update({"source": "user", "user_confirmed": True, "confidence": 1.0})
+        store._conn.execute(
+            "UPDATE memories SET metadata_json=? WHERE text=?",
+            (json.dumps(_m, ensure_ascii=False), _t),
+        )
+    store._conn.commit()
     r = store.save_turn(
         [{"role": "user", "content": "不对，我住广州"}],
         turn_id="t-corr-reuse-1",
@@ -1490,7 +1520,10 @@ def test_correction_supersede_failure_keeps_new_and_old_alive(store, monkeypatch
     """待补 4（按 BOOS 已定行为断言）：mock _supersede_row 抛异常，
     _apply_correction_result 返回 failed；取代失败时保留新记忆、
     诚实报 failed（新记忆已进账本，不删），旧记忆仍活着。"""
-    store.add_memory_text("我住北京", source="inferred")
+    # 2026-11-24 适配：播种改亲口来源——本测要测的正是 _supersede_row
+    # 被调用且失败的路；推断旧行按新裁决根本不会走到 _supersede_row
+    # （先挂待问），测不到这条路。
+    store.add_memory_text("我住北京", source="user")
 
     def _boom(self, *args, **kwargs):
         raise RuntimeError("supersede 记账炸了")
@@ -1619,7 +1652,8 @@ def test_save_turn_correction_e2e_shenzhen(tmp_path, monkeypatch):
     """端到端：库里有“我住北京”，说“不对，我住深圳”→ 回复带
     correction（updated）、账本有 supersede、新事实入库、旧事实被取代。"""
     store = _correction_store(tmp_path, monkeypatch)
-    store.add_memory_text("我住北京", source="inferred")
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
     receipt = store.save_turn(
         [{"role": "user", "content": "不对，我住深圳"}],
         turn_id="t-corr-e2e",
@@ -1651,7 +1685,8 @@ def test_save_turn_correction_general_phrases_e2e(tmp_path, monkeypatch):
     ]
     for i, (message, expected_live) in enumerate(cases):
         store = SQLiteStore(memory_dir=str(tmp_path / ("m%d" % i)))
-        store.add_memory_text("我住北京", source="inferred")
+        # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+        store.add_memory_text("我住北京", source="user")
         receipt = store.save_turn(
             [{"role": "user", "content": message}],
             turn_id="t-corr-gen-%d" % i,
@@ -1722,8 +1757,9 @@ def test_save_turn_correction_ambiguous_slot_retry(tmp_path, monkeypatch):
     “我喜欢深圳菜”（偏好），新说法“我住深圳”带住处槽位，恰好只有
     北京同槽，就改北京那条，不用问 BOOS；深圳菜不动。"""
     store = _correction_store(tmp_path, monkeypatch)
-    store.add_memory_text("我住北京", source="inferred")
-    store.add_memory_text("我喜欢深圳菜", source="inferred")
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
+    store.add_memory_text("我喜欢深圳菜", source="user")
     receipt = store.save_turn(
         [{"role": "user", "content": "不对，我住深圳"}],
         turn_id="t-corr-slot-retry",
