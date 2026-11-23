@@ -1414,6 +1414,7 @@ class SQLiteStore:
         prev = getattr(self, "_turn_organize_thread", None)
 
         def _run():
+            worker = None
             try:
                 if prev is not None and prev.is_alive():
                     prev.join(timeout=30)
@@ -1423,6 +1424,14 @@ class SQLiteStore:
                 )
             except Exception:
                 logger.warning("实时整理后台执行失败。", exc_info=True)
+            finally:
+                # 用完立刻关连接：不长期占着库文件（Windows 下开着
+                # 的库文件删不掉、搬不走）。
+                if worker is not None:
+                    try:
+                        worker._conn.close()
+                    except Exception:
+                        pass
 
         thread = threading.Thread(
             target=_run, daemon=True, name="turn-organize"
