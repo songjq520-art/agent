@@ -1269,6 +1269,157 @@ class SQLiteStore:
         self._conn.commit()
         return promoted
 
+    # ---------- 第 8 条：实时整理（2026-11-24，BOOS 定“尽量做成和十一一样”） ----------
+    def _organize_turn_memories(self, memory_ids, turn_id=None):
+        """一轮对话的小范围整理：只碰本轮触碰到的记忆（本轮新存的、
+        被纠正换上的、被同文引用计数的），不等定时调度：
+        - 晋升计数复核：按已存的出现集合复核晋升（_record_occurrence
+          同款，账本先行；同一个 turn_id 不重复计数）；
+        - 打标：活行还没槽位标的，按原文推断补上（_set_memory_slot，
+          账本先行、已有标不动）；
+        - 去重检查：集合内、以及集合与集合外活行之间归一化同文的，
+          只记进汇总，不删不顶（删改内容要 BOOS 点头）；
+        - 冲突扫描：集合内同槽不同值的两两过 _resolve_conflict，
+          只记进汇总，不执行（本轮真要顶的，存储路径已经顶了；
+          这里是复核网，捞到的留给自检/BOOS 看）。
+        每条独立 try/except：单条失败只记日志，不影响其他条。
+        幂等：同一批重复跑，结果收敛（标已补、晋升已完成）。
+        返回汇总 dict。调用方在后台线程里跑（_schedule_turn_organize）。
+        """
+        summary = {
+            "tagged": [], "promoted": [], "duplicates": [],
+            "conflicts": [], "checked": 0,
+        }
+        ids = [m for m in dict.fromkeys(memory_ids or []) if m]
+        if not ids:
+            return summary
+        today = _shanghai_today().isoformat()
+        with self._lock:
+            rows = {}
+            for mid in ids:
+                try:
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json, superseded, deleted,"
+                        " voided FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                except Exception:
+                    continue
+                if row is None or row[2] or row[3] or row[4]:
+                    continue
+                try:
+                    meta = json.loads(row[1] or "{}")
+                except Exception:
+                    meta = {}
+                rows[mid] = (row[0] or "", meta)
+            summary["checked"] = len(rows)
+            # 晋升计数复核（先做：它会重写 metadata_json，后面的打标
+            # 按库里最新值读，不拿旧 dict 覆盖）。
+            for mid, (text, meta) in rows.items():
+                try:
+                    if self._record_occurrence(
+                        mid, meta, today, turn_id, text
+                    ):
+                        summary["promoted"].append(mid)
+                except Exception:
+                    logger.warning(
+                        "实时整理晋升复核失败：%s", mid, exc_info=True
+                    )
+            # 打标（槽位标）：按库里当前 metadata 判断有没有标。
+            for mid, (text, _meta) in rows.items():
+                try:
+                    fresh = self._conn.execute(
+                        "SELECT metadata_json FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                    fresh_meta = json.loads((fresh or ["{}"])[0] or "{}")
+                    if not fresh_meta.get("slot"):
+                        slot, _value = _infer_fact_slot(text)
+                        if slot:
+                            self._set_memory_slot(mid, slot)
+                            summary["tagged"].append(mid)
+                except Exception:
+                    logger.warning(
+                        "实时整理打标失败：%s", mid, exc_info=True
+                    )
+            # 去重检查（只报告，不删不顶）。
+            try:
+                seen_keys = {}
+                for mid, (text, _meta) in rows.items():
+                    k = _dedupe_key(text)
+                    if not k:
+                        continue
+                    if k in seen_keys:
+                        summary["duplicates"].append(
+                            {"id": mid, "duplicate_of": seen_keys[k]}
+                        )
+                    else:
+                        seen_keys[k] = mid
+                if seen_keys:
+                    for row in self._conn.execute(
+                        "SELECT id, text FROM memories WHERE voided=0"
+                        " AND deleted=0 AND superseded=0"
+                    ).fetchall():
+                        if row[0] in rows:
+                            continue
+                        k = _dedupe_key(row[1] or "")
+                        if k and k in seen_keys:
+                            summary["duplicates"].append(
+                                {"id": seen_keys[k], "duplicate_of": row[0]}
+                            )
+            except Exception:
+                logger.warning("实时整理去重检查失败。", exc_info=True)
+            # 冲突扫描（只报告，不执行）。
+            try:
+                items = list(rows.items())
+                for i in range(len(items)):
+                    for j in range(i + 1, len(items)):
+                        id_a, (text_a, meta_a) = items[i]
+                        id_b, (text_b, meta_b) = items[j]
+                        slot_a, val_a = _infer_fact_slot(text_a)
+                        slot_b, val_b = _infer_fact_slot(text_b)
+                        if not slot_a or slot_a != slot_b:
+                            continue
+                        if _normalize_memory_text(
+                            val_a or ""
+                        ) == _normalize_memory_text(val_b or ""):
+                            continue
+                        verdict = _provenance._resolve_conflict(
+                            meta_a, meta_b
+                        )
+                        summary["conflicts"].append(
+                            {
+                                "a": id_a, "b": id_b, "slot": slot_a,
+                                "action": (verdict or {}).get("action"),
+                            }
+                        )
+            except Exception:
+                logger.warning("实时整理冲突扫描失败。", exc_info=True)
+        return summary
+
+    def _schedule_turn_organize(self, memory_ids, turn_id=None):
+        """把本轮整理放后台线程跑：不拖慢回复；整理出任何异常只
+        记日志，绝不影响本轮对话。返回线程对象（测试可 join 等它
+        跑完验效果）；没有可整理的返回 None。"""
+        ids = [m for m in dict.fromkeys(memory_ids or []) if m]
+        if not ids:
+            return None
+
+        def _run():
+            try:
+                self._last_turn_organize_summary = (
+                    self._organize_turn_memories(ids, turn_id=turn_id)
+                )
+            except Exception:
+                logger.warning("实时整理后台执行失败。", exc_info=True)
+
+        thread = threading.Thread(
+            target=_run, daemon=True, name="turn-organize"
+        )
+        self._turn_organize_thread = thread
+        thread.start()
+        return thread
+
     def _find_same_slot_conflicts(self, slot, value):
         """找同槽位、不同值的活记忆：[(id, text, metadata)]。
         按每条原文重新认槽位（老行存的时候还没打 slot 标，只能从文本认）。"""
@@ -2399,6 +2550,7 @@ class SQLiteStore:
                         sentences = kept
         live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
         new_questions = []  # 本轮拿不准重要性的问题（Phase 2 #4）
+        touched_ids = set()  # 本轮触碰到的记忆 id（第 8 条实时整理用）
         for sentence in sentences:
             receipt["considered"].append(sentence)
             # “记住”前缀先剥（#8）：剥完再判事实、再算日期——“记住”两字
@@ -2518,6 +2670,10 @@ class SQLiteStore:
                     if _q is not None:
                         new_questions.append(_q)
             elif (saved or {}).get("event") == "UNCHANGED":
+                # 同文又出现：晋升计数刚在 add_memory_text 里记过，
+                # 这条算本轮触碰到的（实时整理复核晋升用）。
+                if (saved or {}).get("id"):
+                    touched_ids.add(saved["id"])
                 receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
             elif (saved or {}).get("event") == "SENSITIVE":
                 receipt["dropped"].append({"text": sentence, "reason": "含敏感信息"})
@@ -2566,6 +2722,16 @@ class SQLiteStore:
         )
         if new_questions or backlog:
             receipt["questions"] = new_questions + backlog
+        # 第 8 条实时整理（2026-11-24）：本轮触碰到的记忆（新存的、
+        # 纠正换上的、同文引用计数的）立刻在后台整理一小轮——
+        # 打标/晋升复核/去重检查/集合内冲突扫描，不等定时调度；
+        # 后台线程跑，不拖慢本轮回复，失败只记日志。
+        for _r in receipt["results"]:
+            if isinstance(_r, dict) and _r.get("id"):
+                touched_ids.add(_r["id"])
+        if correction is not None and (correction or {}).get("memory_id"):
+            touched_ids.add(correction["memory_id"])
+        self._schedule_turn_organize(sorted(touched_ids), turn_id=turn_id)
         self._store_turn_receipt(turn_id, receipt)
         return receipt
 
