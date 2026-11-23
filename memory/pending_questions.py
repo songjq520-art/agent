@@ -12,11 +12,14 @@
 # 纯标准库，不读库、不调模型、不联网。
 
 import json
+import logging
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # 问题种类：目前只有 importance（这条新记忆重不重要、进不进核心）。
 QUESTION_KIND_IMPORTANCE = "importance"
@@ -98,8 +101,8 @@ class PendingQuestions:
                 encoding="utf-8",
             )
             os.replace(tmp, self._path)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("pending_questions 保存失败，问题可能丢失：%s", exc, exc_info=True)
 
     def add(self, kind, text, options, reason, memory_id=None, turn_id=None):
         """攒一个新问题，返回问题 dict。
