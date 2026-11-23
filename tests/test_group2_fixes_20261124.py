@@ -3,8 +3,9 @@
 #
 # 2a _dedupe_key 砍逗号（Gemini Bug 3，最危险）：无条件截掉最后一个
 #    逗号后的内容，“每天定投5块，买纳指”与“买标普”算出同一个 key，
-#    第二条被当 UNCHANGED 静默吞掉。修法：逗号不截，只剥末尾括号
-#    补充——丢记忆比多存一条改写版严重得多。
+#    第二条被当 UNCHANGED 静默吞掉。修法：逗号只截“改写补充”尾巴
+#    （“……是X”且 X 已在前半句出现，如“，主食偏好是面条”），普通
+#    分句不截——该合并的改写版照旧合并，不同的事实一条都不丢。
 # 2b “我现在”多子句误拒（Gemini 隐患 1）： “我现在住深圳了，喜欢吃
 #    海鲜”整句结尾不是“了”，_correction_fact_after 返回 None，住址
 #    变更漏掉。修法：整句不合格时按逗号取第一小句再校验，认第一
@@ -49,6 +50,13 @@ def test_dedupe_key_comma_tail_kept():
     assert _dedupe_key("每天定投5块，买纳指") != _dedupe_key("每天定投5块，买标普")
     assert _dedupe_key("我喜欢吃面条，不喜欢吃米饭") != _dedupe_key(
         "我喜欢吃面条，也喜欢吃饺子"
+    )
+
+
+def test_dedupe_key_comma_supplement_still_merged():
+    """逗号版改写补充照旧合并：和括号版算同一条（R2 后续③的实弹）。"""
+    assert _dedupe_key("BOOS 改吃面条了，主食偏好是面条") == _dedupe_key(
+        "我改吃面条了（主食偏好是面条）"
     )
 
 
