@@ -674,7 +674,11 @@ def _run_update_memory(args):
             "请先列出全部记忆，照原文再改。",
         }
     try:
-        outcome = store.correct_memory(stored_text, new_text)
+        # 模型按 BOOS 的话改记忆，是显式纠正：按槽位找目标，不走
+        # 相似度 0.70 阈值（2026-11-23 model fix #2）。
+        outcome = store.correct_memory(
+            stored_text, new_text, explicit_correction=True
+        )
     except Exception as exc:  # noqa: BLE001 - 改失败也算执行失败
         return {"ok": False, "data": None, "error": f"改记忆失败：{exc}"}
     status = (outcome or {}).get("status")

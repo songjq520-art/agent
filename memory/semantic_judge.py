@@ -27,6 +27,11 @@
 #   输出约 60–100 Token，约 $0.0001–0.0002（高峰价翻倍，仍约 $0.0003）。
 #   大模型断了（超时、API 报错、没 Key、没接好）时抛 SemanticJudgeError
 #   或 SemanticJudgeUnavailable，调用方降级走程序，别崩、别丢事实。
+#
+# 2026-11-23 model fix #4（模型优先 + 全上下文）：程序只判明显 case
+#   （槽位能推出、原样对上、库里没候选），其余都问模型；判官输入是
+#   整段对话上下文（judge_semantic / judge_importance 的 context 参数），
+#   不只一句话。
 
 import json
 import logging
@@ -138,10 +143,13 @@ def judge_available():
         return False, f"配置读取失败：{exc}"
 
 
-def build_judge_prompt(new_text, candidates):
+def build_judge_prompt(new_text, candidates, context=None):
     """判官提示词：短、只问三件事，让模型只回一行 JSON，别写大段话。
 
     candidates 是 [{"id", "text"}]（最多 10 条，调用方截过）。
+    context 是整段对话上下文（最近几轮消息，2026-11-23 model fix #4）：
+    判官只看一句话分不清“在纠正哪条”时，对话能定锚——比如上一轮刚
+    说的才是被纠正的那条。没有上下文时不加这一段，老行为不变。
     """
     lines = [
         "你是记忆管家，只判断新说法和旧记忆的关系，只回 JSON，不要解释。",
@@ -150,6 +158,19 @@ def build_judge_prompt(new_text, candidates):
     ]
     for i, cand in enumerate(candidates or [], 1):
         lines.append(f"{i}. [{cand.get('id')}] {cand.get('text')}")
+    if context:
+        lines.append("对话上下文（最近几轮，原样——新说法是在这段对话里说的）：")
+        for msg in list(context or [])[-6:]:
+            role = (msg or {}).get("role")
+            content = ((msg or {}).get("content") or "").strip()
+            if not content:
+                continue
+            who = (
+                "用户" if role == "user"
+                else "助手" if role == "assistant"
+                else (role or "未知")
+            )
+            lines.append(f"{who}：{content[:200]}")
     lines.append(
         "任务：1) 新说法属于哪类偏好/槽位（如“喜欢喝的饮品”“喜欢吃的食物”"
         "“喜欢看的影片”，无法归类写 null）；2) 新说法是不是在纠正/取代"
@@ -241,9 +262,12 @@ def parse_judge_response(text, candidate_ids):
     }
 
 
-def build_importance_prompt(text):
+def build_importance_prompt(text, context=None):
     """重要性判断提示词（Phase 2 #2）：一句话是长期稳定的事实/偏好/
     决定（值得钉住长期记住），还是一次性经历/随口一提。
+
+    context 是整段对话上下文（2026-11-23 model fix #4）：一句话单看
+    分不清长期还是一次性时，对话能定锚。没有上下文时不加这一段。
 
     只回一行 JSON：{"important": true/false/"unsure", "reason": "..."}。
     important 为 true 表示值得长期钉住；false 表示一次性经历、以后
@@ -252,6 +276,21 @@ def build_importance_prompt(text):
     lines = [
         "你是记忆管家，只判断一句话值不值得长期钉住记住，只回 JSON，不要解释。",
         f"句子：{text}",
+    ]
+    if context:
+        lines.append("对话上下文（最近几轮，原样——这句话是在这段对话里说的）：")
+        for msg in list(context or [])[-6:]:
+            role = (msg or {}).get("role")
+            content = ((msg or {}).get("content") or "").strip()
+            if not content:
+                continue
+            who = (
+                "用户" if role == "user"
+                else "助手" if role == "assistant"
+                else (role or "未知")
+            )
+            lines.append(f"{who}：{content[:200]}")
+    lines += [
         "规则：身份（名字、住处）、长期偏好（喜欢吃什么/喝什么/看什么）、"
         "决定（打算、计划、定投、规矩）、钱的规矩、安全权限、项目决策，"
         "这些是长期稳定的，判 important=true；"
@@ -309,7 +348,8 @@ def parse_importance_response(text):
     }
 
 
-def judge_importance(text, provider=None, model=None, budget_tracker=None):
+def judge_importance(text, provider=None, model=None, budget_tracker=None,
+                     context=None):
     """问大模型判官：一句话值不值得长期钉住记住。
 
     复用 judge_semantic 的分发层（provider/model/budget_tracker 同款
@@ -322,7 +362,7 @@ def judge_importance(text, provider=None, model=None, budget_tracker=None):
     provider_obj, provider_name, model_name = resolve_judge_provider(
         provider, model, budget_tracker=budget_tracker
     )
-    prompt = build_importance_prompt(text)
+    prompt = build_importance_prompt(text, context=context)
     cfg = get_judge_config()
     try:
         result = provider_obj.chat_messages(
@@ -386,7 +426,7 @@ def estimate_judge_cost_usd(usage, provider, model):
 
 
 def judge_semantic(new_text, candidates, provider=None, model=None,
-                   budget_tracker=None):
+                   budget_tracker=None, context=None):
     """问大模型判官：新说法和旧记忆的关系。
 
     参数 new_text：新说法（一句话）；candidates：旧记忆 [{"id", "text"}]；
@@ -404,7 +444,7 @@ def judge_semantic(new_text, candidates, provider=None, model=None,
     provider_obj, provider_name, model_name = resolve_judge_provider(
         provider, model, budget_tracker=budget_tracker
     )
-    prompt = build_judge_prompt(new_text, candidates)
+    prompt = build_judge_prompt(new_text, candidates, context=context)
     cfg = get_judge_config()
     try:
         result = provider_obj.chat_messages(

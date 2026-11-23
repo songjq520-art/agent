@@ -128,6 +128,7 @@ from memory.conversation_transcript import (  # noqa: E402
 )
 from memory.mem0_store import create_mem0_store  # noqa: E402
 from memory.redaction import _redact_sensitive  # noqa: E402
+from memory.correction_text import _infer_fact_slot  # noqa: E402
 from memory.sqlite_store import resolve_event_date  # noqa: E402
 
 logger = logging.getLogger("agent")
@@ -273,6 +274,43 @@ def _redacted_messages(messages):
             item["content"] = _redact_sensitive(item["content"])
         out.append(item)
     return out
+
+
+def _correction_reply_text(correction):
+    """纠正执行完后的确定性回复（2026-11-23 model fix #3，措辞）：
+    改好了就直接说“已经改好了”，不提确认、不事后反问“要不要改”。
+    correction 不是 updated 时返回 None（调用方保留模型原回复）。
+    模型回答是存记忆之前生成的，不知道纠正已经改好了，才会说
+    “等你确认后，我会把……存成新的说法”这种过时的话。"""
+    if not isinstance(correction, dict):
+        return None
+    if correction.get("status") != "updated":
+        return None
+    old_text = (correction.get("old_text") or "").strip()
+    new_text = (correction.get("new_text") or "").strip()
+    if old_text and new_text and old_text != new_text:
+        return f"已经改好了：把“{old_text}”改成了“{new_text}”。"
+    if new_text:
+        return f"已经改好了：{new_text}。"
+    return "已经改好了。"
+
+
+def _slot_conflict_reply_text(store, stored):
+    """无纠正词的新陈述存成新行、同槽旧行还在时的回复（2026-11-23
+    model fix #3，措辞）：只认记下了，不反问“要不要改”。
+    stored 是本轮存下的句子列表；没有同槽冲突时返回 None（调用方
+    保留模型原回复）。store 没有 _find_same_slot_conflicts 时返回 None。"""
+    for sent in stored or []:
+        slot, value = _infer_fact_slot(sent)
+        if slot is None:
+            continue
+        try:
+            conflicts = store._find_same_slot_conflicts(slot, value)
+        except Exception:
+            return None
+        if conflicts:
+            return f"记下了：{sent.rstrip('。！')}。"
+    return None
 
 
 class ChatState:
@@ -900,6 +938,51 @@ class ChatState:
             removed = before_len - len(self.messages)
             if removed > 0:
                 self._shift_waiting_history_index(removed)
+        # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
+        # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
+        # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
+        # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
+        # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
+        # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
+        # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
+        # 先存记忆、再写全文记录：纠正执行完要改回复措辞时，全文记录里
+        # 拿到的就是改好后的回复，和历史、页面一致。
+        correction = None
+        questions = None
+        saved = None
+        if self.mem0_store is not None and not skip_memory_save:
+            recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
+            if insert_at is not None and not any(
+                msg is user_msg for msg in recent
+            ):
+                # 恢复的那轮插在中间、又被后面的轮次挤出最近 6 条时，
+                # 把它放进要存记忆的窗口最前面（它比窗口里的消息更早，
+                # 顺序仍是时间顺序），别让它丢了记忆。
+                recent = [user_msg, assistant_msg] + self.messages[
+                    -(_MEMORY_SAVE_HISTORY_MAX - 2):
+                ]
+            with timer.measure("memory_save_ms"):
+                # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
+                # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
+                saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
+            if isinstance(saved, dict):
+                correction = saved.get("correction")
+                questions = saved.get("questions")
+        # 2026-11-23 model fix #3（措辞）：纠正已经执行完了，回复就直接
+        # 说“已经改好了”，不提确认、不事后反问“要不要改”——模型回答是
+        # 存记忆之前生成的，不知道纠正已经改好了，才会说“等你确认后…”
+        # /“要不要我把……改成……？”这种过时的话。覆盖掉它（历史里的助手
+        # 回复、全文记录、返回都用改好后的这句，保持一致）。
+        reply_override = _correction_reply_text(correction)
+        if reply_override is None and isinstance(saved, dict):
+            # 无纠正词的新陈述存成了新行、同槽旧行还在时（E 组 T1 那种），
+            # 也只认记下了，不反问“要不要改”。
+            reply_override = _slot_conflict_reply_text(
+                self.mem0_store, saved.get("stored")
+            )
+        if reply_override is not None:
+            reply_text = reply_override
+            assistant_msg["content"] = reply_override
         # 38 号：全文存盘——本轮两条新消息追加进这场对话的全文记录。
         # 只追加新消息（恢复回来的旧消息不经过这里，不重复写）；
         # 摘要压缩裁掉历史前面时不影响这里，全文已经在文件里了。
@@ -929,33 +1012,6 @@ class ChatState:
                     )
             except Exception:
                 logger.warning("对话全文存盘失败。", exc_info=True)
-        # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
-        # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
-        # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
-        # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
-        # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
-        # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
-        # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
-        correction = None
-        questions = None
-        if self.mem0_store is not None and not skip_memory_save:
-            recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
-            if insert_at is not None and not any(
-                msg is user_msg for msg in recent
-            ):
-                # 恢复的那轮插在中间、又被后面的轮次挤出最近 6 条时，
-                # 把它放进要存记忆的窗口最前面（它比窗口里的消息更早，
-                # 顺序仍是时间顺序），别让它丢了记忆。
-                recent = [user_msg, assistant_msg] + self.messages[
-                    -(_MEMORY_SAVE_HISTORY_MAX - 2):
-                ]
-            with timer.measure("memory_save_ms"):
-                # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
-                # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
-                saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
-            if isinstance(saved, dict):
-                correction = saved.get("correction")
-                questions = saved.get("questions")
         response = {
             "reply": reply_text,
             "model": model_name,

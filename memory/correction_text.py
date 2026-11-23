@@ -142,6 +142,35 @@ def _infer_fact_slot(text):
     return None, None
 
 
+# 纠正目标槽位（2026-11-23 model fix #2，A 组阈值）：带明确纠正词的
+# 纠错不走相似度 0.70 阈值，直接按槽位找要改的那条。单值槽（住处/
+# 名字）复用 _infer_fact_slot；偏好句按“喜欢/爱/讨厌 + 吃/喝/看/
+# 听/玩/用”认话题槽——“我喜欢吃米饭”和“我喜欢吃面条”都是
+# “喜欢吃”槽；“爱吃”归一成“喜欢吃”，“不爱”归一成“不喜欢”。
+# 只认句式，不猜意思；认不出返回 None（调用方走老路，不硬编）。
+_PREF_TOPIC_RE = re.compile(r"(喜欢|爱|讨厌|不喜欢|不爱)(吃|喝|看|听|玩|用)?")
+
+
+def _correction_topic_slot(text):
+    """给纠错按槽位找目标用的粗槽位键，如 "slot:residence" / "pref:喜欢吃"。
+
+    返回 None 表示这句认不出槽位（调用方别按槽位找，走相似度/判官老路）。"""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    slot, _value = _infer_fact_slot(text)
+    if slot is not None:
+        return "slot:" + slot
+    match = _PREF_TOPIC_RE.search(text)
+    if match is None:
+        return None
+    verb, obj = match.group(1), match.group(2) or ""
+    if verb == "爱":
+        verb = "喜欢"
+    elif verb == "不爱":
+        verb = "不喜欢"
+    return "pref:" + verb + obj
+
+
 def _detect_correction(text):
     """从一句话里认出“纠错意图 + 新说法”。
 

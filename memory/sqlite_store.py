@@ -45,7 +45,7 @@ from memory.correction_text import (
     _CORRECTION_PHRASES,
     _detect_correction, _strip_correction_sentences,
     _detect_correction_fragment, _VAGUE_FRAGMENT_VALUES,
-    _infer_fact_slot,
+    _infer_fact_slot, _correction_topic_slot,
 )
 from memory.money_slots import extract_core_slots
 from memory.redaction import _contains_sensitive, _normalize_memory_text
@@ -877,7 +877,11 @@ class SQLiteStore:
             # supersede_old 时才继续存，存好新行再取代旧行（新 key 要
             # 先存在，supersede 事件的 current_key 才有东西可指）。
             to_supersede = []
-            if slot:
+            # 2026-11-23 model fix #1（D 组根因）：新陈述无纠正词时，不自动
+            # supersede 同槽旧记忆——直接存成新行。只带明确纠正词的才算纠正，
+            # 那种调用方显式传 allow_slot_supersede=True 才走槽位裁决。
+            # 默认 False：直存原语（"记住"/工具/逐句循环）一律只存不顶。
+            if slot and kwargs.get("allow_slot_supersede", False):
                 # 槽位裁决的候选：slot 列上打过标的行（SQL 查）+ 按文本
                 # 现认槽位的行（_find_same_slot_conflicts 扫全部活行）——
                 # 修复前工具路存的行没打 slot 标（西安案），只查 SQL 会
@@ -975,6 +979,17 @@ class SQLiteStore:
                 self._queue_importance_question(
                     text, key, _importance_reason, turn_id
                 )
+            if len(to_supersede) > 1:
+                # 2026-11-23 model fix #1：显式纠正也只顶最新的一条同槽
+                # 冲突（被纠正的那条），其余留着——全顶掉曾连带顶掉真记忆。
+                to_supersede = sorted(
+                    to_supersede,
+                    key=lambda c: (
+                        (c[2] or {}).get("write_seq") or 0,
+                        (c[2] or {}).get("created_at") or "",
+                    ),
+                    reverse=True,
+                )[:1]
             for old_id, old_text, old_meta in to_supersede:
                 try:
                     self._supersede_row(old_id, old_text, old_meta, key, text)
@@ -1204,25 +1219,44 @@ class SQLiteStore:
         old_text = same_slot[0].get("text") or ""
         if not old_text:
             return None
-        retry = self.correct_memory(old_text, fact, exclude_identical_to_new=True)
+        retry = self.correct_memory(
+            old_text, fact, exclude_identical_to_new=True,
+            explicit_correction=True,
+        )
         if (retry or {}).get("status") == "updated":
             return retry
         return None
 
     def _apply_same_slot_update(self, sentence, slot, value, receipt,
-                                turn_id, event_date):
+                                turn_id, event_date, is_correction=False):
         """同槽位新值进库前的裁决（save_turn 逐句循环里调）：
         - 没同槽位旧值 → 返回 False，调用方照常存；
-        - 有旧值：逐条按 provenance._resolve_conflict 裁决；只要有一条
-          不是 supersede_old，就不存新句（挂起/留旧），返回 True；
-        - 全是 supersede_old → 逐条调 correct_memory 取代；都换好了
-          返回 True（回执记 stored + correction）；correct_memory 没换
-          成的那条，改走直存 + _supersede_row 兜底（裁决已说该换，
-          不能因为候选检索没找着就并存两条）。
+        - 无纠正词的新陈述（is_correction=False）→ 返回 False，调用方
+          照常存成新行、不顶旧的（2026-11-23 model fix #1，D 组根因：
+          只有带明确纠正词的才算纠正；不问 BOOS、不顶旧）；
+        - 带明确纠正词（is_correction=True）→ 只裁决最新的一条同槽位
+          旧值（被纠正的那条），其余留着；裁决 supersede_old 时走
+          correct_memory 取代，correct_memory 没换成的那条改走直存 +
+          _supersede_row 兜底。
         """
         conflicts = self._find_same_slot_conflicts(slot, value)
         if not conflicts:
             return False
+        if not is_correction:
+            # D 组根因：无纠正词的新陈述不自动顶掉同槽旧记忆——直接存成
+            # 新行（调用方继续走正常存储），不问、不顶。只带明确纠正词
+            # 的才算纠正（is_correction=True 那条路）。
+            return False
+        # 带明确纠正词：只顶最新的一条同槽冲突（被纠正的那条），其余留着——
+        # 旧写法全顶掉，曾把真记忆广州连带顶掉（E 组 T1 顶了长沙又顶广州）。
+        conflicts = sorted(
+            conflicts,
+            key=lambda c: (
+                (c[2] or {}).get("write_seq") or 0,
+                (c[2] or {}).get("created_at") or "",
+            ),
+            reverse=True,
+        )[:1]
         # S10（2026-11-22，BOOS 定选 A）：_apply_same_slot_update 只在
         # save_turn 的逐句循环里调，句子都来自用户本轮直接说的话——新事实
         # 按已确认算（user/1.0），不再按推断（inferred/0.7）。推断赢不了
@@ -1259,7 +1293,8 @@ class SQLiteStore:
         remaining = []
         for old_id, old_text, old_meta in to_supersede:
             outcome = self.correct_memory(
-                old_text, sentence, exclude_identical_to_new=True
+                old_text, sentence, exclude_identical_to_new=True,
+                explicit_correction=True,
             )
             if (outcome or {}).get("status") == "updated":
                 if first_outcome is None:
@@ -1274,6 +1309,9 @@ class SQLiteStore:
                 saved = self.add_memory_text(
                     sentence, source="user", turn_id=turn_id,
                     event_date=event_date, decay_kind="episodic", slot=slot,
+                    # 下面循环会显式 _supersede_row 顶掉 remaining 这一条，
+                    # 这里别再让直存自己裁决顶旧（会顶两遍）。
+                    allow_slot_supersede=False,
                 )
                 if (saved or {}).get("event") != "ADD":
                     receipt["dropped"].append(
@@ -1349,9 +1387,9 @@ class SQLiteStore:
         返回 (trigger, reason, candidates)，trigger 为 True 才问。
         触发条件（至少满足一条，且都要有候选可判）：
         (a) slot 是 None + 偏好句式 + 库里有同类偏好活记忆；
-        (c) 含纠错说法、但 _detect_correction 没认出来 + 偏好句式 + 有候选
-            （比如“我现在喜欢喝豆奶了”：“我现在”那条认纠正要求带单值
-            槽位，偏好句没槽位就认不出来，程序判不定，交给判官）。
+        (c) 含纠错说法 + 有候选（2026-11-23 model fix #4 放宽：不要求
+            偏好标记——“我现在喝豆奶了”这种没“喜欢”也没槽位的，程序
+            判不定，交给判官；“我现在喜欢喝豆奶了”仍是这条）。
         slot 能推出来时走程序路，这里永远返回不触发。
         (b) 纠正候选多条分不清不在这里——那是 correct_memory 报 ambiguous
         之后的事，见 _judge_ambiguous_correction。
@@ -1367,7 +1405,14 @@ class SQLiteStore:
         has_change = any(
             marker in sentence for marker in _JUDGE_CHANGE_MARKERS
         )
-        if not has_marker and not has_change:
+        has_correction_phrase = any(
+            phrase in sentence for phrase in _CORRECTION_PHRASES
+        )
+        # 2026-11-23 model fix #4（模型优先）：程序只判明显 case——
+        # 槽位能推出来的走程序路（上面已返回 False）、库里没同类候选的
+        # 直接存（下面）；其余（带偏好标记/改变说法/纠正说法、且库里有
+        # 同类活记忆）都问模型判官，程序不替模型做语义判断。
+        if not has_marker and not has_change and not has_correction_phrase:
             return False, None, []
         cands = self._preference_judge_candidates(sentence)
         if not cands:
@@ -1375,13 +1420,11 @@ class SQLiteStore:
         # 改变标记是更明确的信号，优先于通用纠正短语匹配（如“我现在”）。
         if has_change and not has_marker:
             return True, "preference_change", cands
-        if _detect_correction(sentence) is None and any(
-            phrase in sentence for phrase in _CORRECTION_PHRASES
-        ):
+        if has_correction_phrase:
             return True, "correction_uncertain", cands
         return True, "slot_none_preference", cands
 
-    def _ask_semantic_judge(self, text, candidates):
+    def _ask_semantic_judge(self, text, candidates, context=None):
         """调大模型判官（只在触发后调）。返回 verdict dict。
 
         模型断了（超时、API 报错、没 Key、没接好）或回的格式不对时
@@ -1389,36 +1432,39 @@ class SQLiteStore:
         失败记一条 warning 日志，方便查。
         判官对象：self._judge_provider（测试注入）或配置解析
         （默认 DeepSeek flash，见 memory/semantic_judge.py）。
+        context 是整段对话上下文（最近几轮消息，2026-11-23 model fix
+        #4）：判官只看一句话分不清“在纠正哪条”时，对话能定锚。
         """
         try:
             from memory import semantic_judge as _sj
             return _sj.judge_semantic(
                 text, candidates, provider=self._judge_provider,
-                budget_tracker=self.budget_tracker,
+                budget_tracker=self.budget_tracker, context=context,
             )
         except Exception as exc:
             logger.warning("语义判断失败，降级走程序：%s", exc)
             return None
 
-    def _ask_importance_judge(self, text):
+    def _ask_importance_judge(self, text, context=None):
         """调大模型重要性判官（只在程序判不定时调）。返回 verdict dict。
 
         模型断了或回的格式不对时返回 None——调用方按程序 fallback 走
         （当一次性经历存，不崩、不丢事实），失败记一条 warning 日志。
         判官对象：self._judge_provider（测试注入）或配置解析
         （默认 DeepSeek flash，见 memory/semantic_judge.py）。
+        context 是整段对话上下文（2026-11-23 model fix #4）。
         """
         try:
             from memory import semantic_judge as _sj
             return _sj.judge_importance(
                 text, provider=self._judge_provider,
-                budget_tracker=self.budget_tracker,
+                budget_tracker=self.budget_tracker, context=context,
             )
         except Exception as exc:
             logger.warning("重要性判断失败，降级走程序：%s", exc)
             return None
 
-    def _decide_importance(self, text, slot=None):
+    def _decide_importance(self, text, slot=None, context=None):
         """重要性三段判（Phase 2 #2，混合法）：程序先判，难的问判官。
 
         返回 (decision, reason, judge_info)：decision 是 "important"
@@ -1452,7 +1498,7 @@ class SQLiteStore:
             return "important", "是决定/计划，长期决定进核心", None
         if re.search(r"(昨天|前天|今天|刚才|刚刚|上次|这次)", text or ""):
             return "episodic", "带过去时间词，是一次性经历", None
-        verdict = self._ask_importance_judge(text)
+        verdict = self._ask_importance_judge(text, context=context)
         if verdict is None:
             return (
                 "episodic",
@@ -1584,7 +1630,7 @@ class SQLiteStore:
             "question_id": question_id, "memory_id": memory_id,
         }
 
-    def _judge_preference_supersede(self, text):
+    def _judge_preference_supersede(self, text, context=None):
         """问判官：这句偏好新事实该不该取代某条同类活偏好。
 
         返回 ((old_id, old_text, old_meta), verdict, trigger)；不取代/
@@ -1596,7 +1642,7 @@ class SQLiteStore:
         _trigger, _reason, cands = self._needs_semantic_judge(text, None)
         if not _trigger:
             return None, None, None
-        verdict = self._ask_semantic_judge(text, cands)
+        verdict = self._ask_semantic_judge(text, cands, context=context)
         if not verdict or not verdict.get("should_supersede"):
             return None, None, None
         target = next(
@@ -1612,7 +1658,8 @@ class SQLiteStore:
             return None, None, None
         return (target["id"], target["text"], target["meta"]), verdict, _reason
 
-    def _apply_semantic_judge_update(self, sentence, receipt, turn_id, event_date):
+    def _apply_semantic_judge_update(self, sentence, receipt, turn_id,
+                                     event_date, context=None):
         """save_turn 逐句循环里的模型判官路：触发后问模型，该取代就走
         correct_memory 同款落盘（_apply_correction_result：新说法存一条，
         账本记 supersede，旧行标 superseded=1）。
@@ -1622,7 +1669,9 @@ class SQLiteStore:
         /api/chat 的返回里能看到走了模型。返回 True=已处理，
         False=没处理（调用方照常走 add_memory_text 直存，不丢事实）。
         """
-        target, verdict, trigger = self._judge_preference_supersede(sentence)
+        target, verdict, trigger = self._judge_preference_supersede(
+            sentence, context=context
+        )
         if target is None:
             return False
         old_id, old_text, old_meta = target
@@ -1658,7 +1707,7 @@ class SQLiteStore:
         receipt.setdefault("judge_calls", []).append(outcome["judge"])
         return True
 
-    def _judge_ambiguous_correction(self, correction, fact):
+    def _judge_ambiguous_correction(self, correction, fact, context=None):
         """触发条件 (b)：correct_memory 报 ambiguous 后，再问大模型判官挑一条。
 
         挑出来就按那条落盘（_apply_correction_result，route="model"）；
@@ -1677,7 +1726,7 @@ class SQLiteStore:
         ]
         if len(cand_list) < 2:
             return None
-        verdict = self._ask_semantic_judge(fact, cand_list)
+        verdict = self._ask_semantic_judge(fact, cand_list, context=context)
         if not verdict or not verdict.get("should_supersede"):
             return None
         target = next(
@@ -1777,6 +1826,8 @@ class SQLiteStore:
         #     的状态照实留在回执里，旧的没被取代。
         # 没纠错时走正常逐句循环，原来的键不动。
         correction = None
+        correction_fact_norm = None  # 本轮纠正的新说法（归一化），逐句循环
+        # 里认“这句就是纠正事实”用——只有它才走槽位取代（model fix #1）。
         sentences = _split_sentences(latest_user)
         detected = _detect_correction(latest_user)
         if detected is not None:
@@ -1796,12 +1847,14 @@ class SQLiteStore:
                 # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
                 # 补不出来就原样走 correct_memory（找不到旧记忆时当新记忆存）。
                 fact = self._complete_correction_fragment(fact)
+                correction_fact_norm = _normalize_memory_text(fact)
                 # 当下的想法/问句不纠正（“我现在想喝茶了”不是在改一条记忆）：
                 # 检测到了也不走纠正分支，留给下面的正常循环按老规矩处理
                 # （当下的想法会被 _looks_like_fact 拦下、不存）。
                 if _looks_like_fact(fact)[0]:
                     correction = self.correct_memory(
-                        fact, fact, exclude_identical_to_new=True
+                        fact, fact, exclude_identical_to_new=True,
+                        explicit_correction=True,
                     )
                     if (correction or {}).get("status") == "ambiguous":
                         # 分不清改哪条时按槽位再筛一次：新说法带单值槽位、
@@ -1813,7 +1866,9 @@ class SQLiteStore:
                         # 触发条件 (b)：纠正候选多条、相似度都过线，程序筛不出来——
                         # 再问大模型判官挑一条；挑不出来/模型断了就保持 ambiguous，
                         # 不猜（下面照常把新说法当新记忆存）。
-                        judged = self._judge_ambiguous_correction(correction, fact)
+                        judged = self._judge_ambiguous_correction(
+                            correction, fact, context=messages
+                        )
                         if judged is not None:
                             correction = judged
                     if (correction or {}).get("status") == "updated":
@@ -1828,8 +1883,9 @@ class SQLiteStore:
                         # 没找到旧记忆 / 分不清改哪条：新说法当新记忆存
                         # （带上纠错句之外的部分）。根因 c：ambiguous 时
                         # 以前这里直接丢了新说法，S4 的摩托车就是这么丢的。
-                        # 逐句循环里的槽位更新还会再拦一次（同槽位旧值在时
-                        # 替它走 correct_memory，不并存两条）。
+                        # 逐句循环里这句是纠正事实，同槽位旧值在时才走
+                        # correct_memory 顶掉最新那条（model fix #1）；
+                        # 不是纠正事实的句子只存新行、不顶旧的。
                         sentences = kept + [fact]
                     else:
                         sentences = kept
@@ -1885,12 +1941,20 @@ class SQLiteStore:
             ):
                 receipt["dropped"].append({"text": sentence, "reason": "已被纠正取代"})
                 continue
-            # 同槽位隐式更新（2026-11-22 通用纠正）：新事实带单值槽位、
-            # 库里已有同槽位不同值时，按 _resolve_conflict 裁决、走
-            # correct_memory 取代旧的；没冲突时照常存，顺手把槽位标上。
+            # 这句是不是本轮的纠正事实（只有它是，才走槽位取代；
+            # 普通新陈述只存新行、不顶旧的，2026-11-23 model fix #1）。
+            is_correction_sentence = bool(
+                correction_fact_norm
+                and _normalize_memory_text(sentence) == correction_fact_norm
+            )
+            # 同槽位更新（2026-11-22 通用纠正 + 2026-11-23 model fix #1）：
+            # 只有带明确纠正词的句子才取代同槽位旧值（且只顶最新那条）；
+            # 无纠正词的新事实只存新行、不顶旧的。没冲突时照常存，
+            # 顺手把槽位标上。
             slot, slot_value = _infer_fact_slot(sentence)
             if slot is not None and self._apply_same_slot_update(
-                sentence, slot, slot_value, receipt, turn_id, event_date
+                sentence, slot, slot_value, receipt, turn_id, event_date,
+                is_correction=is_correction_sentence,
             ):
                 continue
             # 混合判断（2026-11-22，BOOS 定）：程序推不出槽位的偏好句，
@@ -1898,12 +1962,14 @@ class SQLiteStore:
             # （见 _needs_semantic_judge：slot 为 None + 偏好句式 + 库里
             # 有同类偏好活记忆）；大模型只当判官，不做分流。
             if slot is None and self._apply_semantic_judge_update(
-                sentence, receipt, turn_id, event_date
+                sentence, receipt, turn_id, event_date, context=messages
             ):
                 continue
             # 来源标 user（已确认）：save_turn 只存用户本轮直接说的话，
             # 不是模型推断——2026-11-22 BOOS 定选 A：用户亲口说的新事实
-            # 直接算已确认（可信度 1.0），能取代已确认的旧事实。unconfirmed
+            # 直接算已确认（可信度 1.0）。但已确认不等于自动取代旧事实：
+            # 2026-11-23 model fix #1——没纠正词的新陈述只存新行、不顶
+            # 旧的，只有带明确纠正词的才取代。unconfirmed
             # 是留给“完全没来源信息”的旧记忆的桶（2026-11-09 之前）。
             # 模型自己推断的事实不走这里，仍按 inferred/0.7 直存
             # （add_memory_text(source="inferred")，见低可信度挂起的回归测试）。
@@ -1911,7 +1977,7 @@ class SQLiteStore:
             # 时间词），难的问大模型判官；判不准时先当一次性经历存，
             # 再问 BOOS（#4，见下面的 new_questions）。
             importance_decision, importance_reason, _importance_judge = (
-                self._decide_importance(sentence, slot)
+                self._decide_importance(sentence, slot, context=messages)
             )
             saved = self.add_memory_text(
                 sentence, source="user", turn_id=turn_id,
@@ -1925,6 +1991,9 @@ class SQLiteStore:
                     "high" if importance_decision == "important" else "normal"
                 ),
                 semantic_judge=False,
+                # 只有纠正事实才允许直存路的槽位取代（model fix #1）；
+                # 普通新陈述只存新行、不顶旧的。
+                allow_slot_supersede=is_correction_sentence,
                 **({"slot": slot} if slot else {}),
             )
             if (saved or {}).get("event") == "ADD":
@@ -2274,12 +2343,35 @@ class SQLiteStore:
                 "audit": audit or {"source": source, "method": "correct_memory"},
             }
 
-    def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True):
+    def _explicit_correction_slot_target(self, candidates, new_fact):
+        """带明确纠正词时按槽位找要改的那条（2026-11-23 model fix #2）：
+        新说法和候选的 _correction_topic_slot 相同（住处/名字/喜欢吃……）
+        时，取候选顺序里的第一条（候选已按已确认在前、同类里新的在前
+        排过）；没有同槽位候选时返回 None（调用方走老路，不硬猜）。"""
+        slot_key = _correction_topic_slot(new_fact)
+        if slot_key is None:
+            return None
+        norm_new = _normalize_memory_text(new_fact)
+        for mid in candidates or []:
+            text = self._candidate_text(mid)
+            if text is None:
+                continue
+            if _normalize_memory_text(text) == norm_new:
+                continue
+            if _correction_topic_slot(text) == slot_key:
+                return mid
+        return None
+
+    def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True,
+                       explicit_correction=False):
         """纠错：把 old_fact 指的那条记忆改成 new_fact（整合方案 §6.3）。
 
         流程（和 mem0_store.correct_memory 一致）：
         先找候选（语义 + 关键词/同槽位 + 近期同一轮）；
         旧说法原样在库里 → 直接改那条；
+        带明确纠正词时（explicit_correction=True，2026-11-23 model fix
+        #2，A 组阈值）：按槽位找要改的那条，不走相似度 0.70 阈值——
+        候选里同槽位的第一条就是目标，找不到同槽位候选时走下面老路；
         只有一条候选 → 过相似度安全网（余弦 ≥ 0.70 才改，否则 ambiguous，
         免得改错不相干的记忆；向量算不出来时跳过安全网，交由调用方兜底）；
         多条候选、没有原样 → 先按相似度筛（根因 b，2026-11-22）：只留
@@ -2361,6 +2453,37 @@ class SQLiteStore:
                     resolution="exact", layer="exact",
                     audit={"source": "user", "method": "exact_match"},
                 )
+            # 2026-11-23 model fix #2（A 组阈值）：带明确纠正词的，不走
+            # 相似度 0.70 阈值，直接按槽位找要改的那条——候选里同槽位的
+            # 第一条（候选已按已确认在前、同类里新的在前排过）。找不到
+            # 同槽位候选时走下面的老路（相似度/判官），不硬猜。
+            if explicit_correction:
+                slot_target = self._explicit_correction_slot_target(
+                    candidates, new_fact
+                )
+                if slot_target is not None:
+                    mid = slot_target
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                    if row is not None:
+                        old_text, old_meta = row[0], json.loads(row[1] or "{}")
+                        same = (
+                            _normalize_memory_text(new_fact)
+                            == _normalize_memory_text(old_text)
+                        )
+                        return self._apply_correction_result(
+                            new_fact, mid, old_text, old_meta, same_text=same,
+                            candidates=candidates,
+                            status="unchanged" if same else "updated",
+                            resolution="explicit_slot", layer="slot",
+                            audit={
+                                "source": "user",
+                                "method": "explicit_correction_slot",
+                                "slot": _correction_topic_slot(new_fact),
+                            },
+                        )
             # 多条候选、没有原样：先按相似度筛（根因 b，2026-11-22）——
             # 0.4 的召回线太宽，“我喜欢…”这种短句会召回一堆无关行；
             # 只留与新说法相似度 ≥ 0.70 的（沿用已有的安全网标准）。
