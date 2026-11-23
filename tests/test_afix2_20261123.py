@@ -6,8 +6,12 @@
 # 顶了（seq 561，只隔 4.5 秒）；E 组同理，西安已被模型顶掉，save_turn 报
 # not_found，回复丢了“改好了”。
 # 修法：correct_memory 开头加“已纠正过”护栏——新说法已是活行、且它顶掉
-# 旧说法的账本事件就是本轮（5 分钟内）的，说明纠正已完成过，不再另找目
-# 标，直接回 updated，old_text 取账本里这行顶掉的旧说法。
+# 旧说法的账本事件就是本轮（turn_id 相同）的，说明纠正已完成过，不再另
+# 找目标，直接回 updated，old_text 取账本里这行顶掉的旧说法。
+# 2026-11-24 1b：护栏认轮次改绑 turn_id（原来靠 5 分钟墙钟，跨轮改回旧
+# 值会误拦）。生产里工具调用（update_memory）没有 turn_id 上下文，靠
+# ask() 检索时登记的 store._active_turn_id 兜底拿到本轮号；测试里用
+# 预置 _active_turn_id 模拟这个登记，save_turn 的调用则自带 turn_id。
 # 只拦两种情况：(a) save_turn 的调用（old_fact == new_fact）；(b) 工具的
 # 重复调用（旧说法已不在库里活着）。旧说法还活着时不拦——那是真纠正。
 
@@ -49,16 +53,18 @@ def test_guard_blocks_double_correction_save_turn(store):
     （长沙，长沙）时必须拦住，广州不能被顶。"""
     store.add_memory_text("用户住在广州", source="user")
     store.add_memory_text("我住在武汉", source="user")
-    # 模型工具调用：原样匹配，武汉→长沙。
+    # 模型工具调用：原样匹配，武汉→长沙。工具没有 turn_id 上下文，
+    # 靠当前轮登记（ask 的检索先登记）拿到本轮号 t1。
+    store._active_turn_id = "t1"
     first = store.correct_memory("我住在武汉", "我住在长沙",
                                  explicit_correction=True)
     assert first["status"] == "updated"
     assert first["old_text"] == "我住在武汉"
     assert _is_superseded(store, "我住在武汉")
     assert "我住在长沙" in _live_texts(store)
-    # save_turn 的第二次调用：新说法已是活行、刚顶过武汉。
+    # save_turn 的第二次调用（同轮 t1）：新说法已是活行、刚顶过武汉。
     second = store.correct_memory("我住在长沙", "我住在长沙",
-                                  explicit_correction=True)
+                                  explicit_correction=True, turn_id="t1")
     assert second["status"] == "updated"
     assert second["memory_id"] == first["memory_id"]
     assert second["old_text"] == "我住在武汉"
@@ -74,6 +80,8 @@ def test_guard_blocks_duplicate_tool_call(store):
     """工具重复调用：correct_memory(武汉，长沙）调两次，第二次拦住。"""
     store.add_memory_text("用户住在广州", source="user")
     store.add_memory_text("我住在武汉", source="user")
+    # 同一轮里工具调两次：都靠当前轮登记认本轮。
+    store._active_turn_id = "t1"
     first = store.correct_memory("我住在武汉", "我住在长沙",
                                  explicit_correction=True)
     assert first["status"] == "updated"
@@ -121,6 +129,8 @@ def test_guard_save_turn_end_to_end(store):
     store.add_memory_text("用户住在广州", source="user")
     _turn(store, "我住在武汉", "t1")
     assert "我住在武汉" in _live_texts(store)
+    # T2 里模型工具先改：工具靠当前轮登记（T2 的检索先登记）拿到 t2。
+    store._active_turn_id = "t2"
     first = store.correct_memory("我住在武汉", "我住在长沙",
                                  explicit_correction=True)
     assert first["status"] == "updated"

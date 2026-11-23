@@ -483,6 +483,10 @@ class SQLiteStore:
         self._turn_receipts = {}
         self._last_context_ids = []
         self._last_stored_turn_id = None
+        # 当前轮登记（2026-11-24 1b）：ask() 检索/存轮时把本轮 turn_id
+        # 登记在这；本轮内工具调 correct_memory 没带 turn_id 时按它记账，
+        # “已纠正过”护栏靠它认本轮（不再靠 5 分钟墙钟）。
+        self._active_turn_id = None
 
     # ---------- 建库 ----------
 
@@ -1061,10 +1065,13 @@ class SQLiteStore:
         self._insert_memory_row(key, text, metadata, vec)
         return key
 
-    def _supersede_row(self, old_id, old_text, old_meta, new_key, new_text):
+    def _supersede_row(self, old_id, old_text, old_meta, new_key, new_text,
+                       turn_id=None):
         """把旧行标成被取代：先标 SQLite superseded=1，再写账本 supersede 事件。
         账本写失败时把 SQLite 的标记撤回来再抛——两边要一致，账本是真相。
         old_id 就是旧 key（SQLite id 就是账本 key）；new_key 是新记忆的 key。
+        turn_id 传了就记进 supersede 事件（2026-11-24 1b）：“已纠正过”
+        护栏按它认本轮，不再靠 5 分钟墙钟猜。
         """
         with self._lock:
             self._conn.execute(
@@ -1072,16 +1079,17 @@ class SQLiteStore:
             )
             self._conn.commit()
             try:
+                _event = {"type": _ledger.LEDGER_EVENT_SUPERSEDE,
+                          "memory_id": new_key,
+                          "supersedes_id": old_id,
+                          "old_text": old_text,
+                          "text": new_text,
+                          "key": old_id,
+                          "current_key": new_key}
+                if turn_id is not None:
+                    _event["turn_id"] = turn_id
                 _ledger.append_event(
-                    self.ledger_path,
-                    {"type": _ledger.LEDGER_EVENT_SUPERSEDE,
-                     "memory_id": new_key,
-                     "supersedes_id": old_id,
-                     "old_text": old_text,
-                     "text": new_text,
-                     "key": old_id,
-                     "current_key": new_key},
-                    lock=self._ledger_lock,
+                    self.ledger_path, _event, lock=self._ledger_lock,
                 )
             except Exception:
                 self._conn.execute(
@@ -1239,7 +1247,7 @@ class SQLiteStore:
             return fact
         return old_text.replace(old_value, value, 1)
 
-    def _retry_correction_by_slot(self, correction, fact):
+    def _retry_correction_by_slot(self, correction, fact, turn_id=None):
         """纠错分不清改哪条（ambiguous）时，按单值槽位再筛一次：新说法
         带槽位、且候选里恰好只有一条同槽位（值不同）时，就改那条。
         筛不出来返回 None（调用方保留 ambiguous，等 BOOS 挑）。"""
@@ -1265,7 +1273,7 @@ class SQLiteStore:
             return None
         retry = self.correct_memory(
             old_text, fact, exclude_identical_to_new=True,
-            explicit_correction=True,
+            explicit_correction=True, turn_id=turn_id,
         )
         if (retry or {}).get("status") == "updated":
             return retry
@@ -1338,7 +1346,7 @@ class SQLiteStore:
         for old_id, old_text, old_meta in to_supersede:
             outcome = self.correct_memory(
                 old_text, sentence, exclude_identical_to_new=True,
-                explicit_correction=True,
+                explicit_correction=True, turn_id=turn_id,
             )
             if (outcome or {}).get("status") == "updated":
                 if first_outcome is None:
@@ -1727,7 +1735,7 @@ class SQLiteStore:
                    "provider": verdict.get("provider"),
                    "model": verdict.get("model"),
                    "judge_slot": verdict.get("slot")},
-            layer="judge",
+            layer="judge", turn_id=turn_id,
         )
         if (outcome or {}).get("status") != "updated":
             return False
@@ -1751,7 +1759,8 @@ class SQLiteStore:
         receipt.setdefault("judge_calls", []).append(outcome["judge"])
         return True
 
-    def _judge_ambiguous_correction(self, correction, fact, context=None):
+    def _judge_ambiguous_correction(self, correction, fact, context=None,
+                                    turn_id=None):
         """触发条件 (b)：correct_memory 报 ambiguous 后，再问大模型判官挑一条。
 
         挑出来就按那条落盘（_apply_correction_result，route="model"）；
@@ -1794,7 +1803,7 @@ class SQLiteStore:
                    "provider": verdict.get("provider"),
                    "model": verdict.get("model"),
                    "judge_slot": verdict.get("slot")},
-            layer="judge",
+            layer="judge", turn_id=turn_id,
         )
         if (outcome or {}).get("status") != "updated":
             return None
@@ -1844,6 +1853,7 @@ class SQLiteStore:
             return {"turn_id": turn_id, "duplicate_turn": True, "results": []}
         if turn_id:
             self._seen_turn_ids.add(turn_id)
+            self._active_turn_id = turn_id
         latest_user = ""
         for m in reversed(messages or []):
             if (m or {}).get("role") == "user":
@@ -1908,12 +1918,14 @@ class SQLiteStore:
                 if _looks_like_fact(fact)[0]:
                     correction = self.correct_memory(
                         fact, fact, exclude_identical_to_new=True,
-                        explicit_correction=True,
+                        explicit_correction=True, turn_id=turn_id,
                     )
                     if (correction or {}).get("status") == "ambiguous":
                         # 分不清改哪条时按槽位再筛一次：新说法带单值槽位、
                         # 且候选里恰好只有一条同槽位时，就改那条，不用问。
-                        retry = self._retry_correction_by_slot(correction, fact)
+                        retry = self._retry_correction_by_slot(
+                            correction, fact, turn_id=turn_id
+                        )
                         if retry is not None:
                             correction = retry
                     if (correction or {}).get("status") == "ambiguous":
@@ -1921,7 +1933,8 @@ class SQLiteStore:
                         # 再问大模型判官挑一条；挑不出来/模型断了就保持 ambiguous，
                         # 不猜（下面照常把新说法当新记忆存）。
                         judged = self._judge_ambiguous_correction(
-                            correction, fact, context=messages
+                            correction, fact, context=messages,
+                            turn_id=turn_id,
                         )
                         if judged is not None:
                             correction = judged
@@ -2263,7 +2276,7 @@ class SQLiteStore:
     def _apply_correction_result(self, new_fact, old_id, old_text, old_meta,
                                  *, same_text, candidates, status="updated",
                                  resolution=None, audit=None, source="user",
-                                 layer="single"):
+                                 layer="single", turn_id=None):
         """纠错收尾（2026-11-22）：按状态把结果写进账本和 SQLite，返回
         回执。纠错是追加式——旧记忆不改原文、不删：新说法当一条新记忆
         存（来源 user、已确认），账本记 supersede，旧行标 superseded=1。
@@ -2280,7 +2293,8 @@ class SQLiteStore:
             candidates = self._candidates_with_text(candidates)
             if status == "unchanged":
                 self._record_occurrence(
-                    old_id, old_meta, _shanghai_today().isoformat(), None, old_text
+                    old_id, old_meta, _shanghai_today().isoformat(), turn_id,
+                    old_text,
                 )
                 return {
                     "status": "unchanged", "memory_id": old_id,
@@ -2340,7 +2354,9 @@ class SQLiteStore:
                     "user_confirmed": True,
                     "created_at": created_at,
                     "write_seq": write_seq,
-                    "turn_id": None,
+                    # 本轮号（2026-11-24 1a）：以前写死 None，撤回按
+                    # turn_id 找这条时找不到，纠正出的新记忆撤不掉。
+                    "turn_id": turn_id,
                     "slot": (old_meta or {}).get("slot"),
                     "is_rule": bool((old_meta or {}).get("is_rule")),
                     "curated": bool((old_meta or {}).get("curated")),
@@ -2382,7 +2398,10 @@ class SQLiteStore:
                         "audit": audit or {"source": source, "method": "correct_memory"},
                     }
             try:
-                self._supersede_row(old_id, old_text, old_meta, new_key, new_fact)
+                self._supersede_row(
+                    old_id, old_text, old_meta, new_key, new_fact,
+                    turn_id=turn_id,
+                )
             except Exception:
                 logger.warning("纠错取代记账失败：旧行未取代。", exc_info=True)
                 return {
@@ -2434,7 +2453,8 @@ class SQLiteStore:
                 return mid
         return None
 
-    def _supersede_note_old_fact(self, old_fact_text, new_key, new_fact):
+    def _supersede_note_old_fact(self, old_fact_text, new_key, new_fact,
+                                 turn_id=None):
         """备注行里被纠正掉的旧说法若还活着，一并取代（2026-11-23 A 组修复
         的兜底）：线上备注行写下时语义判官通常已顶掉旧行，这时旧行已不
         是活的，什么都不做；万一旧行还活着（判官没顶），按备注行里写的
@@ -2461,7 +2481,8 @@ class SQLiteStore:
                 old_meta = {}
             try:
                 self._supersede_row(
-                    row[0], row[1] or "", old_meta, new_key, new_fact
+                    row[0], row[1] or "", old_meta, new_key, new_fact,
+                    turn_id=turn_id,
                 )
             except Exception:
                 logger.warning("备注旧说法取代记账失败。", exc_info=True)
@@ -2471,10 +2492,14 @@ class SQLiteStore:
         新说法和候选的 _correction_topic_slot 相同（住处/名字/喜欢吃……）
         时，取候选顺序里的第一条（候选已按已确认在前、同类里新的在前
         排过）；没有同槽位候选时返回 None（调用方走老路，不硬猜）。
-        同槽位候选有两条以上时也返回 None——分不清改哪条，走老路
-        （相似度筛→ambiguous→判官），不猜一条改掉（2026-11-23 回归修：
-        “不对，我喜欢吃米线”对火锅/冒菜两条同槽旧行时必须报 ambiguous，
-        不能直选第一条就 updated）。"""
+        同槽多条时按相似度差距直选（2026-11-24 1c）：真记忆同槽永远
+        多条（火锅/牛肉面/鸡杂面同为“喜欢吃”），原先“恰好 1 条才
+        直选”在 live 里从未触发。改成：第一名 ≥ 0.70（沿用纠正安全
+        网的线）且第二名 < 0.50（明显不像）才直选第一名；差距不够、
+        或相似度算不出来时返回 None，走老路（相似度筛→ambiguous→
+        判官），不猜一条改掉（2026-11-23 回归修的底线还在：
+        “不对，我喜欢吃米线”对火锅/冒菜两条同槽旧行时相似度都
+        不够线，必须报 ambiguous）。"""
         slot_key = _correction_topic_slot(new_fact)
         if slot_key is None:
             return None
@@ -2488,14 +2513,26 @@ class SQLiteStore:
                 continue
             if _correction_topic_slot(text) == slot_key:
                 same_slot.append(mid)
-        if len(same_slot) != 1:
+        if len(same_slot) == 1:
+            return same_slot[0]
+        if not same_slot:
             return None
-        return same_slot[0]
+        scored = [
+            (mid, self._candidate_similarity(mid, new_fact))
+            for mid in same_slot
+        ]
+        if any(sim is None for _mid, sim in scored):
+            return None
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        if (scored[0][1] >= _CORRECTION_TOPIC_MIN_SIMILARITY
+                and scored[1][1] < 0.50):
+            return scored[0][0]
+        return None
 
 
-    def _already_corrected_receipt(self, new_fact, old_fact):
-        """新说法已是活记忆、且它顶掉旧说法的账本事件就是本轮（5 分钟内）
-        的，说明纠正已在本轮完成过：模型生成回复时调 update_memory 先改
+    def _already_corrected_receipt(self, new_fact, old_fact, turn_id=None):
+        """新说法已是活记忆、且它顶掉旧说法的账本事件就是本轮（turn_id
+        相同）的，说明纠正已在本轮完成过：模型生成回复时调 update_memory 先改
         了，save_turn 又调一次 correct_memory——两边都改就会误顶同槽位
         的另一条旧记忆（D 组把真记忆广州顶掉；E 组则报 not_found、回复
         丢了“改好了”）。此时不再另找目标，直接回 updated，old_text 就是
@@ -2527,7 +2564,7 @@ class SQLiteStore:
                     return None
         # 账本里找这行顶掉的旧说法（最近的一条 supersede 事件）。
         old_text = None
-        sup_ts = None
+        sup_turn_id = None
         try:
             events, _info = _ledger.read_events(self.ledger_path)
         except Exception:
@@ -2536,17 +2573,16 @@ class SQLiteStore:
             if (ev.get("type") == _ledger.LEDGER_EVENT_SUPERSEDE
                     and ev.get("memory_id") == live_id):
                 old_text = ev.get("old_text")
-                sup_ts = ev.get("ts")
+                sup_turn_id = ev.get("turn_id")
                 break
-        if not old_text or not sup_ts:
+        if not old_text:
             return None
-        # 只有本轮（5 分钟内）的 supersede 才算“刚改过”；早就是活行的
-        # 新说法（例如上次对话存下的）不拦，交给正常流程。
-        try:
-            sup_dt = datetime.fromisoformat(str(sup_ts).replace("Z", "+00:00"))
-        except Exception:
-            return None
-        if (datetime.now(timezone.utc) - sup_dt).total_seconds() > 300:
+        # 只有本轮（turn_id 相同）的 supersede 才算“刚改过”（2026-11-24
+        # 1b）。以前靠 5 分钟墙钟猜：上一轮刚改完、这一轮改回旧值时，
+        # 最近一条 supersede 还在 5 分钟内，护栏会误拦，真该顶的那条
+        # 顶不掉。没带 turn_id 的旧事件、和本轮对不上的，一律不拦，
+        # 交给正常流程；turn_id 没传进来（认不出本轮）时也不拦。
+        if not turn_id or sup_turn_id != turn_id:
             return None
         return {
             "status": "updated", "memory_id": live_id,
@@ -2557,7 +2593,7 @@ class SQLiteStore:
         }
 
     def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True,
-                       explicit_correction=False):
+                       explicit_correction=False, turn_id=None):
         """纠错：把 old_fact 指的那条记忆改成 new_fact（整合方案 §6.3）。
 
         流程（和 mem0_store.correct_memory 一致）：
@@ -2593,7 +2629,14 @@ class SQLiteStore:
                     "resolution": "blocked",
                     "audit": {"source": "user", "method": "correct_memory"},
                 }
-            already = self._already_corrected_receipt(new_fact, old_fact)
+            if turn_id is None:
+                # 工具路（update_memory）没有轮次上下文：用当前轮登记
+                # （search / save_turn 登记的 _active_turn_id）兜底，这样
+                # 工具先改、save_turn 再调时，护栏和账本都认得出本轮。
+                turn_id = getattr(self, "_active_turn_id", None)
+            already = self._already_corrected_receipt(
+                new_fact, old_fact, turn_id=turn_id
+            )
             if already is not None:
                 return already
             candidates = self._find_correction_candidates(
@@ -2616,6 +2659,7 @@ class SQLiteStore:
                                 same_text=True, candidates=[], status="unchanged",
                                 resolution="exact", layer="exact",
                                 audit={"source": "user", "method": "exact_match"},
+                                turn_id=turn_id,
                             )
                 return {
                     "status": "not_found", "memory_id": None,
@@ -2643,12 +2687,14 @@ class SQLiteStore:
                         candidates=candidates, status="unchanged",
                         resolution="exact", layer="exact",
                         audit={"source": "user", "method": "exact_match"},
+                        turn_id=turn_id,
                     )
                 return self._apply_correction_result(
                     new_fact, mid, old_text, old_meta, same_text=False,
                     candidates=candidates, status="updated",
                     resolution="exact", layer="exact",
                     audit={"source": "user", "method": "exact_match"},
+                    turn_id=turn_id,
                 )
             # 2026-11-23 model fix #2（A 组阈值）：带明确纠正词的，不走
             # 相似度 0.70 阈值，直接按槽位找要改的那条——候选里同槽位的
@@ -2687,6 +2733,7 @@ class SQLiteStore:
                                 "source": "user",
                                 "method": "explicit_correction_note",
                             },
+                            turn_id=turn_id,
                         )
                         if (result or {}).get("status") == "updated":
                             extracted_old = _extract_note_old_fact(old_text)
@@ -2695,7 +2742,7 @@ class SQLiteStore:
                                 self._supersede_note_old_fact(
                                     extracted_old,
                                     (result or {}).get("memory_id"),
-                                    new_fact,
+                                    new_fact, turn_id=turn_id,
                                 )
                         return result
                 slot_target = self._explicit_correction_slot_target(
@@ -2723,6 +2770,7 @@ class SQLiteStore:
                                 "method": "explicit_correction_slot",
                                 "slot": _correction_topic_slot(new_fact),
                             },
+                            turn_id=turn_id,
                         )
             # 多条候选、没有原样：先按相似度筛（根因 b，2026-11-22）——
             # 0.4 的召回线太宽，“我喜欢…”这种短句会召回一堆无关行；
@@ -2794,6 +2842,7 @@ class SQLiteStore:
                     candidates=candidates, status="unchanged",
                     resolution="semantic", layer="single",
                     audit={"source": "user", "method": "single_candidate"},
+                    turn_id=turn_id,
                 )
             try:
                 # 安全网比的是候选旧记忆和新说法的话题相似度，不是两个入参
@@ -2821,6 +2870,7 @@ class SQLiteStore:
                 resolution="semantic", layer="single",
                 audit={"source": "user", "method": "single_candidate",
                        "similarity": sim},
+                turn_id=turn_id,
             )
 
     def _void_last_stored(self):
@@ -2929,6 +2979,10 @@ class SQLiteStore:
         query = (query or "").strip()
         if not query:
             return []
+        if turn_id is not None:
+            # 登记当前轮（2026-11-24 1b）：ask() 的检索在本轮最前面，
+            # 登记后本轮内工具调 correct_memory 没带 turn_id 时认得出本轮。
+            self._active_turn_id = turn_id
         try:
             return self._search_inner(query, top_k=top_k, include_history=include_history)
         except Exception:
