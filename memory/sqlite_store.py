@@ -1142,7 +1142,9 @@ class SQLiteStore:
             # 过正——现在主目标全顶、连带清扫带门槛）。
             for old_id, old_text, old_meta in to_supersede[:1]:
                 try:
-                    self._supersede_row(old_id, old_text, old_meta, key, text)
+                    # 推断记忆保护：主目标是推断未确认行时不直接顶，
+                    # 攒待问问题（_supersede_or_ask 内部处理）。
+                    self._supersede_or_ask(old_id, old_text, old_meta, key, text)
                 except Exception:
                     logger.warning("槽位取代记账失败：旧行未取代。", exc_info=True)
             if len(to_supersede) > 1:
@@ -1333,6 +1335,14 @@ class SQLiteStore:
             if self._is_core_protected_row(old_meta, slot):
                 continue
             if not (old_meta or {}).get("turn_id"):
+                continue
+            if self._is_inferred_unconfirmed(old_meta):
+                # 推断记忆保护（2026-11-24）：带 turn_id 的推断行
+                # （模型在一轮里推断直存的）也不许连带悄悄顶——
+                # 攒待问问题，BOOS 点头才换。
+                self._queue_conflict_question(
+                    old_id, old_text, new_key, new_text, turn_id=turn_id,
+                )
                 continue
             row = self._conn.execute(
                 "SELECT superseded, deleted, voided FROM memories"
@@ -1565,6 +1575,12 @@ class SQLiteStore:
                 if first_outcome is None:
                     first_outcome = outcome
                 new_key = (outcome or {}).get("memory_id") or new_key
+            elif (outcome or {}).get("status") == "pending_question":
+                # 推断记忆保护：新说法已存、旧的挂待问——这条算
+                # 处理完了，不进兜底（兜底会再存一遍/硬顶）。
+                if first_outcome is None:
+                    first_outcome = outcome
+                new_key = (outcome or {}).get("memory_id") or new_key
             else:
                 remaining.append((old_id, old_text, old_meta))
         if remaining:
@@ -1584,25 +1600,38 @@ class SQLiteStore:
                     )
                     return True
                 new_key = saved.get("id")
+            _fb_superseded = False
             for old_id, old_text, old_meta in remaining:
                 try:
-                    self._supersede_row(old_id, old_text, old_meta, new_key, sentence)
+                    # 推断记忆保护：兜底硬顶也先过护栏——推断未确认
+                    # 的旧行改挂待问，不算顶成。
+                    if self._supersede_or_ask(
+                        old_id, old_text, old_meta, new_key, sentence
+                    ) == "superseded":
+                        _fb_superseded = True
                 except Exception:
                     logger.warning("槽位取代记账失败：旧行未取代。", exc_info=True)
             if first_outcome is None:
                 first_outcome = {
-                    "status": "updated", "memory_id": new_key,
+                    "status": "updated" if _fb_superseded else "pending_question",
+                    "memory_id": new_key,
                     "old_text": remaining[0][1], "new_text": sentence,
                     "candidates": [
                         {"id": oid, "text": ot} for oid, ot, _m in remaining
                     ],
-                    "reason": "已更正", "layer": "slot",
-                    "resolution": "updated",
+                    "reason": "已更正" if _fb_superseded else "旧记忆是推断来的、还没确认过，等你确认再换",
+                    "layer": "slot",
+                    "resolution": "updated" if _fb_superseded else "pending_question",
                     "audit": {"source": "user", "method": "slot_conflict"},
                 }
-        if extra_conflicts and new_key is not None:
+        if (
+            extra_conflicts and new_key is not None
+            and (first_outcome or {}).get("status") == "updated"
+        ):
             # 主目标已顶成：其余同槽冲突旧值走连带清扫（门槛见
             # _sweep_extra_conflicts）。清不掉的不影响本次纠正结果。
+            # 主目标被推断保护挂起（pending_question）时不扫——
+            # 纠正本身还没经 BOOS 确认，其余的更不许先顶。
             self._sweep_extra_conflicts(
                 slot, extra_conflicts, new_key, sentence,
                 turn_id=turn_id,
@@ -1614,7 +1643,11 @@ class SQLiteStore:
             receipt["stored"].append(sentence)
             receipt["results"].append(
                 {"id": first_outcome.get("memory_id"), "memory": sentence,
-                 "event": "SUPERSEDE",
+                 "event": (
+                     "SUPERSEDE"
+                     if first_outcome.get("status") == "updated"
+                     else "CONFLICT_PENDING"
+                 ),
                  "old_text": first_outcome.get("old_text"),
                  "supersedes_id": ((first_outcome.get("candidates") or [{}])[0] or {}).get("id")}
             )
@@ -1802,6 +1835,77 @@ class SQLiteStore:
             turn_id=turn_id,
         )
 
+    # ---------- 推断记忆保护（2026-11-24，BOOS 裁决） ----------
+    # 背景：E 组重跑里，推断来源、未确认的旧记忆（可信度 0.7）被
+    # 亲口新事实（1.0）在主目标裁决里直接顶掉。BOOS 定：“类似的
+    # 事情别再犯”——这类旧记忆不许再被悄悄顶掉：新事实照常存，
+    # 旧的先留着，攒一个待问问题，BOOS 点头才换；说不换就两条
+    # 都留、这对冲突标为已裁决，不再反复问。亲口确认过的旧记忆
+    # 不受保护，照旧最新赢、不问。
+
+    @staticmethod
+    def _is_inferred_unconfirmed(old_meta):
+        """旧记忆是不是“推断来源、未确认”：没有 user_confirmed
+        标记、且来源不是用户亲口陈述（source != "user"）。"""
+        meta = old_meta or {}
+        if meta.get("user_confirmed"):
+            return False
+        return meta.get("source") != "user"
+
+    def _queue_conflict_question(self, old_id, old_text, new_id, new_text,
+                                 turn_id=None):
+        """为一对“推断旧记忆 vs 新事实”冲突攒待问问题（带新旧原文）。
+
+        同一对已问过未答 → 返回已有的那条；已裁决“不换” → 返回
+        None（别反复问）；其余新建。问题正文带新旧两条原文，
+        BOOS 看着原文答。
+        """
+        if not old_id or not new_id or old_id == new_id:
+            return None
+        for q in self.pending_questions.find_questions(
+            kind=_pq.QUESTION_KIND_CONFLICT
+        ):
+            if q.get("old_id") != old_id or q.get("new_id") != new_id:
+                continue
+            if q.get("status") == _pq.QUESTION_STATUS_ANSWERED:
+                if q.get("answer") == "不换":
+                    return None
+            else:
+                return q
+        text = (
+            "有一条我之前推断的记忆和你刚说的新事实对不上，"
+            "要不要换成新的？\n旧的（推断，未确认）：%s\n新的：%s"
+            % (old_text, new_text)
+        )
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_CONFLICT,
+            text,
+            _pq.CONFLICT_QUESTION_OPTIONS,
+            "旧记忆是推断来的、没有确认过，按规矩不能悄悄顶掉，先问你。",
+            memory_id=old_id,
+            turn_id=turn_id,
+            extra={
+                "old_id": old_id, "new_id": new_id,
+                "old_text": old_text, "new_text": new_text,
+            },
+        )
+
+    def _supersede_or_ask(self, old_id, old_text, old_meta, new_key,
+                          new_text, turn_id=None):
+        """取代的统一护栏：旧行是推断未确认的 → 不顶，攒待问问题，
+        返回 "pending"；否则走 _supersede_row（账本先行），返回
+        "superseded"。账本失败时 _supersede_row 自己抛，调用方按
+        原有的失败处理走。"""
+        if self._is_inferred_unconfirmed(old_meta):
+            self._queue_conflict_question(
+                old_id, old_text, new_key, new_text, turn_id=turn_id
+            )
+            return "pending"
+        self._supersede_row(
+            old_id, old_text, old_meta, new_key, new_text, turn_id=turn_id
+        )
+        return "superseded"
+
     def list_pending_questions(self):
         """还没回答的问题（pending + asked），按创建时间从旧到新。"""
         return self.pending_questions.list_unanswered()
@@ -1817,8 +1921,6 @@ class SQLiteStore:
         返回 {"ok", "applied", ...}；问题不存在/已回答/选项不对/记忆
         不在库里时 ok=False，什么都不改。
         """
-        if choice not in ("进核心", "当一次性经历", "不存"):
-            return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
         # P1-5（2026-11-23）：先只看问题、不消耗——账本写失败时问题
         # 还留着可再答，SQLite 也一动不动；以前是先消耗问题、再先改
         # SQLite 后写账本，账本失败只记 warning，SQLite 的改动不回滚，
@@ -1826,6 +1928,12 @@ class SQLiteStore:
         question = self.pending_questions.get(question_id)
         if question is None or question.get("status") == _pq.QUESTION_STATUS_ANSWERED:
             return {"ok": False, "reason": "问题不存在或已经回答过了。"}
+        if question.get("kind") == _pq.QUESTION_KIND_CONFLICT:
+            # 推断记忆保护的冲突问题（2026-11-24）：选项和处理都
+            # 不一样，单独走 _answer_conflict_question。
+            return self._answer_conflict_question(question, choice)
+        if choice not in ("进核心", "当一次性经历", "不存"):
+            return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
         if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
             return {"ok": False, "reason": "未知的问题种类。"}
         memory_id = question.get("memory_id")
@@ -1919,6 +2027,86 @@ class SQLiteStore:
         return {
             "ok": True, "applied": "core",
             "question_id": question_id, "memory_id": memory_id,
+        }
+
+    def _answer_conflict_question(self, question, choice):
+        """BOOS 回答推断保护的冲突问题（2026-11-24）：
+        “换成新的”→ 走 _supersede_row 真顶（账本先行；写失败不
+        消耗问题、如实报 ok=False）；“不换”→ 两条都留着，问题
+        记录本身就是“已裁决”的凭据（_queue_conflict_question
+        认它、同一对不再重问）。旧行已被别的路处理掉时，问题
+        已无意义，消耗掉并如实报 already_gone。"""
+        question_id = question.get("id")
+        if choice not in _pq.CONFLICT_QUESTION_OPTIONS:
+            return {
+                "ok": False,
+                "reason": "选项不对，只能选：换成新的 / 不换。",
+                "question_id": question_id,
+            }
+        old_id = question.get("old_id") or question.get("memory_id")
+        new_id = question.get("new_id")
+        if choice == "不换":
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "kept_old",
+                "question_id": question_id, "memory_id": old_id,
+            }
+        if not old_id or not new_id:
+            return {
+                "ok": False,
+                "reason": "这个问题缺新旧记忆的指向，没法执行。",
+                "question_id": question_id,
+            }
+        with self._lock:
+            old_row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (old_id,),
+            ).fetchone()
+            if old_row is None:
+                return {
+                    "ok": False, "reason": "旧记忆已经不在库里了。",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            if old_row[2] or old_row[3] or old_row[4]:
+                self.pending_questions.answer(question_id, choice)
+                return {
+                    "ok": True, "applied": "already_gone",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            new_row = self._conn.execute(
+                "SELECT text, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (new_id,),
+            ).fetchone()
+            if new_row is None or new_row[1] or new_row[2] or new_row[3]:
+                return {
+                    "ok": False, "reason": "新记忆已经不在了，先不换。",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            try:
+                old_meta = json.loads(old_row[1] or "{}")
+            except Exception:
+                old_meta = {}
+            try:
+                self._supersede_row(
+                    old_id, old_row[0] or "", old_meta,
+                    new_id, new_row[0] or "",
+                )
+            except Exception:
+                logger.warning(
+                    "冲突问题批准后取代记账失败：没换成。", exc_info=True
+                )
+                return {
+                    "ok": False,
+                    "reason": "账本写失败，没换成，问题先留着，可以再答。",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            self.pending_questions.answer(question_id, choice)
+        return {
+            "ok": True, "applied": "superseded",
+            "question_id": question_id, "memory_id": old_id,
+            "new_memory_id": new_id,
         }
 
     def _judge_preference_supersede(self, text, context=None):
@@ -2789,6 +2977,25 @@ class SQLiteStore:
                         "resolution": resolution or "failed",
                         "audit": audit or {"source": source, "method": "correct_memory"},
                     }
+            if self._is_inferred_unconfirmed(old_meta):
+                # 推断记忆保护（2026-11-24，BOOS 裁决“类似的事情
+                # 别再犯”）：新说法照常存下（上面已存/已复用），
+                # 推断来的旧记忆不直接顶——攒待问问题，BOOS 点头
+                # 才换；连带清扫也不跑（主目标都没定，其余的更
+                # 不许先顶）。回答走 answer_question 的冲突分支。
+                question = self._queue_conflict_question(
+                    old_id, old_text, new_key, new_fact, turn_id=turn_id,
+                )
+                return {
+                    "status": "pending_question", "memory_id": new_key,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "旧记忆是推断来的、还没确认过：新说法已存，旧的等你确认再换",
+                    "layer": layer,
+                    "resolution": "pending_question",
+                    "audit": audit or {"source": source, "method": "correct_memory"},
+                    "question_id": (question or {}).get("id"),
+                }
             try:
                 self._supersede_row(
                     old_id, old_text, old_meta, new_key, new_fact,
@@ -2890,7 +3097,9 @@ class SQLiteStore:
             except Exception:
                 old_meta = {}
             try:
-                self._supersede_row(
+                # 推断记忆保护：备注兜底要顶的旧行是推断未确认时，
+                # 改走待问（_supersede_or_ask 内部处理）。
+                self._supersede_or_ask(
                     row[0], row[1] or "", old_meta, new_key, new_fact,
                     turn_id=turn_id,
                 )

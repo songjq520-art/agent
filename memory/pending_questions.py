@@ -21,8 +21,15 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 问题种类：目前只有 importance（这条新记忆重不重要、进不进核心）。
+# 问题种类：importance（这条新记忆重不重要、进不进核心）；
+# conflict（推断记忆保护，2026-11-24）：一条推断来的、未确认的旧
+# 记忆和新事实冲突时，要不要换成新的——不许悄悄顶掉，先问 BOOS。
 QUESTION_KIND_IMPORTANCE = "importance"
+QUESTION_KIND_CONFLICT = "conflict"
+
+# 冲突保护问题的选项（固定两个）：换成新的 = 按答案取代旧记忆；
+# 不换 = 两条都留着，这对冲突记为已裁决，不再重复问。
+CONFLICT_QUESTION_OPTIONS = ("换成新的", "不换")
 
 # 问题状态：pending（攒着、还没问过）、asked（已在某轮回复里问过、
 # 等回答）、answered（已回答、按答案处理完）。
@@ -122,11 +129,15 @@ class PendingQuestions:
         except Exception as exc:
             logger.warning("pending_questions 保存失败，问题可能丢失：%s", exc, exc_info=True)
 
-    def add(self, kind, text, options, reason, memory_id=None, turn_id=None):
+    def add(self, kind, text, options, reason, memory_id=None, turn_id=None,
+            extra=None):
         """攒一个新问题，返回问题 dict。
 
         同一条记忆、同一种问题还没回答时不重复攒（返回已有的那条）——
         一轮里同一句问两遍是打扰。options 传列表/元组，原样存。
+        extra 是可选的附加字段（冲突保护问题带 old_id/new_id/新旧
+        原文，回答时按它执行取代）；只补没有的键，不许盖掉问题
+        本身的固有字段。
         """
         text = (text or "").strip()
         if not text:
@@ -155,9 +166,28 @@ class PendingQuestions:
                 "asked_at": None,
                 "ask_count": 0,
             }
+            if extra:
+                for _k, _v in extra.items():
+                    question.setdefault(_k, _v)
             self._questions.append(question)
             self._save()
             return dict(question)
+
+    def find_questions(self, kind=None, statuses=None):
+        """按种类/状态找问题（返回副本列表，含已回答的）。
+
+        冲突保护按 (old_id, new_id) 配对查用：同一对冲突是不是
+        已经问过、是不是已经裁决过（答了"不换"），都认这里。
+        """
+        with self._lock:
+            out = []
+            for item in self._questions:
+                if kind is not None and item.get("kind") != kind:
+                    continue
+                if statuses is not None and item.get("status") not in statuses:
+                    continue
+                out.append(dict(item))
+            return out
 
     def get(self, question_id):
         """按 id 取一条问题（没有返回 None）。"""
