@@ -2483,6 +2483,81 @@ class SQLiteStore:
             return high[0]
         return None
 
+    def _cross_slot_net_target(self, old_fact, new_fact):
+        """第 5 条跨槽安全网（2026-11-24，BOOS 定“让他概率最小”）。
+
+        纠正靠同槽找对手 + R-9 同槽兜底；两条冲突记忆没分进一个槽
+        时，真目标仍可能不在候选里，主路只能报 not_found、旧错留着。
+        这里在主路全落空之后，对全部活记忆再扫一遍：
+        - 与新说法或旧说法的语义相似度 ≥ 0.80（_CROSS_SLOT_NET_MIN_
+          SIMILARITY，高于主路 0.70，宁缺毋滥）才算命中；
+        - 命中按相似度取前 5 条打包给判官，判官明确 should_supersede
+          且点名其中一条，才返回那条作取代目标。
+        护栏（一条不许松）：
+        - 判官说不取代 / 模型断了 / 点名的不在命中里 → 返回 None，
+          调用方维持 not_found（旧错留着，也不误伤）；
+        - 核心/置顶（_is_core_protected_row）命中也不自动顶，
+          返回 None——动核心永远走问 BOOS 的路径；
+        - 纠正便条行不进判官候选（和判官路同一口径）；
+        - 与新说法相同的行跳过（那是新值本身，不是旧错）；
+        - 判官目标还要过主食合理性守卫（和判官路同一口径）。
+        返回 (memory_id, text, meta, verdict) 或 None。调用方需持锁。"""
+        norm_new = _normalize_memory_text(new_fact or "")
+        norm_old = _normalize_memory_text(old_fact or "")
+        hits = []
+        try:
+            rows = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall()
+        except Exception:
+            return None
+        for mid, text, meta_json in rows:
+            text = text or ""
+            if not text or _normalize_memory_text(text) == norm_new:
+                continue
+            if any(m in text for m in _JUDGE_SKIP_MARKERS):
+                continue
+            sims = []
+            sim_new = self._candidate_similarity(mid, new_fact)
+            if sim_new is not None:
+                sims.append(sim_new)
+            if norm_old and norm_old != norm_new:
+                sim_old = self._candidate_similarity(mid, old_fact)
+                if sim_old is not None:
+                    sims.append(sim_old)
+            if not sims or max(sims) < _CROSS_SLOT_NET_MIN_SIMILARITY:
+                continue
+            hits.append((max(sims), mid, text, meta_json))
+        if not hits:
+            return None
+        hits.sort(key=lambda h: h[0], reverse=True)
+        hits = hits[:5]
+        cand_list = [
+            {"id": mid, "text": text} for _s, mid, text, _m in hits
+        ]
+        verdict = self._ask_semantic_judge(new_fact, cand_list)
+        if not verdict or not verdict.get("should_supersede"):
+            return None
+        target = next(
+            (h for h in hits if h[1] == verdict.get("target_id")), None
+        )
+        if target is None:
+            logger.warning("跨槽安全网：判官点名的目标不在命中里，不取代。")
+            return None
+        _best, mid, text, meta_json = target
+        try:
+            meta = json.loads(meta_json or "{}")
+        except Exception:
+            meta = {}
+        if self._is_core_protected_row(meta, meta.get("slot")):
+            logger.info("跨槽安全网：命中核心/置顶记忆，不自动顶：%s", text)
+            return None
+        if not _judge_target_is_staple_plausible(new_fact, text):
+            logger.warning("跨槽安全网：判官目标不是主食，不取代：%s", text)
+            return None
+        return mid, text, meta, verdict
+
     def _candidate_text(self, memory_id):
         """按 ID 查一条记忆的原文；查不到返回 None（调用方兜底，不抛异常）。"""
         try:
@@ -2955,6 +3030,23 @@ class SQLiteStore:
                                 audit={"source": "user", "method": "exact_match"},
                                 turn_id=turn_id, slot_sweep=slot_sweep,
                             )
+                # 第 5 条跨槽安全网（2026-11-24）：主路一条候选都
+                # 没找到时，先别下 not_found——对全部活记忆再扫一遍
+                # （高门槛 + 判官确认），捞到真冲突就按那条落盘；
+                # 捞不到才维持原判。
+                net = self._cross_slot_net_target(old_fact, new_fact)
+                if net is not None:
+                    mid, old_text, old_meta, verdict = net
+                    return self._apply_correction_result(
+                        new_fact, mid, old_text, old_meta, same_text=False,
+                        candidates=[mid], status="updated",
+                        resolution="cross_slot_net", layer="net",
+                        audit={"source": "user", "method": "cross_slot_net",
+                               "provider": verdict.get("provider"),
+                               "model": verdict.get("model"),
+                               "judge_slot": verdict.get("slot")},
+                        turn_id=turn_id, slot_sweep=slot_sweep,
+                    )
                 return {
                     "status": "not_found", "memory_id": None,
                     "old_text": old_fact, "new_text": new_fact,
@@ -3105,6 +3197,27 @@ class SQLiteStore:
                     if rescued is not None:
                         chosen = rescued
                     else:
+                        # 第 5 条跨槽安全网（2026-11-24）：同槽兜底也
+                        # 落空了，对全部活记忆再扫一遍（高门槛 + 判官
+                        # 确认）；捞到真冲突就直接按那条落盘（判官
+                        # 确认就是这条路的安全网，不再回下面的相似度
+                        # 安全网——它过的就是 ≥0.80 的更高门槛），
+                        # 捞不到维持原判 not_found。
+                        net = self._cross_slot_net_target(old_fact, new_fact)
+                        if net is not None:
+                            mid, old_text, old_meta, verdict = net
+                            return self._apply_correction_result(
+                                new_fact, mid, old_text, old_meta,
+                                same_text=False, candidates=[mid],
+                                status="updated",
+                                resolution="cross_slot_net", layer="net",
+                                audit={"source": "user",
+                                       "method": "cross_slot_net",
+                                       "provider": verdict.get("provider"),
+                                       "model": verdict.get("model"),
+                                       "judge_slot": verdict.get("slot")},
+                                turn_id=turn_id, slot_sweep=slot_sweep,
+                            )
                         best = max(sim for _mid, sim in scored)
                         return {
                             "status": "not_found", "memory_id": None,
@@ -4104,6 +4217,11 @@ def _default_memory_dir():
 # 干净空隙 0.656–0.757，取中点约 0.70；见 mem0_store.py 同名常量）。
 # 向量算不出来（模型没起来）时跳过这道网，交由调用方兜底。
 _CORRECTION_TOPIC_MIN_SIMILARITY = 0.70
+
+# 跨槽安全网的命中门槛（缺点清单第 5 条，2026-11-24）：纠正主路和
+# 同槽兜底全落空后，对全部活记忆再扫一遍时用——比主路安全网的
+# 0.70 更高（宁缺毋滥），且命中后还必须过判官确认才允许取代。
+_CROSS_SLOT_NET_MIN_SIMILARITY = 0.80
 
 
 def _cosine(a, b):

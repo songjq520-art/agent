@@ -118,3 +118,190 @@ def test_item4_item9_samples_20_by_default():
     report = self_check_module.run_self_check(_Adapter(), model_judge=judge)
     assert len(calls) == 20
     assert report["items"][9]["status"] == "pass"
+
+
+# ---------- 第 5 条：跨槽安全网 ----------
+
+import math  # noqa: E402
+
+
+def _net_embed(self, text):
+    """确定性假向量：米饭/白饭同向（余弦 1.0），面条与米饭 0.68，
+    火锅正交，其余正交——专为跨槽网的门槛场景设计。"""
+    text = text or ""
+    if "米饭" in text or "白饭" in text:
+        return [1.0, 0.0, 0.0, 0.0]
+    if "面条" in text:
+        return [0.68, math.sqrt(1 - 0.68 ** 2), 0.0, 0.0]
+    if "火锅" in text:
+        return [0.0, 0.0, 1.0, 0.0]
+    return [0.0, 0.0, 0.0, 1.0]
+
+
+def _plant_row(store, text, **meta_over):
+    """绕过 add 入口直接插一行（模拟别的路存进来的旧行），meta 可覆盖。"""
+    created_at = _now_iso()
+    key = _ledger.ledger_event_key(text, created_at)
+    meta = {
+        "source": "user", "confidence": 1.0, "user_confirmed": True,
+        "created_at": created_at, "write_seq": 1, "turn_id": "t-old",
+        "slot": None, "is_rule": False, "curated": False,
+        "decay_kind": "stable", "importance": "normal",
+        "event_date": None,
+    }
+    meta.update(meta_over)
+    store._insert_memory_row(key, text, meta, None)
+    return key
+
+
+def _is_superseded(store, text):
+    row = store._conn.execute(
+        "SELECT superseded FROM memories WHERE text=?", (text,)
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def _live_texts(store):
+    return [item["text"] for item in store.get_all()]
+
+
+def _judge_confirming(target_marker):
+    """判官打桩：候选里带 target_marker 的那条判真冲突、取代它。"""
+    def _judge(self, text, candidates, context=None):
+        for cand in candidates or []:
+            if target_marker in (cand.get("text") or ""):
+                return {
+                    "should_supersede": True,
+                    "target_id": cand.get("id"),
+                    "slot": None, "provider": "test", "model": "test",
+                    "reason": "测试判官确认冲突", "cost_usd": 0.0,
+                }
+        return {"should_supersede": False, "target_id": None}
+    return _judge
+
+
+@pytest.fixture
+def net_store(tmp_path, monkeypatch):
+    """带假向量 + 可控判官的 store（判官默认确认“白饭”那条）。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _net_embed)
+    monkeypatch.setattr(
+        SQLiteStore, "_ask_semantic_judge", _judge_confirming("白饭")
+    )
+    return SQLiteStore(memory_dir=str(tmp_path / "memory"))
+
+
+def test_item5_net_catches_cross_slot_conflict_at_exit_a(net_store, monkeypatch):
+    """出口 A：召回一条候选都没找到（打桩模拟真目标不在候选里），
+    跨槽行“我的主食是白饭”分错了槽、主路和同槽兜底都够不着——
+    安全网扫到（与旧说法余弦 1.0 ≥ 0.80）、判官确认后顶掉，
+    账本记 supersede（标记不删除），新说法成活行。"""
+    _plant_row(net_store, "我的主食是白饭")
+    monkeypatch.setattr(
+        SQLiteStore, "_find_correction_candidates",
+        lambda self, old_fact, new_fact=None, **kw: [],
+    )
+    result = net_store.correct_memory(
+        "我喜欢吃米饭", "我喜欢吃面条", explicit_correction=True
+    )
+    assert result["status"] == "updated", result
+    assert result["resolution"] == "cross_slot_net", result
+    assert _is_superseded(net_store, "我的主食是白饭")
+    assert "我喜欢吃面条" in _live_texts(net_store)
+    events, _info = _ledger.read_events(net_store.ledger_path)
+    assert any(
+        e.get("type") == "supersede" and e.get("old_text") == "我的主食是白饭"
+        for e in events
+    )
+
+
+def test_item5_net_judge_says_no_means_not_found(net_store, monkeypatch):
+    """判官说不冲突就绝不顶：命中行在、相似度够，判官判不取代时
+    维持 not_found，旧行活着。模型断了（判官返回 None）同理。"""
+    _plant_row(net_store, "我的主食是白饭")
+    monkeypatch.setattr(
+        SQLiteStore, "_find_correction_candidates",
+        lambda self, old_fact, new_fact=None, **kw: [],
+    )
+    monkeypatch.setattr(
+        SQLiteStore, "_ask_semantic_judge",
+        lambda self, text, candidates, context=None: {
+            "should_supersede": False, "target_id": None
+        },
+    )
+    result = net_store.correct_memory(
+        "我喜欢吃米饭", "我喜欢吃面条", explicit_correction=True
+    )
+    assert result["status"] == "not_found", result
+    assert not _is_superseded(net_store, "我的主食是白饭")
+    assert "我的主食是白饭" in _live_texts(net_store)
+    monkeypatch.setattr(
+        SQLiteStore, "_ask_semantic_judge",
+        lambda self, text, candidates, context=None: None,
+    )
+    result = net_store.correct_memory(
+        "我喜欢吃米饭", "我喜欢吃面条", explicit_correction=True
+    )
+    assert result["status"] == "not_found", result
+    assert not _is_superseded(net_store, "我的主食是白饭")
+
+
+def test_item5_net_never_touches_core_row(net_store, monkeypatch):
+    """核心/置顶行哪怕被网扫中、判官也确认，仍不自动顶：
+    维持 not_found，核心行活着（动核心永远走问 BOOS 的路径）。"""
+    _plant_row(net_store, "我的主食是白饭", curated=True)
+    monkeypatch.setattr(
+        SQLiteStore, "_find_correction_candidates",
+        lambda self, old_fact, new_fact=None, **kw: [],
+    )
+    result = net_store.correct_memory(
+        "我喜欢吃米饭", "我喜欢吃面条", explicit_correction=True
+    )
+    assert result["status"] == "not_found", result
+    assert not _is_superseded(net_store, "我的主食是白饭")
+    assert "我的主食是白饭" in _live_texts(net_store)
+
+
+def test_item5_net_catches_at_exit_b(net_store, monkeypatch):
+    """出口 B：召回有两条同槽候选但与新说法相似度都为 0（直选和
+    相似度筛全落空），R-9 同槽兜底也捞不到（跨槽行与新说法只有
+    0.68）——安全网按与旧说法的高相似（1.0）扫中、判官确认后落盘。"""
+    _plant_row(net_store, "我的主食是白饭")
+    id_a = _plant_row(net_store, "我喜欢吃火锅")
+    id_b = _plant_row(net_store, "我喜欢吃牛肉面")
+    monkeypatch.setattr(
+        SQLiteStore, "_find_correction_candidates",
+        lambda self, old_fact, new_fact=None, **kw: [id_a, id_b],
+    )
+    result = net_store.correct_memory(
+        "我喜欢吃米饭", "我喜欢吃面条", explicit_correction=True
+    )
+    assert result["status"] == "updated", result
+    assert result["resolution"] == "cross_slot_net", result
+    assert _is_superseded(net_store, "我的主食是白饭")
+    assert not _is_superseded(net_store, "我喜欢吃火锅")
+    assert not _is_superseded(net_store, "我喜欢吃牛肉面")
+
+
+def test_item5_net_below_threshold_not_even_judged(net_store, monkeypatch):
+    """门槛宁缺毋滥：与新旧说法相似度都 < 0.80 的行（火锅，与米饭
+    正交）连判官都不会被问到——判官打桩记录调用次数为 0，
+    结果维持 not_found。"""
+    _plant_row(net_store, "我喜欢吃火锅")
+    monkeypatch.setattr(
+        SQLiteStore, "_find_correction_candidates",
+        lambda self, old_fact, new_fact=None, **kw: [],
+    )
+    calls = []
+
+    def _judge(self, text, candidates, context=None):
+        calls.append(candidates)
+        return {"should_supersede": True, "target_id": None}
+
+    monkeypatch.setattr(SQLiteStore, "_ask_semantic_judge", _judge)
+    result = net_store.correct_memory(
+        "我喜欢吃米饭", "我喜欢吃面条", explicit_correction=True
+    )
+    assert result["status"] == "not_found", result
+    assert calls == []
+    assert not _is_superseded(net_store, "我喜欢吃火锅")
+
