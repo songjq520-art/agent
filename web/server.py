@@ -98,6 +98,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -2139,6 +2140,158 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
     return ThreadingHTTPServer((config.host, config.port), handler), state
 
 
+class MemoryMaintenanceScheduler:
+    """记忆维护调度（R-5，2026-11-24）：衰减清扫每天一次、记忆自检
+    每月一次，进程内轻量守护线程，不加新依赖。
+
+    背景：sweep_decay / run_self_check 以前没有任何生产调用方——
+    函数都在，服务跑起来也永远不会执行，记忆不会沉底、自检不出
+    报告（P1 重查 R-5）。这里把它们挂上真正的节奏：
+    - 上次运行时间存一个小 JSON 文件（state_path），重启不重复
+      跑、到期才跑；启动时已到期（或从没跑过）就补跑一次；
+    - 每个任务独立 try/except：调度出任何异常只记日志，绝不把
+      服务带崩；任务本身失败时也记下本次时间，下个间隔再试，
+      不会每个 tick 重试刷屏/烧钱；
+    - 间隔可调（构造参数；main 里从环境变量读）：
+      SHIER_DECAY_SWEEP_INTERVAL_HOURS（默认 24）、
+      SHIER_SELF_CHECK_INTERVAL_DAYS（默认 30）、
+      SHIER_MAINTENANCE_TICK_SECONDS（默认 3600，内部检查节奏）。
+    自检走 store.run_self_check（SQLite 后端内部已接整理路由判官，
+    R-6）；衰减走 store.sweep_decay。store 没这方法就跳过该任务。
+    """
+
+    def __init__(self, store, state_path, decay_interval_seconds=24 * 3600,
+                 self_check_interval_seconds=30 * 24 * 3600,
+                 tick_seconds=3600, now_fn=None):
+        self._store = store
+        self._state_path = Path(state_path)
+        self._decay_interval = float(decay_interval_seconds)
+        self._self_check_interval = float(self_check_interval_seconds)
+        self._tick = max(1.0, float(tick_seconds))
+        self._now_fn = now_fn or time.time
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _load_state(self):
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_state(self, state):
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning(
+                "维护调度状态写不进去：下次启动可能重复跑一次。",
+                exc_info=True,
+            )
+
+    def run_due(self, now=None):
+        """到期才跑到期的任务；返回 {"decay": 有没有跑, "self_check": ...}。
+
+        任何单个任务的异常都在这里吞掉记日志——调用方（调度线程、
+        测试）永远不会因为维护任务失败而出错。
+        """
+        now = float(now if now is not None else self._now_fn())
+        state = self._load_state()
+        ran = {"decay": False, "self_check": False}
+        jobs = (
+            ("decay", "decay_last_run", self._decay_interval, "sweep_decay"),
+            ("self_check", "self_check_last_run",
+             self._self_check_interval, "run_self_check"),
+        )
+        for name, key, interval, method in jobs:
+            last = state.get(key)
+            if isinstance(last, (int, float)) and now - float(last) < interval:
+                continue
+            fn = getattr(self._store, method, None)
+            if fn is None:
+                state[key] = now
+                continue
+            try:
+                result = fn()
+                if name == "decay":
+                    logger.info("记忆维护：衰减清扫已跑，结果 %s。", result)
+                else:
+                    logger.info("记忆维护：每月自检已跑完（报告见自检日志）。")
+            except Exception:
+                logger.warning(
+                    "记忆维护：%s 跑失败，下个间隔再试。", name, exc_info=True
+                )
+            state[key] = now
+            ran[name] = True
+        self._save_state(state)
+        return ran
+
+    def start(self):
+        """起守护线程：先补跑到期的，再按 tick 节奏巡回。重复调不重复起。"""
+        if self._thread is not None:
+            return self._thread
+
+        def _loop():
+            while not self._stop.is_set():
+                try:
+                    self.run_due()
+                except Exception:
+                    logger.warning("记忆维护调度一圈失败。", exc_info=True)
+                self._stop.wait(self._tick)
+
+        self._thread = threading.Thread(
+            target=_loop, daemon=True, name="memory-maintenance"
+        )
+        self._thread.start()
+        return self._thread
+
+    def stop(self):
+        self._stop.set()
+
+
+def _maintenance_interval_value(env_name, default):
+    """读间隔环境变量（个数值，单位由调用方定）：没设/写错/非正数都用默认。"""
+    raw = os.environ.get(env_name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else float(default)
+
+
+def start_memory_maintenance(store):
+    """给服务挂记忆维护调度（R-5）：状态文件放记忆库旁边——SQLite
+    后端是账本同目录，其他后端放仓库的 memory 目录。返回调度器。"""
+    ledger_path = getattr(store, "ledger_path", None)
+    if ledger_path:
+        state_path = Path(ledger_path).parent / "maintenance_state.json"
+    else:
+        state_path = (
+            Path(__file__).resolve().parent.parent
+            / "memory" / "maintenance_state.json"
+        )
+    scheduler = MemoryMaintenanceScheduler(
+        store,
+        state_path,
+        decay_interval_seconds=_maintenance_interval_value(
+            "SHIER_DECAY_SWEEP_INTERVAL_HOURS", 24
+        ) * 3600,
+        self_check_interval_seconds=_maintenance_interval_value(
+            "SHIER_SELF_CHECK_INTERVAL_DAYS", 30
+        ) * 24 * 3600,
+        tick_seconds=_maintenance_interval_value(
+            "SHIER_MAINTENANCE_TICK_SECONDS", 3600
+        ),
+    )
+    scheduler.start()
+    return scheduler
+
+
 def main(argv=None):
     """命令行入口：解析端口参数，启动服务，按 Ctrl+C 停止。"""
     parser = argparse.ArgumentParser(description="个人多模型 Agent 本地网页入口")
@@ -2256,6 +2409,16 @@ def main(argv=None):
             )
     except Exception:
         logger.warning("启动时流转对话全文失败。", exc_info=True)
+    # R-5（2026-11-24）：记忆维护调度——衰减清扫每天一次、每月自检
+    # 每月一次（到期才跑，上次运行时间落盘，启动时到期就补跑）。
+    # 以前这两个函数没有任何调用方，记忆永远不会沉底、自检永远
+    # 不出报告。调度挂不上只记日志，绝不拦服务启动。
+    if mem0_store is not None:
+        try:
+            start_memory_maintenance(mem0_store)
+            print("记忆维护调度已启动：衰减每天一次、自检每月一次（到期才跑）。", flush=True)
+        except Exception:
+            logger.warning("记忆维护调度启动失败：衰减/自检暂不自动跑。", exc_info=True)
     print(f"本地网页入口已启动：http://{config.host}:{config.port}", flush=True)
     print("在浏览器打开上面的地址就能对话，按 Ctrl+C 停止服务。", flush=True)
     try:
