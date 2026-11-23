@@ -2172,13 +2172,11 @@ def main(argv=None):
     # SHIER_MEMORY_BACKEND=sqlite 时走 memory/sqlite_store.py
     # （JSONL 账本仍是真相源，SQLite WAL 只做索引）。
     # 切换只看环境变量，不改默认行为；测试服务在启动脚本里设。
-    _backend = os.environ.get("SHIER_MEMORY_BACKEND", "mem0").strip().lower()
-    if _backend == "sqlite":
-        from memory.sqlite_store import create_sqlite_store
+    # 2026-11-24 3c：选后端的逻辑收进 memory/store_factory，
+    # 命令行（main.py 的“记住……”）和网页共用一个入口，不再各选各的。
+    from memory.store_factory import create_store
 
-        mem0_store = create_sqlite_store(tracker)
-    else:
-        mem0_store = create_mem0_store(tracker)
+    mem0_store = create_store(tracker)
     if mem0_store is None:
         print("⚠️ 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
     else:

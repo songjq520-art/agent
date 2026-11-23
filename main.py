@@ -404,8 +404,10 @@ def remember_content(text):
 def handle_remember(budget_tracker, text):
     """处理“记住……”命令：懒加载 mem0 记忆库，原文存一条记忆，不用确认。
 
-    记忆内容是“记住”后面的文字。命令行默认不加载 mem0（启动要约 25 秒），
-    只有用户明确说“记住”时才懒加载一次（get_mem0_store，建好后一直复用）。
+    记忆内容是“记住”后面的文字。命令行默认不加载记忆库（启动要约 25 秒），
+    只有用户明确说“记住”时才懒加载一次（store_factory.get_store，
+    默认 mem0 单例、建好后一直复用；后端按 SHIER_MEMORY_BACKEND
+    选，和网页服务同一个入口，2026-11-24 3c）。
     拿不到记忆库（没配 DEEPSEEK_API_KEY 或没装 mem0）时直接提示，不保存。
     保存失败时也只打印提示，不抛异常、不影响对话。
     """
@@ -413,7 +415,9 @@ def handle_remember(budget_tracker, text):
     if not content:
         print("要记住什么？用法：记住：内容（例如“记住：我喜欢喝咖啡”）。")
         return
-    store = mem0_store.get_mem0_store(budget_tracker)
+    from memory import store_factory as _store_factory
+
+    store = _store_factory.get_store(budget_tracker)
     if store is None:
         print("记忆未启用：请先配置 DEEPSEEK_API_KEY 并安装 mem0。")
         return

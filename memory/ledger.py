@@ -51,6 +51,7 @@ LEDGER_EVENT_PROMOTE = "promote"
 LEDGER_EVENT_INFERENCE = "inference"
 LEDGER_EVENT_RELATE = "relate"
 LEDGER_EVENT_SNAPSHOT = "snapshot"
+LEDGER_EVENT_TOUCH = "touch"
 LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_ADD,
     LEDGER_EVENT_SUPERSEDE,
@@ -61,6 +62,7 @@ LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_INFERENCE,
     LEDGER_EVENT_RELATE,
     LEDGER_EVENT_SNAPSHOT,
+    LEDGER_EVENT_TOUCH,
 )
 
 # 账本里的状态名（resolve_state 的 by_id 值里 "state" 字段的取值）。
@@ -258,6 +260,10 @@ def resolve_state(events, snapshot=None):
         回 current（key 在事件里，没带时按 id_to_key 找）；
       - delete：标 deleted；原话的 key 也标 deleted；
       - promote：kind 记 stable，状态不动；
+      - touch：检索真用上了（2026-11-24 3a）——只记每个 id 的最后
+        使用时间（last_touched，取事件 ts，最新赢），不改状态；
+        对账重建时按它恢复 last_used_at（快照不带这个字段，压缩后
+        丢了只是时间退回 add 时的值，不丢记忆）；
       - relate：进 relations 列表（双向都认）；
       - snapshot：只记 snapshot_seq，不改状态（状态在快照文件里）。
     key_states 是给“按原话认”的流程用的：检索兜底和对账认的都是
@@ -271,6 +277,7 @@ def resolve_state(events, snapshot=None):
     key_states = {}
     id_to_key = {}
     inferences = {}
+    last_touched = {}
     seq_max = 0
     snapshot_seq = None
     if snapshot is not None:
@@ -287,6 +294,8 @@ def resolve_state(events, snapshot=None):
             id_to_key[mem_id] = key
         for key, entry in (snapshot.get("inferences") or {}).items():
             inferences[key] = dict(entry)
+        for _tid, _ts in (snapshot.get("last_touched") or {}).items():
+            last_touched[_tid] = _ts
         if isinstance(snapshot_seq, int):
             seq_max = snapshot_seq
     for event in events or []:
@@ -411,6 +420,14 @@ def resolve_state(events, snapshot=None):
                     "seq": seq,
                 }
             )
+        elif etype == LEDGER_EVENT_TOUCH:
+            _touch_ts = event.get("ts")
+            if _touch_ts:
+                for _tid in event.get("memory_ids") or []:
+                    if _tid and _touch_ts >= str(last_touched.get(_tid) or ""):
+                        last_touched[_tid] = _touch_ts
+                if key and _touch_ts >= str(last_touched.get(key) or ""):
+                    last_touched[key] = _touch_ts
         elif etype == LEDGER_EVENT_SNAPSHOT:
             snapshot_seq = event.get("snapshot_seq")
     return {
@@ -420,6 +437,7 @@ def resolve_state(events, snapshot=None):
         "key_states": key_states,
         "id_to_key": id_to_key,
         "inferences": inferences,
+        "last_touched": last_touched,
         "seq_max": seq_max,
         "snapshot_seq": snapshot_seq,
     }

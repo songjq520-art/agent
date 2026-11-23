@@ -640,17 +640,29 @@ class SQLiteStore:
             # 不碰 last_used_at / seen_*（那是后来的使用记录，PROMOTE
             # 那一刻的值是旧的）。
             promote_meta = {}
+            decay_marks = {}
             try:
                 _events, _info = _ledger.read_events(self.ledger_path)
                 for _event in _events:
-                    if _event.get("type") != _ledger.LEDGER_EVENT_PROMOTE:
-                        continue
-                    _meta = _event.get("meta") or {}
+                    _etype = _event.get("type")
                     _key = _event.get("key") or _event.get("memory_id")
-                    if _key and _meta:
-                        promote_meta[_key] = _meta
+                    if _etype == _ledger.LEDGER_EVENT_PROMOTE:
+                        _meta = _event.get("meta") or {}
+                        if _key and _meta:
+                            promote_meta[_key] = _meta
+                    elif _etype == _ledger.LEDGER_EVENT_DORMANT and _key:
+                        # 3b（2026-11-24）：沉底/待删标记在账本里有
+                        # 事件，重建时把 decay_state 一并带回来。
+                        decay_marks[_key] = (
+                            _decay.DECAY_STATE_DELETE_DUE
+                            if _event.get("delete_due")
+                            else _decay.DECAY_STATE_DORMANT
+                        )
+                    elif _etype == _ledger.LEDGER_EVENT_REVIVE and _key:
+                        decay_marks.pop(_key, None)
             except Exception:
                 logger.warning("读账本 PROMOTE 事件失败：重建时不应用晋升。", exc_info=True)
+            touch_map = (state or {}).get("last_touched") or {}
             added = 0
             for record in (state or {}).get("adds") or []:
                 key = record.get("key")
@@ -668,11 +680,20 @@ class SQLiteStore:
                 ).fetchone():
                     continue
                 _promoted = promote_meta.get(key) or {}
-                if _promoted:
+                _touched = touch_map.get(key)
+                _mark = decay_marks.get(key)
+                if _promoted or _touched or _mark:
                     meta = dict(meta)
+                if _promoted:
                     for _field in ("source", "user_confirmed", "decay_kind", "importance"):
                         if _promoted.get(_field) is not None:
                             meta[_field] = _promoted[_field]
+                if _touched and _touched > str(meta.get("last_used_at") or ""):
+                    # 3a（2026-11-24）：TOUCH 事件记着最后使用时间，
+                    # 重建时带回来，不退回 add 时的值（P1-6 修掉）。
+                    meta["last_used_at"] = _touched
+                if _mark:
+                    meta["decay_state"] = _mark
                 vec = self._embed_text(text)
                 self._insert_memory_row(key, text, meta, vec)
                 added += 1
@@ -2983,10 +3004,26 @@ class SQLiteStore:
             # 登记后本轮内工具调 correct_memory 没带 turn_id 时认得出本轮。
             self._active_turn_id = turn_id
         try:
-            return self._search_inner(query, top_k=top_k, include_history=include_history)
+            results = self._search_inner(
+                query, top_k=top_k, include_history=include_history
+            )
         except Exception:
             logger.warning("SQLite 检索失败。", exc_info=True)
             return []
+        if reinforce and results:
+            # 真用上了才强化（2026-11-24 3a，和 Mem0Store.search 的
+            # reinforce 同款语义）：以前 SQLite 的 search 接了
+            # reinforce/turn_id 却没往下传，强化从没发生过。SQLite
+            # 这边由 note_context 一并做（刷新 last_used_at、沉底
+            # 复活、记账本 TOUCH）；历史结果不强化——翻出来看看
+            # 不算用上。写回失败不拦检索。
+            try:
+                self.note_context(
+                    [r for r in results if not (r or {}).get("is_history")]
+                )
+            except Exception:
+                logger.warning("检索强化写回失败：记忆本身还在。", exc_info=True)
+        return results
 
     def _search_inner(self, query, top_k=5, include_history=False):
         """宽召回 → RRF 融合 → 先筛后截（旧 mem0 search 的排名逻辑，
@@ -3257,15 +3294,16 @@ class SQLiteStore:
         """记下本轮检索到的记忆 id，并写回 last_used_at（刚被用上）：
         沉底的（dormant）和待删的（decay_delete_due）都复活回 verbatim，
         账本记 REVIVE（2026-11-22 decay 接线）。
-        注意（P1-6，2026-11-23，接受 + 注明）：last_used_at 的刷新只写
-        SQLite、不记账本——每次检索都记账本事件太吵。所以账本重建后
-        last_used_at 会变回账本里的旧值，衰减状态可能随之重置；这是
-        接受了的行为，不是 bug，见自检第 2 项的说明。
+        last_used_at 同时记账本（2026-11-24 3a）：每轮一笔 TOUCH
+        事件（带本轮全部 id、同一个时间戳），对账重建时按 TOUCH
+        把 last_used_at 带回来——P1-6 时期“只写 SQLite、重建退回
+        旧值”的已知问题就此修掉；一轮一笔，不逐条记，不吵。
         """
         with self._lock:
             self._last_context_ids = [
                 (m or {}).get("id") for m in (memories or []) if (m or {}).get("id")
             ]
+            used_at = _now_iso()
             for mid in self._last_context_ids:
                 try:
                     row = self._conn.execute(
@@ -3279,7 +3317,7 @@ class SQLiteStore:
                     was_dormant = meta.get("decay_state") in (
                         _decay.DECAY_STATE_DORMANT, _decay.DECAY_STATE_DELETE_DUE,
                     )
-                    meta["last_used_at"] = _now_iso()
+                    meta["last_used_at"] = used_at
                     if was_dormant:
                         meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
                     self._conn.execute(
@@ -3300,6 +3338,19 @@ class SQLiteStore:
                             logger.warning("复活记账失败。", exc_info=True)
                 except Exception:
                     logger.warning("note_context 写回失败。", exc_info=True)
+            if self._last_context_ids:
+                try:
+                    _ledger.append_event(
+                        self.ledger_path,
+                        {"type": _ledger.LEDGER_EVENT_TOUCH,
+                         "memory_id": self._last_context_ids[0],
+                         "key": self._last_context_ids[0],
+                         "memory_ids": list(self._last_context_ids),
+                         "ts": used_at},
+                        lock=self._ledger_lock,
+                    )
+                except Exception:
+                    logger.warning("使用时间记账失败。", exc_info=True)
 
     def sweep_decay(self, now=None):
         """衰减扫一遍（2026-11-22 decay 接线）：按 decay.py 的规矩，
@@ -3308,6 +3359,9 @@ class SQLiteStore:
         记忆还在、可搜；delete_due 只是到期标记，不删——真删永远只
         走 BOOS 点头的那条路（delete_memory / 忘记这个）。
         不自动跑：由调用方（定时任务/自检）定期调一次。
+        标待删也记账本（2026-11-24 3d）：写一笔 DORMANT 事件带
+        delete_due=True（账本状态层早就认这个标记）——以前待删只
+        写 SQLite，账本里没有，重建就丢了待删状态。
         返回 {"dormant": n, "delete_due": n}。
         """
         now = now or _now_epoch()
@@ -3335,6 +3389,16 @@ class SQLiteStore:
                         (json.dumps(meta, ensure_ascii=False), row[0]),
                     )
                     delete_due += 1
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {"type": _ledger.LEDGER_EVENT_DORMANT,
+                             "memory_id": row[0], "key": row[0],
+                             "text": row[1] or "", "delete_due": True},
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning("待删记账失败。", exc_info=True)
                 elif state == _decay.DECAY_STATE_DORMANT and meta.get(
                     "decay_state"
                 ) != _decay.DECAY_STATE_DORMANT:
@@ -3379,6 +3443,69 @@ class SQLiteStore:
                         logger.warning("复活记账失败。", exc_info=True)
             self._conn.commit()
         return {"dormant": dormant, "delete_due": delete_due}
+
+    def run_self_check(self, now=None, sample_size=10):
+        """跑一次每月自检（SQLite 版，2026-11-24 3b）：先扫一遍衰减
+        （sweep_decay：该沉底的沉底、该标待删的标待删，都记账本），
+        再跑十项自检（memory/self_check.py，只查、只报告，不改库）。
+        返回自检报告 dict，多带一个 "decay_sweep" 键记这次衰减扫的
+        结果。不在服务启动时自动跑（启动会变慢）：由每月定时任务
+        调，和 Mem0Store.run_self_check 同名同节奏，调用方不用分
+        后端。模型抽查（第 9/10 项）要整理路由，SQLite 这边还没接
+        路由时 model_judge 为 None、两项 skipped——和 mem0 路由
+        不可用时一样，判不出来就不猜。"""
+        sweep_now = None
+        if isinstance(now, bool):
+            sweep_now = None
+        elif isinstance(now, (int, float)):
+            sweep_now = float(now)
+        elif isinstance(now, datetime):
+            sweep_now = now.timestamp()
+        sweep = self.sweep_decay(now=sweep_now)
+        from memory import self_check as _self_check_module
+        from memory import store_self_check as _store_self_check
+
+        class _SQLiteAdapter(_store_self_check._StoreSelfCheckAdapter):
+            """SQLite 版适配器：只有索引口径和 mem0 不同——mem0 对的
+            是 history.db vs Chroma，SQLite 索引就是本库，对的是账本
+            当前态（current + dormant 的 key）vs SQLite 活行 id；
+            两边对不上就是索引丢了/坏了。其余方法照用基类的。"""
+
+            def index_counts(self):
+                live_ids = {
+                    row[0]
+                    for row in self._store._conn.execute(
+                        "SELECT id FROM memories WHERE voided=0"
+                        " AND deleted=0 AND superseded=0"
+                    ).fetchall()
+                }
+                key_states = (
+                    (self._store.ledger_state() or {}).get("key_states")
+                    or {}
+                )
+                ledger_ids = {
+                    k
+                    for k, v in key_states.items()
+                    if v in (
+                        _ledger.LEDGER_STATE_CURRENT,
+                        _ledger.LEDGER_STATE_DORMANT,
+                    )
+                }
+                return {
+                    "sqlite": len(live_ids),
+                    "chroma": len(ledger_ids),
+                    "mismatched_ids": sorted(live_ids ^ ledger_ids),
+                }
+
+        report = _self_check_module.run_self_check(
+            _SQLiteAdapter(self),
+            now=now,
+            model_judge=None,
+            sample_size=sample_size,
+            router_status={},
+        )
+        report["decay_sweep"] = sweep
+        return report
 
     # ---------- 改 / 删（今天只实现删除；纠错后面再做） ----------
 
