@@ -212,7 +212,11 @@ def _check_decay(items, now):
     """第 2 项：过期没沉底。
     用 decay_should_go_dormant / decay_should_delete 判：该标沉底、
     该标待删但状态没变的列出来，只建议打标——不压摘要、不直接删，
-    删要等 BOOS 亲口说。"""
+    删要等 BOOS 亲口说。
+    注意（P1-6，2026-11-23，接受 + 注明）：note_context 刷新 last_used_at
+    只写 SQLite、不记账本，所以账本重建后 last_used_at 会变回账本里的
+    旧值，衰减状态可能随之重置；这是接受了的行为，不是 bug——每次检索
+    都记账本事件太吵，故意不记。"""
     name = "2 过期没沉底"
     findings = []
     actions = []

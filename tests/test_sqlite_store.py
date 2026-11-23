@@ -1523,7 +1523,9 @@ def test_add_same_text_user_then_inferred_is_one_row(store):
 
 def test_add_same_text_inferred_then_user_upgrades_to_confirmed(store):
     """同一文本先 inferred 再 user 存：只留一条活行，且升级成已确认
-    （source 改 user、decay_kind 改 stable）；升级不另记账本。"""
+    （source 改 user、decay_kind 改 stable）；升级补一笔账本 PROMOTE
+    （P1-4，2026-11-23：不记账本的话，对账重建会把升级丢掉、变回
+    推断版/episodic——账本是唯一真相）。"""
     r1 = store.add_memory_text("我住广州", source="inferred")
     assert r1.get("event") == "ADD"
     assert _meta_of(store, r1["id"]).get("user_confirmed") is False
@@ -1535,7 +1537,13 @@ def test_add_same_text_inferred_then_user_upgrades_to_confirmed(store):
     assert meta.get("user_confirmed") is True
     assert meta.get("source") == "user"
     assert meta.get("decay_kind") == "stable"
-    assert len(_ledger_lines(store)) == 1  # 升级不另记账本，只有最初一笔 add
+    lines = _ledger_lines(store)
+    assert len(lines) == 2  # 最初一笔 add + 升级补的一笔 promote
+    promote = json.loads(lines[1])
+    assert promote.get("type") == "promote"
+    assert promote.get("memory_id") == r1["id"]
+    assert (promote.get("meta") or {}).get("decay_kind") == "stable"
+    assert (promote.get("meta") or {}).get("user_confirmed") is True
 
 
 # ---------- 16. 通用纠正（2026-11-22）：纠正检测扩到所有常见说法，

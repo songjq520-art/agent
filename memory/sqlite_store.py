@@ -585,6 +585,25 @@ class SQLiteStore:
         with self._lock:
             state = self.ledger_state()
             key_states = (state or {}).get("key_states") or {}
+            # P1-4（2026-11-23）：PROMOTE 事件带升级后的完整 meta——
+            # 去重升级（add_memory_text）、3 天 3 次晋升、回答问题进核心
+            # 都记 PROMOTE。重建缺失行时按最新一笔 PROMOTE 的 meta 覆盖
+            # 升级过的字段，否则重建出来的还是 add 那笔的旧 meta
+            #（推断版/episodic），升级就丢了。只覆盖这 4 个晋升字段，
+            # 不碰 last_used_at / seen_*（那是后来的使用记录，PROMOTE
+            # 那一刻的值是旧的）。
+            promote_meta = {}
+            try:
+                _events, _info = _ledger.read_events(self.ledger_path)
+                for _event in _events:
+                    if _event.get("type") != _ledger.LEDGER_EVENT_PROMOTE:
+                        continue
+                    _meta = _event.get("meta") or {}
+                    _key = _event.get("key") or _event.get("memory_id")
+                    if _key and _meta:
+                        promote_meta[_key] = _meta
+            except Exception:
+                logger.warning("读账本 PROMOTE 事件失败：重建时不应用晋升。", exc_info=True)
             added = 0
             for record in (state or {}).get("adds") or []:
                 key = record.get("key")
@@ -601,6 +620,12 @@ class SQLiteStore:
                     "SELECT 1 FROM memories WHERE id=?", (key,)
                 ).fetchone():
                     continue
+                _promoted = promote_meta.get(key) or {}
+                if _promoted:
+                    meta = dict(meta)
+                    for _field in ("source", "user_confirmed", "decay_kind", "importance"):
+                        if _promoted.get(_field) is not None:
+                            meta[_field] = _promoted[_field]
                 vec = self._embed_text(text)
                 self._insert_memory_row(key, text, meta, vec)
                 added += 1
@@ -803,10 +828,12 @@ class SQLiteStore:
                         # 确认状态只往上提：推断版在库、已确认版后到时，
                         # 把已有行升级成已确认（source 改 "user"、确认位
                         # 置 1、decay_kind 改 stable——用户亲口确认的事实
-                        # 应该是稳定的）。升级不记账本：复用那条路
-                        # （_apply_correction_result）也没给复用记账本，
-                        # 只在 decay_state 复活时记一笔 REVIVE，这里不复活，
-                        # 不自作主张加新事件类型。
+                        # 应该是稳定的）。
+                        # P1-4（2026-11-23）：升级要补一笔账本 PROMOTE
+                        #（复用已有事件类型，meta 带升级后的完整 meta）。
+                        # 不记账本的话，对账重建（reconcile_ledger_index）
+                        # 会按账本里旧的 add 元数据把这条重建成推断版/
+                        # episodic，升级就丢了——账本是唯一真相。
                         new_meta = dict(old_meta)
                         new_meta["source"] = "user"
                         new_meta["user_confirmed"] = True
@@ -818,7 +845,30 @@ class SQLiteStore:
                              _decay.DECAY_KIND_STABLE, row[0]),
                         )
                         self._conn.commit()
-                        old_meta = new_meta
+                        try:
+                            _ledger.append_event(
+                                self.ledger_path,
+                                {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                                 "memory_id": row[0], "key": row[0],
+                                 "text": row[1] or "",
+                                 "meta": dict(new_meta)},
+                                lock=self._ledger_lock,
+                            )
+                        except Exception:
+                            # 账本写不进去：把 SQLite 的升级撤回来再继续
+                            #（只记出现，不升确认），两边要一致，账本是真相。
+                            logger.warning("去重升级记账失败：升级已撤回。", exc_info=True)
+                            self._conn.execute(
+                                "UPDATE memories SET metadata_json=?, source=?,"
+                                " user_confirmed=?, decay_kind=? WHERE id=?",
+                                (json.dumps(old_meta, ensure_ascii=False),
+                                 old_meta.get("source", "inferred"),
+                                 1 if old_meta.get("user_confirmed") else 0,
+                                 old_meta.get("decay_kind"), row[0]),
+                            )
+                            self._conn.commit()
+                        else:
+                            old_meta = new_meta
                     # 同一条事实又出现一次：记出现集合，够 3 天 + 3 会就晋升。
                     self._record_occurrence(row[0], old_meta, today, turn_id, text)
                     return {"id": row[0], "memory": text, "event": "UNCHANGED"}
@@ -1379,7 +1429,7 @@ class SQLiteStore:
         joke/test/hypothesis）→ episodic；有槽位（住处/名字，
         核心类别）→ important；偏好句式（喜欢/爱吃/爱喝/爱看/
         爱听/爱玩/不爱/讨厌）→ important；决定句式（决定/打算/
-        计划/准备/定投）→ important；带过去时间词（昨天/前天/
+        计划/准备/定投，“我”和动词之间可插时间词）→ important；带过去时间词（昨天/前天/
         今天/刚才/刚刚/上次/这次）→ episodic。都没命中才问判官：
         判 important→important，false→episodic，"unsure"→unsure；
         模型断了→episodic（不问 BOOS，兜底还能晋升）。
@@ -1395,7 +1445,10 @@ class SQLiteStore:
             return "important", "带槽位 %s，是核心类别" % slot, None
         if any(m in (text or "") for m in _JUDGE_PREFERENCE_MARKERS):
             return "important", "是偏好句式，长期偏好进核心", None
-        if re.search(r"(我决定|我打算|我计划|我准备|定投)", text or ""):
+        # P1-2（2026-11-23）：“我”和动词之间可插时间词——旧正则要求“我”紧贴
+        # 动词，“我今天决定去北京”“我明天打算去上海”都漏判，掉到后面的
+        # 过去时间词分支里被当成一次性经历。
+        if re.search(r"(我(?:今天|明天|下周|下个月|刚才)?(?:决定|打算|计划|准备)|定投)", text or ""):
             return "important", "是决定/计划，长期决定进核心", None
         if re.search(r"(昨天|前天|今天|刚才|刚刚|上次|这次)", text or ""):
             return "episodic", "带过去时间词，是一次性经历", None
@@ -1448,13 +1501,18 @@ class SQLiteStore:
         """
         if choice not in ("进核心", "当一次性经历", "不存"):
             return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
-        question = self.pending_questions.answer(question_id, choice)
-        if question is None:
+        # P1-5（2026-11-23）：先只看问题、不消耗——账本写失败时问题
+        # 还留着可再答，SQLite 也一动不动；以前是先消耗问题、再先改
+        # SQLite 后写账本，账本失败只记 warning，SQLite 的改动不回滚，
+        # 重建后记忆又变回 episodic。
+        question = self.pending_questions.get(question_id)
+        if question is None or question.get("status") == _pq.QUESTION_STATUS_ANSWERED:
             return {"ok": False, "reason": "问题不存在或已经回答过了。"}
         if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
             return {"ok": False, "reason": "未知的问题种类。"}
         memory_id = question.get("memory_id")
         if choice == "当一次性经历":
+            self.pending_questions.answer(question_id, choice)
             return {
                 "ok": True, "applied": "episodic",
                 "question_id": question_id, "memory_id": memory_id,
@@ -1462,6 +1520,7 @@ class SQLiteStore:
         if choice == "不存":
             if not memory_id:
                 return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+            self.pending_questions.answer(question_id, choice)
             deleted = self.delete_memory(memory_id, approve=True)
             return {
                 "ok": True, "applied": "dropped",
@@ -1484,36 +1543,42 @@ class SQLiteStore:
                 return {"ok": False, "reason": "这条记忆已被取代/删除/作废，不能进核心。"}
             meta = json.loads(row[1] or "{}")
             if meta.get("decay_kind") == _decay.DECAY_KIND_STABLE:
+                self.pending_questions.answer(question_id, choice)
                 return {
                     "ok": True, "applied": "core",
                     "question_id": question_id, "memory_id": memory_id,
                     "already_core": True,
                 }
-            meta["decay_kind"] = _decay.DECAY_KIND_STABLE
-            meta["importance"] = "high"
-            self._conn.execute(
-                "UPDATE memories SET metadata_json=?, decay_kind=?,"
-                " importance=? WHERE id=?",
-                (
-                    json.dumps(meta, ensure_ascii=False),
-                    _decay.DECAY_KIND_STABLE,
-                    meta.get("importance"),
-                    memory_id,
-                ),
-            )
-            self._conn.commit()
+            # 先写账本、再改 SQLite（和 _append_new_memory 同款顺序）：
+            # 账本写不进去就直接返回，SQLite 不动，问题也不消耗。
+            new_meta = dict(meta)
+            new_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+            new_meta["importance"] = "high"
             try:
                 _ledger.append_event(
                     self.ledger_path,
                     {
                         "type": _ledger.LEDGER_EVENT_PROMOTE,
                         "memory_id": memory_id, "key": memory_id,
-                        "text": row[0] or "", "meta": dict(meta),
+                        "text": row[0] or "", "meta": dict(new_meta),
                     },
                     lock=self._ledger_lock,
                 )
             except Exception:
-                logger.warning("回答问题晋升记账失败。", exc_info=True)
+                logger.warning("回答问题晋升记账失败：记忆没进核心。", exc_info=True)
+                return {"ok": False, "reason": "账本写失败，记忆没进核心。"}
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, decay_kind=?,"
+                " importance=? WHERE id=?",
+                (
+                    json.dumps(new_meta, ensure_ascii=False),
+                    _decay.DECAY_KIND_STABLE,
+                    new_meta.get("importance"),
+                    memory_id,
+                ),
+            )
+            self._conn.commit()
+            self.pending_questions.answer(question_id, choice)
         return {
             "ok": True, "applied": "core",
             "question_id": question_id, "memory_id": memory_id,
@@ -1992,15 +2057,23 @@ class SQLiteStore:
                     kept.append(mid)
                 found = kept
             # 排：已确认的在前，同类里新的在前。
+            # P1-1（2026-11-23）：旧 key 是 (-confirmed, -(created_at 字符串))，
+            # 字符串取负号抛 TypeError、被下面的 try/except 吞掉，排序从不执行。
+            # ISO 时间字符串字典序即时间序，(confirmed, created_at) 倒序排
+            # 就是“已确认在前，同类里新的在前”。
             def _cand_key(mid):
                 row = self._conn.execute(
                     "SELECT metadata_json, created_at FROM memories WHERE id=?", (mid,)
                 ).fetchone()
-                meta = json.loads((row or [None, None])[0] or "{}")
+                try:
+                    meta = json.loads(((row or [None, None])[0]) or "{}")
+                except Exception:
+                    meta = {}
                 confirmed = 1 if meta.get("user_confirmed") else 0
-                return (-confirmed, -(row[1] or ""))
+                created_at = (row[1] if row else None) or ""
+                return (confirmed, created_at)
             try:
-                found.sort(key=_cand_key)
+                found.sort(key=_cand_key, reverse=True)
             except Exception:
                 pass
             return found
@@ -2141,7 +2214,13 @@ class SQLiteStore:
                     "slot": (old_meta or {}).get("slot"),
                     "is_rule": bool((old_meta or {}).get("is_rule")),
                     "curated": bool((old_meta or {}).get("curated")),
-                    "decay_kind": _decay.classify_decay_kind(
+                    # P1-3（2026-11-23）：新记忆的 decay_kind 继承旧记忆的。
+                    # 旧写法按 source="user" 一律算 stable，纠正一条一次性事件
+                    #（“昨天我吃了牛肉面”→“鸡杂面”）也会变 stable，违背
+                    #“一次性经历是 episodic”的规矩。旧记忆没写 decay_kind
+                    # 时才回退到 classify_decay_kind。
+                    "decay_kind": (old_meta or {}).get("decay_kind")
+                    or _decay.classify_decay_kind(
                         source, False, bool((old_meta or {}).get("is_rule"))
                     ),
                     "importance": (old_meta or {}).get("importance", "normal"),
@@ -2762,6 +2841,10 @@ class SQLiteStore:
         """记下本轮检索到的记忆 id，并写回 last_used_at（刚被用上）：
         沉底的（dormant）和待删的（decay_delete_due）都复活回 verbatim，
         账本记 REVIVE（2026-11-22 decay 接线）。
+        注意（P1-6，2026-11-23，接受 + 注明）：last_used_at 的刷新只写
+        SQLite、不记账本——每次检索都记账本事件太吵。所以账本重建后
+        last_used_at 会变回账本里的旧值，衰减状态可能随之重置；这是
+        接受了的行为，不是 bug，见自检第 2 项的说明。
         """
         with self._lock:
             self._last_context_ids = [
