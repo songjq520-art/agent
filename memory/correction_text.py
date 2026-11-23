@@ -281,11 +281,22 @@ def _correction_fact_after(text, idx, phrase):
         fact = _clean_correction_fact("我" + after)
         if fact is None:
             return None
-        if not fact.rstrip("。！？；，、.!?;,").endswith("了"):
-            return None
-        if _infer_fact_slot(fact)[0] is None:
-            return None
-        return fact
+        if fact.rstrip("。！？；，、.!?;,").endswith("了"):
+            if _infer_fact_slot(fact)[0] is None:
+                return None
+            return fact
+        # 多子句（2026-11-24 隐患 1）：“我现在住深圳了，喜欢吃海鲜”
+        # 整句结尾不是“了”，但第一小句就是状态变更——按逗号取第一
+        # 小句做同样的校验（以“了”结尾 + 带单值槽位），认第一小句
+        # 为新说法；第一小句也不合格时照旧不触发。
+        first = re.split(r"[，,]", fact)[0].strip()
+        if first and first != fact:
+            if not first.rstrip("。！？；、.!?;").endswith("了"):
+                return None
+            if _infer_fact_slot(first)[0] is None:
+                return None
+            return first
+        return None
     fact = _clean_correction_fact(after)
     if fact is None:
         return None
