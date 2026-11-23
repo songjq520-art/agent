@@ -2475,6 +2475,70 @@ class SQLiteStore:
             return None
         return same_slot[0]
 
+
+    def _already_corrected_receipt(self, new_fact, old_fact):
+        """新说法已是活记忆、且它顶掉旧说法的账本事件就是本轮（5 分钟内）
+        的，说明纠正已在本轮完成过：模型生成回复时调 update_memory 先改
+        了，save_turn 又调一次 correct_memory——两边都改就会误顶同槽位
+        的另一条旧记忆（D 组把真记忆广州顶掉；E 组则报 not_found、回复
+        丢了“改好了”）。此时不再另找目标，直接回 updated，old_text 就是
+        账本里这行顶掉的旧说法。返回 None 表示没撞上这条路。
+        只拦两种情况：(a) save_turn 的调用（old_fact == new_fact）；
+        (b) 工具的重复调用（旧说法已不在库里活着）。旧说法还活着时不拦
+        ——那是真纠正（例如新说法早就在库里、旧说法还活着），正常流程会
+        顶掉旧行、复用新行。
+        """
+        norm_new = _normalize_memory_text(new_fact)
+        live_id = None
+        for row in self._conn.execute(
+            "SELECT id, text FROM memories WHERE voided=0 AND deleted=0"
+            " AND superseded=0"
+        ).fetchall():
+            if _normalize_memory_text(row[1] or "") == norm_new:
+                live_id = row[0]
+                break
+        if live_id is None:
+            return None
+        # (b) 工具调用：旧说法还活着 → 真纠正，别拦。
+        if _normalize_memory_text(old_fact) != norm_new:
+            norm_old = _normalize_memory_text(old_fact)
+            for row in self._conn.execute(
+                "SELECT id, text FROM memories WHERE voided=0 AND deleted=0"
+                " AND superseded=0"
+            ).fetchall():
+                if _normalize_memory_text(row[1] or "") == norm_old:
+                    return None
+        # 账本里找这行顶掉的旧说法（最近的一条 supersede 事件）。
+        old_text = None
+        sup_ts = None
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            return None
+        for ev in reversed(events):
+            if (ev.get("type") == _ledger.LEDGER_EVENT_SUPERSEDE
+                    and ev.get("memory_id") == live_id):
+                old_text = ev.get("old_text")
+                sup_ts = ev.get("ts")
+                break
+        if not old_text or not sup_ts:
+            return None
+        # 只有本轮（5 分钟内）的 supersede 才算“刚改过”；早就是活行的
+        # 新说法（例如上次对话存下的）不拦，交给正常流程。
+        try:
+            sup_dt = datetime.fromisoformat(str(sup_ts).replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if (datetime.now(timezone.utc) - sup_dt).total_seconds() > 300:
+            return None
+        return {
+            "status": "updated", "memory_id": live_id,
+            "old_text": old_text, "new_text": new_fact,
+            "candidates": [], "reason": "已改好（本轮已纠正过）",
+            "layer": "already", "resolution": "already_corrected",
+            "audit": {"source": "user", "method": "already_corrected"},
+        }
+
     def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True,
                        explicit_correction=False):
         """纠错：把 old_fact 指的那条记忆改成 new_fact（整合方案 §6.3）。
@@ -2512,6 +2576,9 @@ class SQLiteStore:
                     "resolution": "blocked",
                     "audit": {"source": "user", "method": "correct_memory"},
                 }
+            already = self._already_corrected_receipt(new_fact, old_fact)
+            if already is not None:
+                return already
             candidates = self._find_correction_candidates(
                 old_fact, new_fact=new_fact,
                 exclude_identical_to_new=exclude_identical_to_new,
