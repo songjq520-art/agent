@@ -3764,12 +3764,13 @@ class SQLiteStore:
         self._organizing_router = router
         return router
 
-    def run_self_check(self, now=None, sample_size=10):
-        """跑一次每月自检（SQLite 版，2026-11-24 3b）：先扫一遍衰减
+    def run_self_check(self, now=None, sample_size=20):
+        """跑一次定期自检（SQLite 版，2026-11-24 3b；第 9 项抽查
+        20 条、自检节奏改每周见缺点清单第 4 条）：先扫一遍衰减
         （sweep_decay：该沉底的沉底、该标待删的标待删，都记账本），
         再跑十项自检（memory/self_check.py，只查、只报告，不改库）。
         返回自检报告 dict，多带一个 "decay_sweep" 键记这次衰减扫的
-        结果。不在服务启动时自动跑（启动会变慢）：由每月定时任务
+        结果。不在服务启动时自动跑（启动会变慢）：由维护调度按周
         调，和 Mem0Store.run_self_check 同名同节奏，调用方不用分
         后端。模型抽查（第 9/10 项）走整理路由的判官（R-6，
         2026-11-24，和 mem0 同款接法）；路由建不起来时 model_judge

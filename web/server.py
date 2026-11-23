@@ -2142,7 +2142,8 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
 
 class MemoryMaintenanceScheduler:
     """记忆维护调度（R-5，2026-11-24）：衰减清扫每天一次、记忆自检
-    每月一次，进程内轻量守护线程，不加新依赖。
+    每周一次（缺点清单第 4 条加密，2026-11-24），进程内轻量守护
+    线程，不加新依赖。
 
     背景：sweep_decay / run_self_check 以前没有任何生产调用方——
     函数都在，服务跑起来也永远不会执行，记忆不会沉底、自检不出
@@ -2154,14 +2155,14 @@ class MemoryMaintenanceScheduler:
       不会每个 tick 重试刷屏/烧钱；
     - 间隔可调（构造参数；main 里从环境变量读）：
       SHIER_DECAY_SWEEP_INTERVAL_HOURS（默认 24）、
-      SHIER_SELF_CHECK_INTERVAL_DAYS（默认 30）、
+      SHIER_SELF_CHECK_INTERVAL_DAYS（默认 7）、
       SHIER_MAINTENANCE_TICK_SECONDS（默认 3600，内部检查节奏）。
     自检走 store.run_self_check（SQLite 后端内部已接整理路由判官，
     R-6）；衰减走 store.sweep_decay。store 没这方法就跳过该任务。
     """
 
     def __init__(self, store, state_path, decay_interval_seconds=24 * 3600,
-                 self_check_interval_seconds=30 * 24 * 3600,
+                 self_check_interval_seconds=7 * 24 * 3600,
                  tick_seconds=3600, now_fn=None):
         self._store = store
         self._state_path = Path(state_path)
@@ -2219,7 +2220,7 @@ class MemoryMaintenanceScheduler:
                 if name == "decay":
                     logger.info("记忆维护：衰减清扫已跑，结果 %s。", result)
                 else:
-                    logger.info("记忆维护：每月自检已跑完（报告见自检日志）。")
+                    logger.info("记忆维护：定期自检已跑完（报告见自检日志）。")
             except Exception:
                 logger.warning(
                     "记忆维护：%s 跑失败，下个间隔再试。", name, exc_info=True
@@ -2282,7 +2283,7 @@ def start_memory_maintenance(store):
             "SHIER_DECAY_SWEEP_INTERVAL_HOURS", 24
         ) * 3600,
         self_check_interval_seconds=_maintenance_interval_value(
-            "SHIER_SELF_CHECK_INTERVAL_DAYS", 30
+            "SHIER_SELF_CHECK_INTERVAL_DAYS", 7
         ) * 24 * 3600,
         tick_seconds=_maintenance_interval_value(
             "SHIER_MAINTENANCE_TICK_SECONDS", 3600

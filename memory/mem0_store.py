@@ -5213,8 +5213,9 @@ class Mem0Store:
             return {"ok": False, "reason": "update_failed"}
         return {"ok": True, "memory_id": memory_id}
 
-    def run_self_check(self, now=None, sample_size=10):
-        """跑一次每月自检（见 memory/self_check.py 的九项表）。
+    def run_self_check(self, now=None, sample_size=20):
+        """跑一次定期自检（见 memory/self_check.py 的十项表；
+        第 9 项抽查 20 条，缺点清单第 4 条）。
         只查、只报告，不直接改库；要改的在报告每项的 actions 里，
         由调用方决定做不做。第 9 项模型抽查走 organizing_router
         （判官是大模型，费用记进整理记忆的预算）；路由不可用时

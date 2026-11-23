@@ -28,7 +28,7 @@
 #   embed(text) -> list | None：文本的向量；没有向量模型时返回 None，
 #       第 1 项（重复记忆）跳过并注明。
 #
-# run_self_check(adapter, now=None, model_judge=None, sample_size=10,
+# run_self_check(adapter, now=None, model_judge=None, sample_size=20,
 #                router_status=None) 返回报告 dict：
 #   {"generated_at", "items": {1..10}, "most_likely_wrong_5": [...],
 #    "replaced_last_month": [...], "tagged_tone_memories": [...],
@@ -622,9 +622,10 @@ def _check_core_usefulness(items, model_judge):
     return _item(name, "pass", findings, [])
 
 
-def run_self_check(adapter, now=None, model_judge=None, sample_size=10,
+def run_self_check(adapter, now=None, model_judge=None, sample_size=20,
                    router_status=None):
-    """跑一次十二的每月自检（只查、只报告，不直接改库）。
+    """跑一次十二的定期自检（只查、只报告，不直接改库；
+    调度节奏每周一次，见 web 维护调度与缺点清单第 4 条）。
 
     adapter：见模块 docstring 的适配器约定。
     now：判衰减用的“现在”（datetime 或 ISO 串，不传就是现在）。
