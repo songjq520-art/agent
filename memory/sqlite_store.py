@@ -1691,14 +1691,33 @@ class SQLiteStore:
         if choice == "不存":
             if not memory_id:
                 return {"ok": False, "reason": "这个问题没有对应的记忆。"}
-            self.pending_questions.answer(question_id, choice)
+            # R-10（2026-11-24）：和「进核心」同款顺序（P1-5 标准）
+            # ——先删成功、再消耗问题。以前先把问题标已答再删，删除
+            # 因账本失败时问题已经没了、记忆还在，这条问题再也没
+            # 机会重答。现在删不掉就如实报 ok=False，问题留着。
             deleted = self.delete_memory(memory_id, approve=True)
+            deleted_ok = (
+                deleted.get("deleted") is True
+                if isinstance(deleted, dict)
+                else bool(deleted)
+            )
+            if not deleted_ok:
+                return {
+                    "ok": False,
+                    "reason": "没删掉（%s），问题先留着，可以再答。"
+                    % (
+                        (deleted.get("reason") or "未知原因")
+                        if isinstance(deleted, dict)
+                        else "未知原因"
+                    ),
+                    "question_id": question_id, "memory_id": memory_id,
+                    "deleted": False,
+                }
+            self.pending_questions.answer(question_id, choice)
             return {
                 "ok": True, "applied": "dropped",
                 "question_id": question_id, "memory_id": memory_id,
-                "deleted": deleted.get("deleted") is True
-                if isinstance(deleted, dict)
-                else bool(deleted),
+                "deleted": True,
             }
         if not memory_id:
             return {"ok": False, "reason": "这个问题没有对应的记忆。"}
