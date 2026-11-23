@@ -152,13 +152,22 @@ def _dedupe_key(text):
     尾巴是“……是X”、且 X 已在前半句出现过（把前半句的内容换个
     说法重述，如“，主食偏好是面条”）时才截；普通多分句（买纳指/
     买标普、不喜欢吃米饭、也喜欢吃饺子）一律不截，两条都存得下。
+    末尾括号和逗号同一条规矩（2026-11-24 R-3）：以前无条件截掉，
+    “定投5块（买纳指）”和“（买标普）”算出同一个 key，同样静默
+    吞第二条；现在只有括号里是“……是X”、且 X 已在括号前出现过
+    （改写重述，如“（主食偏好是面条）”）时才截，内容性括号一律
+    保留。
     """
     norm = _normalize_memory_text(text or "")
-    # 末尾括号补充（改写常带的“（主食偏好是面条）”）
+    # 末尾括号补充：只截改写重述（见 docstring），内容性括号不截。
     if norm.endswith(")"):
         idx = norm.rfind("(")
         if idx > 0:
-            norm = norm[:idx]
+            inner = norm[idx + 1:-1]
+            if "是" in inner:
+                stated = inner.rsplit("是", 1)[-1].strip()
+                if stated and stated in norm[:idx]:
+                    norm = norm[:idx]
     # 逗号补充：只截改写重述尾巴（见 docstring），普通分句不截。
     if "," in norm:
         head, _sep, tail = norm.rpartition(",")
