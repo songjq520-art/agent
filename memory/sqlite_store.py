@@ -2297,6 +2297,63 @@ class SQLiteStore:
                 pass
             return found
 
+    def _rescue_correction_candidate(self, old_fact, new_fact, exclude_ids):
+        """R-9（2026-11-24）：相似度筛全军覆没时补跑一次同槽兜底。
+
+        _find_correction_candidates 的兜底（最近上下文 + 同核心槽位
+        扫描）只在语义召回为空时才跑；召回返回了一堆不相关命中时，
+        兜底不触发，真目标压根不在候选里，筛完只能报 not_found、
+        旧错留着。这里把兜底单独再跑一次：排除已有候选、排除与
+        新说法相同的行，兜底里恰好只有一条与新说法相似度 ≥ 0.70
+        时返回它，其余情况返回 None（调用方维持原判）。
+        只加查找，不放宽任何顶替护栏——返回的候选回主流程后还要
+        再过单候选的相似度安全网。调用方需持锁（correct_memory 里）。"""
+        seen = set(exclude_ids or [])
+        rescued = []
+        try:
+            for mid in list(getattr(self, "_last_context_ids", []) or []):
+                if mid and mid not in seen:
+                    row = self._conn.execute(
+                        "SELECT id FROM memories WHERE id=? AND voided=0"
+                        " AND deleted=0 AND superseded=0",
+                        (mid,),
+                    ).fetchone()
+                    if row is not None:
+                        seen.add(mid)
+                        rescued.append(mid)
+        except Exception:
+            pass
+        try:
+            slots = extract_core_slots(new_fact or old_fact)
+            if slots:
+                for row in self._conn.execute(
+                    "SELECT id, text FROM memories"
+                    " WHERE voided=0 AND deleted=0 AND superseded=0"
+                ).fetchall():
+                    if row[0] in seen:
+                        continue
+                    if extract_core_slots(row[1] or "") & slots:
+                        seen.add(row[0])
+                        rescued.append(row[0])
+        except Exception:
+            pass
+        if not rescued:
+            return None
+        norm_new = _normalize_memory_text(new_fact or "")
+        high = []
+        for mid in rescued:
+            text = self._candidate_text(mid)
+            if text is None:
+                continue
+            if _normalize_memory_text(text) == norm_new:
+                continue
+            sim = self._candidate_similarity(mid, new_fact)
+            if sim is not None and sim >= _CORRECTION_TOPIC_MIN_SIMILARITY:
+                high.append(mid)
+        if len(high) == 1:
+            return high[0]
+        return None
+
     def _candidate_text(self, memory_id):
         """按 ID 查一条记忆的原文；查不到返回 None（调用方兜底，不抛异常）。"""
         try:
@@ -2876,15 +2933,26 @@ class SQLiteStore:
                 if len(high) == 1 and not unknown:
                     chosen = high[0]
                 elif len(high) == 0 and not unknown:
-                    best = max(sim for _mid, sim in scored)
-                    return {
-                        "status": "not_found", "memory_id": None,
-                        "old_text": old_fact, "new_text": new_fact,
-                        "candidates": self._candidates_with_text(candidates),
-                        "reason": "候选与新说法相似度均低于 0.70（最高 %.2f），未找到可纠正的记忆" % best,
-                        "layer": "none", "resolution": "not_found",
-                        "audit": {"source": "user", "method": "correct_memory"},
-                    }
+                    # R-9（2026-11-24）：下 not_found 结论前补跑一次
+                    # 同槽兜底——召回有命中但全不相关时，真目标可能
+                    # 不在候选里（兜底只在召回为空时才跑）。兜底恰好
+                    # 捞出一条过线的，按单候选继续走（还要过下面的
+                    # 安全网）；捞不出就维持原判。
+                    rescued = self._rescue_correction_candidate(
+                        old_fact, new_fact, candidates
+                    )
+                    if rescued is not None:
+                        chosen = rescued
+                    else:
+                        best = max(sim for _mid, sim in scored)
+                        return {
+                            "status": "not_found", "memory_id": None,
+                            "old_text": old_fact, "new_text": new_fact,
+                            "candidates": self._candidates_with_text(candidates),
+                            "reason": "候选与新说法相似度均低于 0.70（最高 %.2f），未找到可纠正的记忆" % best,
+                            "layer": "none", "resolution": "not_found",
+                            "audit": {"source": "user", "method": "correct_memory"},
+                        }
                 else:
                     return {
                         "status": "ambiguous", "memory_id": None,
