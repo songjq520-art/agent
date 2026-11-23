@@ -106,6 +106,54 @@ _JUDGE_CHANGE_MARKERS = tuple(
     for verb in ("吃", "喝", "看", "听", "玩")
 )
 
+# 判官候选里不要纠正记录（2026-11-23 R2 后续③收窄）：写着“纠正了此前……”
+# 的便条是纠正的记录、不是一条活偏好，绝不能当取代目标（之前判官两次
+# 把 72cc 那条纠正便条当成同类偏好取代了）。程序过滤是确定性的，
+# 不管判官怎么判，这类记忆都不会被它取代。
+_JUDGE_SKIP_MARKERS = ("纠正", "更正")
+
+# 主食词（R2 后续③收窄）：天天吃的主食。判官目标合理性检查用——
+# 新说法在换主食（米饭/面条这类）时，取代目标也必须是另一条主食记忆；
+# 火锅/冒菜/烤鸡这类具体菜式或吃法不是主食，不能当目标。
+_STAPLE_FOODS = (
+    "米饭", "面条", "米粉", "米线", "馒头", "包子", "饺子", "面包", "粥", "主食",
+)
+
+
+def _judge_target_is_staple_plausible(new_text, target_text):
+    """判官目标合理性：新说法含主食词时，目标也必须含主食词。
+
+    主食换主食（面条换米饭）才合理；新说法在换主食、目标却是火锅/
+    冒菜/牛肉面这类非主食时，判不取代（返回 False）。新说法不含主食词
+    （饮品等）时不受这条限制，返回 True。注意这是判官路的守卫，
+    程序纠正路不受影响——守卫拦下后，纠正路仍可正常取代米饭。
+    """
+    if not any(word in (new_text or "") for word in _STAPLE_FOODS):
+        return True
+    return any(word in (target_text or "") for word in _STAPLE_FOODS)
+
+
+def _dedupe_key(text):
+    """去重用的比对键：归一化后截掉句尾补充说明、再去掉全部标点。
+
+    模型改写同一事实时标点不固定——“（主食偏好是面条）”和
+    “，主食偏好是面条”都是句尾补充说明，截掉后与原句“改吃面条了”
+    是同一串字，算同一条。只用于去重比对，不改原文；否定词
+    （不/没）是汉字，不受影响。
+    局限：最后一个逗号后的内容也被截掉——多分句的句子若首句已是
+    活记忆，整句会被当重复；本系统存的多是单句偏好，暂可接受。
+    """
+    norm = _normalize_memory_text(text or "")
+    # 末尾括号补充（改写常带的“（主食偏好是面条）”）
+    if norm.endswith(")"):
+        idx = norm.rfind("(")
+        if idx > 0:
+            norm = norm[:idx]
+    # 逗号补充（改写成“，主食偏好是面条”时）：截掉最后一个逗号后的部分
+    if "," in norm:
+        norm = norm[: norm.rfind(",")]
+    return re.sub(r"[^\w]", "", norm, flags=re.UNICODE)
+
 # 问句不存：以这些结尾的用户话是提问，不是陈述事实。
 _QUESTION_ENDINGS = ("?", "？", "吗", "么", "呢", "吧", "嘛")
 
@@ -714,7 +762,10 @@ class SQLiteStore:
                     "SELECT id, text, metadata_json FROM memories"
                     " WHERE voided=0 AND deleted=0 AND superseded=0"
                 ).fetchall():
-                    if _normalize_memory_text(row[1] or "") != norm_text:
+                    # 去重键比对（R2 后续③）：归一化+去全部标点。
+                    # 改写句“（主食偏好是面条）”与“，主食偏好是面条”
+                    # 去标点后是同一串字，算同一条，不存两份。
+                    if _dedupe_key(row[1] or "") != _dedupe_key(text):
                         continue
                     try:
                         old_meta = json.loads(row[2] or "{}")
@@ -1191,6 +1242,9 @@ class SQLiteStore:
                 continue
             if not any(marker in cand_text for marker in _JUDGE_PREFERENCE_MARKERS):
                 continue
+            # 纠正记录不是偏好，不进候选（见 _JUDGE_SKIP_MARKERS）。
+            if any(marker in cand_text for marker in _JUDGE_SKIP_MARKERS):
+                continue
             out.append({"id": m["id"], "text": cand_text,
                         "meta": m["metadata"]})
             if len(out) >= _JUDGE_MAX_CANDIDATES:
@@ -1275,6 +1329,11 @@ class SQLiteStore:
         if target is None:
             logger.warning("语义判断目标不在候选里，不取代。")
             return None, None, None
+        # 主食守卫（R2 后续③）：新说法在换主食、目标却不是主食时不取代——
+        # 目标可能已被另一条路取代过，判官硬挑了火锅/冒菜这类当目标。
+        if not _judge_target_is_staple_plausible(text, target["text"]):
+            logger.warning("语义判断目标不是主食，不取代：%s", target["text"])
+            return None, None, None
         return (target["id"], target["text"], target["meta"]), verdict, _reason
 
     def _apply_semantic_judge_update(self, sentence, receipt, turn_id, event_date):
@@ -1335,6 +1394,11 @@ class SQLiteStore:
             {"id": c.get("id"), "text": c.get("text")}
             for c in cands if c.get("id") and c.get("text")
         ]
+        # 纠正记录不是偏好，不进候选（见 _JUDGE_SKIP_MARKERS）。
+        cand_list = [
+            c for c in cand_list
+            if not any(m in (c.get("text") or "") for m in _JUDGE_SKIP_MARKERS)
+        ]
         if len(cand_list) < 2:
             return None
         verdict = self._ask_semantic_judge(fact, cand_list)
@@ -1344,6 +1408,10 @@ class SQLiteStore:
             (c for c in cand_list if c["id"] == verdict.get("target_id")), None
         )
         if target is None:
+            return None
+        # 主食守卫（R2 后续③）：同 _judge_preference_supersede。
+        if not _judge_target_is_staple_plausible(fact, target["text"]):
+            logger.warning("语义判断目标不是主食，不取代：%s", target["text"])
             return None
         row = self._conn.execute(
             "SELECT metadata_json FROM memories WHERE id=?", (target["id"],)
@@ -1787,7 +1855,7 @@ class SQLiteStore:
                 " AND deleted=0 AND superseded=0 AND id != ?",
                 (old_id,),
             ).fetchall():
-                if _normalize_memory_text(_row[1] or "") == _normalize_memory_text(new_fact):
+                if _dedupe_key(_row[1] or "") == _dedupe_key(new_fact):
                     existing_id = _row[0]
                     existing_text = _row[1] or ""
                     existing_meta = json.loads(_row[2] or "{}")

@@ -504,3 +504,221 @@ def test_change_marker_judge_says_no_keeps_both(tmp_path, monkeypatch):
     assert "我喜欢吃米饭" in _live_texts(store)
     assert "我改吃面条了" in _live_texts(store)
     assert receipt.get("correction") is None
+
+
+# ---------- 10. R2 后续③：规则 (a) 收窄，只取代同一层级 ----------
+
+
+def test_judge_prompt_narrows_same_level_rule():
+    """规则 (a) 收窄：提示词只让判官取代同一层级、直接冲突的旧偏好。
+
+    2026-11-23 R2 后续③：规则 (a) 太宽，判官把“喜欢吃面条”当成和
+    “喜欢吃牛肉面”“喜欢吃鸡杂面”同类，一并取代了两条真记忆（63ab、
+    a3a90d05）。收窄后提示词要写明：泛指不取代更具体的同类记忆、
+    纠正记录不是取代目标、没有同一层级冲突时判不取代、不要硬挑一条。
+    原来的“只有一个当前答案”和“不要判成'可以并存'”还在。
+    """
+    prompt = sj.build_judge_prompt(
+        "我现在喜欢吃面条了",
+        [{"id": "m1", "text": "我喜欢吃米饭"},
+         {"id": "m2", "text": "BOOS 喜欢吃牛肉面。"}],
+    )
+    assert "只有一个当前答案" in prompt
+    assert "不要判成'可以并存'" in prompt
+    assert "同一层级" in prompt
+    assert "不取代更具体的同类记忆" in prompt
+    assert "喜欢吃牛肉面" in prompt
+    assert "喜欢吃鸡杂面" in prompt
+    assert "纠正了此前" in prompt
+    assert "不要硬挑一条" in prompt
+    # 原来的任务和 JSON 格式还在
+    assert "新说法属于哪类偏好/槽位" in prompt
+    assert "只回这一行 JSON" in prompt
+
+
+def test_judge_candidates_skip_correction_notes(tmp_path, monkeypatch):
+    """纠正记录不进判官候选：72cc 那种“纠正了此前……”的便条不是偏好。
+
+    2026-11-23 R2 后续③：判官两次把 72cc 纠正便条当成同类偏好取代
+    （账本 seq 329、356）。程序过滤是确定性的：候选里有米饭和纠正
+    便条时，便条被滤掉、米饭留下。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我喜欢吃米饭", source="user")
+    store.add_memory_text(
+        "用户表示其实也不是很喜欢吃鸡杂面，纠正了此前"
+        "“喜欢吃鸡杂面”的说法。",
+        source="user",
+    )
+    assert len(_live_texts(store)) == 2
+    cands = store._preference_judge_candidates("我现在喜欢吃面条了")
+    cand_texts = [c["text"] for c in cands]
+    assert "我喜欢吃米饭" in cand_texts
+    assert not any("纠正" in t for t in cand_texts)
+
+
+def test_judge_supersedes_only_same_level_target(tmp_path, monkeypatch):
+    """判官指哪条才取代哪条：牛肉面、鸡杂面、纠正便条都不应被顺带取代。
+
+    2026-11-23 R2 后续③：上一轮重测里判官指了鸡杂面/牛肉面当目标，
+    另一条路又取代了米饭，结果两条真记忆被误伤。收窄后判官只应指
+    同一层级的米饭；这里用 mock 判官指米饭，断言牛肉面、鸡杂面、
+    纠正便条都还活着，只有米饭被取代。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我喜欢吃米饭", source="user")
+    store.add_memory_text("BOOS 喜欢吃牛肉面。", source="user")
+    store.add_memory_text("BOOS 喜欢吃鸡杂面。", source="user")
+    store.add_memory_text(
+        "用户表示其实也不是很喜欢吃鸡杂面，纠正了此前"
+        "“喜欢吃鸡杂面”的说法。",
+        source="user",
+    )
+    live = {item["text"]: item["id"] for item in store.get_all()}
+    assert len(live) == 4
+    judge.verdict = {
+        "slot": "喜欢吃的食物", "is_correction": True,
+        "target_id": live["我喜欢吃米饭"], "should_supersede": True,
+        "reason": "同是主食，新说法取代旧说法",
+    }
+    receipt = _save(store, "我现在喜欢吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert _is_superseded(store, "我喜欢吃米饭") is True
+    assert _is_superseded(store, "BOOS 喜欢吃牛肉面。") is False
+    assert _is_superseded(store, "BOOS 喜欢吃鸡杂面。") is False
+    assert _is_superseded(
+        store,
+        "用户表示其实也不是很喜欢吃鸡杂面，纠正了此前"
+        "“喜欢吃鸡杂面”的说法。",
+    ) is False
+    assert "我现在喜欢吃面条了" in _live_texts(store)
+    assert "BOOS 喜欢吃牛肉面。" in _live_texts(store)
+    assert "BOOS 喜欢吃鸡杂面。" in _live_texts(store)
+    correction = receipt.get("correction") or {}
+    assert correction.get("route") == "model"
+    assert correction.get("status") == "updated"
+
+
+# ---------- 11. R2 后续③补丁：主食守卫 ----------
+
+
+def test_judge_target_is_staple_plausible():
+    """主食守卫判定：换主食时目标必须是主食，非主食目标不合理。"""
+    from memory.sqlite_store import _judge_target_is_staple_plausible as ok
+    assert ok("我改吃面条了", "我喜欢吃米饭") is True
+    assert ok("我现在喜欢吃面条了", "我喜欢吃米饭") is True
+    assert ok("我改吃面条了", "我爱吃火锅") is False
+    assert ok("我改吃面条了", "BOOS 喜欢吃牛肉面。") is False
+    assert ok("我改吃面条了", "我爱的是冒菜，不是麻辣烫") is False
+    assert ok("我改吃面条了", "BOOS 喜欢吃鸡杂面。") is False
+    # 新说法不含主食词（饮品）时不受限制
+    assert ok("我现在喜欢喝豆奶了", "我喜欢喝酸奶") is True
+    assert ok("我现在喜欢喝豆奶了", "我爱吃火锅") is True
+
+
+def test_judge_staple_guard_blocks_hotpot_target(tmp_path, monkeypatch):
+    """主食守卫：判官指火锅当目标时不取代，火锅真记忆保住。
+
+    2026-11-23 R2 后续③重测 D 组：模型 add_memory 先取代了米饭，
+    save_turn 的判官后跑、米饭已不在候选里，判官硬挑“爱吃火锅”当目标
+    误伤了真记忆。守卫拦下后，火锅不被取代，新说法照常存下来。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我喜欢吃米饭", source="user")
+    store.add_memory_text("我爱吃火锅", source="user")
+    live = {item["text"]: item["id"] for item in store.get_all()}
+    judge.verdict = {
+        "slot": "喜欢吃的食物", "is_correction": True,
+        "target_id": live["我爱吃火锅"], "should_supersede": True,
+        "reason": "同是喜欢吃的食物，新说法取代旧说法",
+    }
+    receipt = _save(store, "我改吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert _is_superseded(store, "我爱吃火锅") is False
+    assert "我爱吃火锅" in _live_texts(store)
+    assert "我改吃面条了" in _live_texts(store)
+
+
+def test_judge_staple_guard_allows_rice_target(tmp_path, monkeypatch):
+    """主食守卫放行：判官指米饭（主食）时照常取代，火锅不受牵连。
+
+    同一场景、判官指对目标时：米饭被取代，只剩面条；火锅还活着。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我喜欢吃米饭", source="user")
+    store.add_memory_text("我爱吃火锅", source="user")
+    live = {item["text"]: item["id"] for item in store.get_all()}
+    judge.verdict = {
+        "slot": "喜欢吃的食物", "is_correction": True,
+        "target_id": live["我喜欢吃米饭"], "should_supersede": True,
+        "reason": "同是主食，新说法取代旧说法",
+    }
+    receipt = _save(store, "我改吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert _is_superseded(store, "我喜欢吃米饭") is True
+    assert _is_superseded(store, "我爱吃火锅") is False
+    assert "我改吃面条了" in _live_texts(store)
+    assert "我爱吃火锅" in _live_texts(store)
+    assert "我喜欢吃米饭" not in _live_texts(store)
+
+
+# ---------- 12. R2 后续③补丁 2：括号补充去重 ----------
+
+
+def test_paraphrase_with_parenthetical_is_duplicate(tmp_path, monkeypatch):
+    """括号补充算同一条：改写句与原句不存两份。
+
+    2026-11-23 R2 后续③：模型 add_memory 存了“我改吃面条了（主食偏好是面条）”，
+    save_turn 又存原句“我改吃面条了”，活面条变 2 条，D 组 noodle1 失败。
+    去重时去掉末尾括号补充再比，两句算同一条，只留改写句那一条。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我改吃面条了（主食偏好是面条）", source="user")
+    assert len(_live_texts(store)) == 1
+    result = store.add_memory_text("我改吃面条了", source="user")
+    assert result.get("event") == "UNCHANGED"
+    assert len(_live_texts(store)) == 1
+    assert "我改吃面条了（主食偏好是面条）" in _live_texts(store)
+
+
+def test_parenthetical_duplicate_reverse_order(tmp_path, monkeypatch):
+    """反过来也一样：先存原句、后存改写句，改写句不再存第二份。"""
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我改吃面条了", source="user")
+    assert len(_live_texts(store)) == 1
+    result = store.add_memory_text("我改吃面条了（主食偏好是面条）", source="user")
+    assert result.get("event") == "UNCHANGED"
+    assert len(_live_texts(store)) == 1
+    assert "我改吃面条了" in _live_texts(store)
+
+
+def test_different_food_not_deduped_by_parenthetical(tmp_path, monkeypatch):
+    """括号去重不误伤：米饭和面条不是同一条，两条都留着。"""
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我喜欢吃米饭", source="user")
+    result = store.add_memory_text("我喜欢吃面条", source="user")
+    assert result.get("event") == "ADD"
+    assert len(_live_texts(store)) == 2
+
+
+def test_comma_paraphrase_is_duplicate(tmp_path, monkeypatch):
+    """逗号改写也算同一条：括号版与逗号版去标点后相同，不存两份。
+
+    2026-11-23 R2 后续③实弹：模型改写同一事实时标点不固定，存了
+    “我改吃面条了（主食偏好是面条）”后又存“BOOS 改吃面条了，主食偏好是面条”，
+    活面条变 2 条。去重键去掉全部标点后再比，两句是同一串字。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    store.add_memory_text("我改吃面条了（主食偏好是面条）", source="user")
+    assert len(_live_texts(store)) == 1
+    result = store.add_memory_text("BOOS 改吃面条了，主食偏好是面条", source="user")
+    assert result.get("event") == "UNCHANGED"
+    assert len(_live_texts(store)) == 1
