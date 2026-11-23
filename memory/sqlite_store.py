@@ -96,6 +96,10 @@ _JUDGE_PREFERENCE_MARKERS = (
 # 一次判断最多带几条旧偏好候选（提示词要短，超了只带最近的）。
 _JUDGE_MAX_CANDIDATES = 10
 
+# 轮次回执缓存上限（2026-11-24）：去重回执要查 _turn_receipts，
+# 无上限会一直长；只留最近 200 轮，超了删插入顺序最旧的。
+_TURN_RECEIPTS_MAX = 200
+
 # 偏好改变说法（2026-11-23 R2 后续①）：明确表达偏好变了的说法。
 # “改吃/只吃/改喝/只喝/改看/只看……”——前缀“改/只/改成”+动词
 # （吃/喝/看/听/玩）。不含“换成”等泛词，避免“改成明天”这类
@@ -1805,6 +1809,16 @@ class SQLiteStore:
         outcome["judge"]["trigger"] = "ambiguous_candidates"
         return outcome
 
+    def _store_turn_receipt(self, turn_id, receipt):
+        """存一轮回执进缓存，只留最近 _TURN_RECEIPTS_MAX 条。
+
+        dict 按插入顺序，超了就删最旧的（去重回执要查它，无上限
+        会一直长）。
+        """
+        self._turn_receipts[turn_id] = copy.deepcopy(receipt)
+        while len(self._turn_receipts) > _TURN_RECEIPTS_MAX:
+            self._turn_receipts.pop(next(iter(self._turn_receipts)))
+
     def save_turn(self, messages, turn_id=None):
         """一轮对话的收尾：同步把用户亲口说的事实原样存下来，留回执。
 
@@ -1845,14 +1859,14 @@ class SQLiteStore:
             "results": [],
         }
         if not (latest_user or "").strip():
-            self._turn_receipts[turn_id] = copy.deepcopy(receipt)
+            self._store_turn_receipt(turn_id, receipt)
             return receipt
         # 撤回：光秃秃的整句信号，把上一轮刚存的那条作废（软删进账本）。
         if latest_user.strip().rstrip("。！？.!?") in _BARE_RETRACTION:
             dropped = self._void_last_stored()
             receipt["retracted"] = True
             receipt["dropped_count"] = dropped
-            self._turn_receipts[turn_id] = copy.deepcopy(receipt)
+            self._store_turn_receipt(turn_id, receipt)
             return receipt
         today = _shanghai_today()
         # 聊天纠错（2026-11-22 correct_memory 接线）：本轮最后一条 user 消息
@@ -2092,7 +2106,7 @@ class SQLiteStore:
                 else []
             )
             receipt["questions"] = new_questions + backlog
-        self._turn_receipts[turn_id] = copy.deepcopy(receipt)
+        self._store_turn_receipt(turn_id, receipt)
         return receipt
 
     def _find_correction_candidates(self, old_fact, new_fact=None, top_k=10,
