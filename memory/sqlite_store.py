@@ -1170,19 +1170,27 @@ class SQLiteStore:
             is_core=False,
             tone=meta.get("tone"),
         ):
-            meta["decay_kind"] = _decay.DECAY_KIND_STABLE
-            promoted = True
+            # R-4（2026-11-24）：账本先行——PROMOTE 写不进去就
+            # 不晋升，SQLite 不许跑到账本前面。以前写失败只警告、
+            # 照样把 decay_kind 改成 stable，账本里没有这笔晋升，
+            # 两边静默分叉（对账只补缺失行、不修已有行）。出现
+            # 记录（seen_*）照常写回，下次出现时再试晋升。
+            promoted_meta = dict(meta)
+            promoted_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
             try:
                 _ledger.append_event(
                     self.ledger_path,
                     {"type": _ledger.LEDGER_EVENT_PROMOTE,
                      "memory_id": memory_id, "key": memory_id,
                      "text": text,
-                     "meta": dict(meta)},
+                     "meta": promoted_meta},
                     lock=self._ledger_lock,
                 )
             except Exception:
-                logger.warning("晋升记账失败。", exc_info=True)
+                logger.warning("晋升记账失败：本次不晋升（账本为准）。", exc_info=True)
+            else:
+                meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                promoted = True
         self._conn.execute(
             "UPDATE memories SET metadata_json=?, decay_kind=? WHERE id=?",
             (json.dumps(meta, ensure_ascii=False), meta.get("decay_kind"), memory_id),
@@ -3338,15 +3346,12 @@ class SQLiteStore:
                     was_dormant = meta.get("decay_state") in (
                         _decay.DECAY_STATE_DORMANT, _decay.DECAY_STATE_DELETE_DUE,
                     )
-                    meta["last_used_at"] = used_at
                     if was_dormant:
-                        meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
-                    self._conn.execute(
-                        "UPDATE memories SET metadata_json=? WHERE id=?",
-                        (json.dumps(meta, ensure_ascii=False), mid),
-                    )
-                    self._conn.commit()
-                    if was_dormant:
+                        # R-4（2026-11-24）：复活账本先行——REVIVE
+                        # 写不进去就整条不动（last_used_at 也不写），
+                        # 下次用上时再试。以前先改 SQLite、记账失败
+                        # 只警告，SQLite 已是原话态、账本还认为它
+                        # 沉底，两边静默分叉。
                         try:
                             _ledger.append_event(
                                 self.ledger_path,
@@ -3356,7 +3361,15 @@ class SQLiteStore:
                                 lock=self._ledger_lock,
                             )
                         except Exception:
-                            logger.warning("复活记账失败。", exc_info=True)
+                            logger.warning("复活记账失败：本条先不复活。", exc_info=True)
+                            continue
+                        meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
+                    meta["last_used_at"] = used_at
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), mid),
+                    )
+                    self._conn.commit()
                 except Exception:
                     logger.warning("note_context 写回失败。", exc_info=True)
             if self._last_context_ids:
@@ -3401,15 +3414,12 @@ class SQLiteStore:
                     is_core=bool(_provenance._is_core_memory(meta)),
                     is_curated=bool(meta.get("curated")),
                 )
+                # R-4（2026-11-24）：三个分支统一账本先行——账本写
+                # 不进去就整条不动、不计数，下次扫再试。以前是先改
+                # SQLite、记账失败只警告，账本与 SQLite 静默分叉。
                 if state == _decay.DECAY_STATE_DELETE_DUE and meta.get(
                     "decay_state"
                 ) != _decay.DECAY_STATE_DELETE_DUE:
-                    meta["decay_state"] = state
-                    self._conn.execute(
-                        "UPDATE memories SET metadata_json=? WHERE id=?",
-                        (json.dumps(meta, ensure_ascii=False), row[0]),
-                    )
-                    delete_due += 1
                     try:
                         _ledger.append_event(
                             self.ledger_path,
@@ -3419,16 +3429,17 @@ class SQLiteStore:
                             lock=self._ledger_lock,
                         )
                     except Exception:
-                        logger.warning("待删记账失败。", exc_info=True)
-                elif state == _decay.DECAY_STATE_DORMANT and meta.get(
-                    "decay_state"
-                ) != _decay.DECAY_STATE_DORMANT:
+                        logger.warning("待删记账失败：本条先不标待删。", exc_info=True)
+                        continue
                     meta["decay_state"] = state
                     self._conn.execute(
                         "UPDATE memories SET metadata_json=? WHERE id=?",
                         (json.dumps(meta, ensure_ascii=False), row[0]),
                     )
-                    dormant += 1
+                    delete_due += 1
+                elif state == _decay.DECAY_STATE_DORMANT and meta.get(
+                    "decay_state"
+                ) != _decay.DECAY_STATE_DORMANT:
                     try:
                         _ledger.append_event(
                             self.ledger_path,
@@ -3438,7 +3449,14 @@ class SQLiteStore:
                             lock=self._ledger_lock,
                         )
                     except Exception:
-                        logger.warning("沉底记账失败。", exc_info=True)
+                        logger.warning("沉底记账失败：本条先不沉底。", exc_info=True)
+                        continue
+                    meta["decay_state"] = state
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), row[0]),
+                    )
+                    dormant += 1
                 elif state == _decay.DECAY_STATE_VERBATIM and meta.get(
                     "decay_state"
                 ) in (
@@ -3447,11 +3465,6 @@ class SQLiteStore:
                 ):
                     # 复活过的记忆：算出来已是原话态，把库里还顶着的旧
                     # 牌子改回 verbatim，别让它一直挂着 dormant / delete_due。
-                    meta["decay_state"] = state
-                    self._conn.execute(
-                        "UPDATE memories SET metadata_json=? WHERE id=?",
-                        (json.dumps(meta, ensure_ascii=False), row[0]),
-                    )
                     try:
                         _ledger.append_event(
                             self.ledger_path,
