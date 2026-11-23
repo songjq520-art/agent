@@ -89,6 +89,35 @@ class MemoryOutbox:
         except Exception:
             logger.warning("发件箱删盘文件失败：turn_id=%s。", turn_id, exc_info=True)
 
+    def mark_committed(self, turn_id, result=None):
+        """把一轮的回执改成已提交（待定区真正落库时调，见 Mem0Store._commit_pending_turn）。
+
+        落库了就不再需要落盘文件：顺手删掉它——下次启动不用再捞。
+        删失败只记日志，不拦回执。
+        """
+        try:
+            self._drop_pending(turn_id)
+        except Exception:
+            logger.warning("回执改已提交后删发件箱文件失败：turn_id=%s。", turn_id, exc_info=True)
+        with self._outcomes_lock:
+            self._outcomes[turn_id] = {"status": "committed", "result": result}
+
+    def mark_dropped(self, turn_id):
+        """撤回一轮：删掉它的落盘文件，回执标成已撤回（dropped）。
+
+        撤回的轮次根本没提交，绝不能调 mark_committed（那会把回执
+        标成已提交，以后查回执以为这轮存进去了）。删盘失败只记日志，
+        不拦回执；turn_id 为空时什么都不做。
+        """
+        if not turn_id:
+            return
+        try:
+            self._drop_pending(turn_id)
+        except Exception:
+            logger.warning("回执改已撤回后删发件箱文件失败：turn_id=%s。", turn_id, exc_info=True)
+        with self._outcomes_lock:
+            self._outcomes[turn_id] = {"status": "dropped", "result": None}
+
     def recover_pending(self):
         """启动时捞回盘上没存完的轮次（57 号）：按文件名排序重交进队列，
         返回捞回的轮数。文件坏了的跳过并记日志，不拦启动。"""
@@ -128,7 +157,8 @@ class MemoryOutbox:
 
     def turn_status(self, turn_id):
         """一轮记忆的回执（52 号）：pending（还在队列里/正在存）、
-        committed（存完了）、failed（存失败了）、unknown（没见过这个 turn_id）。"""
+        committed（存完了）、failed（存失败了）、dropped（撤回了、文件已删，
+        不会再存）、unknown（没见过这个 turn_id）。"""
         with self._outcomes_lock:
             outcome = self._outcomes.get(turn_id)
         if outcome is not None:
@@ -177,7 +207,7 @@ class MemoryOutbox:
         raised = None
         for attempt in range(1, self._SAVE_RETRIES + 1):
             try:
-                outcome = self._store.add_turn(messages)
+                outcome = self._store.add_turn(messages, turn_id=turn_id)
                 break
             except Exception as exc:  # noqa: BLE001 - 重试完还失败才记失败清单
                 raised = exc
@@ -198,7 +228,13 @@ class MemoryOutbox:
                 (outcome or {}).get("extraction_failed")
                 or (outcome or {}).get("protection_failed")
             )
-            if not _failed:
+            # 2026-11-20 游泳事故：add_turn 只返回“待定”（pending）时，
+            # 这轮只是进了待定区、还没真正落库——盘文件不能删（删了重启
+            # 也捞不回来），等 _commit_pending_turn 真正落库时再删。
+            # 只有“不待定也不失败”（同步存完了、纠错/撤回当场处理完了）
+            # 才删盘。
+            _parked = bool((outcome or {}).get("pending"))
+            if not _failed and not _parked:
                 self._drop_pending(turn_id)
         with self._pending_lock:
             self._pending -= 1
@@ -221,8 +257,19 @@ class MemoryOutbox:
                     (outcome or {}).get("extraction_failed")
                     or (outcome or {}).get("protection_failed")
                 )
+                # 2026-11-20 游泳事故：只返回“待定”时记 pending，别报
+                # committed——待定不是提交，报 committed 会撒谎，查回执
+                # 查不出丢记忆；真正落库时 _commit_pending_turn 会改成
+                # committed。
+                parked = bool((outcome or {}).get("pending"))
+                if failed:
+                    status = "failed"
+                elif parked:
+                    status = "pending"
+                else:
+                    status = "committed"
                 self._outcomes[turn_id] = {
-                    "status": "failed" if failed else "committed",
+                    "status": status,
                     "result": outcome,
                 }
 

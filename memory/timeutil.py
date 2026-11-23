@@ -86,9 +86,12 @@ def _parse_created_at(value):
 # _WRITE_SEQ_LOCK / _WRITE_SEQ：同一批写进去的序号（进程内严格递增）。
 # 同一批写进去的几条记忆，时间戳也可能撞在同一微秒——单调 +1 微秒能
 # 分开绝大多数，但序号是更稳的第二道：同一批里每条各拿一个号，先后
-# 一目了然。序号只管同一进程里的先后，跨进程重启从 0 再来——新旧判断
-# 先看 created_at，序号只是平局时的决胜（见 _memory_order_key）。
-# 真正的写操作本来就串在 _WRITE_LOCK 里，这里这把锁只是兜底。
+# 一目了然。新旧判断先看 created_at，序号只是平局时的决胜
+# （见 _memory_order_key）。序号本来只管同一进程里的先后，重启从 0
+# 再来——2026-11-19 改成持久化：Mem0Store 启动时扫一遍库里已有的
+# write_seq，用最大的那个喂给 _seed_write_seq（见下面），之后新写
+# 的序号一定比库里的大，重启也不归零。真正的写操作本来就串在
+# _WRITE_LOCK 里，这里这把锁只是兜底。
 _WRITE_SEQ_LOCK = threading.Lock()
 
 _WRITE_SEQ = 0
@@ -98,5 +101,17 @@ def _next_write_seq():
     global _WRITE_SEQ
     with _WRITE_SEQ_LOCK:
         _WRITE_SEQ += 1
+        return _WRITE_SEQ
+
+def _seed_write_seq(value):
+    """把写序号的起点抬到至少 value（启动时用库里最大的 write_seq 喂一次）。
+
+    只往上抬、不往下压：value 不是整数、或比当前值小，都不动——
+    进程里已经发出去的序号绝不能重发（重发会让新旧判断撞车）。
+    返回抬完之后的当前值。"""
+    global _WRITE_SEQ
+    with _WRITE_SEQ_LOCK:
+        if isinstance(value, int) and not isinstance(value, bool) and value > _WRITE_SEQ:
+            _WRITE_SEQ = value
         return _WRITE_SEQ
 

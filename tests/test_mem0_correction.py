@@ -35,6 +35,7 @@ from memory.mem0_store import (
     _detect_correction,
     _parse_judge_choice,
 )
+from memory.sqlite_store import SQLiteStore
 from web.server import ChatState
 
 
@@ -389,6 +390,31 @@ def test_cli_print_correction_lines(capsys):
     assert "我喜欢喝黑咖啡。" in printed and "我喜欢喝拿铁咖啡。" in printed
     assert "第 1 条" in printed
     assert "纠正失败，原记忆没动" in printed
+
+
+def test_print_correction_result_handles_string_and_dict_candidates(tmp_path, monkeypatch, capsys):
+    """Bug 1 回归（2026-11-22）：ambiguous 的纠正结果里 candidates 不管是
+    字典列表还是 ID 字符串列表，_print_correction_result 都不抛异常、
+    正常返回；字典的印文本，字符串的印 ID 本身。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
+    store = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    store.add_memory_text("我喜欢吃冒菜", source="inferred")
+    out = store.correct_memory("我喜欢吃辣的", "我喜欢吃米线")
+    assert out.get("status") == "ambiguous"
+    cands = out.get("candidates") or []
+    assert len(cands) == 2
+    assert all(isinstance(c, dict) and c.get("text") for c in cands)
+    assert _print_correction_result({"correction": out}) == out
+    printed = capsys.readouterr().out
+    assert "我喜欢吃火锅" in printed and "我喜欢吃冒菜" in printed
+    # 老格式（光秃秃的 ID 字符串）也要认：印 ID 本身，不崩。
+    ids = [c["id"] for c in cands]
+    assert _print_correction_result(
+        {"correction": {"status": "ambiguous", "candidates": ids}}
+    ) == {"status": "ambiguous", "candidates": ids}
+    printed = capsys.readouterr().out
+    assert ids[0] in printed and ids[1] in printed
 
 
 def test_web_ask_returns_correction_field(monkeypatch, tmp_path):

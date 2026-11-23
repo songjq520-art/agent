@@ -499,3 +499,91 @@ def test_update_stays_literal(dingtou_store):
         )
     assert error is not None
     assert "每天定投 5 块。" in _texts(dingtou_store)
+
+# ---------- 2026-11-21 网页测第二轮 #6：id/原文由程序带，不靠模型现抄 ----------
+
+def test_delete_autofills_id_from_matching_text(mem_store):
+    """#6：模型抄错 id（抄成全 0）但原文抄对了——程序按原文把 id 纠回来，照样建卡。"""
+    from tools.memory_tool import _check_delete_anchor
+
+    ramen_id = _mem_id(mem_store, "BOOS 爱吃拉面。")
+    with bound_memory_store(mem_store):
+        error, augment = _check_delete_anchor(
+            {"memory_id": "0" * 64, "text": "BOOS 爱吃拉面。", "anchor_text": "拉面"}
+        )
+    assert error is None
+    assert (augment or {}).get("memory_id") == ramen_id
+    assert (augment or {}).get("text") == "BOOS 爱吃拉面。"
+    assert "补上了" in (augment or {}).get("_anchor_match", "")
+
+
+def test_delete_autofills_id_and_text_from_unique_anchor(mem_store):
+    """#6：id 和原文都没给，anchor 只有一个字面命中——程序按 anchor 全填上。"""
+    from tools.memory_tool import _check_delete_anchor
+
+    with bound_memory_store(mem_store):
+        error, augment = _check_delete_anchor({"anchor_text": "冰美式"})
+    assert error is None
+    assert (augment or {}).get("memory_id") == _mem_id(mem_store, "用户喜欢喝冰美式。")
+    assert (augment or {}).get("text") == "用户喜欢喝冰美式。"
+
+
+def test_delete_autofill_skipped_when_anchor_matches_many(mem_store):
+    """#6：anchor 命中多条（鸡杂面两条）时程序不替 BOOS 挑——还是报错，让模型/BOOS 挑。"""
+    from tools.memory_tool import _check_delete_anchor
+
+    with bound_memory_store(mem_store):
+        error, augment = _check_delete_anchor(
+            {"memory_id": "错的id", "text": "不对的原文", "anchor_text": "鸡杂面"}
+        )
+    assert error is not None
+    assert augment is None
+
+
+def test_delete_autofill_skipped_for_already_deleted_row(mem_store):
+    """#6 回归：已经删掉的那条再删一次，程序不能按 anchor 另找一条删掉。
+    （第二轮 #6 修法时发现的边界：anchor 唯一命中剩下的是纠正句那条，
+    填它就删错了。）"""
+    from tools.memory_tool import _run_delete_memory
+
+    chicken_id = _mem_id(mem_store, "BOOS 喜欢吃鸡杂面。")
+    args = {"memory_id": chicken_id, "text": "BOOS 喜欢吃鸡杂面。", "anchor_text": "鸡杂面"}
+    with bound_memory_store(mem_store):
+        assert _run_delete_memory(args)["ok"] is True
+    with bound_memory_store(mem_store):
+        second = _run_delete_memory(args)
+    assert second["ok"] is False
+    assert "挑错了" in second["error"]
+    # 纠正句那条还在，不能被“唯一命中”顺手删掉。
+    assert "用户表示其实也不是很喜欢吃鸡杂面，纠正了此前“喜欢吃鸡杂面”的说法。" in _texts(mem_store)
+
+
+def test_delete_wrong_id_still_deletes(mem_store):
+    """#6 端到端：模型抄错 id，直接调执行函数也能删掉（precheck 填好的那份）。"""
+    from tools.memory_tool import _run_delete_memory
+
+    ramen_id = _mem_id(mem_store, "BOOS 爱吃拉面。")
+    with bound_memory_store(mem_store):
+        result = _run_delete_memory(
+            {"memory_id": "0" * 64, "text": "BOOS 爱吃拉面。", "anchor_text": "拉面"}
+        )
+    assert result["ok"] is True
+    assert "BOOS 爱吃拉面。" not in _texts(mem_store)
+
+
+def test_delete_wrong_id_approval_carries_filled_args(mem_store, tmp_path):
+    """#6 端到端：确认卡上存的是程序填好的 id/原文，不是模型抄错的那份。"""
+    from tools.audit import AuditLog
+    from tools.tool_gateway import ToolGateway
+
+    register_memory_tools()
+    gateway = ToolGateway(audit_log=AuditLog(str(tmp_path / "audit.log")))
+    ramen_id = _mem_id(mem_store, "BOOS 爱吃拉面。")
+    with bound_memory_store(mem_store):
+        outcome = gateway.execute(
+            "delete_memory",
+            {"memory_id": "0" * 64, "text": "BOOS 爱吃拉面。", "anchor_text": "拉面"},
+        )
+    assert outcome["decision"] == "needs_approval"
+    assert outcome["approval"]["args"]["memory_id"] == ramen_id
+    assert outcome["approval"]["args"]["text"] == "BOOS 爱吃拉面。"

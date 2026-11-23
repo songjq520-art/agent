@@ -15,6 +15,8 @@ import json
 import logging
 import re
 import sys
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from config import (
@@ -83,6 +85,38 @@ def _is_cjk_char(ch):
     return "\u4e00" <= ch <= "\u9fff"
 
 
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
+def _shanghai_today_str():
+    """今天的日期（Asia/Shanghai，BOOS 的参考时区），格式 YYYY-MM-DD。
+
+    笔记本在美国，date.today() 拿的是当地日期，和 BOOS 说的“今天”
+    可能差一天；事件日期是按上海日期算的（memory/sqlite_store.py 的
+    _shanghai_today），锚点必须用同一个时区，不然“昨天”又对不上。
+    """
+    return datetime.now(_SHANGHAI_TZ).date().isoformat()
+
+
+_WEEKDAY_CN = ("一", "二", "三", "四", "五", "六", "日")
+
+
+def _week_hint_str():
+    """未来 7 天的星期对照（第三轮 #1）：模型把 11 月 25 日说成“本周三”，
+    其实今天 11 月 22 日是周日、25 日是下周三。周一是一周的开始；
+    和今天同一周的叫“本周”，下一周的叫“下周”。格式：
+    “2026-11-22（本周日）；2026-11-23（下周一）；……”。
+    格式里“本周”后面直接跟“日/一/二……”——“本周日”不是“本周周日”。"""
+    today = datetime.now(_SHANGHAI_TZ).date()
+    monday = today - timedelta(days=today.weekday())
+    parts = []
+    for offset in range(7):
+        day = today + timedelta(days=offset)
+        week = "本周" if monday <= day < monday + timedelta(days=7) else "下周"
+        parts.append(f"{day.isoformat()}（{week}{_WEEKDAY_CN[day.weekday()]}）")
+    return "；".join(parts)
+
+
 def _estimate_tokens(text):
     """估算一段文本的 Token 数（保守估计，供记忆注入预算用）。
 
@@ -98,6 +132,27 @@ def _estimate_tokens(text):
     non_cjk = "".join(" " if _is_cjk_char(ch) else ch for ch in text)
     words = len(non_cjk.split())
     return cjk * 2 + words
+
+
+# 日期/星期词（第四轮 #3）：记忆正文里提到“下周三”这类日期/星期词时，
+# 也要给星期对照——已经存进去的老记忆没有 event_date，光靠 event_date
+# 触发会漏掉它（“下周三我要出差”就是这么漏的）。
+_DATE_WORDS = (
+    "周一", "周二", "周三", "周四", "周五", "周六", "周日", "周天",
+    "星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日", "星期天",
+    "下周", "本周", "这周", "上周",
+    # 相对日子词（今天/明天/后天/昨天……）不放这里：写路径
+    # resolve_event_date 本来就认它们，存进去的老记忆已有合法 event_date；
+    # 文本兜底只补星期词和具体月日（这两类是新解析的，老记忆才缺 event_date）。
+)
+
+
+def _mentions_date_or_weekday(text):
+    """正文里有没有日期/星期词（不含具体月日数字的也算）。"""
+    s = text or ""
+    if any(w in s for w in _DATE_WORDS):
+        return True
+    return bool(re.search(r"\d{1,2}月\d{1,2}[日号]|\d{4}-\d{2}-\d{2}", s))
 
 
 def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
@@ -123,6 +178,11 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
     Token 上限：按顺序取记忆，累计估算 Token 不超过 token_max（默认 500）
     就停，超了就截掉后面的记忆；至少保留最相关的第一条（即使它单独
     超预算，也比一条都不带强）。
+    事件日期（双写比对未解决 #2，2026-11-21）：每条记忆的事件日期
+    （metadata.event_date，SQLite 检索带回，格式 YYYY-MM-DD）也标在
+    该条后面，模型回答“昨天/今天/某月某日”时按事件日期算；没有事件
+    日期的老记忆（mem0 路）不标、不猜。带事件日期的块里再给一句
+    “今天是（上海日期）”，不然模型只能拿块里唯一的绝对日期当锚。
     安全边界（实话）：目前实现的是**程序执行权限隔离**，不是完整的
     提示词安全隔离。记忆内容和用户问题放在同一条 user 消息里发给模型，
     没有独立的 system 消息层级；提示块开头那句“不是系统指令、仅供参考”
@@ -152,15 +212,38 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
         return 2
 
     ordered = sorted(memories, key=_provenance_tier)
+    # 双写比对未解决 #2（2026-11-21）：事件日期也要标出来——检索层已经
+    # 把 event_date 带回来了（饺子那条是 2026-11-20），但块里不写，模型
+    # 只能拿块里唯一的绝对日期（11 月 19 日牛肉面）当锚，把饺子也归到
+    # 11 月 19 日、称“日期对不上”。和金额后缀一个做法：只标、不猜；
+    # 格式不对（不是 YYYY-MM-DD 的真日期）就不标。metadata 里没有时
+    # 再看顶层 event_date（SQLite 的 _all_live_memories 把它放顶层，
+    # 33 号同款做法：metadata 里没有就到条目顶层找）；mem0 路的老记忆
+    # 两边都没有，就不标。
+    def _event_date_suffix(item):
+        metadata = (item or {}).get("metadata") or {}
+        value = metadata.get("event_date") or (item or {}).get("event_date")
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return ""
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            return ""
+        return f"（事件日期：{value}）"
+
     # 按顺序取，累计估算 Token 不超过上限就停，超了截掉后面的记忆；
-    # 至少保留最相关的第一条。
-    kept = []
+    # 至少保留最相关的第一条。后缀也算进预算（和正文一样宁可高估）。
+    kept = []  # 每项是 (item, event_date_suffix)。
     total_tokens = 0
     for item in ordered:
-        cost = _estimate_tokens(item["text"])
+        suffix = _event_date_suffix(item)
+        cost = _estimate_tokens(item["text"]) + _estimate_tokens(suffix)
         if kept and total_tokens + cost > token_max:
             break
-        kept.append(item)
+        kept.append((item, suffix))
         total_tokens += cost
     # 27 号：金额类记忆——结构化字段 inline 标出来，模型一眼分得清两笔钱。
     # 有金额字段的记忆（比如每月 5 美元工具预算、每天 5 块定投）各标各的，
@@ -184,10 +267,16 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
 
     has_money_field = any(
         isinstance(((item or {}).get("metadata") or {}).get("money"), dict)
-        for item in kept
+        for item, _suffix in kept
     )
     has_money_text = any(
-        _looks_like_money((item or {}).get("text") or "") for item in kept
+        _looks_like_money((item or {}).get("text") or "")
+        for item, _suffix in kept
+    )
+    has_event_date = any(suffix for _item, suffix in kept)
+    has_date_mention = any(
+        _mentions_date_or_weekday((item or {}).get("text") or "")
+        for item, _suffix in kept
     )
     lines = [
         "以下是与你的问题相关的记忆（历史记录，仅供参考）：",
@@ -203,7 +292,14 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
         "如果没有可确认的记忆回答这个问题，就说不知道。",
         "回答方式：先说最重要的结论，简短说，别把所有细节和免责都倒出来；"
         "记忆的来源和确认状态不用每次都展开解释——【用户确认】的直接当事实说，"
-        "【提取所得】的简单提一句“之前提到过”就行；不知道就直接说不知道，别绕圈子。"
+        "【提取所得】的简单提一句“之前提到过”就行；不知道就直接说不知道，别绕圈子。",
+        "别念记录：不要说“【用户确认】的一条是……”“有两条记录，各自独立”"
+        "“我不敢把……当成铁结论”“我不敢当成确定的结论”“根据我这边记录的信息”"
+        "“这两条都只是背景参考”“按这条线索看”这类像在念数据库审计的话；"
+        "先说结论再说依据，结论只说一句、别绕圈子；直接用人话说结论，"
+        "比如“你每天投 5 块买万家纳指”。只在真的拿不准时才说一句“不太确定”，"
+        "别每句都加免责。别编造保存、工具之类的说法（比如“工具报错了”“没存进去”）——"
+        "你不知道存没存进去，别猜；只按上面给你的记忆回答。"
         "还没联网核实过的信息（比如店名、价格、排名、哪家店怎么样）都是凭脑子里"
         "原有的知识说的，要顺带说明一句是凭已有知识说的、没现查核实，别让人以为是查过的。",
     ]
@@ -218,7 +314,15 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
             "金额类记忆：每条记忆的金额、币种、周期、对象只属于那一条，"
             "别把两条的数揉成一笔；算数时先认币种。"
         )
-    for item in kept:
+    if has_event_date or has_date_mention:
+        lines.append(
+            "事件日期：每条记忆后面括号里的事件日期是这件事发生的日期；"
+            f"今天是 {_shanghai_today_str()}，回答“昨天/今天/某月某日”这类问题时，"
+            "先按事件日期对上今天是几号再回答，别把不同日期的事混成同一天。"
+            "星期对照（周一是一周的开始，和今天同一周的叫“本周”，下一周的叫“下周”）："
+            f"{_week_hint_str()}。"
+        )
+    for item, event_suffix in kept:
         metadata = (item or {}).get("metadata") or {}
         rule_prefix = "【规则】" if metadata.get("is_rule") is True else ""
         if metadata.get("confirmed") is True:
@@ -227,7 +331,14 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
             label = "【提取所得，未经逐条确认】"
         else:
             label = "【来源未确认】"
-        lines.append(f"- {rule_prefix}{label}{item['text']}{_money_suffix(metadata.get('money'))}")
+        lines.append(
+            f"- {rule_prefix}{label}{item['text']}"
+            f"{_money_suffix(metadata.get('money'))}{event_suffix}"
+            f"{_budget_setting_suffix(item['text'])}"
+        )
+    lines.append(
+        "回答时第一句必须是结论（一句话），不要先复述上面的记忆、不要先说“我这边记录是……”。"
+    )
     return "\n".join(lines)
 
 
@@ -241,15 +352,36 @@ def _looks_like_money(text):
     return bool(_MONEY_TEXT_RE.search(text or ""))
 
 
+# 工具预算设置的认法（第三轮 #11）：页面底下固定的预算说明
+# （“每月预算 5 美元，到 5 美元提醒，不自动停”）是一条工具调用的
+# 预算设置，不是投资/定投计划。认法收得紧：必须同时有“预算”+
+# “美元”+“提醒/不自动停”——“每月预算 5 美元买基金”这种投资
+# 计划没有“提醒/不自动停”，不会误标。
+_BUDGET_SETTING_RE = re.compile(r"预算.*美元.*(提醒|不自动停|永不自动停)")
+
+
+def _budget_setting_suffix(text):
+    """预算设置记忆的标注：是工具预算设置时返回一句说明，
+    让模型回答投资问题时别把它当成一条定投记录引用；不是时返回 ""。"""
+    if _BUDGET_SETTING_RE.search(text or ""):
+        return "（这是工具调用的预算设置，不是投资/定投计划）"
+    return ""
+
+
 # REMEMBER_PREFIX（记记忆命令）：连续对话里输入 "记住……" 就原文存一条记忆，
 # 不用确认（mem0 的 add_memory_text 直接存原文，不经过提取）。
 # 格式：记住：内容 或 记住 内容。
+# “记住”类前缀（2026-11-21 网页测第二轮 #8）：“帮我记住/请记住”也是
+# 记住命令；顺序按最长优先。memory/sqlite_store.py 里有同一份名单
+# （REMEMBER_PREFIXES / _strip_remember_prefix），两边改了要同步。
+REMEMBER_PREFIXES = ("帮我记住", "请记住", "记住")
 REMEMBER_PREFIX = "记住"
 
 
 def is_remember_command(text):
     """判断输入是不是“记住……”命令（记一条新记忆）。"""
-    return str(text or "").strip().startswith(REMEMBER_PREFIX)
+    s = str(text or "").strip()
+    return any(s.startswith(prefix) for prefix in REMEMBER_PREFIXES)
 
 
 def remember_content(text):
@@ -260,9 +392,13 @@ def remember_content(text):
     """
     if not is_remember_command(text):
         return ""
-    # “记住”后面常跟的分隔符都剥掉：冒号、逗号（中英文）、空格。
-    # 不剥的话“记住，我喜欢喝冰美式”会存成“，我喜欢喝冰美式”。
-    return str(text or "").strip()[len(REMEMBER_PREFIX):].lstrip("：:，, ").strip()
+    s = str(text or "").strip()
+    for prefix in REMEMBER_PREFIXES:
+        if s.startswith(prefix):
+            # “记住”后面常跟的分隔符都剥掉：冒号、逗号（中英文）、空格。
+            # 不剥的话“记住，我喜欢喝冰美式”会存成“，我喜欢喝冰美式”。
+            return s[len(prefix):].lstrip("：:、，, ").strip()
+    return "" 
 
 
 def handle_remember(budget_tracker, text):
@@ -288,6 +424,58 @@ def handle_remember(budget_tracker, text):
         print("没记住：保存失败，记忆库可能出了问题，稍后再试。")
 
 
+# 揣摩提示词（2026-11-17，BOOS定；2026-11-21 网页测第二轮 #4 收紧触发）：
+# 原文照搬——模型正常聊天就行，不用特意猜；只有 BOOS 话里有个很明显、
+# 没说出口的想法或想要的东西时，才在回话里顺带提一句。猜的时候用问句，
+# 别下结论，别把猜的当成他已经说了的。
+_MIND_READ_HINT = (
+    "你是十二，BOOS的个人助理。正常聊天就行，不用特意猜；"
+    "只有 BOOS 话里有个很明显、没说出口的想法或想要的东西时，才在回话里"
+    "顺带提一句：用大白话说你猜了什么、为什么这么猜（从他以前说过的话出发），"
+    "然后问他一句'对吗？'。别把观察到的规律当成猜，别猜他下一步要干嘛；"
+    "他交代你做事（比如恢复、删除、查东西）的时候不猜；'可以'、'好'、"
+    "'对'、'不对'这种简单的回话也不猜。不确定就别猜，没东西可猜就正常回。"
+    "猜的时候用问句，别下结论，别把猜的当成他已经说了的。"
+)
+
+# 简单回话（整句就是这几个词的，直接跳过猜）。
+_MIND_READ_SIMPLE_REPLIES = {
+    "可以", "好", "对", "不对", "嗯", "哦", "行", "知道了", "谢谢",
+    "没事", "好的", "是的", "不是", "对啊", "嗯嗯", "收到", "好吧",
+}
+
+# 交代做事的标志词：出现这些词就是在交代十二做事，不猜。
+_MIND_READ_INSTRUCTION_WORDS = (
+    "帮我", "请", "忘记", "忘掉", "删除", "删掉", "记住", "查", "告诉",
+    "取消", "恢复", "打开", "设置", "发给", "算一下", "帮我算",
+)
+
+# 没说出口的想要的信号：只有话里带了这些词，才可能藏着一个没说出口的想法。
+_MIND_READ_WANT_WORDS = (
+    "想", "馋", "好久没", "很久没", "累", "困", "渴", "饿",
+    "冷", "热", "没电", "快没", "想要", "想吃", "想去", "想买", "想喝", "想看",
+)
+
+
+def _should_offer_mind_read(prompt):
+    """这句话值不值得给模型递揣摩提示（2026-11-21 网页测第二轮 #4）。
+
+    简单表态、交代做事，一律不递；只有话里带了想要的信号
+    （想/馋/好久没/累/没电……）时才递。揣摩是“没猜也要找个猜”的口子，
+    flash 在这条边界上判断得差，不递比在提示词里写“别猜”更管用。
+    “我喜欢喝茶”“周末去爬山”这类随口一提的喜好/安排没有想要的信号，
+    不递；“好久没吃火锅了”“手机快没电了”有信号，递。
+    """
+    text = str(prompt or "").strip()
+    if not text:
+        return False
+    if text.rstrip("。！？.!?") in _MIND_READ_SIMPLE_REPLIES:
+        return False
+    if any(w in text for w in _MIND_READ_INSTRUCTION_WORDS):
+        return False
+    return any(w in text for w in _MIND_READ_WANT_WORDS)
+
+
 def _print_correction_result(saved):
     """把 add_turn 的纠错结果用人话打印一行（只在有纠错时打印）。
 
@@ -301,7 +489,11 @@ def _print_correction_result(saved):
     - failed：说清楚改失败了、原记忆没动；
     - not_found：新说法已经当新记忆正常存了，不用多说。
     """
-    correction = (saved or {}).get("correction") or {}
+    if not isinstance(saved, dict):
+        return None
+    correction = saved.get("correction") or {}
+    if not isinstance(correction, dict):
+        return None
     status = correction.get("status")
     if not status:
         return None
@@ -315,7 +507,16 @@ def _print_correction_result(saved):
         candidates = correction.get("candidates") or []
         print(f"有 {len(candidates)} 条相似的记忆，分不清改哪条：")
         for i, cand in enumerate(candidates, 1):
-            print(f"  {i}. {(cand or {}).get('text')}")
+            # 候选两种形状都认（2026-11-22 Bug 1）：字典取 text，
+            # 字符串是内存 ID（老数据/别的 store 交过来的），这里拿不到
+            # store 查文本，直接印 ID 本身，绝不崩。
+            if isinstance(cand, dict):
+                text = cand.get("text") or cand.get("id") or ""
+            elif isinstance(cand, str):
+                text = cand
+            else:
+                text = str(cand)
+            print(f"  {i}. {text}")
         print("请回复第几条（比如“第 1 条”），我再帮你改。")
     elif status == "failed":
         print(
@@ -453,7 +654,7 @@ def _run_deepseek_with_tools(prompt, original_prompt, model_prompt, provider,
     }
 
 
-def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, resume_task=None, pending_tool_result=None, user_declined=False, original_prompt=None, confirm_callback=None):
+def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, resume_task=None, pending_tool_result=None, user_declined=False, original_prompt=None, confirm_callback=None, turn_id=None):
     """跑一次普通问答任务（最简单的运行示例）.
 
     参数 prompt：用户的问题；task_type：任务类型，默认 "question"。
@@ -487,6 +688,9 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     参数 confirm_callback：命令行下用的确认函数，收到 approval 字典
     返回 True（确认）/ False（取消）；网页不传——网页要先把确认卡
     推给 BOOS，等他点了再调 run_question 恢复。
+    参数 turn_id：本轮的 id（2026-11-19）——网页 ask() 在检索之前就
+    生成、传进来；命令行直接调时不传，这里现生成一个。检索强化和存
+    记忆用同一个 id：强化记的“这轮用过”和存进去的那轮是同一轮。
     返回：字典，含 mode（模式）、route（路由结果）、result（模型结果或 None）、message（提示）。
     模式：
       - "demo"（演示模式）：无 Key，只演示配置 + 路由，不调用模型；
@@ -558,6 +762,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 记忆提示块和摘要已经在存着的循环消息里了，再拼一份会重复。
     # searches（48 号）：本轮调过的搜索记录，DeepSeek 工具循环那条路才有，
     # 其他路是空列表；最终返回里带上，网页显示在回答下面。
+    # 2026-11-19：本轮的 turn_id 在检索之前就生成——强化要按会话记，
+    # 检索发生时这轮的编号必须已经有了；存记忆时用同一个 id。
+    # 调用方（网页 ask）传了就用传的，没传（命令行）现生成一个。
+    turn_id = turn_id or uuid.uuid4().hex
     searches = []
     # 先找相关记忆，拼进发给模型的问题里（历史里仍记原话，
     # 这里只改发给模型的那一份）；找不到记忆时原样提问，不注入近似记忆。
@@ -567,7 +775,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             with timer.measure("memory_search_ms"):
                 # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
                 # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
-                memories = mem0_store.search(prompt, top_k=5, reinforce=True)
+                memories = mem0_store.search(prompt, top_k=5, reinforce=True, turn_id=turn_id)
             # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
             # “当前在聊什么”的提示（见 Mem0Store.note_context）。
             mem0_store.note_context(memories)
@@ -590,18 +798,34 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             summary_text = ""
         if summary_text:
             model_prompt = summary_text + "\n\n" + model_prompt
+    # 算数题先算再答（2026-11-21 网页测第二轮 #11）：本地计算器算好的
+    # 结果直接拼进提示，模型照着用，不自己心算、不编数字。算不出来
+    # （没识别到算式）时不拼，提示词里那句“算不出来就说算不出来”兜底。
+    try:
+        from memory.calculator import calculator_block
+        # 第三轮 #11：网页调进来时 prompt 已经是拼了记忆提示块的
+        # model_prompt，块里的记忆也可能含“年化/定投”——用原话算，
+        # 不然第一个“年化”可能来自某条记忆、不是问题本身。
+        _calc = calculator_block(original_prompt or prompt)
+    except Exception:
+        logger.warning("本地计算器失败，本次不带计算结果继续。", exc_info=True)
+        _calc = ""
+    if _calc:
+        model_prompt = _calc + "\n\n" + model_prompt
     # 揣摩（2026-11-17，BOOS定）：不固定每轮问一次，也不主动找东西猜。
     # 模型正常聊天就行；只有 BOOS 话里有个很明显、没说出口的想法时，
     # 才在回话里顺带提一句。别把观察到的规律当成猜，别在交代做事
     # （恢复/删除/查东西）和简单回话（“可以”“好”“对”“不对”）上猜。
     # 不确定就别猜。BOOS 2026-11-17 说：不是要跟十一一模一样，十二就是十二。
+    # 揣摩提示词只在可能有没说出口的想法时才递（#4：_should_offer_mind_read
+    # 把简单表态、交代做事、随口一提的喜好/安排直接拦在程序层）；数字规则
+    # 常驻（#11）：给了本地计算结果就直接用，没给、不会算就说算不出来。
+    _mind_read_hint = _MIND_READ_HINT if _should_offer_mind_read(prompt) else ""
     model_prompt = (
-        "【给十二的提示】你是十二，BOOS的个人助理。正常聊天就行，不用特意猜；"
-        "只有 BOOS 话里有个很明显、没说出口的想法或想要的东西时，才在回话里"
-        "顺带提一句：用大白话说你猜了什么、为什么这么猜（从他以前说过的话出发），"
-        "然后问他一句'对吗？'。别把观察到的规律当成猜，别猜他下一步要干嘛；"
-        "他交代你做事（比如恢复、删除、查东西）的时候不猜；'可以'、'好'、"
-        "'对'、'不对'这种简单的回话也不猜。不确定就别猜，没东西可猜就正常回。\n\n" + model_prompt
+        "【给十二的提示】" + _mind_read_hint
+        + "数字题先算再答：上面给了本地计算结果就直接用那个数，别自己再算；"
+        "没给、你也不会算时就说算不出来，别编数字、别编“工具到上限”"
+        "“没存进去”这类借口。\n\n" + model_prompt
     )
     # 按路由结果选 Provider 类（DeepSeek 默认，Muse 保留为工作模型），
     # 并把路由算出的模型名传给 Provider——路由说用哪个模型就用哪个，
@@ -685,8 +909,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # （save_turn 内部已把异常吞掉，只记日志；后台线程里的失败也一样）。
     # 26 号：save_turn 是后台存——回答先回、记忆后存；纠错/撤回的轮次
     # 在 save_turn 里自动走同步（结果要立刻告诉 BOOS）。
-    # 注意：这是每轮唯一一次 save_turn——chat_loop 和网页服务都不再
-    # 另外调（run_question 已存过，重复调等于每轮多付几次提取费用）。
+    # 注意：网页服务那条路每轮会调两次 save_turn——run_question 这里一次、
+    # ask() 收尾一次，同一 turn_id；第二次直接返回上次的回执（含
+    # correction），不重复存。chat_loop 不再另外调（run_question 已存过，
+    # 重复调等于每轮多付几次提取费用）。
     # 只带最近 6 条（约 3 轮）：每轮都把全部历史发去提取又贵又慢，
     # 最近的就够提取理解本轮了；和网页服务（web/server.py）一致。
     # 聊天纠错：add_turn 里已经改好/问好了，这里只把结果用人话告诉
@@ -704,12 +930,28 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             ]
         )[-6:]
         with timer.measure("memory_save_ms"):
-            saved = mem0_store.save_turn(recent)
-        correction = _print_correction_result(saved)
-        _print_protection_result(saved)
+            saved = mem0_store.save_turn(recent, turn_id=turn_id)
+        try:
+            correction = _print_correction_result(saved)
+        except Exception:
+            # 显示步骤绝不能把一次聊天变成 500（2026-11-22 Bug 1）：
+            # 打印崩了只记日志，纠错结果本身照常放进返回。
+            logger.warning("打印纠错结果失败。", exc_info=True)
+            correction = (saved or {}).get("correction")
+        try:
+            _print_protection_result(saved)
+        except Exception:
+            logger.warning("打印保护结果失败。", exc_info=True)
         # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
-        # 告诉 BOOS 一声（dropped==0 时什么都没丢，不用多说）。
-        if (saved or {}).get("retracted") and (saved or {}).get("dropped", 0) > 0:
+        # 告诉 BOOS 一声（dropped 为空且 dropped_count 是 0 时什么都没丢，不用多说）。
+        # 撤回后回消息崩（2026-11-21 网页测第二轮 #1）：dropped 是句子列表，
+        # list > 0 直接抛 TypeError → 500；撤回那条路的回执里 dropped 恒为
+        # []、真正记数的是 dropped_count，所以两边都算上。只按 len(dropped)
+        # 判断会让这句提示永远打不出来（撤回时 dropped 本来就是空的）。
+        if (saved or {}).get("retracted") and (
+            (saved or {}).get("dropped_count", 0) > 0
+            or len((saved or {}).get("dropped") or []) > 0
+        ):
             print("刚说的那句已经撤回，不记了。")
         # 揣摩改成跟十一一样（2026-11-17，BOOS定）：不再固定每轮调
         # infer_from_turn 追加一句正式的猜——猜由模型自己在回话里

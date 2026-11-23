@@ -47,6 +47,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from memory.mem0_store import _redact_sensitive
+from memory.redaction import _contains_sensitive
 
 logger = logging.getLogger("agent")
 
@@ -308,18 +309,37 @@ def _make_title(messages, summary=None):
         title = _first_sentence(summary or "")
     if not title:
         return "新对话"
+    if _contains_sensitive(title):
+        # 2026-11-21 网页测第二轮 #10：标题是对话第一句用户话原样截的，
+        # 敏感内容（比如密码）会直接露在侧边栏标题上——命中脱敏规则
+        # 时给通用默认标题，不暴露原文、也不暴露打码后的形状。
+        return "新对话"
     if len(title) > TITLE_MAX_CHARS:
         title = title[:TITLE_MAX_CHARS] + "…"
     return title
 
 
 def _copy_messages(messages):
-    """复制一段消息列表（只留 role/content，调用方改了原列表也不影响存档）。"""
-    return [
-        {"role": (msg or {}).get("role"), "content": (msg or {}).get("content") or ""}
-        for msg in (messages or [])
-        if (msg or {}).get("role") in ("user", "assistant")
-    ]
+    """复制一段消息列表（只留 role/content，assistant 再带 model/cost_usd，
+    调用方改了原列表也不影响存档）。
+
+    model/cost_usd 只作展示用（第四轮 #4：恢复对话时模型/成本行要能显示）：
+    发给模型前 providers/deepseek.py 的 _normalize_messages 会把它们剥掉，
+    不会漏进 API；指纹只算 role+content，不受影响。
+    """
+    copied = []
+    for msg in (messages or []):
+        msg = msg or {}
+        if msg.get("role") not in ("user", "assistant"):
+            continue
+        item = {"role": msg.get("role"), "content": msg.get("content") or ""}
+        if msg.get("role") == "assistant":
+            if msg.get("model") is not None:
+                item["model"] = msg.get("model")
+            if msg.get("cost_usd") is not None:
+                item["cost_usd"] = msg.get("cost_usd")
+        copied.append(item)
+    return copied
 
 
 class ConversationSummaryStore:
@@ -611,16 +631,26 @@ class ConversationSummaryStore:
 
         只记元数据和最近几轮，不总结（总结是 maybe_compact / flush 的事）。
         新对话第一轮后它自动出现在列表顶部。空消息时什么都不做。
+        第三轮 #4：只看不说话时间不该变——消息没变时（比如切对话时
+        对当前对话再 sync 一次、或双击同一段对话）只确保记录在列表里，
+        不碰 updated_at；只有消息真的多了才更新时间。时间是最后一条
+        消息的时间，不是最后一次打开/总结的时间。
         """
         if not messages:
             return False
         record = self._ensure_current()
+        tail = messages[-self.keep_last_rounds * 2 :]
+        if self._fingerprint(tail) == self._fingerprint(record.get("recent") or []):
+            # 消息没变：只确保记录在列表里，不更新时间、不重写 recent。
+            self._ensure_current_in_list(record)
+            self.save()
+            return True
         if not record.get("started_at"):
             record["started_at"] = _now_iso()
         if not (record.get("title") or "").strip() or record.get("title") == "新对话":
             record["title"] = _make_title(messages, record.get("summary"))
         record["updated_at"] = _now_iso()
-        record["recent"] = _copy_messages(messages[-self.keep_last_rounds * 2 :])
+        record["recent"] = _copy_messages(tail)
         self._ensure_current_in_list(record)
         self.save()
         return True
@@ -653,7 +683,11 @@ class ConversationSummaryStore:
             return False
         record["summary"] = _truncate_summary(new_summary.strip())
         record["turns_summarized"] += len(old_turns)
-        record["updated_at"] = _now_iso()
+        # 第三轮 #4：总结不加消息，已有 updated_at 的不碰（时间是最后一条
+        # 消息的时间，不是总结的时间）；新记录还没有时间时才补一个
+        # （这就是它第一批消息的时间，不然它在列表里排不到前面）。
+        if not record.get("updated_at"):
+            record["updated_at"] = _now_iso()
         if not record.get("started_at"):
             record["started_at"] = record["updated_at"]
         if not (record.get("title") or "").strip() or record.get("title") == "新对话":
@@ -705,7 +739,10 @@ class ConversationSummaryStore:
             return False
         record["summary"] = _truncate_summary(new_summary.strip())
         record["turns_summarized"] += len(messages)
-        record["updated_at"] = _now_iso()
+        # 第三轮 #4：同上，总结不加消息，已有 updated_at 的不碰；
+        # 新记录还没有时间时才补一个（第一批消息的时间）。
+        if not record.get("updated_at"):
+            record["updated_at"] = _now_iso()
         if not record.get("started_at"):
             record["started_at"] = record["updated_at"]
         if not (record.get("title") or "").strip() or record.get("title") == "新对话":

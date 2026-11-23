@@ -7,6 +7,8 @@
 # delete_due_memories。行为与 fix/memory-decay 分支（e6d82dc）一致，
 # 合并时以那边已测过的版本为准。
 
+import json
+import re
 from datetime import datetime, timezone
 
 from memory.timeutil import _parse_created_at
@@ -44,9 +46,15 @@ DECAY_DORMANT_WEIGHT = 0.30
 DECAY_DORMANT_IDLE_DAYS = 30
 DECAY_DELETE_IDLE_DAYS = 180
 DECAY_PROMOTION_DAYS = 3
+DECAY_PROMOTION_SESSIONS = 3  # 晋升要的会话数：和天数一样，3 个不同会话
 DECAY_STATE_VERBATIM = "verbatim"
 DECAY_STATE_DORMANT = "dormant"
+DECAY_STATE_DELETE_DUE = "decay_delete_due"
 DECAY_DELETE_BACKUP_PREFIX = "decay-delete-backup-"
+# 未确认权重封顶（补丁 4，第二层）：没经过 BOOS 确认的记忆权重
+# 升不到最高——错的也爬不上去。初始值 0.80，以后按回测调（BOOS 定：
+# 衰减参数有了真实数据再调，封顶值也是参数，先不动它）。
+UNCONFIRMED_WEIGHT_CAP = 0.80
 
 
 def _decay_now_dt(now=None):
@@ -130,6 +138,20 @@ def decay_weight(kind, last_used_at, now=None, is_core=False):
     return max(DECAY_WEIGHT_FLOOR, min(1.0, weight))
 
 
+def effective_weight(kind, last_used_at, now=None, is_core=False,
+                     user_confirmed=False):
+    """一条记忆实际用的权重：衰减权重再过一道未确认封顶。
+
+    没经过 BOOS 确认的记忆（user_confirmed=False），权重最高只到
+    UNCONFIRMED_WEIGHT_CAP（0.80），升不到 1.0——错的也爬不上去
+    （补丁 4 第二层）。已确认的、核心的照常满格。权重只管排位，
+    不管“能不能搜到”，和 decay_weight 一个规矩。"""
+    weight = decay_weight(kind, last_used_at, now, is_core=is_core)
+    if is_core or user_confirmed:
+        return weight
+    return min(weight, UNCONFIRMED_WEIGHT_CAP)
+
+
 def promotion_reached(seen_days):
     """一次性经历在不同天出现够 3 次没有——够了就晋升成稳定事实。
     seen_days 不是整数、或没数过时按没够算。"""
@@ -140,17 +162,33 @@ def promotion_reached(seen_days):
     )
 
 
-def decay_should_go_dormant(kind, last_used_at, now=None, is_core=False):
+def decay_should_go_dormant(kind, last_used_at, now=None, is_core=False,
+                             is_curated=False):
     """这条记忆该标沉底了吗：30 天没人找，且权重已经掉到 0.30 下面。
-    核心记忆永远不标；没时间的老记忆不标（闲了多久都算不出来）。
-    只判“该不该打标”，标了也只是打标——原话和文本都不动（见
-    sweep_monthly）。"""
-    if is_core:
+    核心记忆永远不标；精选清单（curated）的记忆也不沉底（2026-11-20，
+    最重要的记忆常年待在常用层）；没时间的老记忆不标（闲了多久都算
+    不出来）。只判“该不该打标”，标了也只是打标——原话和文本都不动
+    （见 sweep_monthly）。"""
+    if is_core or is_curated:
         return False
     idle = _decay_idle_days(last_used_at, now)
     if idle is None or idle < DECAY_DORMANT_IDLE_DAYS:
         return False
     return decay_weight(kind, last_used_at, now, is_core=False) < DECAY_DORMANT_WEIGHT
+
+
+def decay_state(kind, last_used_at, now=None, is_core=False, is_curated=False):
+    """这条记忆现在该是什么状态（2026-11-22 接线用）：
+    decay_delete_due（180 天没人找）> dormant（30 天没人找且权重 < 0.30）
+    > verbatim（原话态）。只判状态、不删不改——核心记忆和精选记忆
+    永远是 verbatim（见 decay_should_delete / decay_should_go_dormant）。
+    180 天的先判：它同时也满足沉底条件，待删优先。"""
+    if decay_should_delete(last_used_at, now=now, is_core=is_core):
+        return DECAY_STATE_DELETE_DUE
+    if decay_should_go_dormant(kind, last_used_at, now=now, is_core=is_core,
+                                is_curated=is_curated):
+        return DECAY_STATE_DORMANT
+    return DECAY_STATE_VERBATIM
 
 
 def decay_should_delete(last_used_at, now=None, is_core=False):
@@ -163,3 +201,89 @@ def decay_should_delete(last_used_at, now=None, is_core=False):
     if idle is None:
         return False
     return idle >= DECAY_DELETE_IDLE_DAYS
+
+
+# ---------- 出现集合：不同天、不同会话的计数（2026-11-19） ----------
+# 晋升“一次性经历在不同天、不同会话出现 3 次”要数得清：一次聊天里
+# 说 3 遍不算、三次聊天各说一遍才算，跨午夜但同一轮也不算——只数天数
+# 分不出来，得把“出现过哪几天、出现过哪几轮”都记下来。
+# 存法：Chroma 只接受标量 metadata 值，dict/list 直接存会炸（和
+# evidence 一个做法），所以两个集合都以 JSON 字符串存（见
+# _dump_seen_list），读回来再解析（见 _parse_seen_list）。
+# 下面全是纯函数（只算、不读库、不写库），和本文件其他函数一样。
+
+
+def _parse_seen_list(value):
+    """把出现集合读回列表：库里的 JSON 字符串、规整后的列表都认；
+    别的、坏的都按空算。只认非空字符串，去重后按原序返回。"""
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, str) and item and item not in out:
+                out.append(item)
+        return out
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+        if isinstance(parsed, list):
+            return _parse_seen_list(parsed)
+    return []
+
+
+def _dump_seen_list(values):
+    """出现集合写回 metadata 的写法：JSON 字符串。去重、排序后写，
+    读回来和写进去的样子一致。"""
+    seen = []
+    for item in values or []:
+        if isinstance(item, str) and item and item not in seen:
+            seen.append(item)
+    return json.dumps(sorted(seen), ensure_ascii=False)
+
+
+def record_seen_occurrence(seen_dates, seen_sessions, today, turn_id):
+    """一次“出现”记进两个集合，返回 (新日期列表, 新会话列表, 日期是新加的)。
+
+    计数规矩（2026-11-19，BOOS 定，写代码时分清）：
+    - 同一轮里说几遍都只算一次：turn_id 已经在会话集合里，这次什么都不加；
+    - 新日期且新会话才 +1：会话是新的，才把 turn_id 加进会话集合；
+      日期是新的，才把今天加进日期集合；
+    - 跨午夜但同一轮不算：日期变了、会话没变——会话集合里已经有它，
+      日期也不加（每个会话最多贡献 1 次）。
+    turn_id 没传（老路子、没轮次信息）时只按日期数：今天不在日期
+    集合里就加上，会话集合不动——老记忆、老调用方照常能晋升。
+    today 不是 YYYY-MM-DD 时什么都不加（不猜今天）。"""
+    dates = _parse_seen_list(seen_dates)
+    sessions = _parse_seen_list(seen_sessions)
+    if not isinstance(today, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", today):
+        return dates, sessions, False
+    if isinstance(turn_id, str) and turn_id:
+        if turn_id in sessions:
+            return dates, sessions, False
+        sessions.append(turn_id)
+        if today not in dates:
+            dates.append(today)
+            return sorted(dates), sorted(sessions), True
+        return sorted(dates), sorted(sessions), False
+    if today not in dates:
+        dates.append(today)
+        return sorted(dates), sorted(sessions), True
+    return sorted(dates), sorted(sessions), False
+
+
+def should_promote(seen_dates, seen_sessions, is_core=False, tone=None):
+    """这条记忆该晋升成稳定事实了吗：出现过的自然日 ≥3 且出现过的
+    会话 ≥3，且不是核心记忆（核心记忆本来就是稳定事实，不用晋升）。
+    seen_dates / seen_sessions 传集合、列表或库里的 JSON 字符串都行。
+    tone（补丁 3）：玩笑 / 测试 / 假设打标的记忆不晋升——打标的记忆
+    照常存、照常能搜，但不算进晋升次数；没打标（None）按认真算。
+    只判“该不该晋升”，晋升本身（改 kind、记 PROMOTE 事件）是调用方
+    的事（见 Mem0Store._decay_touch）。"""
+    if is_core:
+        return False
+    if tone in ("joke", "test", "hypothesis"):
+        return False
+    dates = _parse_seen_list(seen_dates)
+    sessions = _parse_seen_list(seen_sessions)
+    return len(dates) >= DECAY_PROMOTION_DAYS and len(sessions) >= DECAY_PROMOTION_SESSIONS

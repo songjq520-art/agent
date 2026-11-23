@@ -115,7 +115,7 @@ FLASH_MODEL = MODEL_CONFIG["deepseek"]["model"]
 #     原来“一两句就够”太干巴，显得没展开；结论在前的好习惯留着，
 #     后面把道理说清楚，别啰嗦）；
 #   47 号：第 7 条，日期不许编（30 号的日期注入是地基，这条是死规矩）。
-#   45 号：第 8 条，长期记忆用记忆工具——先列出全部再动手，改/删过确认卡，
+#   45 号：第 8 条，长期记忆用记忆工具——先列出全部再动手，改直接改、删过确认卡，
 #     记新事只有 BOOS 明确说“记住”时才调。
 #   50/54 号：第 10 条在 build_loop_system_message 里现加（数字-日期对照），
 #     LOOP_SYSTEM_MESSAGE 本身不动（测试直接拿它拼消息）。
@@ -147,8 +147,9 @@ LOOP_SYSTEM_MESSAGE = (
     "6. 先给结论，再给必要的解释；结论在前，把道理说清楚，别啰嗦。\n"
     "7. 日期不许编：没给日期就说不知道，不许凭自己的“现在”推断日期。\n"
     "8. BOOS 让你看/改/删长期记忆时，用记忆工具：先调 list_memories 列出全部"
-    "再动手，别只凭提问前检索到的几条就改删；改和删要先过确认卡"
-    "（BOOS 点了确认才执行），别自己悄悄改删；删记忆时把 BOOS 原话里的"
+    "再动手，别只凭提问前检索到的几条就改删；改直接改、改完告诉 BOOS"
+    "改了什么，删要先过确认卡（BOOS 点了确认才执行），别自己悄悄删；"
+    "删记忆时把 BOOS 原话里的"
     "删除目标写进 anchor_text（比如他说“删掉鸡杂面”时 anchor_text 就是"
     "“鸡杂面”），程序核对过挑的这条原文里有 anchor 才建卡，对不上、没找到时"
     "先问清楚，别自己挑一条；记新事：BOOS 明确表达的事实/偏好/决定/习惯"
@@ -236,6 +237,15 @@ def build_loop_system_message():
         "提取所得、待定区里的推断只是“可能”，不是 BOOS 说过的话；BOOS 明确让"
         "你做的事（比如恢复一条删掉的记忆），就算和某条推断对不上，也照做，"
         "拿不准就问他，别自己下结论说“不行”。"
+        "\n16. 删记忆别问得太烦（第三轮 #6）：BOOS 说“删掉 XX”时，一句话说清范围"
+        "（删哪几条）、一次调 delete_memory 或 delete_memories、等一张确认卡，"
+        "完事；别在聊天里把候选一条一条列出来问、别反复确认“是不是全部”。"
+        "他说“全部删掉”就一次批量删，不用再问“是不是全部”；只有程序说 anchor"
+        "对不上、找不到时才问。"
+        "\n17. 删完照实报（第三轮 #7）：删除工具返回里有 remaining_count"
+        "（还剩几条同目标的）和 remaining_texts（剩的是哪几条），按它报——"
+        "剩 0 条时才能说“都清干净了”，还剩时要说“删了 X 条，还剩 Y 条：……”；"
+        "没调工具、没看到结果时别说删完了。"
     )
 
 
@@ -309,6 +319,96 @@ _TOOL_LABELS = {
 def _tool_label(tool_name):
     """工具名的中文说法（进度显示用）。"""
     return _TOOL_LABELS.get(tool_name or "", tool_name or "工具")
+
+
+
+def _is_correction_delete(user_text, target_text):
+    """判断一次删除调用是不是“纠正伪装的删除”（2026-11-23 R2 后续②）。
+
+    用户这句话是在纠正旧说法（带新说法，如“不对，我喜欢吃面条”）
+    且删除目标正是要被取代的旧记忆时，返回 True。真正的删除意图
+    （如“忘记这个”，没有新说法可取代）返回 False，删除照常走。
+    判定：先看纠正检测能不能从用户话里取出新说法；再看删除目标
+    是不是同槽位（住处/名字等），或新说法与目标都是偏好类记忆
+    （含喜欢/爱吃……或改吃/只吃类标记）。
+    """
+    if not isinstance(user_text, str) or not user_text.strip():
+        return False
+    if not isinstance(target_text, str) or not target_text.strip():
+        return False
+    from memory.correction_text import _detect_correction, _infer_fact_slot
+
+    detected = _detect_correction(user_text)
+    if detected is None:
+        return False
+    fact = (detected.get("fact") or "").strip()
+    if not fact:
+        return False
+    fact_slot, _ = _infer_fact_slot(fact)
+    target_slot, _ = _infer_fact_slot(target_text)
+    if fact_slot is not None and fact_slot == target_slot:
+        return True
+    from memory.sqlite_store import (
+        _JUDGE_CHANGE_MARKERS,
+        _JUDGE_PREFERENCE_MARKERS,
+    )
+
+    fact_pref = any(m in fact for m in _JUDGE_PREFERENCE_MARKERS) or any(
+        m in fact for m in _JUDGE_CHANGE_MARKERS
+    )
+    target_pref = any(m in target_text for m in _JUDGE_PREFERENCE_MARKERS)
+    return bool(fact_pref and target_pref)
+
+
+def _intercept_correction_delete(task, tool_name, args, tool_call_id):
+    """纠正抢占拦截：本轮是纠正时，删除工具不抢先（2026-11-23 R2 后续②）。
+
+    模型在纠正轮里调 delete_memory/delete_memories 会弹确认卡，
+    纠正路被抢占、纠正本身还来不及存。拦截后返回一个“已处理”的
+    工具结果，告诉模型旧记忆会在保存时由新说法自动取代、直接按
+    新说法回答，不要再调删除。不是纠正轮、或删除目标与纠正无关时
+    返回 None，不拦截，删除照常走确认卡。
+    返回的零件包与 _run_tool_call 其余分支同形。
+    """
+    goal = (task or {}).get("goal") or ""
+    if tool_name == "delete_memory":
+        texts = [(args or {}).get("text") or (args or {}).get("anchor_text") or ""]
+    elif tool_name == "delete_memories":
+        items = (args or {}).get("items") or []
+        texts = [((item or {}).get("text") or "") for item in items]
+    else:
+        return None
+    texts = [t for t in texts if t.strip()]
+    if not texts:
+        return None
+    if not all(_is_correction_delete(goal, t) for t in texts):
+        return None
+    from memory.correction_text import _detect_correction
+
+    fact = ((_detect_correction(goal) or {}).get("fact") or "").strip()
+    logger.info("纠正轮删除拦截：目标=%s 新说法=%s", texts, fact)
+    return {
+        "outcome": "done",
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "content": (
+            "不用删除：用户这句话是在纠正旧说法"
+            + (f"，新说法是“{fact}”" if fact else "")
+            + "，旧记忆会在保存时自动被新说法取代。"
+              "你直接按新说法回答，不要再调用删除工具。"
+        ),
+        "record": {
+            "tool": tool_name,
+            "args": args,
+            "tool_call_id": tool_call_id,
+            "status": "ok",
+        },
+        "approval": None,
+        "failure_key": None,
+        "failure_increment": 0,
+        "search_args": None,
+        "search_result": None,
+    }
 
 
 class AgentLoop:
@@ -833,6 +933,50 @@ class AgentLoop:
         return self._finish(task, messages, final_text,
                             tool_calls_made, total_cost, cost_unknown, timer)
 
+    @staticmethod
+    def _delete_target_key(tool_name, args):
+        """一次删除的目标键（2026-11-21 网页测第二轮 #5）：同记忆的
+        删除确认卡去重用。单条删按核对过的 memory_id 认；批量删按
+        一组 id（排过序）认。认不出来时返回 None（不去重）。"""
+        args = args or {}
+        if tool_name == "delete_memory":
+            mid = (args.get("memory_id") or "").strip()
+            return ("delete_memory", mid) if mid else None
+        if tool_name == "delete_memories":
+            items = args.get("items") or []
+            if not isinstance(items, list):
+                return None
+            ids = sorted(
+                {(item or {}).get("memory_id") or "" for item in items
+                 if isinstance(item, dict)}
+            )
+            ids = [i for i in ids if i]
+            return ("delete_memories", tuple(ids)) if ids else None
+        return None
+
+    def _find_waiting_delete_approval(self, tool_name, args):
+        """找一张等确认中的、同一个删除目标的确认卡（#5）。
+
+        只在 delete_memory、delete_memories 上找；别的工具不去重。
+        读不到等确认列表时返回 None（不拦路，该建卡照样建）。
+        """
+        target = self._delete_target_key(tool_name, args)
+        if target is None:
+            return None
+        try:
+            waiting = self.task_store.list_waiting()
+        except Exception:
+            return None
+        for task in waiting or []:
+            approval = (task or {}).get("approval") or {}
+            if approval.get("tool") != tool_name:
+                continue
+            if self._delete_target_key(
+                tool_name, approval.get("args") or {}
+            ) == target:
+                return approval
+        return None
+
     def _run_tool_call(self, task, call, failures):
         """跑一次工具调用（只算、不改共享状态）。
 
@@ -946,6 +1090,16 @@ class AgentLoop:
                     "search_result": None,
                 }
 
+        # 2026-11-23 R2 后续②：纠正轮里模型调删除会弹确认卡、抢占纠正路。
+        # 先拦截：是纠正就直接回“已处理”，不进网关、不弹卡；不是纠正
+        # 才走正常删除流程。
+        if tool_name in ("delete_memory", "delete_memories"):
+            intercepted = _intercept_correction_delete(
+                task, tool_name, args, tool_call_id
+            )
+            if intercepted is not None:
+                return intercepted
+
         outcome = self.gateway.execute(
             tool_name, args,
             task_id=task["task_id"],
@@ -955,6 +1109,39 @@ class AgentLoop:
             run_id=task.get("run_id"),
         )
         if outcome["decision"] == "needs_approval":
+            # 2026-11-21 网页测第二轮 #5：同一次删除只弹一张卡——
+            # 同一个记忆的删除确认卡已经在等 BOOS 点了（别的轮次建的，
+            # 还没点），模型又调一次同样的删除时，不再建一张新卡：
+            # 新 approval 直接丢掉（还没存盘，不留痕），告诉模型等
+            # 那张旧卡就行。旧卡点了就删，不用再问一次。
+            # 只认等确认中的卡（list_waiting）：已经点过/取消/过期的
+            # 不算；同任务内刚确认完的也不算（那张卡已经执行过了，
+            # 再调同样的删除时 precheck 会按“库里没找到”拦下来）。
+            existing = self._find_waiting_delete_approval(
+                tool_name, (outcome.get("approval") or {}).get("args") or {}
+            )
+            if existing is not None:
+                _new_args = (outcome.get("approval") or {}).get("args") or {}
+                _target_text = (
+                    _new_args.get("text") or _new_args.get("anchor_text") or ""
+                )
+                return {
+                    "outcome": "skipped",
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "content": (
+                        "删除"
+                        + (f"“{_target_text}”" if _target_text else "这条记忆")
+                        + "的确认卡已经在等 BOOS 确认了，不用再建一张，"
+                        "等他点了那张卡就删。"
+                    ),
+                    "record": None,
+                    "approval": None,
+                    "failure_key": None,
+                    "failure_increment": 0,
+                    "search_args": None,
+                    "search_result": None,
+                }
             # 在等确认：先把确认记录存进任务（调用方 _wait_approval 会存盘），
             # 本轮的 tool 消息先不补——恢复时再按确认结果补。
             return {

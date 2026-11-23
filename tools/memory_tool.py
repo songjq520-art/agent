@@ -7,8 +7,9 @@
 #       ContextVar 绑记忆库（每轮/每次请求有自己的绑定，不串线），
 #       register_memory_tools() 登记四个工具，网关按登记执行。
 #       列是只读（low、不确认）；记是 BOOS 当轮明确让记的（medium、
-#       不确认，和“记住”直存同一条路）；改和删是 medium、要确认——
-#       模型调了先弹确认卡，BOOS 点了确认才执行，取消了就不执行。
+#       不确认，和“记住”直存同一条路）；改是 medium、不确认（纠正直接
+#       改，改完告诉 BOOS 改了什么）；删是 medium、要确认——模型调了先
+#       弹确认卡，BOOS 点了确认才执行，取消了就不执行。
 #       删的守卫（mem0_store.delete_memory 的三道关：归属校验、
 #       BOOS 同意、验干净）一个不少——工具里 approve=True 只是
 #       “网关确认过了”的意思，确认卡没点之前网关根本不会调到这里；
@@ -23,6 +24,7 @@
 #       绑传进来的库；没绑时工具报“记忆库没启用”，不崩、不瞎编。
 
 import contextvars
+import re
 
 from memory.money_slots import extract_core_slots
 from memory.redaction import _normalize_memory_text
@@ -337,6 +339,38 @@ def _check_delete_anchor(args):
         )
     norm_anchor = _norm_anchor_text(anchor)
     matches = _find_anchor_matches(store, anchor)
+    # 2026-11-21 网页测第二轮 #6：id 和原文由程序带，不靠模型现抄——
+    # 模型只要给 anchor（用户原话里的删除目标），id 和原文程序按库里
+    # 的原文现找、现填进 augment，网关会把填好的这份存进确认卡，
+    # 确认后执行用的也是它。模型抄错/抄漏 id 就再也不会删失败。
+    # 只在“能唯一认出是哪条”时才填：模型给的原文恰好对上一条候选
+    # 时按原文认（id 抄错了也能纠回来）；id 和原文都没给、anchor
+    # 恰好只有一个字面命中时按 anchor 认。多条对得上、或模型给的
+    # id/原文指向一条已经不在库里的条目时，不替它猜——走原来的报错，
+    # 让模型/BOOS 挑（57 号锚点校验原样保留）。
+    filled = {}
+    filled_how = ""
+    direct = [
+        (mid, cand_text)
+        for mid, cand_text in matches
+        if norm_anchor in _norm_anchor_text(cand_text)
+    ]
+    text_hits = [
+        (mid, cand_text)
+        for mid, cand_text in matches
+        if _same_text(cand_text, text)
+    ]
+    if len(text_hits) == 1:
+        target_id, target_text = text_hits[0]
+        if memory_id != target_id or not _same_text(text, target_text):
+            filled = {"memory_id": target_id, "text": target_text}
+            filled_how = "text"
+            memory_id, text = target_id, target_text
+    elif not memory_id and not (text or "").strip() and len(direct) == 1:
+        target_id, target_text = direct[0]
+        filled = {"memory_id": target_id, "text": target_text}
+        filled_how = "anchor"
+        memory_id, text = target_id, target_text
     guard = guard_memory_target("delete", memory_id, anchor, matches)
     if not guard["ok"]:
         if not matches:
@@ -390,7 +424,12 @@ def _check_delete_anchor(args):
             f"另外还有 {len(copies)} 条同一句话的副本：{shown}{more}"
             "确认后会和这一条一起删掉。"
         )
-    return None, {"_anchor_match": note}
+    if filled:
+        if filled_how == "text":
+            note += "（你给的 id 对不上这条，程序按原文把它补上了。）"
+        else:
+            note += "（id 和原文都没给，程序按 anchor 找到唯一的一条补上了。）"
+    return None, {**filled, "_anchor_match": note}
 
 
 def _check_update_anchor(args):
@@ -485,37 +524,108 @@ def _run_list_memories(args):
     }
 
 
+# “记住”直存时模型可能在句尾补一个日期标注（第三轮 #8）：
+# “后天要去体检（2026-11-24，周二）”——剥掉它再存，存的是原文本身。
+_ADD_DATE_ANNOTATION_RE = re.compile(
+    r"[（(]\d{4}-\d{2}-\d{2}[，,、\s]*周[一二三四五六日][）)]\s*$"
+)
+
+
 def _run_add_memory(args):
     """往长期记忆里加一条 BOOS 明确让记的事（add_memory_text 直存，
-    来源记 user、已确认，自带去重）。返回 {memory_id, text, duplicate}
-    （duplicate 表示库里已经有同一条，没重复存）。"""
+    来源记 user、已确认）。返回 {memory_id, text, duplicate}
+    （duplicate 表示库里已经有同一条，没重复存）。
+
+    2026-11-21 网页测第三轮 #8：原来这里读 (result).get("results")，
+    但 SQLite 的 add_memory_text 返回 {"id", "memory", "event"}，
+    根本没有 "results"——于是每次存成功都谎报“没存进去”。
+    现在按 event 读：ADD 是真存了，UNCHANGED 是库里已有的同一条
+    （不重复存），SENSITIVE 是含敏感信息被拦了，{} 才是真失败。
+    另外两道安全网：句尾的日期标注先剥掉再存；同文已在库里时
+    直接报 duplicate，不重复存（add_memory_text 的去重只认 key，
+    不认同文——同一句话换个时间存，key 就不一样）。
+    """
     store, error = _store_or_error()
     if error is not None:
         return error
     text = ((args or {}).get("text") or "").strip()
     if not text:
         return {"ok": False, "data": None, "error": "要记的内容是空的，没法记。"}
+    text = _ADD_DATE_ANNOTATION_RE.sub("", text).strip()
+    if not text:
+        return {"ok": False, "data": None, "error": "要记的内容是空的，没法记。"}
+    # 同文已在库里：直接报 duplicate，不重复存。
     try:
-        result = store.add_memory_text(text, source="user")
+        copies = _live_copies_of_text(store, text)
+    except Exception:  # noqa: BLE001 - 读库失败不拦路，交给下面的直存
+        copies = []
+    if copies:
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": copies[0][0],
+                "text": text,
+                "duplicate": True,
+            },
+            "error": None,
+        }
+    try:
+        result = store.add_memory_text(text, source="user",
+                                       semantic_judge=True)
     except Exception as exc:  # noqa: BLE001 - 存失败也算执行失败
         return {"ok": False, "data": None, "error": f"存记忆失败：{exc}"}
-    results = (result or {}).get("results") or []
-    if not results:
+    # mem0 那条路的旧形状（{"results": [...]}）还留着兼容。
+    if isinstance((result or {}).get("results"), list):
+        results = result.get("results") or []
+        if not results:
+            return {
+                "ok": False,
+                "data": None,
+                "error": "没存进去（可能内容脱敏后什么都不剩，或存的时候出了问题）。",
+            }
+        first = results[0] or {}
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": first.get("id"),
+                "text": text,
+                "duplicate": bool((result or {}).get("duplicate")),
+            },
+            "error": None,
+        }
+    event = (result or {}).get("event")
+    if event == "ADD":
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": (result or {}).get("id"),
+                "text": text,
+                "duplicate": False,
+            },
+            "error": None,
+        }
+    if event == "UNCHANGED":
+        return {
+            "ok": True,
+            "data": {
+                "memory_id": (result or {}).get("id"),
+                "text": text,
+                "duplicate": True,
+            },
+            "error": None,
+        }
+    if event == "SENSITIVE":
         return {
             "ok": False,
             "data": None,
-            "error": "没存进去（可能内容脱敏后什么都不剩，或存的时候出了问题）。",
+            "error": "这条含敏感信息（密码/卡号/密钥之类），没存。",
         }
-    first = results[0] or {}
     return {
-        "ok": True,
-        "data": {
-            "memory_id": first.get("id"),
-            "text": text,
-            "duplicate": bool((result or {}).get("duplicate")),
-        },
-        "error": None,
+        "ok": False,
+        "data": None,
+        "error": "没存进去（可能内容脱敏后什么都不剩，或存的时候出了问题）。",
     }
+
 
 
 def _run_update_memory(args):
@@ -564,7 +674,11 @@ def _run_update_memory(args):
             "请先列出全部记忆，照原文再改。",
         }
     try:
-        outcome = store.correct_memory(stored_text, new_text)
+        # 模型按 BOOS 的话改记忆，是显式纠正：按槽位找目标，不走
+        # 相似度 0.70 阈值（2026-11-23 model fix #2）。
+        outcome = store.correct_memory(
+            stored_text, new_text, explicit_correction=True
+        )
     except Exception as exc:  # noqa: BLE001 - 改失败也算执行失败
         return {"ok": False, "data": None, "error": f"改记忆失败：{exc}"}
     status = (outcome or {}).get("status")
@@ -593,6 +707,25 @@ def _run_update_memory(args):
     return {"ok": False, "data": None, "error": reason}
 
 
+def _remaining_after_delete(store, anchor_text, deleted_text):
+    """删完后，库里还剩多少条和这次删除目标相关的记忆。
+
+    2026-11-21 网页测第三轮 #7：模型说“都清干净了”，其实 seq 137
+    “我的定投现在是什么情况”还剩着——删除工具没把剩余数告诉模型，
+    它只能凭空猜。anchor（比如“定投”）优先；没有 anchor 时按删掉的
+    那条原文认（同文副本）。返回 {"count": N, "texts": [前 5 条原文]}，
+    读库失败返回 0 条（不拦路，调用方照常报删完的数量）。
+    """
+    try:
+        if _norm_anchor_text(anchor_text):
+            texts = [t for _i, t in _find_anchor_matches(store, anchor_text)]
+        else:
+            texts = [t for _i, t in _live_copies_of_text(store, deleted_text)]
+    except Exception:  # noqa: BLE001 - 读库失败不拦路
+        return {"count": 0, "texts": []}
+    return {"count": len(texts), "texts": texts[:5]}
+
+
 def _run_delete_memory(args):
     """删一条长期记忆（深度删除：向量 + history 审计行都清掉）。
 
@@ -606,6 +739,17 @@ def _run_delete_memory(args):
     store, error = _store_or_error()
     if error is not None:
         return error
+    # 57 号：执行前再验一次 anchor（确认卡建好后库可能变了，防卡上的
+    # 条目在确认前被改掉/删掉）。precheck 已经验过一次，这里是第二道。
+    # 2026-11-21 网页测第二轮 #6：precheck 可能把程序核对过的 id/原文
+    # 填进了 augment（模型抄错/没给时）——先验、再拿填好的这份去查
+    # 范围、验原文，别再用模型原来那份。缺 id/原文的检查也放验后：
+    # anchor 唯一命中时 precheck 会填上，验前拦就把这条路堵死了。
+    anchor_error, _augment = _check_delete_anchor(args)
+    if anchor_error:
+        return {"ok": False, "data": None, "error": anchor_error}
+    if _augment:
+        args = {**args, **_augment}
     memory_id = (args or {}).get("memory_id") or ""
     text = (args or {}).get("text") or ""
     if not memory_id or not text.strip():
@@ -614,11 +758,6 @@ def _run_delete_memory(args):
             "data": None,
             "error": "删记忆要传 memory_id 和 text（列出来的原文），缺了没法删。",
         }
-    # 57 号：执行前再验一次 anchor（确认卡建好后库可能变了，防卡上的
-    # 条目在确认前被改掉/删掉）。precheck 已经验过一次，这里是第二道。
-    anchor_error, _augment = _check_delete_anchor(args)
-    if anchor_error:
-        return {"ok": False, "data": None, "error": anchor_error}
     try:
         scope = store.deletion_scope(memory_id)
     except Exception as exc:  # noqa: BLE001 - 读范围失败也算执行失败
@@ -662,6 +801,11 @@ def _run_delete_memory(args):
     # 用批量删 delete_memories，把每条 id 都列在确认卡上。
     extra_deleted = []
     extra_failed = []
+    # 第三轮 #7：删完核对一次还剩多少条同目标的，写进结果里，
+    # 模型才能照实报“还剩几条”，不能凭空说“都清干净了”。
+    remaining = _remaining_after_delete(
+        store, (args or {}).get("anchor_text") or "", stored_text
+    )
     return {
         "ok": True,
         "data": {
@@ -670,6 +814,8 @@ def _run_delete_memory(args):
             "history_cleared": (scope or {}).get("history_count") or 0,
             "extra_deleted": extra_deleted,
             "extra_failed": extra_failed,
+            "remaining_count": remaining["count"],
+            "remaining_texts": remaining["texts"],
         },
         "error": None,
     }
@@ -985,10 +1131,19 @@ def _run_delete_memories(args):
             )
             continue
         deleted.append({"memory_id": memory_id, "text": stored_text})
+    # 第三轮 #7：同单删，删完核对一次还剩多少条同目标的。
+    remaining = _remaining_after_delete(
+        store, (args or {}).get("anchor_text") or "", ""
+    )
     if failed:
         return {
             "ok": False,
-            "data": {"deleted": deleted, "failed": failed},
+            "data": {
+                "deleted": deleted,
+                "failed": failed,
+                "remaining_count": remaining["count"],
+                "remaining_texts": remaining["texts"],
+            },
             "error": (
                 f"删了 {len(deleted)} 条，还有 {len(failed)} 条没删成："
                 + "；".join(
@@ -999,7 +1154,12 @@ def _run_delete_memories(args):
         }
     return {
         "ok": True,
-        "data": {"deleted": deleted, "failed": []},
+        "data": {
+            "deleted": deleted,
+            "failed": [],
+            "remaining_count": remaining["count"],
+            "remaining_texts": remaining["texts"],
+        },
         "error": None,
     }
 
@@ -1034,8 +1194,9 @@ def _register_one(name, description, parameters, output, risk_level,
 def register_memory_tools():
     """把记忆管理工具登记进工具注册表（已登记过时什么都不做，
     重复调不会报错）。列是只读（low、不确认、可重跑）；记是 BOOS
-    当轮明确让记的（medium、不确认、会改东西、不可重跑）；改和删
-    是 medium、要确认、会改东西、不可重跑——确认卡没点之前不执行，
+    当轮明确让记的（medium、不确认、会改东西、不可重跑）；改是
+    medium、不确认、会改东西、不可重跑（纠正直接改，改完告诉 BOOS）；
+    删是 medium、要确认、会改东西、不可重跑——确认卡没点之前不执行，
     执行过一次也绝不重执行（恢复时喂存下来的结果）。恢复和批量删
     和单条删同一条规矩：要确认、会改东西、不可重跑；列已删是只读。"""
     _register_one(
@@ -1095,12 +1256,12 @@ def register_memory_tools():
     _register_one(
         name="update_memory",
         description=(
-            "改一条长期记忆里的说法。先调 list_memories 列出全部，找到要改的"
+            "改一条长期记忆里的说法（纠正）。先调 list_memories 列出全部，找到要改的"
             "那条，把 memory_id、old_text（列出来的旧原文，一字不差地抄）、"
             "new_text（新说法）一起传来；旧原文对不上库里的就不改。"
-            "程序会先核对：挑的这条原文和 old_text 完全一致才建确认卡，"
-            "对不上、多条候选挑的不是唯一精确的那条时直接拒绝、不建卡；"
-            "改之前会先弹确认卡，BOOS 点了确认才执行，取消了就不改。"
+            "程序会先核对：挑的这条原文和 old_text 完全一致才改，"
+            "对不上、多条候选挑的不是唯一精确的那条时直接拒绝；"
+            "改完直接生效，不用等确认——改完要告诉 BOOS 改了什么（旧说法改成新说法）。"
             "返回 {memory_id, old_text, new_text}。"
         ),
         parameters={
@@ -1136,7 +1297,7 @@ def register_memory_tools():
             "失败时 ok 为 false，error 里写原因。"
         ),
         risk_level="medium",
-        needs_confirmation=True,
+        needs_confirmation=False,
         func=_run_update_memory,
         replay_safe=False,
         side_effect_free=False,
@@ -1150,7 +1311,9 @@ def register_memory_tools():
             "删一条长期记忆。先调 list_memories 列出全部，找到要删的那条，"
             "把 memory_id、text（列出来的原文，一字不差地抄）和 anchor_text"
             "（用户原话里的删除目标，比如 BOOS 说“删掉鸡杂面”时 anchor_text"
-            "就是“鸡杂面”）一起传来；原文对不上库里的就不删。"
+            "就是“鸡杂面”）一起传来；id 和原文不填也行——程序按 anchor_text"
+            "在库里找唯一的一条自动填，填错了程序按库里的原文纠正，"
+            "不用重新抄；原文对不上库里的就不删。"
             "程序会先核对 anchor：挑的这条原文里含 anchor 才建确认卡，"
             "对不上、没找到时直接拒绝、不建卡；库里还有别的提到 anchor 的，"
             "卡上会注明，确认删的是这一条；"
@@ -1165,13 +1328,11 @@ def register_memory_tools():
             "properties": {
                 "memory_id": {
                     "type": "string",
-                    "description": "要删的那条记忆的 id（list_memories 里拿到的）",
-                    "minLength": 1,
+                    "description": "要删的那条记忆的 id（list_memories 里拿到的）；不填也行，程序按 anchor_text 找唯一的一条填；填错了程序按原文纠正",
                 },
                 "text": {
                     "type": "string",
-                    "description": "列出来的原文，一字不差地抄",
-                    "minLength": 1,
+                    "description": "列出来的原文，一字不差地抄；不填也行，程序按 anchor_text 找唯一的一条填；填错了程序按库里的原文纠正",
                     "maxLength": 1000,
                 },
                 "anchor_text": {
@@ -1186,7 +1347,7 @@ def register_memory_tools():
                     "maxLength": 500,
                 },
             },
-            "required": ["memory_id", "text", "anchor_text"],
+            "required": ["anchor_text"],
         },
         output=(
             "成功时 data 是 {memory_id, text, history_cleared}；"

@@ -121,6 +121,25 @@ DEFAULT_MODEL = "deepseek"
 # GPT 是远期主控候选，目前不接入。
 CONTROLLER = "deepseek"  # 第一任主控
 
+# SEMANTIC_JUDGE（语义判官配置，2026-11-22 混合法，BOOS 定）：
+#   程序判不定的记忆语义问题（推不出槽位的偏好、纠正候选分不清等）
+#   问大模型判官。判官是“判官”不是“主控”：什么情况下问、问不问，
+#   由十二本地程序按程序算出的触发条件决定（见
+#   memory/sqlite_store.py 的 _needs_semantic_judge），模型只负责判。
+#   provider / model 都能换：改这里（或环境变量 SHIER_JUDGE_PROVIDER /
+#   SHIER_JUDGE_MODEL）就能换模型，不用改判断代码；现在只有 deepseek
+#   接上了（默认 deepseek-flash，便宜又快），gpt / gemini / grok
+#   接上后（MODEL_CONFIG 里 enabled=True、model 填好、Key 到位）
+#   在这里改个值就能切过去。没接好的模型会被判官分发层拒绝，
+#   调用方按程序 fallback 走，不崩。
+SEMANTIC_JUDGE = {
+    "provider": os.environ.get("SHIER_JUDGE_PROVIDER", "deepseek"),
+    "model": os.environ.get("SHIER_JUDGE_MODEL", "deepseek-flash"),
+    # 单次判断的输出上限（Token）：判官只回一行 JSON，300 足够，
+    # 也把输出成本封顶（flash 输出 $0.60/M，300 Token 约 $0.0002）。
+    "max_tokens": 300,
+}
+
 # ---------- 预算配置 ----------
 MONTHLY_BUDGET_USD = 5.0  # 每月工具账本预算：5 美元（BOOS 2026-11-11 定：只算工具的钱）
 BUDGET_WARN_RATIO = 1.0  # 到预算 100%（$5）时才提醒，永不自动停（BOOS 2026-11-08 定）

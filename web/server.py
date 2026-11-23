@@ -99,10 +99,12 @@ import os
 import sys
 import threading
 import traceback
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+from datetime import date
 
 # 让直接运行 python web/server.py 也能找到项目根目录的 main.py、config.py。
 # 用 python -m web.server 运行时本来就不需要这一行，加上也不影响。
@@ -125,6 +127,9 @@ from memory.conversation_transcript import (  # noqa: E402
     message_fingerprint,
 )
 from memory.mem0_store import create_mem0_store  # noqa: E402
+from memory.redaction import _redact_sensitive  # noqa: E402
+from memory.correction_text import _infer_fact_slot  # noqa: E402
+from memory.sqlite_store import resolve_event_date  # noqa: E402
 
 logger = logging.getLogger("agent")
 
@@ -164,6 +169,148 @@ class ServerConfig:
         except ValueError:
             port = cls.port
         return cls(host=host, port=port)
+
+
+def _summarize_delete_texts(texts):
+    """删除确认卡里列出全部要删的记忆（第四轮 #5）：相同原文只列一次、
+    后面标 ×N；太长时把过长的原文截短，实在放不下才用“等 N 条”收尾。"""
+    counts = []
+    seen = {}
+    for text in texts:
+        if text in seen:
+            counts[seen[text]][1] += 1
+        else:
+            seen[text] = len(counts)
+            counts.append([text, 1])
+
+    def _piece(text, n, limit=None):
+        shown = text if limit is None or len(text) <= limit else text[:limit] + "…"
+        return f"「{shown}」" if n == 1 else f"「{shown}」×{n}"
+
+    joined = "、".join(_piece(t, n) for t, n in counts)
+    if len(joined) <= 60:
+        return joined
+    joined = "、".join(_piece(t, n, 12) for t, n in counts)
+    if len(joined) <= 60:
+        return joined
+    kept = []
+    hidden = 0
+    for text, n in counts:
+        piece = _piece(text, n, 12)
+        if kept and len("、".join(kept)) + 1 + len(piece) > 55:
+            hidden += n
+            continue
+        kept.append(piece)
+    if hidden:
+        kept.append(f"等 {hidden} 条")
+    return "、".join(kept)
+
+
+def _human_approval_summary(tool, args):
+    """确认卡上的人话摘要（第三轮 #5）：卡上只显示一句话，不贴 JSON。
+
+    delete_memory：删除记忆「{text}」；delete_memories：删除 N 条记忆
+    （全部原文列出来，相同原文标 ×N，太长了再精简）；update_memory：把「old」改成「new」；
+    revive_memory：恢复记忆「{text}」。不认的工具给一句通用话。
+    """
+    args = args or {}
+    if tool == "delete_memory":
+        text = (args.get("text") or "").strip()
+        return f"删除记忆「{text}」" if text else "删除一条记忆"
+    if tool == "delete_memories":
+        items = args.get("items") or []
+        if not items:
+            return "删除多条记忆"
+        texts = [((item or {}).get("text") or "").strip() for item in items]
+        texts = [t for t in texts if t]
+        if not texts:
+            return f"删除 {len(items)} 条记忆"
+        if len(texts) == 1:
+            return f"删除记忆「{texts[0]}」"
+        return f"删除 {len(texts)} 条记忆：{_summarize_delete_texts(texts)}"
+    if tool == "update_memory":
+        old = (args.get("old_text") or "").strip()
+        new = (args.get("new_text") or "").strip()
+        if old and new:
+            return f"把记忆「{old}」改成「{new}」"
+        return "修改一条记忆"
+    if tool == "revive_memory":
+        text = (args.get("text") or "").strip()
+        return f"恢复记忆「{text}」" if text else "恢复一条已删记忆"
+    return "确认执行这个操作"
+
+
+def _clean_approval_args(args):
+    """确认卡上能给用户看的参数：去掉内部键（_ 开头）和 memory_id，
+    只留人能看懂的原文。确认执行时后端用存着的任务参数，不靠前端
+    传回来的这份，所以这里只做展示、不影响执行。items 里每条的
+    memory_id 也去掉。"""
+    if not isinstance(args, dict):
+        return args
+    out = {}
+    for key, value in args.items():
+        if str(key).startswith("_") or key == "memory_id":
+            continue
+        if isinstance(value, list):
+            value = [
+                {k: v for k, v in item.items() if k != "memory_id"}
+                if isinstance(item, dict)
+                else item
+                for item in value
+            ]
+        out[key] = value
+    return out
+
+
+def _redacted_messages(messages):
+    """显示层脱敏（第三轮 #9）：返回给页面的消息副本里，密码/卡号/
+    密钥这类敏感内容替换成“【已隐藏敏感信息】”，只改返回的副本，
+    不改内存里的历史和存着的记录。摘要卡本来就是脱敏过的，
+    气泡一直是明文——这里把气泡也补上。"""
+    out = []
+    for item in messages or []:
+        item = dict(item or {})
+        if isinstance(item.get("content"), str):
+            item["content"] = _redact_sensitive(item["content"])
+        out.append(item)
+    return out
+
+
+def _correction_reply_text(correction):
+    """纠正执行完后的确定性回复（2026-11-23 model fix #3，措辞）：
+    改好了就直接说“已经改好了”，不提确认、不事后反问“要不要改”。
+    correction 不是 updated 时返回 None（调用方保留模型原回复）。
+    模型回答是存记忆之前生成的，不知道纠正已经改好了，才会说
+    “等你确认后，我会把……存成新的说法”这种过时的话。"""
+    if not isinstance(correction, dict):
+        return None
+    if correction.get("status") != "updated":
+        return None
+    old_text = (correction.get("old_text") or "").strip()
+    new_text = (correction.get("new_text") or "").strip()
+    if old_text and new_text and old_text != new_text:
+        return f"已经改好了：把“{old_text}”改成了“{new_text}”。"
+    if new_text:
+        return f"已经改好了：{new_text}。"
+    return "已经改好了。"
+
+
+def _slot_conflict_reply_text(store, stored):
+    """无纠正词的新陈述存成新行、同槽旧行还在时的回复（2026-11-23
+    model fix #3，措辞）：只认记下了，不反问“要不要改”。
+    stored 是本轮存下的句子列表；没有同槽冲突时返回 None（调用方
+    保留模型原回复）。store 没有 _find_same_slot_conflicts 时返回 None。"""
+    for sent in stored or []:
+        slot, value = _infer_fact_slot(sent)
+        if slot is None:
+            continue
+        try:
+            conflicts = store._find_same_slot_conflicts(slot, value)
+        except Exception:
+            return None
+        if conflicts:
+            return f"记下了：{sent.rstrip('。！')}。"
+    return None
 
 
 class ChatState:
@@ -357,13 +504,19 @@ class ChatState:
             if self.summary_store is None:
                 return None
             try:
-                return self.summary_store.get_conversation(conv_id)
+                record = self.summary_store.get_conversation(conv_id)
             except Exception:
                 logger.warning("读对话记录失败：id=%s。", conv_id, exc_info=True)
                 return None
+            # 第三轮 #9：记录里的 recent 消息也要脱敏再返回（只改副本，
+            # 不改存着的记录）。
+            if record is not None and record.get("recent"):
+                record = dict(record)
+                record["recent"] = _redacted_messages(record["recent"])
+            return record
 
     def open_conversation(self, conv_id):
-        """回到一段旧对话：先把当前对话收尾（总结保存），再恢复那段的摘要 + 最近几轮。
+        """回到一段旧对话：立刻恢复那段的摘要 + 最近几轮，上一段的总结放后台做。
 
         返回 {"id", "title", "summary", "messages", "transcript_status"}：
         messages 是恢复的最近几轮（原样），页面按它重画
@@ -372,11 +525,32 @@ class ChatState:
         变摘要时，messages 仍是最近几轮，transcript_status 告诉页面
         “全文已转成摘要”，页面可以提一句。
         摘要没启用时也返回 None（没有可回的对话）。
+        2026-11-21 网页测第二轮 #9：以前这里拿着锁同步调模型把当前
+        对话总结完（几秒）才加载旧对话，切对话就卡住。改成照 reset()
+        的做法：锁里只做快事（记当前对话、恢复目标对话、立刻返回），
+        上一段的总结在后台线程里跑，算好了按 id 写回上一段的记录，
+        不写串到刚恢复的这段里。点的是当前这段时不用总结。
         """
         with self._lock:
             if self.summary_store is None:
                 return None
-            self._flush_summary_locked()
+            # 先把当前对话记进列表（只记标题、不调模型），拿到当前 id——
+            # 和 reset() 一样的顺序：没 sync 过的对话先 sync 才有 id，
+            # 后台 flush 按 id 才能找到它。
+            snapshot = [dict(m) for m in self.messages]
+            if snapshot:
+                try:
+                    self.summary_store.sync(snapshot)
+                except Exception:
+                    logger.warning("切换对话时记当前对话失败。", exc_info=True)
+            prev_id = None
+            prev_summary = ""
+            try:
+                prev_id = self.summary_store.current_id
+                prev_record = self.summary_store.current_record() or {}
+                prev_summary = prev_record.get("summary") or ""
+            except Exception:
+                prev_id = None
             try:
                 record = self.summary_store.open_conversation(conv_id)
             except Exception:
@@ -395,13 +569,44 @@ class ChatState:
                 # 38 号：全文还在，恢复全文，不只最近 5 轮。
                 self.messages = [dict(m) for m in transcript.get("messages") or []]
             transcript_status = (transcript or {}).get("status")
-            return {
+            result = {
                 "id": record["id"],
                 "title": record.get("title") or "新对话",
                 "summary": record.get("summary") or "",
-                "messages": [dict(m) for m in self.messages],
+                "messages": _redacted_messages([dict(m) for m in self.messages]),
                 "transcript_status": transcript_status,
             }
+        # 锁外再开后台线程：上一段对话的总结慢慢做（照 reset() 的做法）。
+        # 只有确实换了一段、上一段有话要总结、总结器配了才总结。
+        if (
+            prev_id
+            and prev_id != conv_id
+            and snapshot
+            and self.summary_store is not None
+            and self.summary_store.summarizer is not None
+        ):
+            store = self.summary_store
+            lock = self._lock
+            summarizer = store.summarizer
+
+            def _flush_prev():
+                # 调模型总结是纯函数（只读快照 + 旧摘要），不用拿锁；
+                # 算好了再拿锁写回去，不卡切换。
+                try:
+                    summary_text = summarizer(list(snapshot), prev_summary or None)
+                except Exception:
+                    logger.warning("后台总结上一段对话失败。", exc_info=True)
+                    return
+                try:
+                    with lock:
+                        store.flush(
+                            snapshot, record_id=prev_id, summary_text=summary_text
+                        )
+                except Exception:
+                    logger.warning("后台总结上一段对话失败。", exc_info=True)
+
+            threading.Thread(target=_flush_prev, daemon=True).start()
+        return result
 
     def current_conversation(self):
         """当前正在聊的对话（41 号：刷新后恢复用）。
@@ -424,7 +629,7 @@ class ChatState:
                     "id": None,
                     "title": "新对话",
                     "summary": "",
-                    "messages": [dict(m) for m in self.messages],
+                    "messages": _redacted_messages([dict(m) for m in self.messages]),
                     "transcript_status": None,
                 }
             record = self.summary_store.current_record() or {}
@@ -444,7 +649,7 @@ class ChatState:
                 "id": conv_id,
                 "title": record.get("title") or "新对话",
                 "summary": record.get("summary") or "",
-                "messages": messages,
+                "messages": _redacted_messages(messages),
                 "transcript_status": (transcript or {}).get("status"),
             }
 
@@ -517,6 +722,10 @@ class ChatState:
             # 第 0 步地基：计时——搜记忆、调模型、存记忆各花多久都记下来，
             # 26 号“慢在哪”才有数。只量时间、不改行为。
             timer = Timer()
+            # 2026-11-19：本轮的 turn_id 在检索之前就生成——强化要按会话记，
+            # 检索发生时这轮的编号必须已经有了；“记住”直存、run_question
+            # 的检索强化、收尾存记忆都用同一个 id。
+            turn_id = uuid.uuid4().hex
             # 25 号：“记住……”先直存（和命令行同一条路），别等下一轮。
             # 直存用 add_memory_text：原文存、记 source="user" 已确认、
             # 自带去重（库里已有就不重复存），不经过提取、不调模型，所以快。
@@ -533,7 +742,8 @@ class ChatState:
                 if content:
                     try:
                         result = self.mem0_store.add_memory_text(
-                            content, source="user"
+                            content, source="user", turn_id=turn_id,
+                            semantic_judge=True,
                         )
                         remember_stored = bool(result)
                     except Exception:
@@ -547,7 +757,9 @@ class ChatState:
                     with timer.measure("memory_search_ms"):
                         # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
                         # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
-                        memories = self.mem0_store.search(prompt, top_k=5, reinforce=True)
+                        memories = self.mem0_store.search(
+                            prompt, top_k=5, reinforce=True, turn_id=turn_id
+                        )
                     # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
                     # “当前在聊什么”的提示（见 Mem0Store.note_context）。
                     self.mem0_store.note_context(memories)
@@ -558,6 +770,31 @@ class ChatState:
                 block = _memory_block(memories)
                 if block:
                     model_prompt = block + "\n\n" + prompt
+            if remember_stored:
+                # 第四轮 #8：这条“记住”已经由程序直接存进长期记忆了，
+                # 回执只说记下了就行，不再调模型——模型会多嘴补一段无关内容。
+                content = remember_content(prompt)
+                receipt = f"记下了：{content}。"
+                event_date = resolve_event_date(content)
+                if event_date:
+                    try:
+                        d = date.fromisoformat(event_date)
+                        weekday = "一二三四五六日"[d.weekday()]
+                        receipt = (
+                            f"记下了：{content}（{d.month}月{d.day}日，周{weekday}）。"
+                        )
+                    except ValueError:
+                        pass
+                return self._finish_turn_locked(
+                    prompt,
+                    receipt,
+                    "程序直存",
+                    0.0,
+                    None,
+                    timer=timer,
+                    skip_memory_save=True,
+                    turn_id=turn_id,
+                )
             # 45 号：记忆工具要用的记忆库绑到当前上下文（循环里调
             # 记忆工具时能读到；没启用记忆库时等于没绑，工具会报
             # “记忆库没启用”。出块就恢复，不串到别的请求。）
@@ -574,6 +811,7 @@ class ChatState:
                     task_store=self.task_store,
                     search_service=self.search_service,
                     original_prompt=prompt,
+                    turn_id=turn_id,
                 )
             # run_question 里量的时间（调模型、读摘要）并进本轮的计时。
             for _name, _ms in (outcome.get("timings") or {}).items():
@@ -599,6 +837,10 @@ class ChatState:
                 if waiting_task.get("task_id"):
                     try:
                         waiting_task["history_index"] = len(self.messages)
+                        # 2026-11-19：本轮的编号也存进任务里——确认恢复后
+                        # 收尾存记忆还用这个 id，强化记的“这轮用过”和存
+                        # 进去的那轮是同一轮。
+                        waiting_task["turn_id"] = turn_id
                         self.task_store.save(waiting_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
@@ -621,7 +863,10 @@ class ChatState:
                         "run_id": waiting_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
-                        "args": approval.get("args"),
+                        "args": _clean_approval_args(approval.get("args")),
+                        "summary": _human_approval_summary(
+                            approval.get("tool"), approval.get("args")
+                        ),
                         "risk_level": approval.get("risk_level"),
                         "expires_at": approval.get("expires_at"),
                     },
@@ -638,11 +883,12 @@ class ChatState:
                 skip_memory_save=remember_stored,
                 # 48 号：本轮调过的搜索记录，页面显示在回答下面。
                 searches=outcome.get("searches"),
+                turn_id=turn_id,
             )
 
     def _finish_turn_locked(self, prompt, reply_text, model_name, cost_usd, usage,
                             insert_at=None, timer=None, skip_memory_save=False,
-                            searches=None):
+                            searches=None, turn_id=None):
         """一轮问答答完了的收尾（调用方已拿着锁）：把本轮问答写进历史、
         更新对话摘要、存进长期记忆。返回给页面展示的字典。
         ask() 和 resolve_approval() 共用这一段，保证确认恢复后的那轮
@@ -657,11 +903,19 @@ class ChatState:
         参数 skip_memory_save：25 号——本轮是“记住……”且已经直存进库时
         传 True，收尾跳过 add_turn（这条已经在库里了，再提取会重复存）。
         直存失败时不跳过，走老路。
+        参数 turn_id：本轮的 id（2026-11-19）——ask() 在检索之前就生成、
+        一路传下来；收尾存记忆用这个 id，和强化记的“这轮用过”是同一轮。
+        不传时 save_turn 里现生成一个（老路子）。
         """
         if timer is None:
             timer = Timer()
         user_msg = {"role": "user", "content": prompt}
-        assistant_msg = {"role": "assistant", "content": reply_text}
+        assistant_msg = {
+            "role": "assistant",
+            "content": reply_text,
+            "model": model_name,
+            "cost_usd": cost_usd,
+        }
         if isinstance(insert_at, bool) or not isinstance(insert_at, int):
             insert_at = None
         if insert_at is None:
@@ -684,6 +938,51 @@ class ChatState:
             removed = before_len - len(self.messages)
             if removed > 0:
                 self._shift_waiting_history_index(removed)
+        # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
+        # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
+        # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
+        # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
+        # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
+        # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
+        # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
+        # 先存记忆、再写全文记录：纠正执行完要改回复措辞时，全文记录里
+        # 拿到的就是改好后的回复，和历史、页面一致。
+        correction = None
+        questions = None
+        saved = None
+        if self.mem0_store is not None and not skip_memory_save:
+            recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
+            if insert_at is not None and not any(
+                msg is user_msg for msg in recent
+            ):
+                # 恢复的那轮插在中间、又被后面的轮次挤出最近 6 条时，
+                # 把它放进要存记忆的窗口最前面（它比窗口里的消息更早，
+                # 顺序仍是时间顺序），别让它丢了记忆。
+                recent = [user_msg, assistant_msg] + self.messages[
+                    -(_MEMORY_SAVE_HISTORY_MAX - 2):
+                ]
+            with timer.measure("memory_save_ms"):
+                # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
+                # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
+                saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
+            if isinstance(saved, dict):
+                correction = saved.get("correction")
+                questions = saved.get("questions")
+        # 2026-11-23 model fix #3（措辞）：纠正已经执行完了，回复就直接
+        # 说“已经改好了”，不提确认、不事后反问“要不要改”——模型回答是
+        # 存记忆之前生成的，不知道纠正已经改好了，才会说“等你确认后…”
+        # /“要不要我把……改成……？”这种过时的话。覆盖掉它（历史里的助手
+        # 回复、全文记录、返回都用改好后的这句，保持一致）。
+        reply_override = _correction_reply_text(correction)
+        if reply_override is None and isinstance(saved, dict):
+            # 无纠正词的新陈述存成了新行、同槽旧行还在时（E 组 T1 那种），
+            # 也只认记下了，不反问“要不要改”。
+            reply_override = _slot_conflict_reply_text(
+                self.mem0_store, saved.get("stored")
+            )
+        if reply_override is not None:
+            reply_text = reply_override
+            assistant_msg["content"] = reply_override
         # 38 号：全文存盘——本轮两条新消息追加进这场对话的全文记录。
         # 只追加新消息（恢复回来的旧消息不经过这里，不重复写）；
         # 摘要压缩裁掉历史前面时不影响这里，全文已经在文件里了。
@@ -713,31 +1012,6 @@ class ChatState:
                     )
             except Exception:
                 logger.warning("对话全文存盘失败。", exc_info=True)
-        # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
-        # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
-        # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
-        # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
-        # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
-        # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
-        # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
-        correction = None
-        if self.mem0_store is not None and not skip_memory_save:
-            recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
-            if insert_at is not None and not any(
-                msg is user_msg for msg in recent
-            ):
-                # 恢复的那轮插在中间、又被后面的轮次挤出最近 6 条时，
-                # 把它放进要存记忆的窗口最前面（它比窗口里的消息更早，
-                # 顺序仍是时间顺序），别让它丢了记忆。
-                recent = [user_msg, assistant_msg] + self.messages[
-                    -(_MEMORY_SAVE_HISTORY_MAX - 2):
-                ]
-            with timer.measure("memory_save_ms"):
-                # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
-                # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
-                saved = self.mem0_store.save_turn(recent)
-            if isinstance(saved, dict):
-                correction = saved.get("correction")
         response = {
             "reply": reply_text,
             "model": model_name,
@@ -753,6 +1027,10 @@ class ChatState:
             response["searches"] = searches
         if correction is not None:
             response["correction"] = correction
+        # Phase 2 #4：本轮拿不准的问题（带原文、给选项、说原因），
+        # 没问题时不加这个键，原来的返回形状不动。
+        if questions:
+            response["questions"] = questions
         logger.info(
             "timing | web round total=%.1fms %s",
             timer.total_ms(),
@@ -810,7 +1088,10 @@ class ChatState:
                         "approval": {
                             "approval_id": approval.get("approval_id"),
                             "tool": approval.get("tool"),
-                            "args": approval.get("args"),
+                            "args": _clean_approval_args(approval.get("args")),
+                            "summary": _human_approval_summary(
+                                approval.get("tool"), approval.get("args")
+                            ),
                             "risk_level": approval.get("risk_level"),
                             "expires_at": approval.get("expires_at"),
                             "task_id": approval.get("task_id") or task.get("task_id"),
@@ -847,6 +1128,9 @@ class ChatState:
                 if task is None:
                     return {"ok": False, "reason": f"找不到任务：{task_id}。"}
                 task_id = task["task_id"]
+            # 2026-11-19：等确认那轮的编号存在任务里（ask() 存的）——恢复后
+            # 收尾存记忆还用这个 id；老任务没存时 run_question 里现生成一个。
+            turn_id = task.get("turn_id")
             # 45 号：记忆工具要用的记忆库绑到当前上下文——确认后执行
             # 删/改记忆时，网关在这里直接调工具函数，得能读到库；
             # 下面恢复循环时模型可能再调记忆工具，也得绑着。
@@ -873,6 +1157,7 @@ class ChatState:
                         resume_task=resolved["task"],
                         user_declined=True,
                         original_prompt=goal,
+                        turn_id=turn_id,
                     )
             else:  # 确认执行了
                 with bound_memory_store(self.mem0_store):
@@ -888,6 +1173,7 @@ class ChatState:
                         resume_task=resolved["task"],
                         pending_tool_result=resolved["result"],
                         original_prompt=goal,
+                        turn_id=turn_id,
                     )
             # 第 0 步地基：恢复这轮调模型的时间并进计时，再传给收尾一起记；
             # 停在下一张确认卡上时也记一条日志（第 0 步留的小缺口）。
@@ -903,6 +1189,8 @@ class ChatState:
                 if next_task.get("task_id") and next_task.get("history_index") is None:
                     try:
                         next_task["history_index"] = len(self.messages)
+                        if turn_id:
+                            next_task["turn_id"] = turn_id
                         self.task_store.save(next_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
@@ -923,7 +1211,10 @@ class ChatState:
                         "run_id": next_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
-                        "args": approval.get("args"),
+                        "args": _clean_approval_args(approval.get("args")),
+                        "summary": _human_approval_summary(
+                            approval.get("tool"), approval.get("args")
+                        ),
                         "risk_level": approval.get("risk_level"),
                         "expires_at": approval.get("expires_at"),
                     },
@@ -942,6 +1233,7 @@ class ChatState:
                 # 48 号：确认恢复的那轮调过的搜索记录（任务里攒的，确认前
                 # 调过的也在里面），页面显示在回答下面。
                 searches=outcome.get("searches"),
+                turn_id=turn_id,
             )
             response["ok"] = True
             return response
@@ -1035,6 +1327,9 @@ class ChatState:
             if not ok:
                 return {"ok": False, "reason": "任务状态变了，可能已经有人处理过了。"}
             task = current
+            # 2026-11-19：等确认那轮的编号存在任务里（ask() 存的）——恢复后
+            # 收尾存记忆还用这个 id；老任务没存时 run_question 里现生成一个。
+            turn_id = task.get("turn_id")
             goal = task.get("goal") or ""
             # 没存下循环消息的任务（老记录、或存盘时正好断了）：不拿空历史
             # 去问模型（模型会直接报错），按新任务从头跑——原话还在，
@@ -1053,6 +1348,7 @@ class ChatState:
                     search_service=self.search_service,
                     resume_task=resume_task,
                     original_prompt=goal,
+                    turn_id=turn_id,
                 )
             except Exception:
                 # 恢复没跑起来：把任务放回原来的状态，不挂着 RUNNING。
@@ -1072,6 +1368,8 @@ class ChatState:
                 if next_task.get("task_id") and next_task.get("history_index") is None:
                     try:
                         next_task["history_index"] = len(self.messages)
+                        if turn_id:
+                            next_task["turn_id"] = turn_id
                         self.task_store.save(next_task)
                     except Exception:
                         logger.warning("等确认任务的插入位置没记下来。", exc_info=True)
@@ -1092,7 +1390,10 @@ class ChatState:
                         "run_id": next_task.get("run_id"),
                         "approval_id": approval.get("approval_id"),
                         "tool": approval.get("tool"),
-                        "args": approval.get("args"),
+                        "args": _clean_approval_args(approval.get("args")),
+                        "summary": _human_approval_summary(
+                            approval.get("tool"), approval.get("args")
+                        ),
                         "risk_level": approval.get("risk_level"),
                         "expires_at": approval.get("expires_at"),
                     },
@@ -1113,6 +1414,7 @@ class ChatState:
                 result.get("cost_usd"),
                 result.get("usage"),
                 timer=timer,
+                turn_id=turn_id,
             )
             # 循环正常收尾会把任务标 COMPLETED；万一还是 RUNNING（比如
             # 恢复的那条路没走到收尾），这里补标一下，别留悬案。
@@ -1262,7 +1564,14 @@ class ChatState:
                 raise PermissionError("删除记忆需要先确认删除范围。")
             if self.mem0_store is None:
                 raise RuntimeError("记忆未启用。")
-            return self.mem0_store.delete_memory(memory_id, approve=True)
+            deleted = self.mem0_store.delete_memory(memory_id, approve=True)
+            # 归一化（2026-11-21 网页测第二轮 #6）：SQLite 版
+            # delete_memory 返回 {"deleted": bool, ...} 字典，mem0 版
+            # 返回布尔——调用方（/api/memories/<id>/forget）只认布尔，
+            # 字典恒为真会把“没删掉”也报成删掉了。这里统一成严格布尔。
+            if isinstance(deleted, dict):
+                return deleted.get("deleted") is True
+            return bool(deleted)
 
     def correct_memory(self, old_text, new_text, memory_id=None):
         """纠正一条记忆（返回 correct_memory 的状态字典）。
@@ -1296,6 +1605,29 @@ class ChatState:
                 old_text = item["text"]
             return self.mem0_store.correct_memory(old_text, new_text)
 
+    def list_pending_questions(self):
+        """还没回答的待问问题（Phase 2 #4），按创建时间从旧到新。
+
+        记忆未启用时返回空列表；读失败时也返回空列表，不拦页面。
+        """
+        if self.mem0_store is None:
+            return []
+        try:
+            return self.mem0_store.list_pending_questions()
+        except Exception:
+            logger.warning("读待问问题失败。", exc_info=True)
+            return []
+
+    def answer_question(self, question_id, choice):
+        """回答一个待问问题（Phase 2 #4），按答案改库。
+
+        choice 只能是“进核心 / 当一次性经历 / 不存”（见
+        SQLiteStore.answer_question）。记忆未启用时 ok=False。
+        """
+        if self.mem0_store is None:
+            return {"ok": False, "reason": "记忆未启用。"}
+        return self.mem0_store.answer_question(question_id, choice)
+
 
 def make_handler(state, authenticator=None):
     """按给定的对话状态，生成一个请求处理类。
@@ -1319,7 +1651,8 @@ def make_handler(state, authenticator=None):
         任务：GET /api/tasks/active、GET /api/tasks/unresolved、
         POST /api/tasks/<id>/resume、POST /api/tasks/<id>/discard；
         记忆管理：GET /api/memories、GET /api/memories/<id>/scope、
-        POST /api/memories/<id>/forget、POST /api/memories/correct。
+        POST /api/memories/<id>/forget、POST /api/memories/correct、
+        GET /api/questions/pending、POST /api/questions/answer。
         """
 
         # 日志只写到 Python 的 logging（不往页面里写），保持安静：
@@ -1461,6 +1794,10 @@ def make_handler(state, authenticator=None):
                         "memories": state.list_memories(),
                     }
                 )
+            elif path == "/api/questions/pending":
+                # 待问 BOOS 的问题（Phase 2 #4）：还没回答的都列出来，
+                # 页面据此显示“待问”列表。记忆未启用时列表为空。
+                self._send_json({"questions": state.list_pending_questions()})
             elif path == "/api/protection-events":
                 # 保护记录：快照失败、恢复失败这些事的可见留痕，新的在前。
                 # 记忆未启用时列表为空，页面显示“暂无保护记录”。
@@ -1599,8 +1936,9 @@ def make_handler(state, authenticator=None):
                 return
             if path == "/api/conversations/open":
                 # 回到一段旧对话：请求 {"id": 对话 id}。
-                # 先把当前对话总结保存（state.open_conversation 里做），
-                # 再恢复那段的最近几轮；找不到回 404。
+                # 立刻恢复那段的最近几轮；上一段的总结在后台做
+                # （state.open_conversation 里做，不卡住页面）；
+                # 找不到回 404。
                 payload, error, status = self._read_json_body()
                 if error is not None:
                     self._send_json({"error": error}, status=status)
@@ -1683,6 +2021,25 @@ def make_handler(state, authenticator=None):
                     self._send_json({"error": "记忆未启用。"}, status=503)
                     return
                 result = state.correct_memory(old_text, new_text, memory_id=memory_id)
+                self._send_json(result)
+                return
+            if path == "/api/questions/answer":
+                # 回答一个待问问题：POST /api/questions/answer，请求
+                # {"question_id": id, "choice": "进核心" / "当一次性经历" / "不存"}。
+                # choice 不在这三个里时回 400、什么都不改。
+                payload, error, status = self._read_json_body()
+                if error is not None:
+                    self._send_json({"error": error}, status=status)
+                    return
+                question_id = str(payload.get("question_id") or "").strip()
+                choice = str(payload.get("choice") or "").strip()
+                if not question_id or choice not in ("进核心", "当一次性经历", "不存"):
+                    self._send_json(
+                        {"error": "请选一个问题，并选：进核心 / 当一次性经历 / 不存。"},
+                        status=400,
+                    )
+                    return
+                result = state.answer_question(question_id, choice)
                 self._send_json(result)
                 return
             if path != "/api/chat":
@@ -1811,9 +2168,19 @@ def main(argv=None):
     # 时返回 None：只警告一句，服务照常启动、不带记忆运行——记忆库出问题
     # 不能把服务搞崩。建失败的具体原因，create_mem0_store 已记进日志。
     tracker = BudgetTracker()
-    mem0_store = create_mem0_store(tracker)
+    # 第二步（2026-11-21）：记忆后端可切换，默认 mem0；
+    # SHIER_MEMORY_BACKEND=sqlite 时走 memory/sqlite_store.py
+    # （JSONL 账本仍是真相源，SQLite WAL 只做索引）。
+    # 切换只看环境变量，不改默认行为；测试服务在启动脚本里设。
+    _backend = os.environ.get("SHIER_MEMORY_BACKEND", "mem0").strip().lower()
+    if _backend == "sqlite":
+        from memory.sqlite_store import create_sqlite_store
+
+        mem0_store = create_sqlite_store(tracker)
+    else:
+        mem0_store = create_mem0_store(tracker)
     if mem0_store is None:
-        print("⚠️ mem0 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
+        print("⚠️ 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
     else:
         # Plan C + 17 号：把十二的名字、SOUL.md 和 BOOS 的电脑配置
         # 以“已确认”种进长期记忆（只加没有的，不覆盖已有的；失败只记日志、不拦启动）。
@@ -1837,6 +2204,13 @@ def main(argv=None):
                 print(f"长期记忆：给 {backfilled} 条老记忆补了时间戳。", flush=True)
         except Exception:
             logger.warning("补记忆时间戳失败：本次不补。", exc_info=True)
+        # 闲置提交 + 启动恢复（2026-11-20 游泳事故）：服务器启动时就建并
+        # 启动 outbox，捞回盘上没存完的轮次——别等第一次聊天才懒建，否则
+        # 重启后没人接话，落盘的轮次就没人消费、待定区也没人提交。
+        try:
+            mem0_store.ensure_outbox_started()
+        except Exception:
+            logger.warning("启动后台 outbox 失败：重启后待存的轮次要等第一次聊天才恢复。", exc_info=True)
     # 对话摘要：常驻服务启动时建一个 ConversationSummaryStore（只建一次），
     # 每轮后历史超上限就总结压缩、记一笔最近对话，开新对话/停服务时总结保存。
     # 建不好时不带摘要运行，服务照常启动。

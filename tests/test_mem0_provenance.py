@@ -445,7 +445,10 @@ def test_threshold_still_0_4(tmp_path):
 
 def test_keyword_rescued_item_is_weak_evidence(tmp_path):
     """关键词捞回的记忆是弱证据：语义没命中时，关键词补充能捞回来，
-    但结果里 source=keyword、score=None，调用方知道它不是语义命中的。"""
+    但结果里 source=keyword、score=None，调用方知道它不是语义命中的。
+    （2026-11-20 预整理：这条是 BOOS 亲口确认的，进了精选清单，所以
+    走精选先查、source=curated；同样是关键词命中、score=None，弱证据
+    的性质没变——不是语义命中。）"""
 
     class _EmptySearchMemory(FakeMemory):
         def search(self, query, filters=None, top_k=5):
@@ -465,7 +468,7 @@ def test_keyword_rescued_item_is_weak_evidence(tmp_path):
     store.add_memory_text("我目前在圆通工作，做快递员。")
     found = store.search("圆通是做什么的？")
     assert len(found) == 1
-    assert found[0]["source"] == "keyword"
+    assert found[0]["source"] == "curated"
     assert found[0]["score"] is None
     assert found[0]["metadata"]["source"] == "user"
 
@@ -476,12 +479,14 @@ def test_same_keyword_different_meaning_only_weak_signal(tmp_path):
     这个词确实撞上了），但只作为 source=keyword、score=None 的
     弱证据返回，并且提示块里写着“只用真正回答了问题的记忆”——
     语义上分不分得清是模型的事，适配器保证的是：不把弱证据
-    包装成语义命中、不把来源藏起来。"""
+    包装成语义命中、不把来源藏起来。
+    （2026-11-20 预整理：这条是 BOOS 亲口确认的，进了精选清单，
+    source=curated；同样是关键词命中、score=None，弱证据的性质没变。）"""
     store = make_fake_store(tmp_path)
     store.add_memory_text("我喜欢吃苹果。")
     found = store.search("苹果手机值得买吗？")
     assert len(found) == 1
-    assert found[0]["source"] == "keyword"
+    assert found[0]["source"] == "curated"
     assert found[0]["score"] is None
     block = _memory_block(found)
     assert "只用真正回答了问题的记忆" in block
@@ -491,11 +496,13 @@ def test_same_proper_noun_different_topic_not_semantic(tmp_path):
     """同一专有名词、不同话题（在圆通工作 vs 圆通客服电话）：
     语义检索给低分时不过阈值、不注入；关键词捞回的也只能是弱证据，
     不能冒充语义命中。反过来，没共享关键词的问题（“香蕉好吃吗？”）
-    一条也捞不到——不知道就是不知道。"""
+    一条也捞不到——不知道就是不知道。
+    （2026-11-20 预整理：这条是 BOOS 亲口确认的，进了精选清单，
+    source=curated；同样是关键词命中、score=None，弱证据的性质没变。）"""
     store = make_fake_store(tmp_path)
     store.add_memory_text("我在圆通工作。")
     found = store.search("圆通快递的客服电话是多少？")
-    assert all(item["source"] == "keyword" for item in found)
+    assert all(item["source"] in ("keyword", "curated") for item in found)
     assert all(item["score"] is None for item in found)
     assert store.search("香蕉好吃吗？") == []
 

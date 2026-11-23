@@ -372,6 +372,34 @@ def test_reconcile_rebuilds_index_from_ledger(tmp_path):
     assert again["reconciled"] == 0
 
 
+
+def test_reconcile_skips_when_same_text_already_in_store(tmp_path):
+    """key 对不上但相同文本已在索引里时，对账不重建（不造重复）。
+
+    2026-11-20 冒菜第 21 份的根因：账本 seq 3（正规冒菜记忆）的 key
+    永远对不上库里的副本（重建时 metadata 回退丢了 created_at，
+    新副本的 key 和账本 key 不同），每次启动对账都把它当“缺了”
+    又重建一份。修法是重建前按内容再查一次：相同文本已在就跳过。
+    """
+    store = make_fake_store(tmp_path)
+    _add(store, "我爱的是冒菜，不是麻辣烫")
+    before = store.get_all()
+    old_id = before[0]["id"]
+    # 模拟 key 失配：索引里的副本换了个新 created_at（像重建/恢复
+    # 时 metadata 回退丢了原 created_at），账本的 key 再也对不上。
+    store._memory.delete(old_id)
+    store._add_text_with_metadata(
+        "我爱的是冒菜，不是麻辣烫",
+        _provenance(SOURCE_USER, CONFIDENCE_USER, True),
+    )
+    assert len(store.get_all()) == 1
+    result = store.reconcile_ledger_index()
+    assert result["reconciled"] == 0
+    # 没重建：库里还是只有 1 份冒菜。
+    assert len(store.get_all()) == 1
+    assert _texts(store) == ["我爱的是冒菜，不是麻辣烫"]
+
+
 def test_reconcile_does_not_resurrect_superseded_or_deleted(tmp_path):
     """对账不复活：纠正过的旧说法、删了的，索引丢了也不补回来；
     纠正后的新说法能补回来（它有自己的 add 事件）。"""

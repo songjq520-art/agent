@@ -734,7 +734,7 @@ def test_chat_state_done_appends_only_original_and_final(monkeypatch, store, gat
     assert reply["mode"] == "real"
     assert state.messages == [
         {"role": "user", "content": "广州今天天气怎么样？"},
-        {"role": "assistant", "content": "广州今天晴，23度。"},
+        {"role": "assistant", "content": "广州今天晴，23度。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 
@@ -792,7 +792,7 @@ def test_chat_state_resolve_approval_resumes_and_finishes(monkeypatch, tmp_path,
     assert seen["resume_task"]["status"] == "RUNNING"
     assert state.messages == [
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 
@@ -1059,7 +1059,7 @@ def test_chat_state_resolve_approval_inserts_before_newer_message(monkeypatch, s
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
     # 再点 Q1 的确认卡：恢复的那轮插回位置 2，Q2 那轮不动。
     monkeypatch.setattr(
@@ -1074,9 +1074,9 @@ def test_chat_state_resolve_approval_inserts_before_newer_message(monkeypatch, s
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 
@@ -1120,13 +1120,13 @@ def test_chat_state_resumed_turn_still_saved_to_memory(monkeypatch, store, gatew
     assert reply["mode"] == "real"
     assert state.messages[2:4] == [
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
     # 存记忆的最后一次窗口里有恢复的那轮（最近 6 条已挤不下它）。
     # 26 号：网页服务走 save_turn 存记忆，看 save_turn 的调用记录。
     window = mem0.save_turn.call_args_list[-1].args[0]
     assert {"role": "user", "content": "帮我写个文件"} in window
-    assert {"role": "assistant", "content": "写好了。"} in window
+    assert {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001} in window
     assert len(window) == 6
 
 
@@ -1203,7 +1203,7 @@ def test_chat_state_chained_approval_keeps_original_position(monkeypatch, store,
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
     # 点第二张卡：回答插回位置 2。
     monkeypatch.setattr(
@@ -1217,9 +1217,9 @@ def test_chat_state_chained_approval_keeps_original_position(monkeypatch, store,
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
         {"role": "user", "content": "帮我写个文件"},
-        {"role": "assistant", "content": "写好了。"},
+        {"role": "assistant", "content": "写好了。", "model": "deepseek-flash", "cost_usd": 0.001},
         {"role": "user", "content": "新消息"},
-        {"role": "assistant", "content": "新消息答完了。"},
+        {"role": "assistant", "content": "新消息答完了。", "model": "deepseek-flash", "cost_usd": 0.001},
     ]
 
 
@@ -2088,3 +2088,109 @@ def test_loop_records_search_date_range(store, gateway):
     assert search_service.date_ranges == [
         {"start": "2026-11-10", "end": "2026-11-10"}
     ]
+
+# ---------- 2026-11-21 网页测第二轮 #5：同一次删除只弹一张卡 ----------
+
+def test_delete_same_memory_reuses_waiting_card(store, gateway, tmp_path):
+    """#5：同一个记忆的删除确认卡已经在等 BOOS 点了，模型又调一次同样的
+    删除时，不再建一张新卡——告诉模型等那张旧卡就行；等确认列表里始终只有一张卡。"""
+    from conftest import make_fake_store
+    from tools.memory_tool import bound_memory_store
+
+    mem_store = make_fake_store(tmp_path)
+    mem_store.add_memory_text("我喜欢喝茶", source="user")
+    tea_id = next(
+        item["id"] for item in mem_store.get_all(include_sensitive=True)
+        if item["text"] == "我喜欢喝茶"
+    )
+    delete_args = {"memory_id": tea_id, "text": "我喜欢喝茶", "anchor_text": "喝茶"}
+    with bound_memory_store(mem_store):
+        provider1 = ScriptedProvider(
+            script=[_tool_response(tool_calls=[_tool_call("call_del", "delete_memory", delete_args)])]
+        )
+        loop1 = AgentLoop(provider1, gateway=gateway, task_store=store,
+                          search_service=FakeSearchService())
+        first = loop1.run("忘记我喜欢喝茶")
+    assert first["mode"] == "waiting_approval"
+    assert first["approval"]["tool"] == "delete_memory"
+    assert len(store.list_waiting()) == 1
+    # 第二轮（新任务）：模型又调一次同样的删除。
+    with bound_memory_store(mem_store):
+        provider2 = ScriptedProvider(
+            script=[_tool_response(tool_calls=[_tool_call("call_del2", "delete_memory", delete_args)])]
+        )
+        loop2 = AgentLoop(provider2, gateway=gateway, task_store=store,
+                          search_service=FakeSearchService())
+        second = loop2.run("忘记我喜欢喝茶")
+    assert second["mode"] == "done"
+    # 告诉模型的那句“等旧卡”已经喂进去了（最后回答那轮的消息里有）。
+    final_messages = provider2.final_calls_log[0]["messages"]
+    tool_notes = [m for m in final_messages if m.get("role") == "tool"]
+    assert tool_notes, "第二轮应该有一条 tool 消息告诉模型旧卡在等确认"
+    assert "已经在等" in tool_notes[-1]["content"]
+    # 始终只有第一张卡在等确认，没多建一张；那条记忆也还没删。
+    assert len(store.list_waiting()) == 1
+    assert "我喜欢喝茶" in [i["text"] for i in mem_store.get_all(include_sensitive=True)]
+
+
+# ---------- R2 后续②：纠正轮删除拦截 ----------
+
+
+def test_correction_turn_delete_is_intercepted(store, gateway, tmp_path):
+    """纠正轮里模型调 delete_memory 不弹确认卡，直接回“已处理”。
+
+    2026-11-23 R2 后续②：用户说“不对，我喜欢吃面条”时，模型调
+    delete_memory 删旧米饭记忆会弹确认卡、抢占纠正路。拦截后本轮
+    应直接完成（done），不建确认卡，旧记忆也不被删（等保存时由
+    纠正取代）。
+    """
+    from conftest import make_fake_store
+    from tools.memory_tool import bound_memory_store
+
+    mem_store = make_fake_store(tmp_path)
+    mem_store.add_memory_text("我喜欢吃米饭", source="user")
+    rice_id = next(
+        item["id"] for item in mem_store.get_all(include_sensitive=True)
+        if item["text"] == "我喜欢吃米饭"
+    )
+    delete_args = {"memory_id": rice_id, "text": "我喜欢吃米饭", "anchor_text": "米饭"}
+    with bound_memory_store(mem_store):
+        provider = ScriptedProvider(
+            script=[
+                _tool_response(tool_calls=[_tool_call("call_del", "delete_memory", delete_args)]),
+                _tool_response(text="记下了，你现在喜欢吃面条。"),
+            ]
+        )
+        loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                         search_service=FakeSearchService())
+        outcome = loop.run("不对，我喜欢吃面条")
+    assert outcome["mode"] == "done"
+    assert outcome["reply"] == "记下了，你现在喜欢吃面条。"
+    assert len(store.list_waiting()) == 0
+    assert "我喜欢吃米饭" in [i["text"] for i in mem_store.get_all(include_sensitive=True)]
+
+
+def test_genuine_delete_still_needs_approval(store, gateway, tmp_path):
+    """真正的删除意图（“忘记这个”，无新说法）照常弹确认卡。"""
+    from conftest import make_fake_store
+    from tools.memory_tool import bound_memory_store
+
+    mem_store = make_fake_store(tmp_path)
+    mem_store.add_memory_text("我喜欢吃米饭", source="user")
+    rice_id = next(
+        item["id"] for item in mem_store.get_all(include_sensitive=True)
+        if item["text"] == "我喜欢吃米饭"
+    )
+    delete_args = {"memory_id": rice_id, "text": "我喜欢吃米饭", "anchor_text": "米饭"}
+    with bound_memory_store(mem_store):
+        provider = ScriptedProvider(
+            script=[
+                _tool_response(tool_calls=[_tool_call("call_del", "delete_memory", delete_args)]),
+            ]
+        )
+        loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                         search_service=FakeSearchService())
+        outcome = loop.run("忘记我喜欢吃米饭")
+    assert outcome["mode"] == "waiting_approval"
+    assert outcome["approval"]["tool"] == "delete_memory"
+    assert len(store.list_waiting()) == 1

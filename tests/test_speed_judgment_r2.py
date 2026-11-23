@@ -139,7 +139,10 @@ def test_parallel_readonly_searches_both_run_in_order(store, gateway):
     outcome = loop.run("纳指和标普昨天收盘多少")
     elapsed = time.monotonic() - start
     assert outcome["mode"] == "done"
-    assert search_service.queries == ["纳指", "标普"]
+    # 两条都执行了（顺序不钉死：FakeSearchService 先睡 0.6 秒再记，
+    # 两个线程谁先醒谁先记，记录顺序是竞态；“按顺序拼回去”由下面
+    # tool 消息的 tool_call_id 顺序保证，不是由这儿保证）。
+    assert sorted(search_service.queries) == sorted(["纳指", "标普"])
     assert outcome["tool_calls"] == 2
     # 两条都睡 0.6 秒：并行约 0.6 秒，串行要 1.2 秒以上。
     assert elapsed < 1.0, f"并行没生效，耗时 {elapsed:.2f} 秒"

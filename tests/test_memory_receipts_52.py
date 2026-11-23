@@ -89,7 +89,7 @@ class _RaisingStore:
     def __init__(self):
         self.calls = 0
 
-    def add_turn(self, messages):
+    def add_turn(self, messages, turn_id=None):
         self.calls += 1
         raise RuntimeError("模拟后台存记忆一直失败")
 
@@ -99,9 +99,11 @@ class _RecordingStore:
 
     def __init__(self):
         self.calls = 0
+        self.last_turn_id = None
 
-    def add_turn(self, messages):
+    def add_turn(self, messages, turn_id=None):
         self.calls += 1
+        self.last_turn_id = turn_id
         return {"pending": True, "results": []}
 
 
@@ -123,15 +125,25 @@ def test_52_outbox_retries_then_reports_failed(tmp_path):
 
 
 def test_52_outbox_success_reports_committed(tmp_path):
-    """52 号：后台存完的轮次，turn_status 是 committed，失败清单是空的。"""
+    """52 号：后台把轮次交给 store（store 收下、放进待定区）后，
+    turn_status 是 pending（还没真正落库，不是 committed）；store
+    真正落库后调 mark_committed，回执才变 committed。失败清单是空的。
+    （2026-11-20 游泳事故：待定不是提交，别报 committed 撒谎。）"""
     store = _RecordingStore()
     outbox = MemoryOutbox(store, pending_dir=tmp_path / "outbox_pending")
     outbox.start()
     turn_id = outbox.submit([{"role": "user", "content": "我喜欢吃拉面。"}])
     assert outbox.flush(timeout=10) is True
-    assert outbox.turn_status(turn_id) == "committed"
+    # store 只收下放进待定区，还没真正落库：回执是 pending，文件还留着。
+    assert outbox.turn_status(turn_id) == "pending"
+    assert (tmp_path / "outbox_pending" / f"{turn_id}.json").exists()
     assert outbox.failed_turns() == []
     assert store.calls == 1
+    assert store.last_turn_id == turn_id
+    # store 真正落库（调 mark_committed 模拟）：回执变 committed，文件删掉。
+    outbox.mark_committed(turn_id)
+    assert outbox.turn_status(turn_id) == "committed"
+    assert not (tmp_path / "outbox_pending" / f"{turn_id}.json").exists()
     outbox.stop()
 
 
@@ -142,7 +154,9 @@ def test_52_outbox_unknown_turn_id(tmp_path):
 
 
 def test_57_outbox_persists_and_recovers(tmp_path):
-    """57 号：submit 当场写盘，存完删盘；进程死前没存完的，重启捞回重存。"""
+    """57 号：submit 当场写盘；store 只收下放进待定区时文件还留着
+    （没真正落库就删盘，重启捞不回来——2026-11-20 游泳事故）；
+    真正落库（mark_committed）后删盘；进程死前没存完的，重启捞回重存。"""
     pending_dir = tmp_path / "outbox_pending"
     store = _RecordingStore()
     outbox = MemoryOutbox(store, pending_dir=pending_dir)
@@ -150,6 +164,11 @@ def test_57_outbox_persists_and_recovers(tmp_path):
     assert (pending_dir / f"{turn_id}.json").exists()
     outbox.start()
     assert outbox.flush(timeout=10) is True
+    # 只进了待定区，还没真正落库：回执 pending，文件还留着。
+    assert outbox.turn_status(turn_id) == "pending"
+    assert (pending_dir / f"{turn_id}.json").exists()
+    # 真正落库（mark_committed 模拟）：回执变 committed，文件删掉。
+    outbox.mark_committed(turn_id)
     assert outbox.turn_status(turn_id) == "committed"
     assert not (pending_dir / f"{turn_id}.json").exists()
     outbox.stop()
@@ -164,6 +183,10 @@ def test_57_outbox_persists_and_recovers(tmp_path):
     outbox3.start()
     assert outbox3.flush(timeout=10) is True
     assert store3.calls == 1
+    # 捞回的这轮也只进了待定区：回执 pending，文件还留着；落库后才删。
+    assert outbox3.turn_status(turn_id2) == "pending"
+    assert (pending_dir / f"{turn_id2}.json").exists()
+    outbox3.mark_committed(turn_id2)
     assert not (pending_dir / f"{turn_id2}.json").exists()
     outbox3.stop()
 
