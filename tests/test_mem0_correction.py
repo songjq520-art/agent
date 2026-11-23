@@ -442,7 +442,9 @@ def test_web_ask_returns_correction_field(monkeypatch, tmp_path):
     monkeypatch.setattr("web.server.run_question", _fake_run_question)
     result = state.ask("你记错了，我喜欢用 Go 写代码。")
     assert result["mode"] == "real"
-    assert result["reply"] == "好的，我帮你改。"
+    # 2026-11-23 model fix #3（BOOS 定）：纠正执行完直接说“已经改好了”，
+    # 不再原样返回模型那句“好的，我帮你改。”。
+    assert result["reply"] == "已经改好了：把“我喜欢用 Python 写代码”改成了“我喜欢用 Go 写代码。”。"
     assert result["model"] == "deepseek-flash"
     assert result["correction"]["status"] == "updated"
     assert result["correction"]["old_text"] == "我喜欢用 Python 写代码"

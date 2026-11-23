@@ -739,10 +739,10 @@ def test_revive_memory_restores_superseded_row(store):
     assert store.revive_memory("no-such-id").get("status") == "not_found"
 
 
-def test_slot_conflict_same_credibility_new_wins_even_with_smaller_seq(store):
-    """S1（2026-11-22，BOOS 定：同可信度时新的赢，最新说的算数）：
-    旧行写序号比新探测大（服务重启后 _WRITE_SEQ 归零的真实情形），
-    新说法仍取代旧的，不再 keep_old 丢掉。"""
+def test_slot_conflict_no_correction_keeps_both(store):
+    """2026-11-23 model fix #1（BOOS 定，取代 S1 2026-11-22“同可信度新的赢”）：
+    没纠正词的新陈述只存新行、不顶旧的——哪怕旧行写序号比新探测大
+    （服务重启后 _WRITE_SEQ 归零的真实情形），南京也留着，苏州另存一条。"""
     store.add_memory_text("我住在南京", source="inferred")
     row = store._conn.execute(
         "SELECT id, metadata_json FROM memories WHERE text=?", ("我住在南京",)
@@ -757,10 +757,10 @@ def test_slot_conflict_same_credibility_new_wins_even_with_smaller_seq(store):
     r = store.save_turn(
         [{"role": "user", "content": "我住在苏州"}], turn_id="t-slot-s1",
     )
-    assert "我住在苏州" in _live_texts(store)
-    assert "我住在南京" not in _live_texts(store)
+    assert set(_live_texts(store)) == {"我住在苏州", "我住在南京"}
     assert r["stored"] == ["我住在苏州"]
-    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert r.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
 def test_save_turn_correction_utterance_goes_through_correction(store):
@@ -1271,23 +1271,25 @@ def test_add_same_text_different_source_keeps_one_row(store):
     assert results[0]["confirmed"] is True
 
 
-def test_add_same_slot_supersedes_old(store):
-    """Gemini #4 slot 覆盖：同槽位、文本不同、同级且新的在后时，
-    新的取代旧的（旧行标被取代，账本记 supersede）。"""
+def test_add_same_slot_no_correction_keeps_both(store):
+    """2026-11-23 model fix #1（BOOS 定，取代 Gemini #4 同槽自动顶旧）：
+    无纠正词的直存只存新行、不顶旧的——“我叫大明”和“我叫小宋”并存，
+    账本只有 add、没有 supersede。"""
     store.add_memory_text("我叫小宋", source="user", slot="user_name")
     out = store.add_memory_text("我叫大明", source="user", slot="user_name")
     assert out.get("event") == "ADD"
-    assert _live_texts(store) == ["我叫大明"]
-    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert _live_texts(store) == ["我叫大明", "我叫小宋"]
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
-def test_add_same_slot_lower_credibility_pending(store):
-    """Gemini #4 slot 覆盖：新说法可信度低于旧的（推断 vs 已确认），
-    挂起来待确认，不存、不覆盖。"""
+def test_add_same_slot_lower_credibility_stores_new_row(store):
+    """2026-11-23 model fix #1（BOOS 定）：无纠正词的新说法不裁决取代、
+    也不挂起——直接存成新行（ADD），新旧并存。待确认（PENDING）只在
+    “要不要取代旧的”这个决定本身拿不准时才出现；不取代就没什么可挂的。"""
     store.add_memory_text("我叫小宋", source="user", slot="user_name")
     out = store.add_memory_text("我叫大明", source="inferred", slot="user_name")
-    assert out.get("event") == "PENDING"
-    assert _live_texts(store) == ["我叫小宋"]
+    assert out.get("event") == "ADD"
+    assert _live_texts(store) == ["我叫大明", "我叫小宋"]
 
 
 def test_search_history_returns_superseded_versions(store):
@@ -1662,9 +1664,10 @@ def test_save_turn_correction_general_phrases_e2e(tmp_path, monkeypatch):
         ), message
 
 
-def test_save_turn_implicit_update_supersedes_same_slot(tmp_path, monkeypatch):
-    """隐式更新：没说纠正词，直接说新事实“我住深圳”，库里“我住北京”
-    照样被取代（同槽位不同值）；不相关的“我喜欢喝咖啡”不动。"""
+def test_save_turn_implicit_update_keeps_old(tmp_path, monkeypatch):
+    """2026-11-23 model fix #1（BOOS 定）：没说纠正词、直接说新事实
+    “我住深圳”，库里“我住北京”照样活着——新说法只存新行，不取代
+    同槽位旧值；不相关的“我喜欢喝咖啡”不动。"""
     store = _correction_store(tmp_path, monkeypatch)
     store.add_memory_text("我住北京", source="inferred")
     store.add_memory_text("我喜欢喝咖啡", source="inferred")
@@ -1672,15 +1675,16 @@ def test_save_turn_implicit_update_supersedes_same_slot(tmp_path, monkeypatch):
         [{"role": "user", "content": "我住深圳"}],
         turn_id="t-implicit-1",
     )
-    assert set(_live_texts(store)) == {"我住深圳", "我喜欢喝咖啡"}
-    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
-    assert (receipt.get("correction") or {}).get("status") == "updated"
+    assert set(_live_texts(store)) == {"我住深圳", "我住北京", "我喜欢喝咖啡"}
     assert receipt["stored"] == ["我住深圳"]
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
-def test_save_turn_implicit_update_name_slot(tmp_path, monkeypatch):
-    """隐式更新（名字槽）：库里“我叫小宋”，新说“我叫大明”→ 大明
-    取代小宋；不同槽位（喝咖啡）不互相取代。"""
+def test_save_turn_implicit_update_name_slot_keeps_old(tmp_path, monkeypatch):
+    """2026-11-23 model fix #1（BOOS 定）：隐式更新（名字槽）：库里
+    “我叫小宋”，新说“我叫大明”→ 两条并存，大明不取代小宋；
+    不同槽位（喝咖啡）不互相取代。"""
     store = _correction_store(tmp_path, monkeypatch)
     store.add_memory_text("我叫小宋", source="inferred")
     store.add_memory_text("我喜欢喝咖啡", source="inferred")
@@ -1688,27 +1692,29 @@ def test_save_turn_implicit_update_name_slot(tmp_path, monkeypatch):
         [{"role": "user", "content": "我叫大明"}],
         turn_id="t-implicit-name",
     )
-    assert set(_live_texts(store)) == {"我叫大明", "我喜欢喝咖啡"}
-    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
-    assert (receipt.get("correction") or {}).get("status") == "updated"
+    assert set(_live_texts(store)) == {"我叫大明", "我叫小宋", "我喜欢喝咖啡"}
+    assert receipt["stored"] == ["我叫大明"]
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
-def test_save_turn_implicit_update_supersedes_confirmed_old(tmp_path, monkeypatch):
-    """S10（2026-11-22，BOOS 定选 A）：库里“我叫小宋”是已确认版，
-    用户亲口说的新说“我叫大明”同样算已确认，同可信度新的赢，直接
-    取代旧的、不挂起。模型推断的新事实仍挂起，见
-    test_add_same_slot_lower_credibility_pending（inferred 直存那路）。"""
+def test_save_turn_implicit_update_keeps_confirmed_old(tmp_path, monkeypatch):
+    """2026-11-23 model fix #1（BOOS 定，取代 S10 2026-11-22 选 A）：
+    库里“我叫小宋”是已确认版，用户亲口说新说“我叫大明”同样算已确认，
+    但没纠正词就不取代旧的——两条并存。已确认不等于自动取代旧事实；
+    模型推断的新事实同样只存新行，见
+    test_add_same_slot_lower_credibility_stores_new_row。"""
     store = _correction_store(tmp_path, monkeypatch)
     store.add_memory_text("我叫小宋", source="user")
     receipt = store.save_turn(
         [{"role": "user", "content": "我叫大明"}],
         turn_id="t-implicit-pending",
     )
-    assert _live_texts(store) == ["我叫大明"]
-    assert _is_superseded(store, "我叫小宋")
+    assert _live_texts(store) == ["我叫大明", "我叫小宋"]
+    assert _is_superseded(store, "我叫小宋") is False
     assert receipt["stored"] == ["我叫大明"]
-    assert (receipt.get("correction") or {}).get("status") == "updated"
-    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
 def test_save_turn_correction_ambiguous_slot_retry(tmp_path, monkeypatch):
@@ -1741,30 +1747,32 @@ def test_bare_new_correction_signals_still_dropped(tmp_path, monkeypatch):
     assert _live_texts(store) == []
     assert _ledger_lines(store) == []
 
-# ---------- 16. S10（2026-11-22，BOOS 定选 A） ----------
-# 用户亲口说的新事实直接算已确认（user/1.0），能取代已确认的旧事实；
-# 工具路 add_memory_text 没传 slot 时也按文本推断 slot、走槽位裁决，
-# 不再出现两条活住址并存。模型推断的事实仍按 inferred/0.7、不直接
-# 取代已确认旧行（已覆盖：test_add_same_slot_lower_credibility_pending，
-# 这里不再重复造）。
+# ---------- 16. S10（2026-11-22，BOOS 定选 A；取代部分 2026-11-23 已废止） ----------
+# 用户亲口说的新事实直接算已确认（user/1.0）——这一半不变；
+# 但“能取代已确认的旧事实”这一半已由 2026-11-23 model fix #1（BOOS 定）
+# 废止：没纠正词的新陈述只存新行、不顶旧的。工具路 add_memory_text
+# 没传 slot 时仍按文本推断 slot（新行照常打槽位标），但同样只存新行。
+# 模型推断的事实仍按 inferred/0.7 直存（已覆盖：
+# test_add_same_slot_lower_credibility_stores_new_row）。
 
 
-def test_s10_user_spoken_new_fact_supersedes_confirmed_old(tmp_path, monkeypatch):
-    """S10(a)：库里“我住长沙”是已确认版，用户直接说新事实“我住郑州”
-    （没说纠正词）→ 新的取代旧的：旧的 superseded=1，新的活着，
-    回执 correction=updated。修之前新事实按 inferred/0.7 探针，
-    被 _resolve_conflict 判 pending_new、进 dropped，郑州没入库。"""
+def test_s10_user_spoken_new_fact_keeps_confirmed_old(tmp_path, monkeypatch):
+    """S10(a) 改：库里“我住长沙”是已确认版，用户直接说新事实“我住郑州”
+    （没说纠正词）→ 2026-11-23 model fix #1（BOOS 定）起不再取代旧的：
+    两条并存，长沙活着，回执没有 correction。修之前新事实按 inferred/0.7
+    探针，被 _resolve_conflict 判 pending_new、进 dropped，郑州没入库——
+    那是旧行为，现在郑州照常入库、长沙也不被顶掉。"""
     store = _correction_store(tmp_path, monkeypatch)
     store.add_memory_text("我住长沙", source="user")
     receipt = store.save_turn(
         [{"role": "user", "content": "我住郑州"}],
         turn_id="t-s10-user-1",
     )
-    assert _live_texts(store) == ["我住郑州"]
-    assert _is_superseded(store, "我住长沙")
+    assert _live_texts(store) == ["我住郑州", "我住长沙"]
+    assert _is_superseded(store, "我住长沙") is False
     assert receipt["stored"] == ["我住郑州"]
-    assert (receipt.get("correction") or {}).get("status") == "updated"
-    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
 def test_s10_user_spoken_now_living_in_zhengzhou(tmp_path, monkeypatch):
@@ -1783,22 +1791,23 @@ def test_s10_user_spoken_now_living_in_zhengzhou(tmp_path, monkeypatch):
 
 
 def test_s10_tool_path_add_memory_text_infers_slot(store):
-    """S10(b)：工具路 add_memory_text 不传 slot（模型只传文本），
-    source="user" 存“我住西安”，库里已有已确认的“我住长沙”→ 西安
-    取代长沙，只剩一条活住址。修之前不推断 slot、裁决不跑，西安直存、
-    两条活住址并存。"""
+    """S10(b) 改：工具路 add_memory_text 不传 slot（模型只传文本），
+    source="user" 存“我住西安”，库里已有已确认的“我住长沙”→ 2026-11-23
+    model fix #1（BOOS 定）起不取代：两条活住址并存，西安这行照常按文本
+    推断出 slot 标。修之前不推断 slot、裁决不跑，西安直存、两条活住址
+    并存——现在行为上也是并存，但西安行有 slot 标、且是新规则有意为之。"""
     store.add_memory_text("我住长沙", source="user")
     out = store.add_memory_text("我住西安", source="user")
     assert out.get("event") == "ADD"
-    assert _live_texts(store) == ["我住西安"]
-    assert _is_superseded(store, "我住长沙")
-    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert _live_texts(store) == ["我住西安", "我住长沙"]
+    assert _is_superseded(store, "我住长沙") is False
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
-def test_s10_tool_path_supersedes_unstamped_legacy_row(store):
-    """S10(b) 旧行没打 slot 标：修复前工具路存的“我住长沙”行 slot 列
-    是空的（西安案现状），工具路再存“我住西安”时只查 slot 列会漏掉
-    它；按文本现认槽位补查后，长沙照样被取代，只剩一条活住址。"""
+def test_s10_tool_path_keeps_unstamped_legacy_row(store):
+    """S10(b) 改：旧行没打 slot 标，工具路再存“我住西安”时按文本现认
+    槽位能查到长沙，但 2026-11-23 model fix #1（BOOS 定）起无纠正词
+    不取代——长沙留着，西安另存一条，两条活住址并存。"""
     _plant_memory_row(store, "我住长沙")
     # 旧行改成工具路已确认版、但 slot 列保持为空（修复前的真实状态）：
     # 只改来源/确认位，不动其他字段。
@@ -1817,5 +1826,5 @@ def test_s10_tool_path_supersedes_unstamped_legacy_row(store):
     store._conn.commit()
     out = store.add_memory_text("我住西安", source="user")
     assert out.get("event") == "ADD"
-    assert _live_texts(store) == ["我住西安"]
-    assert _is_superseded(store, "我住长沙")
+    assert _live_texts(store) == ["我住西安", "我住长沙"]
+    assert _is_superseded(store, "我住长沙") is False

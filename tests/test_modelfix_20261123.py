@@ -194,6 +194,22 @@ def test_modelfix_a2_explicit_correction_bypasses_similarity(sim68_store):
     assert "我喜欢吃面条" in _live_texts(store)
 
 
+def test_modelfix_a2_explicit_slot_target_needs_unique_candidate(store):
+    """回归修（2026-11-23）：槽位直选只在同槽位候选恰好一条时才用——
+    “不对，我喜欢吃米线”对火锅/冒菜两条同槽旧行时，correct_memory
+    必须报 ambiguous（走老路），不能直选第一条就 updated。"""
+    store.add_memory_text("我喜欢吃火锅", source="user")
+    store.add_memory_text("我喜欢吃冒菜", source="user")
+    out = store.correct_memory(
+        "我喜欢吃米线", "我喜欢吃米线", explicit_correction=True
+    )
+    assert out.get("status") == "ambiguous"
+    assert _is_superseded(store, "我喜欢吃火锅") is False
+    assert _is_superseded(store, "我喜欢吃冒菜") is False
+    assert "我喜欢吃火锅" in _live_texts(store)
+    assert "我喜欢吃冒菜" in _live_texts(store)
+
+
 def test_modelfix_a2_save_turn_end_to_end(sim68_store):
     """A 组端到端：T1 米饭 → T2“记错了，我喜欢吃面条”→ 米饭被取代，
     面条是当前答案，纠正回执是 updated。"""

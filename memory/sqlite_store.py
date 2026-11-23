@@ -156,6 +156,46 @@ def _dedupe_key(text):
         norm = norm[: norm.rfind(",")]
     return re.sub(r"[^\w]", "", norm, flags=re.UNICODE)
 
+def _extract_note_old_fact(note_text):
+    """从模型写的纠正备注行里提被纠正掉的旧说法（2026-11-23 A 组修复）。
+    备注行形如“BOOS 喜欢吃面条（纠正：不是喜欢吃米饭）”——
+    “纠正：不是”后面就是旧说法的主干（“喜欢吃米饭”），前面那半句
+    的主语（“BOOS”/“我”）拼上去就是整句旧说法。
+    提不出来返回 None（调用方用整条备注行当 old_text，不硬编）。"""
+    if not isinstance(note_text, str) or not note_text:
+        return None
+    marker_idx = -1
+    marker_len = 0
+    for marker in ("纠正：不是", "纠正:不是", "纠正：", "纠正:"):
+        idx = note_text.find(marker)
+        if idx >= 0:
+            marker_idx = idx
+            marker_len = len(marker)
+            break
+    if marker_idx < 0:
+        return None
+    old_core = note_text[marker_idx + marker_len:].strip()
+    old_core = old_core.rstrip("）)。！").strip()
+    if old_core.startswith("不是"):
+        old_core = old_core[len("不是"):].strip()
+    if not old_core or len(old_core) > 40:
+        return None
+    if any(w in old_core for w in ("之前", "是错的", "错了", "不对")):
+        return None
+    head = note_text[:marker_idx].rstrip("（(").strip()
+    subject = ""
+    if head:
+        if head.startswith("BOOS"):
+            subject = "BOOS"
+        elif head.startswith("我"):
+            subject = "我"
+        elif head.startswith("用户"):
+            subject = "用户"
+    if subject:
+        return subject + " " + old_core
+    return old_core
+
+
 # 问句不存：以这些结尾的用户话是提问，不是陈述事实。
 _QUESTION_ENDINGS = ("?", "？", "吗", "么", "呢", "吧", "嘛")
 
@@ -2026,10 +2066,14 @@ class SQLiteStore:
                 self._last_stored_turn_id = turn_id
         if correction is not None and (
             "correction" not in receipt
-            or (correction or {}).get("status") != "not_found"
+            or (correction or {}).get("status") == "updated"
+            or (receipt.get("correction") or {}).get("status") != "updated"
         ):
-            # 显式纠错优先；但它报 not_found、而逐句循环里的槽位更新已经
-            # 真换了旧记忆时，留循环那边的 updated，不拿 not_found 盖掉它。
+            # 显式纠错优先；但它报 not_found/ambiguous、而逐句循环里的槽位
+            # 更新已经真换了旧记忆时，留循环那边的 updated，不拿
+            # not_found/ambiguous 盖掉它（2026-11-23 回归修：纠正分支先报
+            # ambiguous 时，循环兜底顶掉最新那条后回执仍要是 updated，
+            # 回复才说得出“已经改好了”）。
             receipt["correction"] = correction
             if (correction or {}).get("status") == "updated":
                 # 纠错存的新记忆属于本轮：撤回标记拨到本轮，
@@ -2343,15 +2387,82 @@ class SQLiteStore:
                 "audit": audit or {"source": source, "method": "correct_memory"},
             }
 
+    def _find_correction_note_target(self, candidates, new_fact):
+        """找模型写的纠正备注行（2026-11-23 A 组修复）：
+        备注行是模型在 save_turn 之前自己调 add_memory 写下的，
+        形如“BOOS 喜欢吃面条（纠正：不是喜欢吃米饭）”——它已经顶掉了
+        旧说法，但 slot 是 null、相似度又被括号里的旧说法拉低，
+        纠正分支认不出它，就会报 not_found。
+        认法：文本含“纠正：”标记，且标记前面那半句与新说法归一化后
+        相同（主语“我/BOOS”已由 _normalize_memory_text 剥掉）。
+        只在带明确纠正词时用；找不到返回 None（调用方走老路，不硬猜）。
+        真纠正便条（如“用户表示……纠正了此前‘喜欢吃鸡杂面’的说法”）
+        没有“纠正：”冒号标记，不会误认。"""
+        norm_new = _normalize_memory_text(new_fact)
+        if not norm_new:
+            return None
+        for mid in candidates or []:
+            text = self._candidate_text(mid)
+            if not text:
+                continue
+            marker_idx = text.find("纠正：")
+            if marker_idx < 0:
+                marker_idx = text.find("纠正:")
+            if marker_idx < 0:
+                continue
+            head = text[:marker_idx].rstrip("（(").strip()
+            if not head:
+                continue
+            if _normalize_memory_text(head) == norm_new:
+                return mid
+        return None
+
+    def _supersede_note_old_fact(self, old_fact_text, new_key, new_fact):
+        """备注行里被纠正掉的旧说法若还活着，一并取代（2026-11-23 A 组修复
+        的兜底）：线上备注行写下时语义判官通常已顶掉旧行，这时旧行已不
+        是活的，什么都不做；万一旧行还活着（判官没顶），按备注行里写的
+        旧说法原样找出来顶掉——归一化后完全相同才顶，不猜。"""
+        if not old_fact_text or not new_key:
+            return
+        norm_old = _normalize_memory_text(old_fact_text)
+        if not norm_old:
+            return
+        try:
+            rows = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0 AND id != ?",
+                (new_key,),
+            ).fetchall()
+        except Exception:
+            return
+        for row in rows:
+            if _normalize_memory_text(row[1] or "") != norm_old:
+                continue
+            try:
+                old_meta = json.loads(row[2] or "{}")
+            except Exception:
+                old_meta = {}
+            try:
+                self._supersede_row(
+                    row[0], row[1] or "", old_meta, new_key, new_fact
+                )
+            except Exception:
+                logger.warning("备注旧说法取代记账失败。", exc_info=True)
+
     def _explicit_correction_slot_target(self, candidates, new_fact):
         """带明确纠正词时按槽位找要改的那条（2026-11-23 model fix #2）：
         新说法和候选的 _correction_topic_slot 相同（住处/名字/喜欢吃……）
         时，取候选顺序里的第一条（候选已按已确认在前、同类里新的在前
-        排过）；没有同槽位候选时返回 None（调用方走老路，不硬猜）。"""
+        排过）；没有同槽位候选时返回 None（调用方走老路，不硬猜）。
+        同槽位候选有两条以上时也返回 None——分不清改哪条，走老路
+        （相似度筛→ambiguous→判官），不猜一条改掉（2026-11-23 回归修：
+        “不对，我喜欢吃米线”对火锅/冒菜两条同槽旧行时必须报 ambiguous，
+        不能直选第一条就 updated）。"""
         slot_key = _correction_topic_slot(new_fact)
         if slot_key is None:
             return None
         norm_new = _normalize_memory_text(new_fact)
+        same_slot = []
         for mid in candidates or []:
             text = self._candidate_text(mid)
             if text is None:
@@ -2359,8 +2470,74 @@ class SQLiteStore:
             if _normalize_memory_text(text) == norm_new:
                 continue
             if _correction_topic_slot(text) == slot_key:
-                return mid
-        return None
+                same_slot.append(mid)
+        if len(same_slot) != 1:
+            return None
+        return same_slot[0]
+
+
+    def _already_corrected_receipt(self, new_fact, old_fact):
+        """新说法已是活记忆、且它顶掉旧说法的账本事件就是本轮（5 分钟内）
+        的，说明纠正已在本轮完成过：模型生成回复时调 update_memory 先改
+        了，save_turn 又调一次 correct_memory——两边都改就会误顶同槽位
+        的另一条旧记忆（D 组把真记忆广州顶掉；E 组则报 not_found、回复
+        丢了“改好了”）。此时不再另找目标，直接回 updated，old_text 就是
+        账本里这行顶掉的旧说法。返回 None 表示没撞上这条路。
+        只拦两种情况：(a) save_turn 的调用（old_fact == new_fact）；
+        (b) 工具的重复调用（旧说法已不在库里活着）。旧说法还活着时不拦
+        ——那是真纠正（例如新说法早就在库里、旧说法还活着），正常流程会
+        顶掉旧行、复用新行。
+        """
+        norm_new = _normalize_memory_text(new_fact)
+        live_id = None
+        for row in self._conn.execute(
+            "SELECT id, text FROM memories WHERE voided=0 AND deleted=0"
+            " AND superseded=0"
+        ).fetchall():
+            if _normalize_memory_text(row[1] or "") == norm_new:
+                live_id = row[0]
+                break
+        if live_id is None:
+            return None
+        # (b) 工具调用：旧说法还活着 → 真纠正，别拦。
+        if _normalize_memory_text(old_fact) != norm_new:
+            norm_old = _normalize_memory_text(old_fact)
+            for row in self._conn.execute(
+                "SELECT id, text FROM memories WHERE voided=0 AND deleted=0"
+                " AND superseded=0"
+            ).fetchall():
+                if _normalize_memory_text(row[1] or "") == norm_old:
+                    return None
+        # 账本里找这行顶掉的旧说法（最近的一条 supersede 事件）。
+        old_text = None
+        sup_ts = None
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            return None
+        for ev in reversed(events):
+            if (ev.get("type") == _ledger.LEDGER_EVENT_SUPERSEDE
+                    and ev.get("memory_id") == live_id):
+                old_text = ev.get("old_text")
+                sup_ts = ev.get("ts")
+                break
+        if not old_text or not sup_ts:
+            return None
+        # 只有本轮（5 分钟内）的 supersede 才算“刚改过”；早就是活行的
+        # 新说法（例如上次对话存下的）不拦，交给正常流程。
+        try:
+            sup_dt = datetime.fromisoformat(str(sup_ts).replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if (datetime.now(timezone.utc) - sup_dt).total_seconds() > 300:
+            return None
+        return {
+            "status": "updated", "memory_id": live_id,
+            "old_text": old_text, "new_text": new_fact,
+            "candidates": [], "reason": "已改好（本轮已纠正过）",
+            "layer": "already", "resolution": "already_corrected",
+            "audit": {"source": "user", "method": "already_corrected"},
+        }
 
     def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True,
                        explicit_correction=False):
@@ -2399,6 +2576,9 @@ class SQLiteStore:
                     "resolution": "blocked",
                     "audit": {"source": "user", "method": "correct_memory"},
                 }
+            already = self._already_corrected_receipt(new_fact, old_fact)
+            if already is not None:
+                return already
             candidates = self._find_correction_candidates(
                 old_fact, new_fact=new_fact,
                 exclude_identical_to_new=exclude_identical_to_new,
@@ -2458,6 +2638,49 @@ class SQLiteStore:
             # 第一条（候选已按已确认在前、同类里新的在前排过）。找不到
             # 同槽位候选时走下面的老路（相似度/判官），不硬猜。
             if explicit_correction:
+                # 2026-11-23 A 组修复：先认模型已写的纠正备注行——
+                # 模型在 save_turn 之前自己调 add_memory 写下
+                # “BOOS 喜欢吃面条（纠正：不是喜欢吃米饭）”，已经顶掉
+                # 了米饭；但备注行 slot 是 null、相似度又被括号拉低，
+                # 槽位直选和相似度筛都认不出它，纠正分支会报 not_found，
+                # 新说法又被 _dedupe_key 当成备注行的重复而不存。
+                # 认出来就用 exact 新说法取代备注行，回执 updated；
+                # 备注行里被纠正掉的旧说法（米饭）若还活着，也一并取代。
+                note_target = self._find_correction_note_target(
+                    candidates, new_fact
+                )
+                if note_target is not None:
+                    mid = note_target
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                    if row is not None:
+                        old_text, old_meta = row[0], json.loads(row[1] or "{}")
+                        same = (
+                            _normalize_memory_text(new_fact)
+                            == _normalize_memory_text(old_text)
+                        )
+                        result = self._apply_correction_result(
+                            new_fact, mid, old_text, old_meta, same_text=same,
+                            candidates=candidates,
+                            status="unchanged" if same else "updated",
+                            resolution="explicit_note", layer="note",
+                            audit={
+                                "source": "user",
+                                "method": "explicit_correction_note",
+                            },
+                        )
+                        if (result or {}).get("status") == "updated":
+                            extracted_old = _extract_note_old_fact(old_text)
+                            if extracted_old:
+                                result["old_text"] = extracted_old
+                                self._supersede_note_old_fact(
+                                    extracted_old,
+                                    (result or {}).get("memory_id"),
+                                    new_fact,
+                                )
+                        return result
                 slot_target = self._explicit_correction_slot_target(
                     candidates, new_fact
                 )
