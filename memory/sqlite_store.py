@@ -301,6 +301,45 @@ def _split_sentences(text):
     return [p.strip() for p in parts if p.strip()]
 
 
+# 一句话分两条发时的续接碎片判据（缺点清单第 11 条，2026-11-24）。
+# 判据保守：单独的语气词、以标点开头、或极短（≤2 字）且不是能独立
+# 成句的回复词。像“好/好的/行/嗯/谢谢”这种本身就是完整回复的，
+# 永远不算碎片——拼错一句话比漏拼一句代价大。
+_FRAGMENT_PARTICLES = "吗呢吧啊么嘛哦呀哇"
+_FRAGMENT_TRAILING_PUNCT = "。！？.!?~～…、，,；;：:"
+_FRAGMENT_STANDALONE = {
+    "好", "好的", "行", "嗯", "对", "是", "可以", "没错", "不", "不要",
+    "没事", "谢谢", "知道了", "继续", "嗯嗯", "好吧", "算了", "不用",
+    "没了", "就这", "完了",
+}
+
+
+def _is_continuation_fragment(text, prev_text=""):
+    """text 是不是上一条 user 消息的续接碎片（判据见上方注释）。
+
+    prev_text 只用于一条护栏：极短规则（≤2 字）要求上一条没以句号/
+    问号/感叹号收尾——上一句已经说完了，短消息多半是新话题，不拼。
+    语气词和标点开头两条不看 prev：它们本身就成不了句。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t[0] in "，。、；：？！,.!?;:":
+        return True
+    core = t.rstrip(_FRAGMENT_TRAILING_PUNCT).strip()
+    if not core:
+        return True
+    if core in _FRAGMENT_STANDALONE:
+        return False
+    if len(core) <= 2 and all(ch in _FRAGMENT_PARTICLES for ch in core):
+        return True
+    if len(core) <= 2:
+        prev = (prev_text or "").strip()
+        if prev and prev[-1] in "。！？!?":
+            return False
+        return True
+    return False
+
+
 # “记住”类前缀（2026-11-21 网页测第二轮 #8）：save_turn 逐句循环里
 # 先剥掉再存——“记住后天要去体检”要存成“后天要去体检”，不能把
 # “记住”两个字也存进记忆。顺序按最长优先；main.py 的
@@ -2057,9 +2096,21 @@ class SQLiteStore:
             self._seen_turn_ids.add(turn_id)
             self._active_turn_id = turn_id
         latest_user = ""
-        for m in reversed(messages or []):
-            if (m or {}).get("role") == "user":
-                latest_user = (m or {}).get("content") or ""
+        _msgs = list(messages or [])
+        for _i in range(len(_msgs) - 1, -1, -1):
+            if (_msgs[_i] or {}).get("role") == "user":
+                latest_user = (_msgs[_i] or {}).get("content") or ""
+                # 缺点清单第 11 条（2026-11-24）：一句话分两条发——
+                # 紧挨着的上一条也是 user 消息（中间没有助手回复）、
+                # 且本条是明显续接碎片时，拼成整句再走后面的存储/
+                # 纠正处理，不让“吗”这类碎片被当成独立消息。只拼
+                # 本轮输入，会话历史里的原始两条不动。
+                if _i > 0 and (_msgs[_i - 1] or {}).get("role") == "user":
+                    _prev_user = (_msgs[_i - 1] or {}).get("content") or ""
+                    if _prev_user.strip() and _is_continuation_fragment(
+                        latest_user, _prev_user
+                    ):
+                        latest_user = _prev_user.strip() + latest_user.strip()
                 break
         receipt = {
             "turn_id": turn_id,

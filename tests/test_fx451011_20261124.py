@@ -282,7 +282,7 @@ def test_item5_net_catches_at_exit_b(net_store, monkeypatch):
     assert not _is_superseded(net_store, "我喜欢吃牛肉面")
 
 
-def test_item5_net_below_threshold_not_even_judged(net_store, monkeypatch):
+def test_item5_net_below_threshold_not_even_judged(net_store, monkeypatch):  # noqa: E501
     """门槛宁缺毋滥：与新旧说法相似度都 < 0.80 的行（火锅，与米饭
     正交）连判官都不会被问到——判官打桩记录调用次数为 0，
     结果维持 not_found。"""
@@ -304,4 +304,101 @@ def test_item5_net_below_threshold_not_even_judged(net_store, monkeypatch):
     assert result["status"] == "not_found", result
     assert calls == []
     assert not _is_superseded(net_store, "我喜欢吃火锅")
+
+
+# ---------- 第 11 条：「吗」碎片消息拼整句 ----------
+
+from memory.sqlite_store import _is_continuation_fragment  # noqa: E402
+
+
+@pytest.fixture
+def fx_store(tmp_path, monkeypatch):
+    """离线确定性 store：无向量、无判官（同 test_r1r5 的打桩口径）。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
+    monkeypatch.setattr(
+        SQLiteStore, "_ask_semantic_judge",
+        lambda self, text, candidates, context=None: None,
+    )
+    return SQLiteStore(memory_dir=str(tmp_path / "memory"))
+
+
+def test_item11_fragment_predicate():
+    """碎片判据：语气词/标点开头/极短续接算碎片；能独立成句的
+    回复词、长句、空串不算；上一句已收尾时极短消息不拼。"""
+    assert _is_continuation_fragment("吗")
+    assert _is_continuation_fragment("呢？", "你明天有空")
+    assert _is_continuation_fragment("，也喜欢吃烧烤", "我喜欢吃火锅")
+    assert _is_continuation_fragment("？", "你刚说什么")
+    assert _is_continuation_fragment("火锅", "我想吃")
+    assert not _is_continuation_fragment("火锅", "我想吃火锅。")
+    assert not _is_continuation_fragment("好", "我们明天见面聊")
+    assert not _is_continuation_fragment("好的", "那就这么定")
+    assert not _is_continuation_fragment("嗯", "你同意")
+    assert not _is_continuation_fragment("谢谢", "帮我查一下天气")
+    assert not _is_continuation_fragment("我明天去上海出差", "刚才说到哪了")
+    assert not _is_continuation_fragment("", "上一句")
+
+
+def test_item11_fragment_merged_in_save_turn(fx_store):
+    """一句话分两条发（中间没有助手回复）：拼成整句再处理——
+    存下来的是拼好的整句一条，碎片本身不单独成行；
+    会话历史列表原样不动（save_turn 只读不改）。"""
+    messages = [
+        {"role": "user", "content": "我喜欢吃火锅"},
+        {"role": "user", "content": "，也喜欢吃烧烤"},
+    ]
+    receipt = fx_store.save_turn(messages, turn_id="fx11-merge")
+    assert receipt["stored"], receipt
+    texts = _live_texts(fx_store)
+    assert any("火锅" in t and "烧烤" in t for t in texts), texts
+    assert all("也喜欢吃烧烤" != t.strip("，, ") for t in texts), texts
+    assert messages[1]["content"] == "，也喜欢吃烧烤"
+
+
+def test_item11_no_merge_across_assistant_reply(fx_store):
+    """中间有助手回复就不拼：碎片单独处理，库里不会出现把两句
+    拼在一起的行。"""
+    fx_store.save_turn(
+        [
+            {"role": "user", "content": "我喜欢吃火锅"},
+            {"role": "assistant", "content": "好的，记下了"},
+            {"role": "user", "content": "，也喜欢吃烧烤"},
+        ],
+        turn_id="fx11-nomerge",
+    )
+    texts = _live_texts(fx_store)
+    assert not any("火锅" in t and "烧烤" in t for t in texts), texts
+
+
+def test_item11_standalone_reply_not_merged(fx_store):
+    """单独回「好」不是碎片：不和上一条拼，也不会存出
+    “我喜欢吃火锅好”这种拼错的行。"""
+    receipt = fx_store.save_turn(
+        [
+            {"role": "user", "content": "我喜欢吃火锅"},
+            {"role": "user", "content": "好"},
+        ],
+        turn_id="fx11-hao",
+    )
+    assert receipt["stored"] == [], receipt
+    assert _live_texts(fx_store) == []
+
+
+def test_item11_lone_fragment_without_context_unchanged(fx_store):
+    """单独的语气词、前面没有可拼的 user 消息（或紧挨着的是
+    助手消息）时行为不变：不报错、不存东西。"""
+    receipt = fx_store.save_turn(
+        [{"role": "user", "content": "吗"}], turn_id="fx11-lone"
+    )
+    assert receipt["stored"] == [], receipt
+    receipt = fx_store.save_turn(
+        [
+            {"role": "assistant", "content": "你明天有空吗"},
+            {"role": "user", "content": "吗"},
+        ],
+        turn_id="fx11-lone2",
+    )
+    assert receipt["stored"] == [], receipt
+    assert _live_texts(fx_store) == []
+
 
