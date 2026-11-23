@@ -4303,7 +4303,8 @@ class SQLiteStore:
         self._organizing_router = router
         return router
 
-    def run_self_check(self, now=None, sample_size=20):
+    def run_self_check(self, now=None, sample_size=20,
+                       include_model_judge=True):
         """跑一次定期自检（SQLite 版，2026-11-24 3b；第 9 项抽查
         20 条、自检节奏改每周见缺点清单第 4 条）：先扫一遍衰减
         （sweep_decay：该沉底的沉底、该标待删的标待删，都记账本），
@@ -4361,7 +4362,11 @@ class SQLiteStore:
         # R-6（2026-11-24）：把整理路由的判官接进来（make_model_judge
         # 和 mem0 同款），第 9/10 项在 SQLite 后端也真跑；路由不可用
         # 时 model_judge=None，两项 skipped，和 mem0 路由不可用时一样。
-        router = self.organizing_router()
+        # 错过补跑（2026-11-24）：include_model_judge=False 是离线
+        # 模式——判官项（第 9/10 项）不接路由、直接 skipped，报告
+        # 里标 model_judge_deferred，维护调度据此把判官部分挂成
+        # 待跑、等网络恢复补跑；本地项（衰减扫 + 其余八项）照常跑。
+        router = self.organizing_router() if include_model_judge else None
         model_judge = None
         if router is not None:
             model_judge = _store_self_check.make_model_judge(router)
@@ -4373,6 +4378,8 @@ class SQLiteStore:
             router_status=router.status() if router is not None else {},
         )
         report["decay_sweep"] = sweep
+        if not include_model_judge:
+            report["model_judge_deferred"] = True
         return report
 
     # ---------- 改 / 删（今天只实现删除；纠错后面再做） ----------

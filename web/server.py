@@ -2140,6 +2140,22 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
     return ThreadingHTTPServer((config.host, config.port), handler), state
 
 
+def _default_network_probe():
+    """轻量连通性探针（错过补跑用）：能连上任一常用 HTTPS 端点
+    就算有网。只判连通、不发业务请求；全失败才算离线。判官的
+    主力端点排第一（它通了判官基本就能跑），再加一个通用端点
+    兜底（判官换供应商时也不至于误判离线）。"""
+    import socket
+
+    for host, port in (("api.deepseek.com", 443), ("www.baidu.com", 443)):
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 class MemoryMaintenanceScheduler:
     """记忆维护调度（R-5，2026-11-24）：衰减清扫每天一次、记忆自检
     每周一次（缺点清单第 4 条加密，2026-11-24），进程内轻量守护
@@ -2157,13 +2173,19 @@ class MemoryMaintenanceScheduler:
       SHIER_DECAY_SWEEP_INTERVAL_HOURS（默认 24）、
       SHIER_SELF_CHECK_INTERVAL_DAYS（默认 7）、
       SHIER_MAINTENANCE_TICK_SECONDS（默认 3600，内部检查节奏）。
+    - 错过补跑（2026-11-24，BOOS 补定）：关机错过的靠上面的
+      “启动时到期就补跑”；断网错过的靠探网待跑——自检到期时
+      没网，本地部分照常跑、判官部分挂成待跑（不记已跑、不推
+      满周期），进程内每 15 分钟探一次网（SHIER_MAINTENANCE_
+      PROBE_SECONDS 可调），网络一恢复立刻补跑完整自检。
     自检走 store.run_self_check（SQLite 后端内部已接整理路由判官，
     R-6）；衰减走 store.sweep_decay。store 没这方法就跳过该任务。
     """
 
     def __init__(self, store, state_path, decay_interval_seconds=24 * 3600,
                  self_check_interval_seconds=7 * 24 * 3600,
-                 tick_seconds=3600, now_fn=None):
+                 tick_seconds=3600, now_fn=None, network_probe=None,
+                 probe_interval_seconds=900):
         self._store = store
         self._state_path = Path(state_path)
         self._decay_interval = float(decay_interval_seconds)
@@ -2172,6 +2194,13 @@ class MemoryMaintenanceScheduler:
         self._now_fn = now_fn or time.time
         self._stop = threading.Event()
         self._thread = None
+        # 错过补跑（2026-11-24，BOOS 补定）：network_probe 是无参
+        # 连通性探针（返回 True/False）；不传（None）时自检走
+        # R-5 原有语义。probe_interval_seconds 是待跑期间的探网
+        # 节奏（默认 15 分钟）。
+        self._network_probe = network_probe
+        self._probe_interval = max(1.0, float(probe_interval_seconds))
+        self._pending_known = False
 
     def _load_state(self):
         try:
@@ -2202,33 +2231,133 @@ class MemoryMaintenanceScheduler:
         now = float(now if now is not None else self._now_fn())
         state = self._load_state()
         ran = {"decay": False, "self_check": False}
-        jobs = (
-            ("decay", "decay_last_run", self._decay_interval, "sweep_decay"),
-            ("self_check", "self_check_last_run",
-             self._self_check_interval, "run_self_check"),
-        )
-        for name, key, interval, method in jobs:
-            last = state.get(key)
-            if isinstance(last, (int, float)) and now - float(last) < interval:
-                continue
-            fn = getattr(self._store, method, None)
-            if fn is None:
-                state[key] = now
-                continue
-            try:
-                result = fn()
-                if name == "decay":
-                    logger.info("记忆维护：衰减清扫已跑，结果 %s。", result)
-                else:
-                    logger.info("记忆维护：定期自检已跑完（报告见自检日志）。")
-            except Exception:
-                logger.warning(
-                    "记忆维护：%s 跑失败，下个间隔再试。", name, exc_info=True
-                )
-            state[key] = now
-            ran[name] = True
+        self._run_decay_due(state, now, ran)
+        self._run_self_check_due(state, now, ran)
+        self._pending_known = bool(state.get("self_check_pending"))
         self._save_state(state)
         return ran
+
+    def _run_decay_due(self, state, now, ran):
+        """衰减：纯本地活，断网也照常跑。到期才跑、异常只记日志、
+        记下本次时间下个间隔再试（R-5 原有语义，一字未改）。"""
+        key = "decay_last_run"
+        last = state.get(key)
+        if isinstance(last, (int, float)) and now - float(last) < self._decay_interval:
+            return
+        fn = getattr(self._store, "sweep_decay", None)
+        if fn is None:
+            state[key] = now
+            return
+        try:
+            result = fn()
+            logger.info("记忆维护：衰减清扫已跑，结果 %s。", result)
+        except Exception:
+            logger.warning(
+                "记忆维护：decay 跑失败，下个间隔再试。", exc_info=True
+            )
+        state[key] = now
+        ran["decay"] = True
+
+    def _run_self_check_local(self, fn):
+        """离线时只跑自检的本地部分：store 的 run_self_check 支持
+        include_model_judge 参数才调（判官项跳过、报告里标
+        deferred）；不支持就不跑（整个自检挂待跑）。返回有没有
+        跑成；跑失败只记日志、返回 False（仍挂待跑）。"""
+        try:
+            import inspect
+
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "include_model_judge" not in params:
+            return False
+        try:
+            fn(include_model_judge=False)
+        except Exception:
+            logger.warning("记忆维护：自检本地部分跑失败。", exc_info=True)
+            return False
+        return True
+
+    def _run_self_check_due(self, state, now, ran):
+        """自检：本地项不依赖网络，判官项（第 9/10 项）要联网。
+
+        - 没配探针：R-5 原有语义（到期就跑、失败记本次时间）。
+        - 配了探针（错过补跑，2026-11-24，BOOS 补定）：到期时先
+          探网——离线就只跑本地部分，判官部分挂成待跑
+          （state.self_check_pending），不写 self_check_last_run
+          （不许记成已尝试、更不许把下次时间推满一个周期）；
+          待跑期间每 probe_interval 秒探一次网，网络一恢复立刻
+          补跑完整自检，跑完才记 last_run、清待跑标记。
+        """
+        key = "self_check_last_run"
+        fn = getattr(self._store, "run_self_check", None)
+        pending = bool(state.get("self_check_pending"))
+        last = state.get(key)
+        due = not (
+            isinstance(last, (int, float))
+            and now - float(last) < self._self_check_interval
+        )
+        if not pending and not due:
+            return
+        if self._network_probe is None:
+            if fn is None:
+                state[key] = now
+                return
+            try:
+                fn()
+                logger.info("记忆维护：定期自检已跑完（报告见自检日志）。")
+            except Exception:
+                logger.warning(
+                    "记忆维护：self_check 跑失败，下个间隔再试。",
+                    exc_info=True,
+                )
+            state[key] = now
+            ran["self_check"] = True
+            return
+        if fn is None:
+            state[key] = now
+            state.pop("self_check_pending", None)
+            state.pop("self_check_pending_since", None)
+            return
+        last_probe = state.get("self_check_last_probe")
+        if (
+            pending
+            and isinstance(last_probe, (int, float))
+            and now - float(last_probe) < self._probe_interval
+        ):
+            return  # 待跑中，还没到下次探网时间
+        try:
+            online = bool(self._network_probe())
+        except Exception:
+            online = False  # 探针自己出错按离线算，宁可晚跑也不误报已跑
+        state["self_check_last_probe"] = now
+        if not online:
+            if not pending:
+                if self._run_self_check_local(fn):
+                    ran["self_check_local"] = True
+                state["self_check_pending"] = True
+                state.setdefault("self_check_pending_since", now)
+                logger.info(
+                    "记忆维护：自检到期但离线——本地部分已跑，"
+                    "判官部分挂待跑，等网络恢复补跑。"
+                )
+            return
+        try:
+            fn()
+            logger.info("记忆维护：定期自检已跑完（报告见自检日志）。")
+        except Exception:
+            logger.warning(
+                "记忆维护：self_check 跑失败，下个间隔再试。", exc_info=True
+            )
+            if not pending:
+                state[key] = now
+                ran["self_check"] = True
+            # 待跑补跑失败：继续挂着，下次探网再试，不记已跑。
+            return
+        state[key] = now
+        state.pop("self_check_pending", None)
+        state.pop("self_check_pending_since", None)
+        ran["self_check"] = True
 
     def start(self):
         """起守护线程：先补跑到期的，再按 tick 节奏巡回。重复调不重复起。"""
@@ -2241,7 +2370,12 @@ class MemoryMaintenanceScheduler:
                     self.run_due()
                 except Exception:
                     logger.warning("记忆维护调度一圈失败。", exc_info=True)
-                self._stop.wait(self._tick)
+                wait = self._tick
+                if getattr(self, "_pending_known", False):
+                    # 有判官部分挂着待跑：按探网节奏醒来看网络
+                    # 恢复了没有，别等满一个 tick（默认 1 小时）。
+                    wait = min(wait, self._probe_interval)
+                self._stop.wait(wait)
 
         self._thread = threading.Thread(
             target=_loop, daemon=True, name="memory-maintenance"
@@ -2287,6 +2421,10 @@ def start_memory_maintenance(store):
         ) * 24 * 3600,
         tick_seconds=_maintenance_interval_value(
             "SHIER_MAINTENANCE_TICK_SECONDS", 3600
+        ),
+        network_probe=_default_network_probe,
+        probe_interval_seconds=_maintenance_interval_value(
+            "SHIER_MAINTENANCE_PROBE_SECONDS", 900
         ),
     )
     scheduler.start()
