@@ -156,6 +156,13 @@ def build_judge_prompt(new_text, candidates):
         "其中某条旧记忆；3) 如果是，是哪条（写它的 id，否则 null），"
         "该不该取代（true/false）。"
     )
+    # 规则 (a)（2026-11-23，R2 食物案）：偏好一次只有一个当前答案；
+    # “我现在喜欢 X 了”这类说法表示当前偏好变了，同类旧偏好应当被取代。
+    lines.append(
+        "规则：'喜欢吃什么/喝什么/看什么'一次只有一个当前答案；新说法带"
+        "'现在''改''其实''不对''更喜欢''只'等词、表示偏好变了时，同类旧偏好"
+        "应当被取代，不要判成'可以并存'。"
+    )
     lines.append(
         '只回这一行 JSON：{"slot": "...", "is_correction": true, '
         '"target_id": "...", "should_supersede": true, "reason": "一句话原因"}'

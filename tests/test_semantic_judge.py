@@ -356,3 +356,72 @@ def test_first_preference_never_calls_judge(tmp_path, monkeypatch):
     receipt = _save(store, "我喜欢喝橙汁", "t1")
     assert judge.calls == []
     assert "我喜欢喝橙汁" in receipt["stored"]
+
+
+# ---------- 8. 规则 (a)：偏好变了就取代 ----------
+
+
+def test_judge_prompt_has_preference_change_rule():
+    """规则 (a)：提示词里有“偏好一次只有一个当前答案”这条规则。
+
+    R2 食物案：判官曾把米饭和面条判成“可以并存”。规则写明：新说法带
+    “现在/改/其实/不对/更喜欢/只”等词表示偏好变了时，同类旧偏好应当
+    被取代，不要判成“可以并存”。加规则不能把原来的任务和 JSON 格式挤掉。
+    """
+    prompt = sj.build_judge_prompt(
+        "我现在喜欢吃面条了",
+        [{"id": "m1", "text": "我喜欢吃米饭"}],
+    )
+    assert "只有一个当前答案" in prompt
+    assert "不要判成'可以并存'" in prompt
+    for word in ("现在", "改", "其实", "不对", "更喜欢", "只"):
+        assert f"'{word}'" in prompt
+    # 原来的任务和 JSON 格式还在（加规则没挤掉别的东西）
+    assert "新说法属于哪类偏好/槽位" in prompt
+    assert "是不是在纠正/取代" in prompt
+    assert "只回这一行 JSON" in prompt
+    assert '"should_supersede"' in prompt
+
+
+def test_judge_supersedes_food_preference(tmp_path, monkeypatch):
+    """R2 食物案（mock）：米饭→面条，判官说取代，米饭被取代、只剩面条。
+
+    规则触发时判取代：和饮品案同一条路，只是换成食物。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    _save(store, "我喜欢吃米饭", "t1")
+    assert judge.calls == []  # 第一条：库里没同类偏好，不问模型
+    rice_id = store.get_all()[0]["id"]
+    judge.verdict = {
+        "slot": "喜欢吃的食物", "is_correction": True,
+        "target_id": rice_id, "should_supersede": True,
+        "reason": "同是喜欢吃的食物，新说法取代旧说法",
+    }
+    receipt = _save(store, "我现在喜欢吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert _is_superseded(store, "我喜欢吃米饭") is True
+    assert "我现在喜欢吃面条了" in _live_texts(store)
+    assert "我喜欢吃米饭" not in _live_texts(store)
+    assert len([t for t in _live_texts(store) if "吃" in t]) == 1
+    correction = receipt.get("correction") or {}
+    assert correction.get("route") == "model"
+    assert correction.get("status") == "updated"
+    assert correction.get("judge", {}).get("trigger") == "correction_uncertain"
+
+
+def test_judge_food_no_supersede_keeps_both(tmp_path, monkeypatch):
+    """规则不触发时行为不变：判官说不取代，两条都活着，不崩、不丢。"""
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    _save(store, "我喜欢吃米饭", "t1")
+    judge.verdict = {
+        "slot": "喜欢吃的食物", "is_correction": False,
+        "target_id": None, "should_supersede": False,
+        "reason": "新说法和旧的不是同一回事",
+    }
+    receipt = _save(store, "我现在喜欢吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert "我喜欢吃米饭" in _live_texts(store)
+    assert "我现在喜欢吃面条了" in _live_texts(store)
+    assert receipt.get("correction") is None
