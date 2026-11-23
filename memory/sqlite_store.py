@@ -659,6 +659,7 @@ class SQLiteStore:
             # 那一刻的值是旧的）。
             promote_meta = {}
             decay_marks = {}
+            slot_map = {}
             try:
                 _events, _info = _ledger.read_events(self.ledger_path)
                 for _event in _events:
@@ -668,6 +669,11 @@ class SQLiteStore:
                         _meta = _event.get("meta") or {}
                         if _key and _meta:
                             promote_meta[_key] = _meta
+                    elif _etype == _ledger.LEDGER_EVENT_SLOT and _key:
+                        # R-7（2026-11-24）：补槽位标的账本事件，
+                        # 重建缺失行时把 slot 一并带回来（最新一笔赢）。
+                        if _event.get("slot"):
+                            slot_map[_key] = _event["slot"]
                     elif _etype == _ledger.LEDGER_EVENT_DORMANT and _key:
                         # 3b（2026-11-24）：沉底/待删标记在账本里有
                         # 事件，重建时把 decay_state 一并带回来。
@@ -700,12 +706,17 @@ class SQLiteStore:
                 _promoted = promote_meta.get(key) or {}
                 _touched = touch_map.get(key)
                 _mark = decay_marks.get(key)
-                if _promoted or _touched or _mark:
+                _slot = slot_map.get(key)
+                if _promoted or _touched or _mark or _slot:
                     meta = dict(meta)
                 if _promoted:
                     for _field in ("source", "user_confirmed", "decay_kind", "importance"):
                         if _promoted.get(_field) is not None:
                             meta[_field] = _promoted[_field]
+                if _slot and not meta.get("slot"):
+                    # R-7：add 那笔还没有槽位标，按 SLOT 事件补上
+                    # （_insert_memory_row 会把 meta 里的 slot 写进列）。
+                    meta["slot"] = _slot
                 if _touched and _touched > str(meta.get("last_used_at") or ""):
                     # 3a（2026-11-24）：TOUCH 事件记着最后使用时间，
                     # 重建时带回来，不退回 add 时的值（P1-6 修掉）。
@@ -1236,6 +1247,22 @@ class SQLiteStore:
             except Exception:
                 meta = {}
             if meta.get("slot"):
+                return
+            # R-7（2026-11-24）：槽位标也记一笔账本（SLOT 事件），
+            # 对账重建缺失行时按它把标带回来——以前只写 SQLite，
+            # add 事件的 meta 里没有槽位标，重建出来标就丢了。
+            # 账本先行：写不进去就先不补标（本函数是尽力而为的
+            # 补标、不抛异常，下次用到这条时还会再试）。
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_SLOT,
+                     "memory_id": memory_id, "key": memory_id,
+                     "slot": slot},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("补槽位记账失败：本次先不补标。", exc_info=True)
                 return
             meta["slot"] = slot
             self._conn.execute(

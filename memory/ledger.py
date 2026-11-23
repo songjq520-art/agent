@@ -52,6 +52,11 @@ LEDGER_EVENT_INFERENCE = "inference"
 LEDGER_EVENT_RELATE = "relate"
 LEDGER_EVENT_SNAPSHOT = "snapshot"
 LEDGER_EVENT_TOUCH = "touch"
+# R-7（2026-11-24）：补槽位标事件——槽位标以前只写 SQLite 索引，
+# 对账重建缺失行时无从恢复；记一笔 slot 事件（带 memory_id/key 和
+# slot），重建时按它把标带回来。只是索引提示，不改变记忆状态，
+# resolve_state 不处理它（状态层不认这个类型，无副作用）。
+LEDGER_EVENT_SLOT = "slot"
 LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_ADD,
     LEDGER_EVENT_SUPERSEDE,
@@ -63,6 +68,7 @@ LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_RELATE,
     LEDGER_EVENT_SNAPSHOT,
     LEDGER_EVENT_TOUCH,
+    LEDGER_EVENT_SLOT,
 )
 
 # 账本里的状态名（resolve_state 的 by_id 值里 "state" 字段的取值）。
