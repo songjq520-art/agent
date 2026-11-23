@@ -2136,20 +2136,23 @@ class SQLiteStore:
                 # 下一句“撤回”作废的是这条新记忆，不是上一轮的。
                 with self._lock:
                     self._last_stored_turn_id = turn_id
-        # #4：本轮拿不准的问题先问；有新问题时，顺带把攒着的旧问题
-        # 一起问（最多 3 条）。没新问题时不打扰，旧问题继续攒着。
-        if new_questions:
-            # 一轮最多问 3 个（QUESTIONS_PER_CHAT_MAX）：只把前 3 个
-            # 标成已问、放进回执；多出来的留在 pending 里，下一轮再带。
-            new_questions = new_questions[:_pq.QUESTIONS_PER_CHAT_MAX]
-            for _q in new_questions:
-                self.pending_questions.mark_asked(_q["id"])
-            room = max(0, _pq.QUESTIONS_PER_CHAT_MAX - len(new_questions))
-            backlog = (
-                self.pending_questions.drain_for_chat(max_n=room)
-                if room > 0
-                else []
-            )
+        # #4：本轮拿不准的问题先问，顺带把攒着的旧问题一起带出来
+        # （一轮最多 3 条，含新问题）。R-2（2026-11-24）：以前只有
+        # 本轮有新问题时才带旧问题——本轮没新问题时，攒着的旧问题
+        # 连带都不带，永远没机会在聊天里被问。现在每轮都带；重问
+        # 的间隔/上限在 drain_for_chat 里管，不会每轮轰炸同一条。
+        # 一轮最多问 3 个（QUESTIONS_PER_CHAT_MAX）：只把前 3 个
+        # 标成已问、放进回执；多出来的留在 pending 里，下一轮再带。
+        new_questions = new_questions[:_pq.QUESTIONS_PER_CHAT_MAX]
+        for _q in new_questions:
+            self.pending_questions.mark_asked(_q["id"])
+        room = max(0, _pq.QUESTIONS_PER_CHAT_MAX - len(new_questions))
+        backlog = (
+            self.pending_questions.drain_for_chat(max_n=room)
+            if room > 0
+            else []
+        )
+        if new_questions or backlog:
             receipt["questions"] = new_questions + backlog
         self._store_turn_receipt(turn_id, receipt)
         return receipt

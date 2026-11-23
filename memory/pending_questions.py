@@ -39,11 +39,29 @@ IMPORTANCE_QUESTION_OPTIONS = ("进核心", "当一次性经历", "不存")
 # 一轮回复里最多顺带问几条（含本轮新问题）：多了 BOOS 看不过来。
 QUESTIONS_PER_CHAT_MAX = 3
 
+# 问过没人答的问题，隔多久可以在聊天里再带出来问一次（R-2，
+# 2026-11-24）：问一次没答不等于这事就放下了，但也不能每轮都
+# 追着问——隔 7 天才重问，且同一个问题最多在聊天里问
+# QUESTION_MAX_ASKS 次（第一次 + 两次重问），到顶就只留在待答
+# 列表里（/api/questions 还能答），不再往聊天里带。
+REASK_AFTER_DAYS = 7
+QUESTION_MAX_ASKS = 3
+
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _parse_iso(value):
+    """解析 _now_iso 写的时间串；解析不了返回 None（调用方按没时间算）。"""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class PendingQuestions:
@@ -132,6 +150,10 @@ class PendingQuestions:
                 "created_at": _now_iso(),
                 "status": QUESTION_STATUS_PENDING,
                 "answer": None,
+                # 在聊天里问过几次、最近一次是什么时候问的（R-2 重问
+                # 间隔/上限靠这两个字段；老文件里没有时按未问过算）。
+                "asked_at": None,
+                "ask_count": 0,
             }
             self._questions.append(question)
             self._save()
@@ -161,11 +183,37 @@ class PendingQuestions:
         """还没回答的问题数。"""
         return len(self.list_unanswered())
 
+    def _recycle_stale_asked(self, now):
+        """把问过太久没人答的问题回滚成 pending（R-2，调用方持锁）。
+
+        条件：状态是 asked、上次问的时间（asked_at，老数据没有时按
+        created_at 算）距今 ≥ REASK_AFTER_DAYS 天、且总共问过的次数
+        还没到 QUESTION_MAX_ASKS。返回有没有改动。"""
+        changed = False
+        for item in self._questions:
+            if item.get("status") != QUESTION_STATUS_ASKED:
+                continue
+            if int(item.get("ask_count") or 1) >= QUESTION_MAX_ASKS:
+                continue
+            asked_at = _parse_iso(item.get("asked_at") or item.get("created_at"))
+            if asked_at is None:
+                continue
+            if (now - asked_at).days >= REASK_AFTER_DAYS:
+                item["status"] = QUESTION_STATUS_PENDING
+                changed = True
+        return changed
+
     def drain_for_chat(self, max_n=QUESTIONS_PER_CHAT_MAX):
-        """取一批攒着的问题去聊天里问：只取 pending 的（asked 的已经
-        问过一遍了，不重复问），按创建时间从旧到新，最多 max_n 条；
-        取出来的标成 asked（等回答）。返回问题 dict 列表。"""
+        """取一批攒着的问题去聊天里问：pending 的按创建时间从旧到新，
+        最多 max_n 条；取出来的标成 asked（等回答），并记 asked_at /
+        ask_count。返回问题 dict 列表。
+
+        R-2（2026-11-24）：取之前先把「问过超过 REASK_AFTER_DAYS 天
+        还没人答、且没问满 QUESTION_MAX_ASKS 次」的 asked 问题回滚
+        成 pending，让它们能被再带出来问一次——以前 asked 的永远
+        不重问，问一次没答，这事就等于被悄悄放下了。"""
         with self._lock:
+            changed = self._recycle_stale_asked(datetime.now(timezone.utc))
             pending = [
                 item
                 for item in sorted(
@@ -175,7 +223,9 @@ class PendingQuestions:
             ][:max_n]
             for item in pending:
                 item["status"] = QUESTION_STATUS_ASKED
-            if pending:
+                item["asked_at"] = _now_iso()
+                item["ask_count"] = int(item.get("ask_count") or 0) + 1
+            if pending or changed:
                 self._save()
             return [dict(item) for item in pending]
 
@@ -191,6 +241,8 @@ class PendingQuestions:
                 if item.get("status") == QUESTION_STATUS_ASKED:
                     return True
                 item["status"] = QUESTION_STATUS_ASKED
+                item["asked_at"] = _now_iso()
+                item["ask_count"] = int(item.get("ask_count") or 0) + 1
                 self._save()
                 return True
         return False
