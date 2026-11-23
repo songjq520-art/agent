@@ -425,3 +425,82 @@ def test_judge_food_no_supersede_keeps_both(tmp_path, monkeypatch):
     assert "我喜欢吃米饭" in _live_texts(store)
     assert "我现在喜欢吃面条了" in _live_texts(store)
     assert receipt.get("correction") is None
+
+
+# ---------- 9. R2 后续①：改吃/只吃类说法也触发判官 ----------
+
+
+def test_judge_trigger_change_eat_phrasing(tmp_path, monkeypatch):
+    """“我改吃面条了”没有“喜欢”标记，也要叫判官、取代米饭。
+
+    2026-11-23 R2 后续①：触发器只认喜欢类标记时，改吃类说法根本
+    叫不到判官，旧偏好换不掉。放宽后判官应被叫一次、取代米饭，
+    最后只剩一条活的面条偏好。
+    """
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    _save(store, "我喜欢吃米饭", "t1")
+    assert judge.calls == []
+    rice_id = store.get_all()[0]["id"]
+    judge.verdict = {
+        "slot": "喜欢吃的实物", "is_correction": True,
+        "target_id": rice_id, "should_supersede": True,
+        "reason": "同类喜欢吃的食物，新说法取代旧说法",
+    }
+    receipt = _save(store, "我改吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert _is_superseded(store, "我喜欢吃米饭") is True
+    assert "我改吃面条了" in _live_texts(store)
+    assert "我喜欢吃米饭" not in _live_texts(store)
+    assert len([t for t in _live_texts(store) if "面" in t]) == 1
+    correction = receipt.get("correction") or {}
+    assert correction.get("route") == "model"
+    assert correction.get("status") == "updated"
+    assert correction.get("judge", {}).get("trigger") == "preference_change"
+
+
+def test_judge_trigger_only_eat_phrasing(tmp_path, monkeypatch):
+    """“我现在只吃面条了”也要叫判官、取代米饭。"""
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    _save(store, "我喜欢吃米饭", "t1")
+    assert judge.calls == []
+    rice_id = store.get_all()[0]["id"]
+    judge.verdict = {
+        "slot": "喜欢吃的实物", "is_correction": True,
+        "target_id": rice_id, "should_supersede": True,
+        "reason": "同类喜欢吃的食物，新说法取代旧说法",
+    }
+    receipt = _save(store, "我现在只吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert _is_superseded(store, "我喜欢吃米饭") is True
+    assert "我现在只吃面条了" in _live_texts(store)
+    assert "我喜欢吃米饭" not in _live_texts(store)
+    correction = receipt.get("correction") or {}
+    assert correction.get("judge", {}).get("trigger") == "preference_change"
+
+
+def test_change_marker_without_candidate_no_judge(tmp_path, monkeypatch):
+    """没有同类旧偏好时，改吃类说法不叫判官，直接存。"""
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    receipt = _save(store, "我改吃面条了", "t1")
+    assert judge.calls == []
+    assert "我改吃面条了" in receipt["stored"]
+
+
+def test_change_marker_judge_says_no_keeps_both(tmp_path, monkeypatch):
+    """判官说不取代时，改吃类新说法与旧偏好共存。"""
+    judge = FakeJudge()
+    store = _judge_store(tmp_path, monkeypatch, judge)
+    _save(store, "我喜欢吃米饭", "t1")
+    judge.verdict = {
+        "slot": "喜欢吃的实物", "is_correction": False,
+        "target_id": None, "should_supersede": False,
+        "reason": "新说法与旧的不是同一类",
+    }
+    receipt = _save(store, "我改吃面条了", "t2")
+    assert len(judge.calls) == 1
+    assert "我喜欢吃米饭" in _live_texts(store)
+    assert "我改吃面条了" in _live_texts(store)
+    assert receipt.get("correction") is None

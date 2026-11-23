@@ -94,6 +94,18 @@ _JUDGE_PREFERENCE_MARKERS = (
 # 一次判断最多带几条旧偏好候选（提示词要短，超了只带最近的）。
 _JUDGE_MAX_CANDIDATES = 10
 
+# 偏好改变说法（2026-11-23 R2 后续①）：明确表达偏好变了的说法。
+# “改吃/只吃/改喝/只喝/改看/只看……”——前缀“改/只/改成”+动词
+# （吃/喝/看/听/玩）。不含“换成”等泛词，避免“改成明天”这类
+# 非偏好句也触发。触发只决定“问不问判官”，判官才是裁决者；
+# 边界说法（如“我只吃了一口”）判官会判不取代，所以宁可多问
+# 一次判官，也别漏掉真正的偏好改变。
+_JUDGE_CHANGE_MARKERS = tuple(
+    prefix + verb
+    for prefix in ("改", "只", "改成")
+    for verb in ("吃", "喝", "看", "听", "玩")
+)
+
 # 问句不存：以这些结尾的用户话是提问，不是陈述事实。
 _QUESTION_ENDINGS = ("?", "？", "吗", "么", "呢", "吧", "嘛")
 
@@ -1200,11 +1212,23 @@ class SQLiteStore:
         """
         if slot is not None:
             return False, None, []
-        if not any(marker in sentence for marker in _JUDGE_PREFERENCE_MARKERS):
+        # 2026-11-23 R2 后续①：偏好改变说法（改吃/只吃类）也触发判官。
+        # 这类说法没有“喜欢”等偏好标记，但明确表达偏好变了；只认
+        # _JUDGE_CHANGE_MARKERS 里的表达，避免过度触发。
+        has_marker = any(
+            marker in sentence for marker in _JUDGE_PREFERENCE_MARKERS
+        )
+        has_change = any(
+            marker in sentence for marker in _JUDGE_CHANGE_MARKERS
+        )
+        if not has_marker and not has_change:
             return False, None, []
         cands = self._preference_judge_candidates(sentence)
         if not cands:
             return False, None, []
+        # 改变标记是更明确的信号，优先于通用纠正短语匹配（如“我现在”）。
+        if has_change and not has_marker:
+            return True, "preference_change", cands
         if _detect_correction(sentence) is None and any(
             phrase in sentence for phrase in _CORRECTION_PHRASES
         ):

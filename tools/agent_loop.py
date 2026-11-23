@@ -321,6 +321,96 @@ def _tool_label(tool_name):
     return _TOOL_LABELS.get(tool_name or "", tool_name or "工具")
 
 
+
+def _is_correction_delete(user_text, target_text):
+    """判断一次删除调用是不是“纠正伪装的删除”（2026-11-23 R2 后续②）。
+
+    用户这句话是在纠正旧说法（带新说法，如“不对，我喜欢吃面条”）
+    且删除目标正是要被取代的旧记忆时，返回 True。真正的删除意图
+    （如“忘记这个”，没有新说法可取代）返回 False，删除照常走。
+    判定：先看纠正检测能不能从用户话里取出新说法；再看删除目标
+    是不是同槽位（住处/名字等），或新说法与目标都是偏好类记忆
+    （含喜欢/爱吃……或改吃/只吃类标记）。
+    """
+    if not isinstance(user_text, str) or not user_text.strip():
+        return False
+    if not isinstance(target_text, str) or not target_text.strip():
+        return False
+    from memory.correction_text import _detect_correction, _infer_fact_slot
+
+    detected = _detect_correction(user_text)
+    if detected is None:
+        return False
+    fact = (detected.get("fact") or "").strip()
+    if not fact:
+        return False
+    fact_slot, _ = _infer_fact_slot(fact)
+    target_slot, _ = _infer_fact_slot(target_text)
+    if fact_slot is not None and fact_slot == target_slot:
+        return True
+    from memory.sqlite_store import (
+        _JUDGE_CHANGE_MARKERS,
+        _JUDGE_PREFERENCE_MARKERS,
+    )
+
+    fact_pref = any(m in fact for m in _JUDGE_PREFERENCE_MARKERS) or any(
+        m in fact for m in _JUDGE_CHANGE_MARKERS
+    )
+    target_pref = any(m in target_text for m in _JUDGE_PREFERENCE_MARKERS)
+    return bool(fact_pref and target_pref)
+
+
+def _intercept_correction_delete(task, tool_name, args, tool_call_id):
+    """纠正抢占拦截：本轮是纠正时，删除工具不抢先（2026-11-23 R2 后续②）。
+
+    模型在纠正轮里调 delete_memory/delete_memories 会弹确认卡，
+    纠正路被抢占、纠正本身还来不及存。拦截后返回一个“已处理”的
+    工具结果，告诉模型旧记忆会在保存时由新说法自动取代、直接按
+    新说法回答，不要再调删除。不是纠正轮、或删除目标与纠正无关时
+    返回 None，不拦截，删除照常走确认卡。
+    返回的零件包与 _run_tool_call 其余分支同形。
+    """
+    goal = (task or {}).get("goal") or ""
+    if tool_name == "delete_memory":
+        texts = [(args or {}).get("text") or (args or {}).get("anchor_text") or ""]
+    elif tool_name == "delete_memories":
+        items = (args or {}).get("items") or []
+        texts = [((item or {}).get("text") or "") for item in items]
+    else:
+        return None
+    texts = [t for t in texts if t.strip()]
+    if not texts:
+        return None
+    if not all(_is_correction_delete(goal, t) for t in texts):
+        return None
+    from memory.correction_text import _detect_correction
+
+    fact = ((_detect_correction(goal) or {}).get("fact") or "").strip()
+    logger.info("纠正轮删除拦截：目标=%s 新说法=%s", texts, fact)
+    return {
+        "outcome": "done",
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "content": (
+            "不用删除：用户这句话是在纠正旧说法"
+            + (f"，新说法是“{fact}”" if fact else "")
+            + "，旧记忆会在保存时自动被新说法取代。"
+              "你直接按新说法回答，不要再调用删除工具。"
+        ),
+        "record": {
+            "tool": tool_name,
+            "args": args,
+            "tool_call_id": tool_call_id,
+            "status": "ok",
+        },
+        "approval": None,
+        "failure_key": None,
+        "failure_increment": 0,
+        "search_args": None,
+        "search_result": None,
+    }
+
+
 class AgentLoop:
     """工具循环：跑完一轮对话（可能含多次工具调用），返回最后的回答。
 
@@ -999,6 +1089,16 @@ class AgentLoop:
                     "search_args": None,
                     "search_result": None,
                 }
+
+        # 2026-11-23 R2 后续②：纠正轮里模型调删除会弹确认卡、抢占纠正路。
+        # 先拦截：是纠正就直接回“已处理”，不进网关、不弹卡；不是纠正
+        # 才走正常删除流程。
+        if tool_name in ("delete_memory", "delete_memories"):
+            intercepted = _intercept_correction_delete(
+                task, tool_name, args, tool_call_id
+            )
+            if intercepted is not None:
+                return intercepted
 
         outcome = self.gateway.execute(
             tool_name, args,
