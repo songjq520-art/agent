@@ -2097,6 +2097,9 @@ class SQLiteStore:
         # #4：本轮拿不准的问题先问；有新问题时，顺带把攒着的旧问题
         # 一起问（最多 3 条）。没新问题时不打扰，旧问题继续攒着。
         if new_questions:
+            # 一轮最多问 3 个（QUESTIONS_PER_CHAT_MAX）：只把前 3 个
+            # 标成已问、放进回执；多出来的留在 pending 里，下一轮再带。
+            new_questions = new_questions[:_pq.QUESTIONS_PER_CHAT_MAX]
             for _q in new_questions:
                 self.pending_questions.mark_asked(_q["id"])
             room = max(0, _pq.QUESTIONS_PER_CHAT_MAX - len(new_questions))
