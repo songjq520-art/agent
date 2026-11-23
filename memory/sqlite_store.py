@@ -1400,15 +1400,26 @@ class SQLiteStore:
     def _schedule_turn_organize(self, memory_ids, turn_id=None):
         """把本轮整理放后台线程跑：不拖慢回复；整理出任何异常只
         记日志，绝不影响本轮对话。返回线程对象（测试可 join 等它
-        跑完验效果）；没有可整理的返回 None。"""
+        跑完验效果）；没有可整理的返回 None。
+
+        线程里不用本 store 的连接：另开一个同目录的 store 实例
+        （独立 SQLite 连接，靠 WAL 的文件级并发）——跨线程共用
+        一条连接在全套测试里触发过原生层 access violation
+        （2026-11-24 全套崩溃定位），独立连接 + 实例被线程帧
+        持有（不会被提前回收）才稳。整理线程之间串行：新线程
+        先等上一条整理完，不堆积。"""
         ids = [m for m in dict.fromkeys(memory_ids or []) if m]
         if not ids:
             return None
+        prev = getattr(self, "_turn_organize_thread", None)
 
         def _run():
             try:
+                if prev is not None and prev.is_alive():
+                    prev.join(timeout=30)
+                worker = SQLiteStore(memory_dir=str(self.memory_dir))
                 self._last_turn_organize_summary = (
-                    self._organize_turn_memories(ids, turn_id=turn_id)
+                    worker._organize_turn_memories(ids, turn_id=turn_id)
                 )
             except Exception:
                 logger.warning("实时整理后台执行失败。", exc_info=True)
