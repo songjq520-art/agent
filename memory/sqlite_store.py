@@ -1000,6 +1000,17 @@ class SQLiteStore:
                                 (row[0], row[1],
                                  json.dumps(row[2] or {}, ensure_ascii=False))
                             )
+                # R-1 护栏：核心/置顶行不进槽位裁决名单——不顶，
+                # 也不让它拦住新行落存，留着走问 BOOS 的路径。
+                _kept_rows = []
+                for _r in conflict_rows:
+                    try:
+                        _m = json.loads(_r[2] or "{}")
+                    except Exception:
+                        _m = {}
+                    if not self._is_core_protected_row(_m, slot):
+                        _kept_rows.append(_r)
+                conflict_rows = _kept_rows
                 for row in conflict_rows:
                     old_meta = json.loads(row[2] or "{}")
                     new_meta_probe = {
@@ -1077,8 +1088,6 @@ class SQLiteStore:
                     text, key, _importance_reason, turn_id
                 )
             if len(to_supersede) > 1:
-                # 2026-11-23 model fix #1：显式纠正也只顶最新的一条同槽
-                # 冲突（被纠正的那条），其余留着——全顶掉曾连带顶掉真记忆。
                 to_supersede = sorted(
                     to_supersede,
                     key=lambda c: (
@@ -1086,12 +1095,22 @@ class SQLiteStore:
                         (c[2] or {}).get("created_at") or "",
                     ),
                     reverse=True,
-                )[:1]
-            for old_id, old_text, old_meta in to_supersede:
+                )
+            # R-1（2026-11-24，BOOS 定“像十一”）：裁决判该顶的不再
+            # 只顶最新一条——主目标（最新那条）照旧直接顶；其余走
+            # 连带清扫的门槛（只清对话里亲口说过的，防广州式误伤：
+            # 旧写法无差别全顶曾连带顶掉真记忆，只顶一条又是矫枉
+            # 过正——现在主目标全顶、连带清扫带门槛）。
+            for old_id, old_text, old_meta in to_supersede[:1]:
                 try:
                     self._supersede_row(old_id, old_text, old_meta, key, text)
                 except Exception:
                     logger.warning("槽位取代记账失败：旧行未取代。", exc_info=True)
+            if len(to_supersede) > 1:
+                self._sweep_extra_conflicts(
+                    slot, to_supersede[1:], key, text, turn_id=turn_id,
+                    probe_source=source, probe_confirmed=user_confirmed,
+                )
             # 直存不走 save_turn：刚写的新记忆不再属于上一轮，撤回标记清掉，
             # 否则下一次“撤回”会误作废上一轮（2026-11-21 Gemini 第三轮真 Bug）。
             # save_turn 内部也调这里，但它在循环结束后才重设标记，顺序不冲突。
@@ -1231,6 +1250,74 @@ class SQLiteStore:
                 out.append((row[0], row[1] or "", old_meta))
             return out
 
+    def _is_core_protected_row(self, old_meta, slot=None):
+        """核心/置顶记忆：身份槽位（名字/SOUL/电脑配置）、规则、精选
+        置顶。这类记忆的内容变更永远要 BOOS 点头（项目红线），自动
+        裁决/连带清扫一律不碰——要改只能走 BOOS 点名纠正的路。"""
+        meta = old_meta or {}
+        if slot in _provenance.KNOWN_SLOTS:
+            return True
+        if meta.get("slot") in _provenance.KNOWN_SLOTS:
+            return True
+        return bool(meta.get("is_rule") or meta.get("curated"))
+
+    def _sweep_extra_conflicts(self, slot, conflicts, new_key, new_text,
+                               turn_id=None, probe_source="user",
+                               probe_confirmed=True):
+        """R-1 连带清扫（2026-11-24，BOOS 定“像十一”）：一次纠正的
+        主目标之外，同槽还有别的真冲突旧值时，逐条一并清掉——不清
+        的话单值槽里更早的错误值永远留着（P1 重查 R-1）。
+
+        清扫的门槛（防广州式误伤的护栏，一条都不许放宽）：
+        - 核心/置顶不碰（_is_core_protected_row，走问 BOOS 的路径）；
+        - 只清 BOOS 在对话里亲口说过的（metadata 带 turn_id）——
+          系统直存、迁移、推断来的行不连带：真记忆“用户住在广州”
+          就是迁移来的推断行（turn_id 为空），它只能被点名纠正
+          （correct_memory 主路），不许被成批清扫误伤；
+        - 每条仍走 _resolve_conflict 裁决，不是 supersede_old 不顶；
+        - 取代走 _supersede_row：账本先行、记 SUPERSEDE 事件，
+          是标记不是删除；记账失败只警告、跳过这条，新记忆不回滚
+          （取代失败留新记忆是既定规矩）。
+        返回清掉的 id 列表。调用方需持锁。"""
+        swept = []
+        probe = {
+            "source": probe_source,
+            "user_confirmed": probe_confirmed,
+            "confidence": 1.0 if probe_confirmed else 0.7,
+            "created_at": _now_iso(),
+            "write_seq": _next_write_seq(),
+            "slot": slot,
+        }
+        for old_id, old_text, old_meta in conflicts or []:
+            if not old_id or old_id == new_key:
+                continue
+            if self._is_core_protected_row(old_meta, slot):
+                continue
+            if not (old_meta or {}).get("turn_id"):
+                continue
+            row = self._conn.execute(
+                "SELECT superseded, deleted, voided FROM memories"
+                " WHERE id=?",
+                (old_id,),
+            ).fetchone()
+            if row is None or row[0] or row[1] or row[2]:
+                continue  # 已不是活行（被主路顺带处理了），不重复顶
+            verdict = _provenance._resolve_conflict(old_meta, probe)
+            if (verdict or {}).get("action") != "supersede_old":
+                continue
+            try:
+                self._supersede_row(
+                    old_id, old_text, old_meta, new_key, new_text,
+                    turn_id=turn_id,
+                )
+            except Exception:
+                logger.warning(
+                    "R-1 连带清扫取代记账失败：旧行未取代。", exc_info=True
+                )
+                continue
+            swept.append(old_id)
+        return swept
+
     def _set_memory_slot(self, memory_id, slot):
         """给一条记忆补槽位标（列 + metadata_json 里都写），以后按槽位
         找它就不用再从文本现认。找不到行、或已有槽位标时什么都不做，不抛异常。"""
@@ -1359,10 +1446,11 @@ class SQLiteStore:
         - 无纠正词的新陈述（is_correction=False）→ 返回 False，调用方
           照常存成新行、不顶旧的（2026-11-23 model fix #1，D 组根因：
           只有带明确纠正词的才算纠正；不问 BOOS、不顶旧）；
-        - 带明确纠正词（is_correction=True）→ 只裁决最新的一条同槽位
-          旧值（被纠正的那条），其余留着；裁决 supersede_old 时走
+        - 带明确纠正词（is_correction=True）→ 裁决最新的一条同槽位
+          旧值（被纠正的那条，主目标）；裁决 supersede_old 时走
           correct_memory 取代，correct_memory 没换成的那条改走直存 +
-          _supersede_row 兜底。
+          _supersede_row 兜底。主目标之外同槽其余真冲突旧值走连带
+          清扫（R-1，2026-11-24，_sweep_extra_conflicts，带护栏）。
         """
         conflicts = self._find_same_slot_conflicts(slot, value)
         if not conflicts:
@@ -1372,8 +1460,19 @@ class SQLiteStore:
             # 新行（调用方继续走正常存储），不问、不顶。只带明确纠正词
             # 的才算纠正（is_correction=True 那条路）。
             return False
-        # 带明确纠正词：只顶最新的一条同槽冲突（被纠正的那条），其余留着——
-        # 旧写法全顶掉，曾把真记忆广州连带顶掉（E 组 T1 顶了长沙又顶广州）。
+        # R-1（2026-11-24，BOOS 定“像十一”）：带明确纠正词时不再
+        # 只顶最新一条——主目标仍是最新那条同槽冲突（被纠正的那条，
+        # 照旧逐条裁决、裁决不过整句不存）；其余冲突旧值在主目标
+        # 顶成之后走连带清扫（_sweep_extra_conflicts：只清对话里
+        # 亲口说过的、非核心的——旧写法无差别全顶，曾把真记忆广州
+        # 连带顶掉，护栏改在清扫的门槛上，不再靠只顶一条）。
+        # 核心/置顶行先剔出裁决名单：不顶、不拦，留着走问 BOOS 的路。
+        conflicts = [
+            c for c in conflicts
+            if not self._is_core_protected_row(c[2], slot)
+        ]
+        if not conflicts:
+            return False
         conflicts = sorted(
             conflicts,
             key=lambda c: (
@@ -1381,7 +1480,9 @@ class SQLiteStore:
                 (c[2] or {}).get("created_at") or "",
             ),
             reverse=True,
-        )[:1]
+        )
+        primary_conflicts = conflicts[:1]
+        extra_conflicts = conflicts[1:]
         # S10（2026-11-22，BOOS 定选 A）：_apply_same_slot_update 只在
         # save_turn 的逐句循环里调，句子都来自用户本轮直接说的话——新事实
         # 按已确认算（user/1.0），不再按推断（inferred/0.7）。推断赢不了
@@ -1397,7 +1498,7 @@ class SQLiteStore:
             "slot": slot,
         }
         to_supersede = []
-        for old_id, old_text, old_meta in conflicts:
+        for old_id, old_text, old_meta in primary_conflicts:
             verdict = _provenance._resolve_conflict(old_meta, new_probe)
             action = (verdict or {}).get("action")
             if action == "supersede_old":
@@ -1460,6 +1561,13 @@ class SQLiteStore:
                     "resolution": "updated",
                     "audit": {"source": "user", "method": "slot_conflict"},
                 }
+        if extra_conflicts and new_key is not None:
+            # 主目标已顶成：其余同槽冲突旧值走连带清扫（门槛见
+            # _sweep_extra_conflicts）。清不掉的不影响本次纠正结果。
+            self._sweep_extra_conflicts(
+                slot, extra_conflicts, new_key, sentence,
+                turn_id=turn_id,
+            )
         if first_outcome is not None:
             slot2, _v = _infer_fact_slot(sentence)
             if slot2:
@@ -1887,6 +1995,8 @@ class SQLiteStore:
             "SELECT metadata_json FROM memories WHERE id=?", (target["id"],)
         ).fetchone()
         old_meta = json.loads((row or [None])[0] or "{}")
+        # R-1：判官路只从 save_turn 的槽位型纠正（old==new）进来，
+        # 挑中一条落盘后，同槽其余真冲突旧值同样走连带清扫。
         outcome = self._apply_correction_result(
             fact, target["id"], target["text"], old_meta, same_text=False,
             candidates=[target["id"]], status="updated",
@@ -1895,7 +2005,7 @@ class SQLiteStore:
                    "provider": verdict.get("provider"),
                    "model": verdict.get("model"),
                    "judge_slot": verdict.get("slot")},
-            layer="judge", turn_id=turn_id,
+            layer="judge", turn_id=turn_id, slot_sweep=True,
         )
         if (outcome or {}).get("status") != "updated":
             return None
@@ -2428,7 +2538,8 @@ class SQLiteStore:
     def _apply_correction_result(self, new_fact, old_id, old_text, old_meta,
                                  *, same_text, candidates, status="updated",
                                  resolution=None, audit=None, source="user",
-                                 layer="single", turn_id=None):
+                                 layer="single", turn_id=None,
+                                 slot_sweep=False):
         """纠错收尾（2026-11-22）：按状态把结果写进账本和 SQLite，返回
         回执。纠错是追加式——旧记忆不改原文、不删：新说法当一条新记忆
         存（来源 user、已确认），账本记 supersede，旧行标 superseded=1。
@@ -2437,6 +2548,9 @@ class SQLiteStore:
         dormant / delete_due 改回 verbatim），不再新插，防重复行。
         layer 哪一层定的（mem0 同款词）：exact（原样对上）/ single
         （单候选过安全网）；调用方显式传，不从 same_text 推。
+        slot_sweep（R-1，2026-11-24）：True 时（槽位型纠正，见
+        correct_memory）取代成功后把同槽其余真冲突旧值走连带清扫
+        （_sweep_extra_conflicts），清掉的 id 记进回执 swept_ids。
         """
         with self._lock:
             # 回执里的 candidates 统一成带文本的字典（2026-11-22 Bug 1）：
@@ -2565,7 +2679,7 @@ class SQLiteStore:
                     "resolution": "failed",
                     "audit": audit or {"source": source, "method": "correct_memory"},
                 }
-            return {
+            result = {
                 "status": status, "memory_id": new_key,
                 "old_text": old_text, "new_text": new_fact,
                 "candidates": candidates or [],
@@ -2574,6 +2688,24 @@ class SQLiteStore:
                 "resolution": resolution or "updated",
                 "audit": audit or {"source": source, "method": "correct_memory"},
             }
+            if slot_sweep:
+                # R-1：主目标已顶掉，同槽其余真冲突旧值连带清扫
+                #（门槛见 _sweep_extra_conflicts，防广州式误伤）。
+                _slot, _value = _infer_fact_slot(new_fact)
+                if _slot is not None:
+                    _extras = [
+                        c for c in self._find_same_slot_conflicts(
+                            _slot, _value
+                        )
+                        if c[0] != old_id
+                    ]
+                    _swept = self._sweep_extra_conflicts(
+                        _slot, _extras, new_key, new_fact,
+                        turn_id=turn_id,
+                    )
+                    if _swept:
+                        result["swept_ids"] = _swept
+            return result
 
     def _find_correction_note_target(self, candidates, new_fact):
         """找模型写的纠正备注行（2026-11-23 A 组修复）：
@@ -2786,6 +2918,16 @@ class SQLiteStore:
                 # （search / save_turn 登记的 _active_turn_id）兜底，这样
                 # 工具先改、save_turn 再调时，护栏和账本都认得出本轮。
                 turn_id = getattr(self, "_active_turn_id", None)
+            # R-1（2026-11-24）：old 与 new 同文（save_turn 的
+            # correct_memory(fact, fact) 路）是一次“槽位型纠正”——
+            # BOOS 直接报了槽位的新值、没点名旧值，纠正的是整个
+            # 槽位：成功后同槽其余真冲突旧值走连带清扫。点名了
+            # 旧值的纠正（old != new）是外科手术式，只改被点名
+            # 的那条，不清扫（group1 槽位直选的护栏）。
+            slot_sweep = (
+                _normalize_memory_text(old_fact)
+                == _normalize_memory_text(new_fact)
+            )
             already = self._already_corrected_receipt(
                 new_fact, old_fact, turn_id=turn_id
             )
@@ -2811,7 +2953,7 @@ class SQLiteStore:
                                 same_text=True, candidates=[], status="unchanged",
                                 resolution="exact", layer="exact",
                                 audit={"source": "user", "method": "exact_match"},
-                                turn_id=turn_id,
+                                turn_id=turn_id, slot_sweep=slot_sweep,
                             )
                 return {
                     "status": "not_found", "memory_id": None,
@@ -2839,14 +2981,14 @@ class SQLiteStore:
                         candidates=candidates, status="unchanged",
                         resolution="exact", layer="exact",
                         audit={"source": "user", "method": "exact_match"},
-                        turn_id=turn_id,
+                        turn_id=turn_id, slot_sweep=slot_sweep,
                     )
                 return self._apply_correction_result(
                     new_fact, mid, old_text, old_meta, same_text=False,
                     candidates=candidates, status="updated",
                     resolution="exact", layer="exact",
                     audit={"source": "user", "method": "exact_match"},
-                    turn_id=turn_id,
+                    turn_id=turn_id, slot_sweep=slot_sweep,
                 )
             # 2026-11-23 model fix #2（A 组阈值）：带明确纠正词的，不走
             # 相似度 0.70 阈值，直接按槽位找要改的那条——候选里同槽位的
@@ -2885,7 +3027,7 @@ class SQLiteStore:
                                 "source": "user",
                                 "method": "explicit_correction_note",
                             },
-                            turn_id=turn_id,
+                            turn_id=turn_id, slot_sweep=slot_sweep,
                         )
                         if (result or {}).get("status") == "updated":
                             extracted_old = _extract_note_old_fact(old_text)
@@ -2922,7 +3064,7 @@ class SQLiteStore:
                                 "method": "explicit_correction_slot",
                                 "slot": _correction_topic_slot(new_fact),
                             },
-                            turn_id=turn_id,
+                            turn_id=turn_id, slot_sweep=slot_sweep,
                         )
             # 多条候选、没有原样：先按相似度筛（根因 b，2026-11-22）——
             # 0.4 的召回线太宽，“我喜欢…”这种短句会召回一堆无关行；
@@ -3005,7 +3147,7 @@ class SQLiteStore:
                     candidates=candidates, status="unchanged",
                     resolution="semantic", layer="single",
                     audit={"source": "user", "method": "single_candidate"},
-                    turn_id=turn_id,
+                    turn_id=turn_id, slot_sweep=slot_sweep,
                 )
             try:
                 # 安全网比的是候选旧记忆和新说法的话题相似度，不是两个入参
@@ -3033,7 +3175,7 @@ class SQLiteStore:
                 resolution="semantic", layer="single",
                 audit={"source": "user", "method": "single_candidate",
                        "similarity": sim},
-                turn_id=turn_id,
+                turn_id=turn_id, slot_sweep=slot_sweep,
             )
 
     def _void_last_stored(self):
