@@ -937,6 +937,7 @@ class ChatState:
         # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
         # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
         correction = None
+        questions = None
         if self.mem0_store is not None and not skip_memory_save:
             recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
             if insert_at is not None and not any(
@@ -954,6 +955,7 @@ class ChatState:
                 saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
             if isinstance(saved, dict):
                 correction = saved.get("correction")
+                questions = saved.get("questions")
         response = {
             "reply": reply_text,
             "model": model_name,
@@ -969,6 +971,10 @@ class ChatState:
             response["searches"] = searches
         if correction is not None:
             response["correction"] = correction
+        # Phase 2 #4：本轮拿不准的问题（带原文、给选项、说原因），
+        # 没问题时不加这个键，原来的返回形状不动。
+        if questions:
+            response["questions"] = questions
         logger.info(
             "timing | web round total=%.1fms %s",
             timer.total_ms(),
@@ -1543,6 +1549,29 @@ class ChatState:
                 old_text = item["text"]
             return self.mem0_store.correct_memory(old_text, new_text)
 
+    def list_pending_questions(self):
+        """还没回答的待问问题（Phase 2 #4），按创建时间从旧到新。
+
+        记忆未启用时返回空列表；读失败时也返回空列表，不拦页面。
+        """
+        if self.mem0_store is None:
+            return []
+        try:
+            return self.mem0_store.list_pending_questions()
+        except Exception:
+            logger.warning("读待问问题失败。", exc_info=True)
+            return []
+
+    def answer_question(self, question_id, choice):
+        """回答一个待问问题（Phase 2 #4），按答案改库。
+
+        choice 只能是“进核心 / 当一次性经历 / 不存”（见
+        SQLiteStore.answer_question）。记忆未启用时 ok=False。
+        """
+        if self.mem0_store is None:
+            return {"ok": False, "reason": "记忆未启用。"}
+        return self.mem0_store.answer_question(question_id, choice)
+
 
 def make_handler(state, authenticator=None):
     """按给定的对话状态，生成一个请求处理类。
@@ -1566,7 +1595,8 @@ def make_handler(state, authenticator=None):
         任务：GET /api/tasks/active、GET /api/tasks/unresolved、
         POST /api/tasks/<id>/resume、POST /api/tasks/<id>/discard；
         记忆管理：GET /api/memories、GET /api/memories/<id>/scope、
-        POST /api/memories/<id>/forget、POST /api/memories/correct。
+        POST /api/memories/<id>/forget、POST /api/memories/correct、
+        GET /api/questions/pending、POST /api/questions/answer。
         """
 
         # 日志只写到 Python 的 logging（不往页面里写），保持安静：
@@ -1708,6 +1738,10 @@ def make_handler(state, authenticator=None):
                         "memories": state.list_memories(),
                     }
                 )
+            elif path == "/api/questions/pending":
+                # 待问 BOOS 的问题（Phase 2 #4）：还没回答的都列出来，
+                # 页面据此显示“待问”列表。记忆未启用时列表为空。
+                self._send_json({"questions": state.list_pending_questions()})
             elif path == "/api/protection-events":
                 # 保护记录：快照失败、恢复失败这些事的可见留痕，新的在前。
                 # 记忆未启用时列表为空，页面显示“暂无保护记录”。
@@ -1931,6 +1965,25 @@ def make_handler(state, authenticator=None):
                     self._send_json({"error": "记忆未启用。"}, status=503)
                     return
                 result = state.correct_memory(old_text, new_text, memory_id=memory_id)
+                self._send_json(result)
+                return
+            if path == "/api/questions/answer":
+                # 回答一个待问问题：POST /api/questions/answer，请求
+                # {"question_id": id, "choice": "进核心" / "当一次性经历" / "不存"}。
+                # choice 不在这三个里时回 400、什么都不改。
+                payload, error, status = self._read_json_body()
+                if error is not None:
+                    self._send_json({"error": error}, status=status)
+                    return
+                question_id = str(payload.get("question_id") or "").strip()
+                choice = str(payload.get("choice") or "").strip()
+                if not question_id or choice not in ("进核心", "当一次性经历", "不存"):
+                    self._send_json(
+                        {"error": "请选一个问题，并选：进核心 / 当一次性经历 / 不存。"},
+                        status=400,
+                    )
+                    return
+                result = state.answer_question(question_id, choice)
                 self._send_json(result)
                 return
             if path != "/api/chat":

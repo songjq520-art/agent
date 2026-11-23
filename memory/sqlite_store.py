@@ -39,6 +39,7 @@ from pathlib import Path
 
 from memory import decay as _decay
 from memory import ledger as _ledger
+from memory import pending_questions as _pq
 from memory import provenance as _provenance
 from memory.correction_text import (
     _CORRECTION_PHRASES,
@@ -49,6 +50,7 @@ from memory.correction_text import (
 from memory.money_slots import extract_core_slots
 from memory.redaction import _contains_sensitive, _normalize_memory_text
 from memory.timeutil import _now_epoch, _now_iso, _next_write_seq, _seed_write_seq
+from memory.tone import local_tone_screen
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +292,12 @@ def _looks_like_fact(sentence):
     之前就是存不存看运气（有的问句存了、有的没存）。
     """
     s = (sentence or "").strip()
+    # 2026-11-23 Phase 2 #2 线上实测根因：分句留着句尾标点（问句判断
+    # 要靠 ？），但 endswith 类规则认不出带 。！的句子——“我想喝茶了。”
+    # 句尾是 。不是了，当下的想法规则没拦住，线上 seq 494 就这么存进
+    # 去了（单测的句子没带句号，所以没抓到）。这里先剥掉句尾的 。！，？
+    # 留着（问句判断要靠它）；存的时候调用方还会再剥一遍，不影响原文。
+    s = s.rstrip("。！")
     if len(s) < 4:
         return False, "太短"
     if s in _SMALL_TALK:
@@ -401,6 +409,8 @@ class SQLiteStore:
         # 语义判官对象（2026-11-22 混合法）：测试注入 mock 用；
         # None 时每次判断按 config.py 的 SEMANTIC_JUDGE 解析（默认 DeepSeek flash）。
         self._judge_provider = judge_provider
+        # 待问 BOOS 的问题（Phase 2 #4）：攒批 + 回答，落盘不丢。
+        self.pending_questions = _pq.PendingQuestions(memory_dir=self.memory_dir)
         self.user_id = kwargs.get("user_id", "boos")
         self._lock = threading.RLock()
         self._ledger_lock = threading.Lock()
@@ -750,6 +760,24 @@ class SQLiteStore:
             decay_kind = kwargs.get("decay_kind") or _decay.classify_decay_kind(
                 source, False, is_rule
             )
+            # 重要性判断（Phase 2 #2，opt-in）：直存路（“记住”/工具）显式
+            # 打开 judge_importance=True 时才问——默认不开，直存原语要
+            # 确定、不花钱（和 semantic_judge 一个规矩）。有槽位的不问
+            # （槽位就是核心类别，见 _decide_importance）；已传 decay_kind
+            # 的不问（调用方已经定了）。判不准时先当一次性经历存，问题
+            # 攒进 pending（下次聊天顺带问）。
+            _importance_decision = None
+            _importance_reason = ""
+            if (
+                kwargs.get("judge_importance")
+                and not kwargs.get("decay_kind")
+                and not slot
+            ):
+                _importance_decision, _importance_reason, _judge_info = (
+                    self._decide_importance(text, slot)
+                )
+                if _importance_decision == "important":
+                    decay_kind = _decay.DECAY_KIND_STABLE
             # 同文去重（2026-11-22 Bug 2 治本）：只看归一化文本，不看来源——
             # 用户亲口说的（工具直存、save_turn）都记 source="user"（已确认），
             # 模型推断直存的才记 source="inferred"，来源不同不是两条事实。
@@ -876,7 +904,10 @@ class SQLiteStore:
                 "is_rule": is_rule,
                 "curated": curated,
                 "decay_kind": decay_kind,
-                "importance": kwargs.get("importance", "normal"),
+                "importance": kwargs.get(
+                    "importance",
+                    "high" if _importance_decision == "important" else "normal",
+                ),
                 "event_date": event_date or resolve_event_date(text),
                 "last_used_at": created_at,
                 "decay_state": _decay.DECAY_STATE_VERBATIM,
@@ -889,6 +920,11 @@ class SQLiteStore:
             key = self._append_new_memory(text, metadata)
             if key is None:
                 return {}
+            if _importance_decision == "unsure":
+                # 判不准的问题攒进 pending，下次聊天顺带问（见 save_turn）。
+                self._queue_importance_question(
+                    text, key, _importance_reason, turn_id
+                )
             for old_id, old_text, old_meta in to_supersede:
                 try:
                     self._supersede_row(old_id, old_text, old_meta, key, text)
@@ -970,7 +1006,13 @@ class SQLiteStore:
         promoted = False
         if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and _decay.should_promote(
             dates, sessions,
-            is_core=bool(_provenance._is_core_memory(meta)),
+            # 2026-11-23 Phase 2 #2 根因：is_core 不能按“已确认”认——
+            # save_turn 存的用户亲口说的事实都是已确认的（含一次性经历），
+            # 按 _is_core_memory（confirmed 或有槽位）认，会把已确认的
+            # 一次性经历也当核心，3 天 3 次兜底永远走不到。核心记忆本来
+            # 就是稳定的（见 should_promote），这里 decay_kind 已保证
+            # 不是 stable，is_core 恒为 False。
+            is_core=False,
             tone=meta.get("tone"),
         ):
             meta["decay_kind"] = _decay.DECAY_KIND_STABLE
@@ -1308,6 +1350,175 @@ class SQLiteStore:
             logger.warning("语义判断失败，降级走程序：%s", exc)
             return None
 
+    def _ask_importance_judge(self, text):
+        """调大模型重要性判官（只在程序判不定时调）。返回 verdict dict。
+
+        模型断了或回的格式不对时返回 None——调用方按程序 fallback 走
+        （当一次性经历存，不崩、不丢事实），失败记一条 warning 日志。
+        判官对象：self._judge_provider（测试注入）或配置解析
+        （默认 DeepSeek flash，见 memory/semantic_judge.py）。
+        """
+        try:
+            from memory import semantic_judge as _sj
+            return _sj.judge_importance(
+                text, provider=self._judge_provider,
+                budget_tracker=self.budget_tracker,
+            )
+        except Exception as exc:
+            logger.warning("重要性判断失败，降级走程序：%s", exc)
+            return None
+
+    def _decide_importance(self, text, slot=None):
+        """重要性三段判（Phase 2 #2，混合法）：程序先判，难的问判官。
+
+        返回 (decision, reason, judge_info)：decision 是 "important"
+        （进核心，长期钉住）/ "episodic"（当一次性经历，3 天 3 次
+        兜底还能晋升）/ "unsure"（拿不准，问 BOOS）；reason 是一句
+        话原因；judge_info 是判官回的信息（没问模型时 None）。
+        程序段（免费、确定性，先判）：语气非认真（本地筛命中
+        joke/test/hypothesis）→ episodic；有槽位（住处/名字，
+        核心类别）→ important；偏好句式（喜欢/爱吃/爱喝/爱看/
+        爱听/爱玩/不爱/讨厌）→ important；决定句式（决定/打算/
+        计划/准备/定投）→ important；带过去时间词（昨天/前天/
+        今天/刚才/刚刚/上次/这次）→ episodic。都没命中才问判官：
+        判 important→important，false→episodic，"unsure"→unsure；
+        模型断了→episodic（不问 BOOS，兜底还能晋升）。
+        """
+        tone, tone_evidence = local_tone_screen(text or "")
+        if tone in ("joke", "test", "hypothesis"):
+            return (
+                "episodic",
+                "语气是%s（%s），不进核心" % (tone, tone_evidence),
+                None,
+            )
+        if slot is not None:
+            return "important", "带槽位 %s，是核心类别" % slot, None
+        if any(m in (text or "") for m in _JUDGE_PREFERENCE_MARKERS):
+            return "important", "是偏好句式，长期偏好进核心", None
+        if re.search(r"(我决定|我打算|我计划|我准备|定投)", text or ""):
+            return "important", "是决定/计划，长期决定进核心", None
+        if re.search(r"(昨天|前天|今天|刚才|刚刚|上次|这次)", text or ""):
+            return "episodic", "带过去时间词，是一次性经历", None
+        verdict = self._ask_importance_judge(text)
+        if verdict is None:
+            return (
+                "episodic",
+                "判官没接通，先当一次性经历（3 天 3 次兜底还能晋升）",
+                None,
+            )
+        important = verdict.get("important")
+        reason = verdict.get("reason") or ""
+        judge_info = {
+            key: verdict.get(key)
+            for key in ("provider", "model", "reason", "cost_usd", "usage")
+            if verdict.get(key) is not None
+        }
+        if important is True:
+            return "important", reason or "判官判为长期重要", judge_info
+        if important is False:
+            return "episodic", reason or "判官判为一次性经历", judge_info
+        return "unsure", reason or "判官拿不准", judge_info
+
+    def _queue_importance_question(self, text, memory_id, reason, turn_id=None):
+        """为一条拿不准重要性的新记忆攒一个问题（Phase 2 #4）。
+        返回问题 dict；同一条记忆已有未回答的问题时返回已有的那条。"""
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_IMPORTANCE,
+            text,
+            _pq.IMPORTANCE_QUESTION_OPTIONS,
+            reason,
+            memory_id=memory_id,
+            turn_id=turn_id,
+        )
+
+    def list_pending_questions(self):
+        """还没回答的问题（pending + asked），按创建时间从旧到新。"""
+        return self.pending_questions.list_unanswered()
+
+    def answer_question(self, question_id, choice):
+        """BOOS 回答了一个待问问题，按答案改库（Phase 2 #4）。
+
+        choice 只能是“进核心 / 当一次性经历 / 不存”：
+          进核心：把那条记忆的 decay_kind 改 stable、importance 改 high
+            （账本记一笔 PROMOTE，和 3 天 3 次晋升同款）；
+          当一次性经历：不动（已经是 episodic，兜底还能晋升）；
+          不存：delete_memory(approve=True) 删掉那条记忆。
+        返回 {"ok", "applied", ...}；问题不存在/已回答/选项不对/记忆
+        不在库里时 ok=False，什么都不改。
+        """
+        if choice not in ("进核心", "当一次性经历", "不存"):
+            return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
+        question = self.pending_questions.answer(question_id, choice)
+        if question is None:
+            return {"ok": False, "reason": "问题不存在或已经回答过了。"}
+        if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
+            return {"ok": False, "reason": "未知的问题种类。"}
+        memory_id = question.get("memory_id")
+        if choice == "当一次性经历":
+            return {
+                "ok": True, "applied": "episodic",
+                "question_id": question_id, "memory_id": memory_id,
+            }
+        if choice == "不存":
+            if not memory_id:
+                return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+            deleted = self.delete_memory(memory_id, approve=True)
+            return {
+                "ok": True, "applied": "dropped",
+                "question_id": question_id, "memory_id": memory_id,
+                "deleted": deleted.get("deleted") is True
+                if isinstance(deleted, dict)
+                else bool(deleted),
+            }
+        if not memory_id:
+            return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "reason": "这条记忆已经不在库里了。"}
+            if row[2] or row[3] or row[4]:
+                return {"ok": False, "reason": "这条记忆已被取代/删除/作废，不能进核心。"}
+            meta = json.loads(row[1] or "{}")
+            if meta.get("decay_kind") == _decay.DECAY_KIND_STABLE:
+                return {
+                    "ok": True, "applied": "core",
+                    "question_id": question_id, "memory_id": memory_id,
+                    "already_core": True,
+                }
+            meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+            meta["importance"] = "high"
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, decay_kind=?,"
+                " importance=? WHERE id=?",
+                (
+                    json.dumps(meta, ensure_ascii=False),
+                    _decay.DECAY_KIND_STABLE,
+                    meta.get("importance"),
+                    memory_id,
+                ),
+            )
+            self._conn.commit()
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {
+                        "type": _ledger.LEDGER_EVENT_PROMOTE,
+                        "memory_id": memory_id, "key": memory_id,
+                        "text": row[0] or "", "meta": dict(meta),
+                    },
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("回答问题晋升记账失败。", exc_info=True)
+        return {
+            "ok": True, "applied": "core",
+            "question_id": question_id, "memory_id": memory_id,
+        }
+
     def _judge_preference_supersede(self, text):
         """问判官：这句偏好新事实该不该取代某条同类活偏好。
 
@@ -1558,6 +1769,7 @@ class SQLiteStore:
                     else:
                         sentences = kept
         live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
+        new_questions = []  # 本轮拿不准重要性的问题（Phase 2 #4）
         for sentence in sentences:
             receipt["considered"].append(sentence)
             # “记住”前缀先剥（#8）：剥完再判事实、再算日期——“记住”两字
@@ -1630,9 +1842,23 @@ class SQLiteStore:
             # 是留给“完全没来源信息”的旧记忆的桶（2026-11-09 之前）。
             # 模型自己推断的事实不走这里，仍按 inferred/0.7 直存
             # （add_memory_text(source="inferred")，见低可信度挂起的回归测试）。
+            # 重要性判断（Phase 2 #2）：程序先判（槽位/偏好/决定/语气/
+            # 时间词），难的问大模型判官；判不准时先当一次性经历存，
+            # 再问 BOOS（#4，见下面的 new_questions）。
+            importance_decision, importance_reason, _importance_judge = (
+                self._decide_importance(sentence, slot)
+            )
             saved = self.add_memory_text(
                 sentence, source="user", turn_id=turn_id,
-                event_date=event_date, decay_kind="episodic",
+                event_date=event_date,
+                decay_kind=(
+                    _decay.DECAY_KIND_STABLE
+                    if importance_decision == "important"
+                    else "episodic"
+                ),
+                importance=(
+                    "high" if importance_decision == "important" else "normal"
+                ),
                 semantic_judge=False,
                 **({"slot": slot} if slot else {}),
             )
@@ -1643,6 +1869,12 @@ class SQLiteStore:
                 receipt["results"].append(
                     {"id": saved.get("id"), "memory": sentence, "event": "ADD"}
                 )
+                if importance_decision == "unsure":
+                    _q = self._queue_importance_question(
+                        sentence, saved.get("id"), importance_reason, turn_id
+                    )
+                    if _q is not None:
+                        new_questions.append(_q)
             elif (saved or {}).get("event") == "UNCHANGED":
                 receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
             elif (saved or {}).get("event") == "SENSITIVE":
@@ -1670,6 +1902,18 @@ class SQLiteStore:
                 # 下一句“撤回”作废的是这条新记忆，不是上一轮的。
                 with self._lock:
                     self._last_stored_turn_id = turn_id
+        # #4：本轮拿不准的问题先问；有新问题时，顺带把攒着的旧问题
+        # 一起问（最多 3 条）。没新问题时不打扰，旧问题继续攒着。
+        if new_questions:
+            for _q in new_questions:
+                self.pending_questions.mark_asked(_q["id"])
+            room = max(0, _pq.QUESTIONS_PER_CHAT_MAX - len(new_questions))
+            backlog = (
+                self.pending_questions.drain_for_chat(max_n=room)
+                if room > 0
+                else []
+            )
+            receipt["questions"] = new_questions + backlog
         self._turn_receipts[turn_id] = copy.deepcopy(receipt)
         return receipt
 

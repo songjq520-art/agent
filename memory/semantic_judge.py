@@ -241,6 +241,120 @@ def parse_judge_response(text, candidate_ids):
     }
 
 
+def build_importance_prompt(text):
+    """重要性判断提示词（Phase 2 #2）：一句话是长期稳定的事实/偏好/
+    决定（值得钉住长期记住），还是一次性经历/随口一提。
+
+    只回一行 JSON：{"important": true/false/"unsure", "reason": "..."}。
+    important 为 true 表示值得长期钉住；false 表示一次性经历、以后
+    可能用不上；拿不准时回 "unsure"，不要硬猜。
+    """
+    lines = [
+        "你是记忆管家，只判断一句话值不值得长期钉住记住，只回 JSON，不要解释。",
+        f"句子：{text}",
+        "规则：身份（名字、住处）、长期偏好（喜欢吃什么/喝什么/看什么）、"
+        "决定（打算、计划、定投、规矩）、钱的规矩、安全权限、项目决策，"
+        "这些是长期稳定的，判 important=true；"
+        "一次性经历（昨天/今天/刚才做了什么、吃了一顿什么、去了一趟哪），"
+        "判 important=false；"
+        "玩笑、测试、假设（开玩笑、这是测试、如果/假如），判 important=false；"
+        "一句话既像长期事实又像一次性经历、分不清时，判 important=\"unsure\"，"
+        "不要硬猜。",
+        '只回这一行 JSON：{"important": true/false/"unsure", "reason": "一句话原因"}',
+    ]
+    return "\n".join(lines)
+
+
+def parse_importance_response(text):
+    """解析重要性判断回的 JSON。
+
+    要求：important 是 true/false 或字符串 "unsure"；reason 是字符串
+    或缺省。格式不对时抛 SemanticJudgeError（调用方按程序 fallback
+    处理，不崩）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise SemanticJudgeError("重要性判断回了空内容")
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match is not None:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        raise SemanticJudgeError(f"重要性判断回的不是 JSON：{raw[:200]}")
+    important = data.get("important")
+    if isinstance(important, bool):
+        pass
+    elif isinstance(important, str) and important.strip().lower() == "unsure":
+        important = "unsure"
+    elif isinstance(important, str) and important.strip().lower() in ("true", "false"):
+        important = important.strip().lower() == "true"
+    elif isinstance(important, (int, float)) and important in (0, 1):
+        important = bool(important)
+    else:
+        raise SemanticJudgeError(
+            f"重要性判断回的 important 不是 true/false/\"unsure\"：{important!r}"
+        )
+    reason = data.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        reason = str(reason)
+    return {
+        "important": important,
+        "reason": (reason or "").strip() or None,
+    }
+
+
+def judge_importance(text, provider=None, model=None, budget_tracker=None):
+    """问大模型判官：一句话值不值得长期钉住记住。
+
+    复用 judge_semantic 的分发层（provider/model/budget_tracker 同款
+    入参，模型能换、断了抛错）。返回 {"important": true/false/"unsure",
+    "reason", "provider", "model", "usage", "cost_usd"}。
+    模型断了或回的格式不对时抛 SemanticJudgeError /
+    SemanticJudgeUnavailable——调用方接到异常就降级走程序（当一次性
+    经历存，3 天 3 次兜底还能晋升），别崩、别丢事实。
+    """
+    provider_obj, provider_name, model_name = resolve_judge_provider(
+        provider, model, budget_tracker=budget_tracker
+    )
+    prompt = build_importance_prompt(text)
+    cfg = get_judge_config()
+    try:
+        result = provider_obj.chat_messages(
+            [{"role": "user", "content": prompt}],
+            ledger="chat", thinking="disabled",
+            max_tokens=cfg["max_tokens"],
+        )
+    except SemanticJudgeError:
+        raise
+    except Exception as exc:
+        logger.warning("重要性判断调用失败，降级走程序：%s", exc)
+        raise SemanticJudgeError(f"重要性判断调用失败：{exc}")
+    if not isinstance(result, dict):
+        raise SemanticJudgeError(f"重要性判断回的不是字典：{result!r}")
+    usage = result.get("usage")
+    cost = result.get("cost_usd")
+    if cost is None:
+        cost = estimate_judge_cost_usd(usage, provider_name, model_name)
+    verdict = parse_importance_response(result.get("text"))
+    verdict.update({
+        "provider": provider_name,
+        "model": model_name,
+        "usage": usage,
+        "cost_usd": cost,
+    })
+    logger.info(
+        "重要性判断：provider=%s model=%s important=%s cost_usd=%s",
+        provider_name, model_name, verdict.get("important"), cost,
+    )
+    return verdict
+
+
 def estimate_judge_cost_usd(usage, provider, model):
     """按配置的单价算一次判断的成本（美元）：用量 Token 数 × 单价。
 

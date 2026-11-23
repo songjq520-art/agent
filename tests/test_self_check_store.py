@@ -33,12 +33,14 @@ def test_run_self_check_report_shape(tmp_path, monkeypatch):
         "organizing_budget",
         "summary",
     }
-    assert set(report["items"].keys()) == {1, 2, 3, 4, 5, 6, 7, 8, 9}
+    assert set(report["items"].keys()) == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
     for item in report["items"].values():
         assert set(item.keys()) == {"name", "status", "findings", "actions"}
         assert item["status"] in ("pass", "warn", "fail", "skipped")
     # 第 9 项：没大模型路由，跳过
     assert report["items"][9]["status"] == "skipped"
+    # 第 10 项：没大模型路由，跳过
+    assert report["items"][10]["status"] == "skipped"
     # 第 5 项：备份演练（建、写、读、验）在临时目录跑，通过
     assert report["items"][5]["status"] == "pass"
     # 打标的玩笑记忆列在报告里

@@ -1,5 +1,6 @@
 # memory/self_check.py（十二每月一次自检：只查、只报告，不直接改库）
-# 方案里的九项表落成代码（2026-11-19，BOOS 定：每月一次自检）。
+# 方案里的十项表落成代码（2026-11-19，BOOS 定：每月一次自检；
+# 第 10 项 2026-11-23 Phase 2 #2 加：核心记忆还管不管用）。
 # 只查不改：要改的写成每项的 actions 列表，由调用方决定做不做；
 # 跑两遍结果一致（findings 里不放随机数、不放当前时间戳以外的可变值，
 # generated_at 除外）。只用标准库 + memory/decay.py + memory/tone.py
@@ -29,13 +30,14 @@
 #
 # run_self_check(adapter, now=None, model_judge=None, sample_size=10,
 #                router_status=None) 返回报告 dict：
-#   {"generated_at", "items": {1..9}, "most_likely_wrong_5": [...],
+#   {"generated_at", "items": {1..10}, "most_likely_wrong_5": [...],
 #    "replaced_last_month": [...], "tagged_tone_memories": [...],
 #    "organizing_budget": {...}, "summary": str}
 # 每项是 {"name", "status", "findings", "actions"}，status 是
 # pass / warn / fail / skipped。九项按方案：
 #   1 重复记忆、2 过期没沉底、3 冲突未决、4 孤儿记忆、5 备份能恢复吗、
-#   6 索引有没有坏、7 晋升计数、8 归档一致性、9 模型抽查。
+#   6 索引有没有坏、7 晋升计数、8 归档一致性、9 模型抽查、
+#   10 核心记忆还管不管用。
 # most_likely_wrong_5 调 content_check.rank_most_likely_wrong；
 # tagged_tone_memories 是 tone 为 joke / test / hypothesis 的记忆；
 # organizing_budget 是传进来的 router_status（没有时 {}）。
@@ -86,6 +88,34 @@ SELF_CHECK_JUDGE_USER_PROMPT_TEMPLATE = (
     "出处证据：{evidence}\n"
     "\n"
     "问题：这条记忆跟它的出处对不对得上、有没有内部矛盾？\n"
+    "evidence 里必须带原文片段。"
+)
+
+# 第 10 项核心记忆有用性抽查用的提示词（写成常量，抽查问法固定、可复核）。
+# 复用第 9 项的 model_judge 接口（judge(system_prompt, user_prompt)
+# -> {"accurate": bool, "evidence": str} 或 None）：这里的
+# "accurate" 读作“这条核心记忆现在还管用”——true 表示还管用，
+# false 表示不管用了（过时了、BOOS 的情况变了、留着只会误导），
+# 判不出来返回 null。只提议、不自动改：不管用的只进 actions
+# （建议沉底/归档），由 BOOS 定，绝不自动降权、绝不自动删。
+SELF_CHECK_USEFULNESS_SYSTEM_PROMPT = (
+    "你是十二记忆系统的自检员，只判断、不改库。\n"
+    "下面给你一条核心记忆的原文和它的基本信息，请判断这条记忆现在还管不管用：\n"
+    "BOOS 的情况是不是变了、这条记忆是不是过时了、留着会不会误导以后的回答。\n"
+    "只答这一条，不要猜别的记忆。\n"
+    "返回 {\"accurate\": true/false, \"evidence\": \"...\"}：\n"
+    "accurate 为 true 表示现在还管用；false 表示不管用了；判不出来时返回 null。\n"
+    "evidence 里必须带原文片段（从记忆原文里抄一句），不能只写结论。"
+)
+SELF_CHECK_USEFULNESS_USER_PROMPT_TEMPLATE = (
+    "请判断下面这条核心记忆现在还管不管用。\n"
+    "记忆 id：{id}\n"
+    "记忆原文：{text}\n"
+    "来源：{source}\n"
+    "可信度：{confidence}\n"
+    "上次用过：{last_used_at}\n"
+    "\n"
+    "问题：BOOS 的情况变了没有？这条记忆现在还管用吗？\n"
     "evidence 里必须带原文片段。"
 )
 
@@ -484,6 +514,110 @@ def _check_model_sample(items, model_judge, sample_size):
     return _item(name, "pass", findings, [])
 
 
+def _check_core_usefulness(items, model_judge):
+    """第 10 项：核心记忆还管不管用（Phase 2 #2）。
+
+    核心记忆是钉住不动的（权重恒 1、不沉底、不待删），但 BOOS 的情况
+    会变——搬家了、换偏好了、不定投了，旧的核心记忆留着只会误导。
+    每月一次：把每条核心记忆拿给大模型判“现在还管不管用”，不管用
+    的只写进 actions（建议沉底/归档），由 BOOS 定——绝不自动降权、
+    绝不自动删、绝不自动改。model_judge 复用第 9 项的接口：
+    judge(system_prompt, user_prompt) -> {"accurate": bool,
+    "evidence": str} 或 None，这里的 accurate 读作“还管用”。
+    没传 model_judge 时 skipped；库里没有核心记忆时 skipped；
+    抽到的全都判不出来时整项记 skipped（不是 pass——什么都没查成，
+    不能写“通过”）；只要有一条判出来了，没发现不管用的记 pass，
+    发现不管用的记 warn。核心记忆按 id 排序后逐条问（确定性，
+    跑两遍结果一致）。
+    """
+    name = "10 核心记忆还管不管用"
+    if model_judge is None:
+        return _item(
+            name,
+            "skipped",
+            [{"reason": "没传 model_judge，核心记忆有用性抽查跳过。"}],
+            [],
+        )
+    core_items = [
+        item
+        for item in items
+        if _is_core_memory(item.get("metadata") or {})
+        and not (item.get("metadata") or {}).get("voided")
+    ]
+    if not core_items:
+        return _item(
+            name, "skipped", [{"reason": "库里没有核心记忆，没得查。"}], []
+        )
+    core_items = sorted(core_items, key=lambda entry: str(entry.get("id") or ""))
+    findings = []
+    for item in core_items:
+        meta = item.get("metadata") or {}
+        user_prompt = SELF_CHECK_USEFULNESS_USER_PROMPT_TEMPLATE.format(
+            id=item.get("id"),
+            text=item.get("text") or "",
+            source=meta.get("source"),
+            confidence=meta.get("confidence"),
+            last_used_at=meta.get("last_used_at"),
+        )
+        try:
+            verdict = model_judge(SELF_CHECK_USEFULNESS_SYSTEM_PROMPT, user_prompt)
+        except Exception:
+            verdict = None
+        if not isinstance(verdict, dict):
+            findings.append(
+                {
+                    "id": item.get("id"),
+                    "text": item.get("text"),
+                    "accurate": None,
+                    "evidence": None,
+                    "reason": "模型判不出来（没返回有效结论），记 skipped。",
+                }
+            )
+            continue
+        accurate = verdict.get("accurate")
+        if not isinstance(accurate, bool):
+            findings.append(
+                {
+                    "id": item.get("id"),
+                    "text": item.get("text"),
+                    "accurate": None,
+                    "evidence": verdict.get("evidence"),
+                    "reason": "模型判不出来（没返回有效结论），记 skipped。",
+                }
+            )
+            continue
+        findings.append(
+            {
+                "id": item.get("id"),
+                "text": item.get("text"),
+                "accurate": accurate,
+                "evidence": verdict.get("evidence"),
+                "reason": "模型抽查：这条核心记忆现在还管用。"
+                if accurate
+                else "模型抽查：这条核心记忆现在不管用了，只提议沉底/归档，不自动改。",
+            }
+        )
+    stale = [entry for entry in findings if entry.get("accurate") is False]
+    if stale:
+        actions = [
+            "建议把 %s 沉底/归档（只提议，不自动改），理由：%s"
+            % (
+                entry.get("id"),
+                entry.get("evidence") or entry.get("reason") or "模型判不管用",
+            )
+            for entry in stale
+        ]
+        return _item(name, "warn", findings, actions)
+    if findings and all(entry.get("accurate") is None for entry in findings):
+        return _item(
+            name,
+            "skipped",
+            findings + [{"reason": "核心记忆全都没判出来，本月这项没查成。"}],
+            [],
+        )
+    return _item(name, "pass", findings, [])
+
+
 def run_self_check(adapter, now=None, model_judge=None, sample_size=10,
                    router_status=None):
     """跑一次十二的每月自检（只查、只报告，不直接改库）。
@@ -551,6 +685,7 @@ def run_self_check(adapter, now=None, model_judge=None, sample_size=10,
         7: _check_promotion(adapter),
         8: _check_archive(items, adapter),
         9: _check_model_sample(items, model_judge, sample_size),
+        10: _check_core_usefulness(items, model_judge),
     }
     statuses = [entry["status"] for entry in report_items.values()]
     passed = statuses.count("pass")
@@ -563,7 +698,7 @@ def run_self_check(adapter, now=None, model_judge=None, sample_size=10,
         if entry["status"] in ("warn", "fail")
     ]
     summary = (
-        f"本次自检共查 9 项：{passed} 项通过，{warned} 项有问题，"
+        f"本次自检共查 10 项：{passed} 项通过，{warned} 项有问题，"
         f"{failed} 项失败，{skipped} 项跳过。"
     )
     if problem_numbers:

@@ -34,17 +34,37 @@ class FakeJudge:
 
     provider_name / model 属性供分发层认名字；calls 记下每次收到的消息，
     断言“调没调模型、调了几次”就看它。
+    Phase 2 #2 起 store 里有两个判官共用一个 provider：语义判官
+    （judge_semantic）和重要性判官（judge_importance）。按提示词分流：
+    含“值不值得长期钉住”的是重要性判断，回 importance_verdict、记进
+    importance_calls；其余是语义判断，回 verdict、记进 calls。老测试
+    断言的 calls 仍是语义调用次数，不受重要性判断影响。
     """
 
-    def __init__(self, verdict=None, fail=False):
+    def __init__(self, verdict=None, fail=False, importance_verdict=None):
         self.verdict = verdict
         self.fail = fail
         self.calls = []
+        self.importance_verdict = importance_verdict or {
+            "important": False, "reason": "测试默认一次性经历",
+        }
+        self.importance_calls = []
         self.provider_name = "deepseek"
         self.model = "deepseek-flash"
 
     def chat_messages(self, messages, ledger="chat", thinking=None,
                       max_tokens=None):
+        prompt = (messages or [{}])[0].get("content") or ""
+        if "值不值得长期钉住" in prompt:
+            self.importance_calls.append(messages)
+            if self.fail:
+                raise RuntimeError("API 断了")
+            return {
+                "text": json.dumps(self.importance_verdict, ensure_ascii=False),
+                "usage": {"prompt_tokens": 400, "completion_tokens": 80},
+                "cost_usd": None,
+                "model": "deepseek-flash",
+            }
         self.calls.append(messages)
         if self.fail:
             raise RuntimeError("API 断了")

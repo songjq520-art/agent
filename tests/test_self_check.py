@@ -417,10 +417,11 @@ def test_organizing_budget_defaults_empty():
 
 def test_clean_report_summary_says_no_need_for_boos():
     report = _clean_report()
-    assert "9 项" in report["summary"]
+    assert "10 项" in report["summary"]
     assert "不用 BOOS 看" in report["summary"]
     assert report["items"][1]["status"] == "skipped"  # 没向量，第 1 项跳过
     assert report["items"][9]["status"] == "skipped"  # 没 judge，第 9 项跳过
+    assert report["items"][10]["status"] == "skipped"  # 没 judge，第 10 项跳过
 
 
 # ---------- 幂等 ----------
