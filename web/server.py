@@ -1603,6 +1603,15 @@ class ChatState:
                         "reason": "库里没有这条记忆，可能已经被删了。",
                     }
                 old_text = item["text"]
+                if old_text.strip().rstrip("。") == new_text.strip().rstrip("。"):
+                    return {
+                        "status": "unchanged",
+                        "memory_id": memory_id,
+                        "old_text": old_text,
+                        "new_text": new_text,
+                        "candidates": [],
+                        "reason": "新内容和原来的说法一样，没有改动。",
+                    }
             return self.memory_store.correct_memory(old_text, new_text)
 
     def list_pending_questions(self):
