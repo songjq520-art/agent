@@ -570,6 +570,19 @@ def test_build_config_shape(tmp_path):
     Gates(config).preflight()  # pytest 全套入口必须被门接受
 
 
+def test_build_config_weekly_interval(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "memory").mkdir()
+    archive = tmp_path / "archive"
+    monkeypatch.delenv("SHIER_HEALTHCHECK_INTERVAL_SECONDS", raising=False)
+    assert build_config(repo, archive).weekly_interval_seconds == 7 * 24 * 3600
+    monkeypatch.setenv("SHIER_HEALTHCHECK_INTERVAL_SECONDS", "2592000")
+    assert build_config(repo, archive).weekly_interval_seconds == 2592000
+    explicit = build_config(repo, archive, weekly_interval_seconds=42)
+    assert explicit.weekly_interval_seconds == 42
+
+
 def test_healthcheck_unconnected_still_reports(tmp_path):
     # 不带适配器的模块单独跑：八项齐、记忆项如实异常（模块原行为）。
     repo = tmp_path / "repo"

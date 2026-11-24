@@ -12,6 +12,7 @@
 # - max_seconds 给足 1800：一次完整体检 = 整仓复制 + 全套测试
 #   （约 3 分钟）+ 记忆自检的模型抽查，远超模块默认 120 秒。
 
+import os
 import sys
 from pathlib import Path
 
@@ -20,8 +21,15 @@ from healthcheck import Config, Healthcheck
 from .adapter import ShierHealthcheckAdapter
 
 
-def build_config(repo_root, archive_dir, python_executable=None):
+def build_config(repo_root, archive_dir, python_executable=None,
+                 weekly_interval_seconds=None):
     exe = python_executable or sys.executable
+    if weekly_interval_seconds is None:
+        raw = os.environ.get("SHIER_HEALTHCHECK_INTERVAL_SECONDS", "")
+        try:
+            weekly_interval_seconds = float(raw) if raw.strip() else 7 * 24 * 3600
+        except ValueError:
+            weekly_interval_seconds = 7 * 24 * 3600
     suite = [exe, "-m", "pytest", "-q", "--tb=short", "-ra", "--no-header"]
     return Config(
         repo=Path(repo_root),
@@ -37,6 +45,7 @@ def build_config(repo_root, archive_dir, python_executable=None):
         permission_paths=[],
         repair_paths=[],
         protected_paths=["memory"],
+        weekly_interval_seconds=float(weekly_interval_seconds),
     )
 
 
@@ -79,7 +88,9 @@ def build_proposer(name="no_candidate", timeout=None, registry=None):
 def build_healthcheck(repo_root, archive_dir, **adapter_kwargs):
     """一步装配：返回 (Healthcheck, adapter)。"""
     python_executable = adapter_kwargs.pop("python_executable", None)
+    weekly_interval_seconds = adapter_kwargs.pop("weekly_interval_seconds", None)
     adapter = build_adapter(repo_root, **adapter_kwargs)
     config = build_config(repo_root, archive_dir,
-                          python_executable=python_executable)
+                          python_executable=python_executable,
+                          weekly_interval_seconds=weekly_interval_seconds)
     return Healthcheck(config, adapter), adapter
