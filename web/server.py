@@ -2194,7 +2194,7 @@ class MemoryMaintenanceScheduler:
                  self_check_interval_seconds=7 * 24 * 3600,
                  tick_seconds=3600, now_fn=None, network_probe=None,
                  probe_interval_seconds=900, backup_runner=None,
-                 backup_hour=3, backup_minute=51):
+                 backup_hour=3, backup_minute=51, on_network_recovered=None):
         self._store = store
         self._state_path = Path(state_path)
         self._decay_interval = float(decay_interval_seconds)
@@ -2217,6 +2217,9 @@ class MemoryMaintenanceScheduler:
         self._backup_runner = backup_runner
         self._backup_hour = int(backup_hour)
         self._backup_minute = int(backup_minute)
+        # 全身体检并入（2026-11-24）：判官自检断网挂起后、网络恢复
+        # 补跑完成时通知一声；None = 不通知（原行为）。
+        self._on_network_recovered = on_network_recovered
 
     def _load_state(self):
         try:
@@ -2379,6 +2382,11 @@ class MemoryMaintenanceScheduler:
         state.pop("self_check_pending", None)
         state.pop("self_check_pending_since", None)
         ran["self_check"] = True
+        if pending and self._on_network_recovered is not None:
+            try:
+                self._on_network_recovered()
+            except Exception:
+                logger.warning("网络恢复回调失败。", exc_info=True)
 
     def start(self):
         """起守护线程：先补跑到期的，再按 tick 节奏巡回。重复调不重复起。"""
@@ -2507,6 +2515,57 @@ def _maintenance_interval_value(env_name, default):
     return value if value > 0 else float(default)
 
 
+
+def _healthcheck_recovery_callback(store, memory_dir):
+    """全身体检周检的断网恢复补跑回调（2026-11-24 并入 healthcheck）。
+
+    只有环境变量 SHIER_HEALTHCHECK_CONFIG 存在且能解析时才启用，
+    内容是 JSON：{"archive": "<存档目录>", "base_url": "<服务地址>"}。
+    未设置/解析失败 → 返回 None，维护调度行为与之前完全一致。
+    启用后：判官自检在断网挂起、网络恢复补跑完成时，后台线程跑
+    一次 healthcheck.weekly()（周租约在适配器侧保证一周一次，
+    重复触发不会重复跑）。回调只起线程，绝不阻塞维护调度。
+    """
+    raw = os.environ.get("SHIER_HEALTHCHECK_CONFIG")
+    if not raw:
+        return None
+    try:
+        cfg = json.loads(raw)
+        archive = cfg["archive"]
+        base_url = cfg.get("base_url")
+    except Exception:
+        logger.warning(
+            "SHIER_HEALTHCHECK_CONFIG 解析失败，全身体检补跑未启用。",
+            exc_info=True,
+        )
+        return None
+    repo_root = Path(__file__).resolve().parent.parent
+
+    def _run_weekly():
+        try:
+            from healthcheck_integration import build_healthcheck
+
+            healthcheck, _adapter = build_healthcheck(
+                repo_root,
+                archive,
+                store=store,
+                memory_dir=memory_dir,
+                server_base_url=base_url,
+                budget_tracker=BudgetTracker(),
+            )
+            result = healthcheck.weekly()
+            logger.info("全身体检周检（网络恢复补跑）：ran=%s", result.get("ran"))
+        except Exception:
+            logger.warning("全身体检周检补跑失败。", exc_info=True)
+
+    def _on_recovered():
+        threading.Thread(
+            target=_run_weekly, daemon=True, name="healthcheck-weekly"
+        ).start()
+
+    return _on_recovered
+
+
 def start_memory_maintenance(store):
     """给服务挂记忆维护调度（R-5）：状态文件放记忆库旁边——SQLite
     后端是账本同目录，其他后端放仓库的 memory 目录。返回调度器。"""
@@ -2542,6 +2601,7 @@ def start_memory_maintenance(store):
             "SHIER_MAINTENANCE_PROBE_SECONDS", 900
         ),
         backup_runner=_backup_runner,
+        on_network_recovered=_healthcheck_recovery_callback(store, memory_dir),
         backup_hour=int(_maintenance_interval_value("SHIER_BACKUP_HOUR", 3)),
         backup_minute=int(
             _maintenance_interval_value("SHIER_BACKUP_MINUTE", 51)
