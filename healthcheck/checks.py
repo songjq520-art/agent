@@ -121,7 +121,7 @@ class Healthcheck:
                 previous.append(dt.datetime.fromisoformat(json.loads(path.read_text())["completed_at"]))
             except (KeyError, ValueError, OSError):
                 pass
-        if previous and (now - max(previous)).total_seconds() < 7 * 24 * 3600:
+        if previous and (now - max(previous)).total_seconds() < self.config.weekly_interval_seconds:
             return {"ran": False, "reason": "未逾期"}
         # 十二调度器提供持久化互斥租约，避免多进程重复补跑。
         if not self.adapter.weekly_lease("healthcheck-weekly"):

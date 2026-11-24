@@ -109,6 +109,7 @@ class Config:
     max_output_bytes: int = 1048576
     repair_paths: list[str] = dataclasses.field(default_factory=list)
     protected_paths: list[str] = dataclasses.field(default_factory=list)
+    weekly_interval_seconds: float = 7 * 24 * 3600
 
     @classmethod
     def load(cls, path):
@@ -127,7 +128,8 @@ class Config:
             raise ValueError("记忆每次必须抽查20条")
         if not 1 <= self.max_attempts <= 2 or not 1 <= self.reflection_rounds <= 3:
             raise ValueError("尝试最多2次，反思最多3轮")
-        for value in (self.max_seconds, self.max_steps, self.max_cost, self.max_output_bytes):
+        for value in (self.max_seconds, self.max_steps, self.max_cost,
+                      self.max_output_bytes, self.weekly_interval_seconds):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("预算必须是有限正数")
         if not isinstance(self.full_suite, bool):

@@ -347,6 +347,23 @@ class Case(unittest.TestCase):
         self.assertTrue(check.weekly(now + dt.timedelta(days=30))["ran"])
         self.assertEqual(len(list((self.config.archive / "weekly").glob("*.json"))), 2)
 
+    def test_weekly_default_interval_is_seven_days(self):
+        self.assertEqual(self.config.weekly_interval_seconds, 7 * 24 * 3600)
+        check = Healthcheck(self.config, self.adapter)
+        now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        self.assertTrue(check.weekly(now)["ran"])
+        self.assertFalse(check.weekly(now + dt.timedelta(days=6))["ran"])
+        self.assertTrue(check.weekly(now + dt.timedelta(days=7))["ran"])
+
+    def test_weekly_custom_interval_monthly(self):
+        self.config.weekly_interval_seconds = 30 * 24 * 3600
+        check = Healthcheck(self.config, self.adapter)
+        now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        self.assertTrue(check.weekly(now)["ran"])
+        self.assertFalse(check.weekly(now + dt.timedelta(days=29))["ran"])
+        self.assertTrue(check.weekly(now + dt.timedelta(days=30))["ran"])
+        self.assertEqual(len(list((self.config.archive / "weekly").glob("*.json"))), 2)
+
     def test_weekly_unconnected_no_claim(self):
         self.assertFalse(Healthcheck(self.config).weekly()["ran"])
 
