@@ -78,6 +78,7 @@ def _plant_row(store, text, **meta_over):
 # ---------- R-1：纠正顶掉全部真冲突 ----------
 
 
+@pytest.mark.requires_judge
 def test_r1_correction_supersedes_all_turn_stated_conflicts(store):
     """同槽两条亲口说过的冲突旧值（武汉、长沙，都是对话里说的），
     一次纠正“错了，我住在郑州”：两条全顶掉，账本各记一笔
@@ -100,6 +101,7 @@ def test_r1_correction_supersedes_all_turn_stated_conflicts(store):
     assert "我住在长沙" in sup_old_texts
 
 
+@pytest.mark.requires_judge
 def test_r1_correction_keeps_non_conflicting_rows(store):
     """同槽不冲突的（同值异说法“我家在郑州”）和别的槽位的
     （“我叫小明”）都不动：只有真冲突的武汉被顶掉。"""
@@ -115,6 +117,7 @@ def test_r1_correction_keeps_non_conflicting_rows(store):
     assert "我叫小明" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_r1_correction_skips_core_row(store):
     """冲突候选是核心/置顶记忆（curated）时不自动顶：哪怕它也是
     对话里说过的（turn_id 在案），也只有普通行武汉被顶掉，
@@ -132,6 +135,7 @@ def test_r1_correction_skips_core_row(store):
     assert "我住在南京" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_r1_correction_skips_migrated_inferred_row(store):
     """广州式护栏：迁移来的推断行（“用户住在广州”，turn_id 为空、
     未确认）哪怕同槽冲突也不连带顶——只有对话里刚说错的武汉被顶。"""
@@ -144,6 +148,7 @@ def test_r1_correction_skips_migrated_inferred_row(store):
     assert "用户住在广州" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_r1_direct_store_supersedes_turn_stated_extras(store):
     """直存路（allow_slot_supersede=True）：主目标（最新冲突）照旧
     顶，其余冲突里对话亲口说过的连带清掉、直存/迁移来的不连带。"""

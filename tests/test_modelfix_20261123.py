@@ -132,6 +132,7 @@ def test_modelfix_d1_add_memory_text_plain_no_supersede(store):
     assert "我住在武汉" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_modelfix_d1_explicit_correction_supersedes_only_newest(store):
     """带明确纠正词的才算纠正，且只顶最新那条同槽冲突：
     广州（旧真记忆）+ 武汉（刚说的）都在，纠正“错了，我住在长沙”
@@ -150,6 +151,7 @@ def test_modelfix_d1_explicit_correction_supersedes_only_newest(store):
     assert "我住在长沙" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_modelfix_d1_add_memory_text_allow_supersede_only_newest(store):
     """显式允许槽位取代时（allow_slot_supersede=True），也只顶最新一条。"""
     store.add_memory_text("用户住在广州", source="user")
@@ -175,6 +177,7 @@ def test_modelfix_a2_topic_slot():
     assert _correction_topic_slot("今天天气不错") is None
 
 
+@pytest.mark.requires_judge
 def test_modelfix_a2_explicit_correction_bypasses_similarity(sim68_store):
     """A 组卡点：米饭行和面条说法的相似度只有 0.68（< 0.70），
     不带纠正词标记时 correct_memory 不敢改（ambiguous，旧行活着）；
@@ -210,6 +213,7 @@ def test_modelfix_a2_explicit_slot_target_needs_unique_candidate(store):
     assert "我喜欢吃冒菜" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_modelfix_a2_save_turn_end_to_end(sim68_store):
     """A 组端到端：T1 米饭 → T2“记错了，我喜欢吃面条”→ 米饭被取代，
     面条是当前答案，纠正回执是 updated。"""

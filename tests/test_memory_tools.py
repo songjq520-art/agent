@@ -250,6 +250,7 @@ def test_add_memory_stores_and_dedups(mem_store):
     assert _texts(mem_store).count("BOOS 喜欢吃拉面") == 1
 
 
+@pytest.mark.requires_judge
 def test_update_memory_changes_text(mem_store):
     """改记忆：按原文找到旧条，换成新条。"""
     from tools.memory_tool import _run_update_memory
@@ -333,6 +334,7 @@ def test_memory_tool_without_store_reports_not_enabled():
 
 # ---------- 网关：删要确认卡，改直接改，列和记不用 ----------
 
+@pytest.mark.requires_judge
 def test_gateway_update_executes_directly_delete_still_needs_approval(mem_store, gateway):
     """S8（2026-11-22，BOOS 定：纠正不用确认，直接改）：网关层面——
     改（update_memory）直接执行、不建确认卡，旧事实被取代、新事实入库；
@@ -447,6 +449,7 @@ def test_loop_delete_via_approval_then_resume(mem_store, gateway, store):
     assert resumed["reply"] == "删掉了。"
 
 
+@pytest.mark.requires_judge
 def test_loop_update_executes_directly_without_approval(mem_store, gateway, store):
     """S8（2026-11-22，BOOS 定：纠正不用确认）：模型调 update_memory →
     直接改、循环正常结束、不停在确认卡，改完模型回答。"""

@@ -291,6 +291,7 @@ def test_search_semantic_with_fake_vectors(tmp_path, monkeypatch):
     assert hits[0]["text"] == "我今天晚上吃了米线"
 
 
+@pytest.mark.requires_judge
 def test_correct_memory_updates_exact_match(store):
     """纠错已接线（2026-11-22）：原样在库里时直接改那条。
     追加式：旧行标被取代、新说法另存一条，原话留在账本里。
@@ -338,6 +339,7 @@ def test_correct_memory_ambiguous_with_two_candidates(store):
     assert set(_live_texts(store)) == {"我喜欢吃火锅", "我喜欢吃冒菜"}
 
 
+@pytest.mark.requires_judge
 def test_save_turn_correction_updates_old_memory(store):
     """save_turn 端到端纠错：先存“我住北京”，再说“你记错了，我住上海”，
     旧的被取代、新的存下来，回执里带 correction（2026-11-22 接线）。"""
@@ -366,6 +368,7 @@ def test_save_turn_correction_not_found_saves_new_fact(store):
     assert _live_texts(store) == ["我住上海"]
 
 
+@pytest.mark.requires_judge
 def test_save_turn_same_turn_id_returns_cached_receipt_with_correction(store):
     """根因 a（2026-11-22）：同一 turn_id 调两次 save_turn，第二次返回
     上次的回执（含 correction），不重复存、纠正结果不丢。"""
@@ -408,6 +411,7 @@ def _tea_fake_embed(self, text):
     return [0.0, 1.0]
 
 
+@pytest.mark.requires_judge
 def test_correct_memory_multi_candidate_filters_by_similarity(store, monkeypatch):
     """根因 b（2026-11-22）：多候选时按相似度筛——只留 ≥0.70 的；
     筛后剩 1 条就取代它，不再一刀切判 ambiguous。"""
@@ -732,6 +736,7 @@ def test_delete_memory_supports_ledger_only_key_and_rejects_missing(store):
     }
 
 
+@pytest.mark.requires_judge
 def test_revive_memory_restores_superseded_row(store):
     """被错取代的记忆能恢复：revive 后行重新变活，账本里有一笔 REVIVE 事件。"""
     added = store.add_memory_text("我住广州", source="user")
@@ -1002,6 +1007,7 @@ def test_save_turn_without_turn_id_retracts_whole_turn(store):
     assert _live_texts(store) == []
 
 
+@pytest.mark.requires_judge
 def test_correction_with_prefix_goes_through_correction(store):
     """“不对/不是”开头的纠错句也走 correct_memory（2026-11-22 接线）；
     句中含“记错了”的正常陈述仍照常存。"""
@@ -1304,6 +1310,7 @@ def test_add_same_slot_lower_credibility_stores_new_row(store):
     assert _live_texts(store) == ["我叫大明", "我叫小宋"]
 
 
+@pytest.mark.requires_judge
 def test_search_history_returns_superseded_versions(store):
     """Gemini #5 历史查询：默认只返回活记忆；include_history=True 时，
     在活记忆后面补账本里被取代的旧版本（is_history=True）。"""
@@ -1323,6 +1330,7 @@ def test_search_history_returns_superseded_versions(store):
     assert store.search_history("我住", top_k=5) == hist
 
 
+@pytest.mark.requires_judge
 def test_deletion_scope_history_after_correction(store):
     """修 bug：deletion_scope 的账本历史不再报 AttributeError，
     纠错后能看到 add + supersede 两笔事件。"""
@@ -1420,6 +1428,7 @@ def test_correction_repeat_same_fact_is_unchanged_no_dup(store):
     assert len(_ledger_lines(store)) == 1
 
 
+@pytest.mark.requires_judge
 def test_correction_to_existing_fact_reuses_row(store):
     """待补 1b：库里同时有“我住上海”和“我住广州”，说“不对，我住广州”，
     最终只有 1 条“我住广州”：复用已有行、不新插，旧的上海被取代。"""
@@ -1516,6 +1525,7 @@ def test_decay_delete_due_revive_and_double_sweep_idempotent(store):
     assert len(_live_texts(store)) == 2
 
 
+@pytest.mark.requires_judge
 def test_correction_supersede_failure_keeps_new_and_old_alive(store, monkeypatch):
     """待补 4（按 BOOS 已定行为断言）：mock _supersede_row 抛异常，
     _apply_correction_result 返回 failed；取代失败时保留新记忆、
@@ -1648,6 +1658,7 @@ def _correction_store(tmp_path, monkeypatch):
     return SQLiteStore(memory_dir=str(tmp_path / "memory"))
 
 
+@pytest.mark.requires_judge
 def test_save_turn_correction_e2e_shenzhen(tmp_path, monkeypatch):
     """端到端：库里有“我住北京”，说“不对，我住深圳”→ 回复带
     correction（updated）、账本有 supersede、新事实入库、旧事实被取代。"""
@@ -1668,6 +1679,7 @@ def test_save_turn_correction_e2e_shenzhen(tmp_path, monkeypatch):
     assert any('"type": "supersede"' in line for line in lines)
 
 
+@pytest.mark.requires_judge
 def test_save_turn_correction_general_phrases_e2e(tmp_path, monkeypatch):
     """端到端：每种纠正说法走 save_turn 都要真换掉旧记忆（不只“不对”）。"""
     monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
@@ -1752,6 +1764,7 @@ def test_save_turn_implicit_update_keeps_confirmed_old(tmp_path, monkeypatch):
     assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
+@pytest.mark.requires_judge
 def test_save_turn_correction_ambiguous_slot_retry(tmp_path, monkeypatch):
     """纠错分不清改哪条时按槽位再筛：候选有“我住北京”（住处）和
     “我喜欢深圳菜”（偏好），新说法“我住深圳”带住处槽位，恰好只有
@@ -1811,6 +1824,7 @@ def test_s10_user_spoken_new_fact_keeps_confirmed_old(tmp_path, monkeypatch):
     assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
 
 
+@pytest.mark.requires_judge
 def test_s10_user_spoken_now_living_in_zhengzhou(tmp_path, monkeypatch):
     """S10(a) 原句：库里“我住长沙”是已确认版，用户说“我现在住在郑州了”
     → 走纠正分支，新说法入库、长沙被取代，不丢。"""

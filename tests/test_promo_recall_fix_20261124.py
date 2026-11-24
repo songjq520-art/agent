@@ -210,6 +210,7 @@ def test_promotion_confirmed_member_evidence_counts(store):
 # ---------- 二、纠正继承：新事实不从零开始 ----------
 
 
+@pytest.mark.requires_judge
 def test_correction_inherits_evidence_and_promotes(store):
     """旧行攒了 2 天 2 会话，纠正出的新行应继承：加上纠正轮就是
     3 天 3 会话，当场晋升成稳定，不许从零开始。"""
@@ -242,6 +243,7 @@ def test_correction_inherits_evidence_and_promotes(store):
     assert meta["decay_kind"] == "stable"
 
 
+@pytest.mark.requires_judge
 def test_correction_no_inherit_from_joke_old(store):
     """旧行是玩笑话（带 tone 标）：它的“出现”本来就不算数，
     纠正出的新行不许继承那份证据。"""
@@ -269,6 +271,7 @@ def test_correction_no_inherit_from_joke_old(store):
     assert sessions == {"t-corr-joke"}
 
 
+@pytest.mark.requires_judge
 def test_slot_supersede_inherits_evidence(store):
     """槽位直存取代（add_memory_text 的 allow_slot_supersede 路）
     落盘后同样继承：旧住处攒的天数/会话并给新住处行。"""

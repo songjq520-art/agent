@@ -58,6 +58,7 @@ def _turn(store, text, turn_id):
 # ---------- 1a：纠正出的新记忆带 turn_id，撤回能作废 ----------
 
 
+@pytest.mark.requires_judge
 def test_correction_new_memory_carries_turn_id(store):
     store.add_memory_text("我喜欢吃米饭", source="user")
     out = store.correct_memory(
@@ -73,6 +74,7 @@ def test_correction_new_memory_carries_turn_id(store):
     assert sup and sup[-1].get("turn_id") == "turn-42"
 
 
+@pytest.mark.requires_judge
 def test_correction_then_retract_voids_new_memory(store):
     _turn(store, "我喜欢吃米饭", "t1")
     assert "我喜欢吃米饭" in _live_texts(store)
@@ -95,6 +97,7 @@ def test_correction_then_retract_voids_new_memory(store):
 # ---------- 1b：护栏绑 turn_id ----------
 
 
+@pytest.mark.requires_judge
 def test_guard_blocks_same_turn_repeat(store):
     """同轮重复纠正（工具先改、save_turn 再调）：护栏拦住。"""
     store.add_memory_text("我住在武汉", source="user")
@@ -110,6 +113,7 @@ def test_guard_blocks_same_turn_repeat(store):
     assert second["old_text"] == "我住在武汉"
 
 
+@pytest.mark.requires_judge
 def test_guard_does_not_block_other_turn(store):
     """上一轮的 supersede 不是本轮的：护栏不许拦（旧 5 分钟窗口会拦）。"""
     store.add_memory_text("我住在武汉", source="user")
@@ -124,6 +128,7 @@ def test_guard_does_not_block_other_turn(store):
     assert second["status"] == "unchanged"
 
 
+@pytest.mark.requires_judge
 def test_guard_no_false_block_change_back(store):
     """改回旧值的场景：长沙是 t1 顶掉武汉存下的，郑州是后来新存的；
     t3 用户说“不对，我住在长沙”——该顶的是郑州，不是回一句
@@ -144,6 +149,7 @@ def test_guard_no_false_block_change_back(store):
     assert "我住在长沙" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_change_back_supersedes_current_value(store):
     """武汉→长沙→郑州→改回长沙：最后一次纠正要顶掉郑州、长沙活着。"""
     store.add_memory_text("我住在武汉", source="user")
@@ -210,6 +216,7 @@ def test_slot_target_close_race_returns_none(store, monkeypatch):
     assert target is None
 
 
+@pytest.mark.requires_judge
 def test_slot_target_end_to_end(store, monkeypatch):
     """端到端：明确纠正走槽位直选，layer=slot，顶掉的是相似度最高那条。"""
     for text in ("我住在广州", "我住在北京", "我住在上海"):

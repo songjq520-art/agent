@@ -1010,6 +1010,7 @@ def test_forget_without_store_returns_503(running_server):
     assert "记忆未启用" in data["error"]
 
 
+@pytest.mark.requires_judge
 def test_correct_success_updates_memory(running_server_with_real_store):
     """纠正一条记忆（页面上选了 id、给了新说法）：返回 updated，
     列表里旧文本没了、新文本在同一条 id 上。"""
@@ -1058,6 +1059,7 @@ def test_correct_ambiguous_returns_candidates_and_changes_nothing(
     assert len(store.get_all()) == 3
 
 
+@pytest.mark.requires_judge
 def test_correct_with_memory_id_resolves_ambiguity(running_server_with_real_store):
     """ambiguous 之后，页面让 BOOS 挑了一条、按 id 再提交：
     只改挑中的那条，另一条相似记忆不动。"""

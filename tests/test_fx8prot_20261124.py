@@ -148,6 +148,7 @@ def test_prot_answer_no_keeps_both_and_never_reasks(store):
     assert not _is_superseded(store, "用户住在广州")
 
 
+@pytest.mark.requires_judge
 def test_prot_confirmed_old_superseded_immediately(store):
     """回归不误伤：亲口确认过的旧记忆撞上纠正，照旧立即顶掉，
     不攒问题（保护只管推断未确认的）。"""

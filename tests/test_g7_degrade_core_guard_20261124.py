@@ -163,6 +163,7 @@ def test_g7_degraded_hold_answer_buhuan_keeps_both(store, judge_off):
     assert store.list_pending_questions() == []
 
 
+@pytest.mark.requires_judge
 def test_g7_judge_on_normal_correction_still_updates(store):
     """对照组：判官可用时，普通纠正照旧立即取代（锁二不误伤）。"""
     _plant_row(store, "我住北京", slot="residence")
@@ -182,6 +183,7 @@ def test_g7_degraded_add_path_unaffected(store, judge_off):
     assert "BOOS 喜欢喝酸梅汤" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_g7_judge_runtime_failure_marks_degraded(tmp_path, monkeypatch):
     """运行时信号：真问判官失败（抛错）后本实例算降级；问通了
     （拿到裁决）自动清标。不打桩 _ask_semantic_judge 本身。"""

@@ -148,6 +148,7 @@ def test_p1_2_decision_with_time_words_is_important(store, text):
 # ---------- P1-3：纠正新记忆一律变 stable ----------
 
 
+@pytest.mark.requires_judge
 def test_p1_3_correction_of_episodic_event_stays_episodic(store):
     """纠正一条一次性事件（“昨天我吃了牛肉面”→“鸡杂面”），新记忆
     还是 episodic——修之前按 source="user" 一律算 stable。"""
@@ -171,6 +172,7 @@ def test_p1_3_correction_of_episodic_event_stays_episodic(store):
         (old_id,)).fetchone()[0] == 1
 
 
+@pytest.mark.requires_judge
 def test_p1_3_correction_of_stable_preference_stays_stable(store):
     """对照：纠正一条稳定偏好，新记忆继承 stable，不降级。"""
     store.add_memory_text("我喜欢吃牛肉面", source="user")

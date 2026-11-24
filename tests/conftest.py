@@ -52,3 +52,41 @@ def _drain_turn_organize_threads():
         if thread is not None and thread.is_alive():
             thread.join(timeout=60)
     _CREATED_STORES.clear()
+# ---------- 判官在场标记 requires_judge（2026-11-24 修②） ----------
+#
+# 有一批纠正类测试的前提是「语义判官在配置层可用」：判官没接好
+# （没 Key 等）时，store 按 G7 规矩把程序路纠正挂成待问问题
+# （pending_question），纠正不执行——这是生产行为本身没错，但这批
+# 测试断言的是判官在场时的纠正结果，在无 Key 环境（体检副本、CI）
+# 里只会假失败。给它们打 requires_judge 标记：判官未配置时正确
+# 跳过并写明缺哪项配置；配置在场时必须真跑、坏了响亮失败。
+# 判定只认「判官配置」这个事实（memory.semantic_judge
+# .judge_available：只查接没接上/启用没/Key 在不在，不调模型、
+# 不读 Key 值），不认「在不在副本里」这类环境嗅探。
+
+
+def judge_skip_reason():
+    """判官没配置好返回缺哪项（str），配置好了返回 None。"""
+    try:
+        from memory.semantic_judge import judge_available
+
+        ok, reason = judge_available()
+    except Exception as exc:  # 判官模块本身坏了也不能连累全套收集
+        return f"判官可用性检查失败：{exc}"
+    return None if ok else reason
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "requires_judge: 需要语义判官已配置（Key 到位）；未配置时跳过并写明原因",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _skip_when_judge_unconfigured(request):
+    if request.node.get_closest_marker("requires_judge") is not None:
+        reason = judge_skip_reason()
+        if reason is not None:
+            pytest.skip(f"判官未配置（{reason}），本测试需要判官在场")
+    yield

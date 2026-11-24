@@ -85,6 +85,7 @@ def test_afix_extract_note_old_fact():
     ) == "BOOS 喜欢吃米饭"
 
 
+@pytest.mark.requires_judge
 def test_afix_note_line_recognized_by_correct_memory(sim68_store):
     """备注行认得出：米饭 + 备注行都在，带明确纠正词纠正到面条时，
     correct_memory 必须 updated（而不是 not_found），exact 新行入库，
@@ -104,6 +105,7 @@ def test_afix_note_line_recognized_by_correct_memory(sim68_store):
     assert "我喜欢吃面条" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_afix_save_turn_end_to_end_with_note(sim68_store):
     """A 组端到端（含备注行）：T1 米饭 → 模型抢跑写备注行 →
     T2“记错了，我喜欢吃面条”→ 纠正回执 updated，米饭被取代，

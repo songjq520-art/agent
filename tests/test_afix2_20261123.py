@@ -48,6 +48,7 @@ def _turn(store, text, turn_id):
     )
 
 
+@pytest.mark.requires_judge
 def test_guard_blocks_double_correction_save_turn(store):
     """D 组复现：模型工具先改武汉→长沙，save_turn 再调 correct_memory
     （长沙，长沙）时必须拦住，广州不能被顶。"""
@@ -76,6 +77,7 @@ def test_guard_blocks_double_correction_save_turn(store):
     assert not _is_superseded(store, "用户住在广州")
 
 
+@pytest.mark.requires_judge
 def test_guard_blocks_duplicate_tool_call(store):
     """工具重复调用：correct_memory(武汉，长沙）调两次，第二次拦住。"""
     store.add_memory_text("用户住在广州", source="user")
@@ -93,6 +95,7 @@ def test_guard_blocks_duplicate_tool_call(store):
     assert "用户住在广州" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_guard_does_not_block_genuine_correction(store):
     """真纠正不拦：长沙早就在库里（刚顶过武汉），现在纠正郑州→长沙，
     旧说法郑州还活着，正常流程顶掉郑州、复用长沙。"""
@@ -110,6 +113,7 @@ def test_guard_does_not_block_genuine_correction(store):
     assert "我住在长沙" in _live_texts(store)
 
 
+@pytest.mark.requires_judge
 def test_guard_does_not_block_when_new_fact_added_directly(store):
     """新说法是直接存的（没顶过谁、账本无 supersede 事件），不拦。"""
     store.add_memory_text("我住在长沙", source="user")
@@ -122,6 +126,7 @@ def test_guard_does_not_block_when_new_fact_added_directly(store):
     assert _is_superseded(store, "我住在郑州")
 
 
+@pytest.mark.requires_judge
 def test_guard_save_turn_end_to_end(store):
     """save_turn 端到端：T1 武汉 → 模型工具改武汉→长沙 → T2“错了，
     我住在长沙”——回复必须是“已经改好了：把‘我住在武汉’改成了

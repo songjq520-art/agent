@@ -320,6 +320,7 @@ def _rig_bad_recall(store, monkeypatch, exclude_ids, sims):
     return junk
 
 
+@pytest.mark.requires_judge
 def test_correction_rescued_by_slot_fallback(store, monkeypatch):
     target = store.add_memory_text("我喜欢吃米饭", source="user")
     store.add_memory_text("我开货车", source="user")

@@ -114,6 +114,7 @@ def test_now_plain_statement_not_detected():
     assert _detect_correction("我现在喜欢吃海鲜") is None
 
 
+@pytest.mark.requires_judge
 def test_now_multi_clause_save_turn_end_to_end(store):
     store.add_memory_text("我住在广州", source="user")
     receipt = _turn(store, "我现在住深圳了，喜欢吃海鲜", "t1")

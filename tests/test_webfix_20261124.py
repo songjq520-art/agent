@@ -182,6 +182,7 @@ def test_negation_conflict_signal(store):
     assert not f("我吃鸡杂面", "BOOS 喜欢吃鸡杂面。")
 
 
+@pytest.mark.requires_judge
 def test_correction_variant_jicha_recognized(store):
     """纠正说法要通用：“记岔了”和“记错了”同义，必须走纠正路
     当轮顶掉旧的（复测 #1 实测：“记岔了”没被认出来，新事实存了、
