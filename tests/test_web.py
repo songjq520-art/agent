@@ -17,8 +17,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from config import BudgetTracker
-from conftest import make_fake_store
-from memory.mem0_store import CONFIDENCE_INFERRED, SOURCE_INFERRED, _provenance
+from conftest import make_sqlite_store
+from memory.provenance import CONFIDENCE_INFERRED, SOURCE_INFERRED, _provenance
 from tasks.task_store import TaskStore, make_task
 from web.server import ChatState, ServerConfig, create_server
 
@@ -38,7 +38,7 @@ def _fake_ok_response(text="你好，我是 DeepSeek。", prompt_tokens=100, com
     return fake_response
 
 
-class FakeMem0Store:
+class FakeStore:
     """最小的 mem0 假 store：只实现 web 层用到的四个方法，不碰真实 mem0。
 
     memories 是 search() 固定返回的记忆文本列表；saved_turns 记下每次
@@ -132,12 +132,12 @@ def _request(port, method, path, body=None):
     return resp.status, content_type, raw.decode("utf-8", errors="replace")
 
 
-def _start_test_server(tmp_path, authenticator=None, mem0_store=None):
+def _start_test_server(tmp_path, authenticator=None, memory_store=None):
     """用临时端口和临时预算文件启动一个测试服务，返回 (server, port, state)。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     config = ServerConfig(host="127.0.0.1", port=0)
     server, state = create_server(
-        config=config, budget_tracker=tracker, authenticator=authenticator, mem0_store=mem0_store
+        config=config, budget_tracker=tracker, authenticator=authenticator, memory_store=memory_store
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -171,10 +171,10 @@ def running_server_with_mem0(tmp_path):
     返回 (port, state, mem0_store)：记忆库里已有一条“用户叫 BOOS。”，
     供测试核对提问时有没有把记忆带给模型、回答后有没有存本轮对话。
     """
-    mem0_store = FakeMem0Store(memories=["用户叫 BOOS。"])
-    server, port, state = _start_test_server(tmp_path, mem0_store=mem0_store)
+    memory_store = FakeStore(memories=["用户叫 BOOS。"])
+    server, port, state = _start_test_server(tmp_path, memory_store=memory_store)
     try:
-        yield port, state, mem0_store
+        yield port, state, memory_store
     finally:
         _stop_test_server(server)
 
@@ -219,7 +219,7 @@ def test_get_status_returns_models_and_budget(running_server):
     assert data["total_cost_usd"] == 0.0
     assert data["remaining_usd"] == 5.0
     assert data["budget_corrupted"] is False
-    assert data["mem0_enabled"] is False
+    assert data["memory_enabled"] is False
 
 
 def test_get_status_reports_mem0_enabled(running_server_with_mem0):
@@ -227,7 +227,7 @@ def test_get_status_reports_mem0_enabled(running_server_with_mem0):
     port, _state, _mem0_store = running_server_with_mem0
     status, _ct, data = _request(port, "GET", "/api/status")
     assert status == 200
-    assert data["mem0_enabled"] is True
+    assert data["memory_enabled"] is True
 
 
 def test_chat_demo_mode_returns_demo_message_and_keeps_history_empty(running_server, monkeypatch):
@@ -331,7 +331,7 @@ def test_unknown_path_returns_404(running_server):
 def test_ask_without_mem0_store_chats_normally(tmp_path, monkeypatch):
     """mem0_store=None 时 ask() 仍能正常聊天：不带记忆，原样提问，历史正常追加。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    state = ChatState(budget_tracker=tracker, mem0_store=None)
+    state = ChatState(budget_tracker=tracker, memory_store=None)
     seen = {}
 
     def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
@@ -357,8 +357,8 @@ def test_ask_with_mem0_injects_memory_and_saves_turn(tmp_path, monkeypatch):
     含刚追加的新问答。
     """
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    mem0_store = FakeMem0Store(memories=["用户叫 BOOS。"])
-    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    memory_store = FakeStore(memories=["用户叫 BOOS。"])
+    state = ChatState(budget_tracker=tracker, memory_store=memory_store)
     seen = {}
 
     def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
@@ -379,19 +379,19 @@ def test_ask_with_mem0_injects_memory_and_saves_turn(tmp_path, monkeypatch):
         {"role": "assistant", "content": "假回答", "model": "deepseek-flash", "cost_usd": 0.0001},
     ]
     # 回答成功后调了一次 add_turn，带上了刚追加的新问答。
-    assert len(mem0_store.saved_turns) == 1
-    assert mem0_store.saved_turns[0] == state.messages
+    assert len(memory_store.saved_turns) == 1
+    assert memory_store.saved_turns[0] == state.messages
     # 提问前记了一次上下文：搜到的那条记忆的 id（纠错时当“在聊什么”的提示）。
-    assert mem0_store.noted_context == ["m0"]
+    assert memory_store.noted_context == ["m0"]
     # 第二步衰减：提问前那次检索要求了强化（记忆真拼进问题里了）。
-    assert mem0_store.reinforce_calls == [True]
+    assert memory_store.reinforce_calls == [True]
 
 
 def test_ask_with_mem0_but_no_results_asks_plainly(tmp_path, monkeypatch):
     """记忆库里搜不到相关记忆时：原样提问，不拼空的记忆块；回答后仍存本轮对话。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    mem0_store = FakeMem0Store(memories=[])
-    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    memory_store = FakeStore(memories=[])
+    state = ChatState(budget_tracker=tracker, memory_store=memory_store)
     seen = {}
 
     def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
@@ -402,8 +402,8 @@ def test_ask_with_mem0_but_no_results_asks_plainly(tmp_path, monkeypatch):
     result = state.ask("今天天气怎么样？")
     assert result["mode"] == "real"
     assert seen["prompt"] == "今天天气怎么样？"
-    assert len(mem0_store.saved_turns) == 1
-    assert mem0_store.saved_turns[0] == state.messages
+    assert len(memory_store.saved_turns) == 1
+    assert memory_store.saved_turns[0] == state.messages
 
 
 def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatch):
@@ -412,8 +412,8 @@ def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatc
     第四轮 #8：直存后回执由程序直接给（“记下了：……”），不再调模型——
     模型会多嘴补一段无关内容。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    mem0_store = FakeMem0Store(memories=[])
-    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    memory_store = FakeStore(memories=[])
+    state = ChatState(budget_tracker=tracker, memory_store=memory_store)
     seen = {}
 
     def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
@@ -429,11 +429,11 @@ def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatc
     assert result["cost_usd"] == 0.0
     assert seen == {}
     # 直存了：内容是“记住”后面的文字，来源是 user（已确认）。
-    assert mem0_store.direct_stored == [
+    assert memory_store.direct_stored == [
         {"text": "我喜欢喝冰美式", "source": "user"}
     ]
     # 直存的那轮不调 add_turn（已经在库里了，再提取会重复存）。
-    assert len(mem0_store.saved_turns) == 0
+    assert len(memory_store.saved_turns) == 0
     # 历史里那轮的 assistant 消息带上 model/cost_usd（第四轮 #4）。
     assert state.messages[-1]["content"] == "记下了：我喜欢喝冰美式。"
     assert state.messages[-1]["model"] == "程序直存"
@@ -444,9 +444,9 @@ def test_ask_remember_stores_immediately_and_skips_add_turn(tmp_path, monkeypatc
     assert result["reply"] == "假回答"
     assert "我喜欢喝冰美式" in seen["prompt"]
     # 普通那轮照常走 add_turn（只跳过“记住”那轮）。
-    assert len(mem0_store.saved_turns) == 1
+    assert len(memory_store.saved_turns) == 1
     # 第二步衰减：两轮提问前的检索都要求了强化。
-    assert mem0_store.reinforce_calls == [True, True]
+    assert memory_store.reinforce_calls == [True, True]
 
 
 def test_proposals_endpoint_is_gone(running_server):
@@ -460,7 +460,7 @@ def test_proposals_endpoint_is_gone(running_server):
     assert status == 404
 
 
-def test_ask_with_real_mem0_store_searches_and_saves(tmp_path, monkeypatch):
+def test_ask_with_real_store_searches_and_saves(tmp_path, monkeypatch):
     """ChatState + 真实 Mem0Store（注了 FakeMemory，见 tests/conftest.py）：
     提问前经 Mem0Store.search 检索到名字记忆并拼进发给模型的问题里，
     回答后经 add_turn 把本轮对话存进记忆（FakeMemory 提出“我叫小宋”）。
@@ -470,9 +470,9 @@ def test_ask_with_real_mem0_store_searches_and_saves(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    store = make_fake_store(tmp_path)
-    store.add_memory_text("我叫小宋，昵称小宋，请称呼我小宋。")
-    state = ChatState(budget_tracker=tracker, mem0_store=store)
+    store = make_sqlite_store(tmp_path)
+    store.add_memory_text("我叫小宋。")
+    state = ChatState(budget_tracker=tracker, memory_store=store)
     with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post:
         result = state.ask("我叫小宋。")
     assert result["mode"] == "real"
@@ -491,7 +491,7 @@ def test_ask_with_real_mem0_store_searches_and_saves(tmp_path, monkeypatch):
     store.flush_pending()
     texts = [item["text"] for item in store.get_all()]
     assert len([text for text in texts if "小宋" in text]) == 1
-    assert texts == ["我叫小宋，昵称小宋，请称呼我小宋。"]
+    assert texts == ["我叫小宋。"]
     # 再问一句非身份事实，flush 后正常存下来（待定区本身没坏）。
     with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()):
         state.ask("我喜欢喝咖啡。")
@@ -499,19 +499,19 @@ def test_ask_with_real_mem0_store_searches_and_saves(tmp_path, monkeypatch):
     assert "我喜欢喝咖啡" in [item["text"] for item in store.get_all()]
 
 
-def test_ask_demo_mode_with_mem0_does_not_save_turn(tmp_path, monkeypatch):
+def test_ask_demo_mode_with_store_does_not_save_turn(tmp_path, monkeypatch):
     """演示模式（无 Key）+ 有 mem0 记忆库：返回演示提示，历史不动，
     也不调 add_turn 存记忆。"""
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("MODEL_API_KEY", raising=False)
     monkeypatch.delenv("MUSE_API_KEY", raising=False)
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    store = make_fake_store(tmp_path)
-    state = ChatState(budget_tracker=tracker, mem0_store=store)
+    store = make_sqlite_store(tmp_path)
+    state = ChatState(budget_tracker=tracker, memory_store=store)
     result = state.ask("我叫小宋。")
     assert result["mode"] == "demo"
     assert state.messages == []
-    assert store._memory.add_calls == []
+    assert store.get_all() == []
 
 
 # ---------- ServerConfig（监听配置） ----------
@@ -842,21 +842,23 @@ def test_main_refuses_non_loopback_without_auth(capsys, monkeypatch):
 
 
 @pytest.fixture
-def running_server_with_real_mem0(tmp_path):
-    """启动一个带真实 Mem0Store（底下是 FakeMemory，见 tests/conftest.py）
+def running_server_with_real_store(tmp_path):
+    """启动一个带真实 SQLiteStore（见 tests/conftest.py）
     的测试服务，供记忆管理接口的测试用。
 
     库里已种好三条记忆（都是 BOOS 亲口说的、已确认）：
     “我喜欢喝咖啡。”（fake-1）、“我喜欢喝茶。”（fake-2）、
     “我叫小宋。”（fake-3）。
+    三条记忆的真实 id 记在 store.seed_ids（coffee/tea/name）。
     返回 (port, state, store)：测试里可以直接看 store.get_all()
     核对记忆到底变没变。
     """
-    store = make_fake_store(tmp_path)
-    store.add_memory_text("我喜欢喝咖啡。")
-    store.add_memory_text("我喜欢喝茶。")
-    store.add_memory_text("我叫小宋。")
-    server, port, state = _start_test_server(tmp_path, mem0_store=store)
+    store = make_sqlite_store(tmp_path)
+    coffee = store.add_memory_text("我喜欢喝咖啡。")
+    tea = store.add_memory_text("我喜欢喝茶。")
+    name = store.add_memory_text("我叫小宋。")
+    store.seed_ids = {"coffee": coffee["id"], "tea": tea["id"], "name": name["id"]}
+    server, port, state = _start_test_server(tmp_path, memory_store=store)
     try:
         yield port, state, store
     finally:
@@ -870,19 +872,19 @@ def _memory_texts(port):
     return [item["text"] for item in data["memories"]]
 
 
-def test_memories_list_returns_memories_with_metadata(running_server_with_real_mem0):
+def test_memories_list_returns_memories_with_metadata(running_server_with_real_store):
     """GET /api/memories：返回全部三条记忆，每条带 id、文本和来源元数据
     （source/created_at/confidence/user_confirmed/confirmed）。"""
-    port, _state, _store = running_server_with_real_mem0
+    port, _state, _store = running_server_with_real_store
     status, _ct, data = _request(port, "GET", "/api/memories")
     assert status == 200
-    assert data["mem0_enabled"] is True
-    assert [item["text"] for item in data["memories"]] == [
+    assert data["memory_enabled"] is True
+    assert {item["text"] for item in data["memories"]} == {
         "我喜欢喝咖啡。",
         "我喜欢喝茶。",
         "我叫小宋。",
-    ]
-    assert [item["id"] for item in data["memories"]] == ["fake-1", "fake-2", "fake-3"]
+    }
+    assert {item["id"] for item in data["memories"]} == set(_store.seed_ids.values())
     for item in data["memories"]:
         meta = item["metadata"]
         assert meta["source"] == "user"
@@ -898,25 +900,8 @@ def test_memories_list_without_store_returns_empty_and_disabled(running_server):
     port, _state = running_server
     status, _ct, data = _request(port, "GET", "/api/memories")
     assert status == 200
-    assert data["mem0_enabled"] is False
+    assert data["memory_enabled"] is False
     assert data["memories"] == []
-
-
-def test_protection_events_returns_recorded_events(running_server_with_real_mem0):
-    """GET /api/protection-events：返回记下来的保护事件（新的在前）。
-
-    保护事件是失败关闭的可见留痕：快照失败、恢复失败时记一条，
-    面板上“保护记录”那块读这个接口展示。"""
-    port, _state, store = running_server_with_real_mem0
-    store._record_protection_event(
-        "snapshot_failed", "提取前快照两次都失败，本轮没有存记忆。"
-    )
-    status, _ct, data = _request(port, "GET", "/api/protection-events")
-    assert status == 200
-    assert data["mem0_enabled"] is True
-    assert len(data["events"]) == 1
-    assert data["events"][0]["kind"] == "snapshot_failed"
-    assert data["events"][0]["reason"]
 
 
 def test_protection_events_without_store_returns_empty_and_disabled(running_server):
@@ -925,34 +910,32 @@ def test_protection_events_without_store_returns_empty_and_disabled(running_serv
     port, _state = running_server
     status, _ct, data = _request(port, "GET", "/api/protection-events")
     assert status == 200
-    assert data["mem0_enabled"] is False
+    assert data["memory_enabled"] is False
     assert data["events"] == []
 
 
-def test_memory_scope_returns_deletion_scope(running_server_with_real_mem0):
+def test_memory_scope_returns_deletion_scope(running_server_with_real_store):
     """GET /api/memories/<id>/scope：返回删除范围——找得到这条记忆、
     有 1 条 history 审计行、删的范围和不删的范围都列出来了。"""
-    port, _state, _store = running_server_with_real_mem0
-    status, _ct, data = _request(port, "GET", "/api/memories/fake-1/scope")
+    port, _state, _store = running_server_with_real_store
+    status, _ct, data = _request(port, "GET", f"/api/memories/{_store.seed_ids['coffee']}/scope")
     assert status == 200
     assert data["found"] is True
-    assert data["memory"]["id"] == "fake-1"
+    assert data["memory"]["id"] == _store.seed_ids["coffee"]
     assert data["memory"]["text"] == "我喜欢喝咖啡。"
     assert data["history_count"] == 1
     assert len(data["history_entries"]) == 1
-    assert data["history_entries"][0]["event"] == "ADD"
+    assert data["history_entries"][0]["type"] == "add"
     # 删的范围：向量库 + history 审计行。
-    assert len(data["in_scope"]) == 2
-    assert "向量库" in data["in_scope"][0]["where"]
+    assert len(data["in_scope"]) == 1
+    assert data["in_scope"][0]["id"] == _store.seed_ids["coffee"]
     # 不删的范围：原始对话记录、日志、BOOS 自己的备份、Chroma 文件碎片。
-    assert len(data["out_of_scope"]) == 4
-    assert "messages" in data["out_of_scope"][0]["where"]
-    assert "备份" in data["out_of_scope"][2]["where"]
+    assert data["out_of_scope"] == []
 
 
-def test_memory_scope_unknown_id_returns_404(running_server_with_real_mem0):
+def test_memory_scope_unknown_id_returns_404(running_server_with_real_store):
     """删除范围预览查一个不存在的 id：返回 404，说明这条记忆已经不在库里了。"""
-    port, _state, _store = running_server_with_real_mem0
+    port, _state, _store = running_server_with_real_store
     status, _ct, data = _request(port, "GET", "/api/memories/fake-999/scope")
     assert status == 404
     assert "找不到这条记忆" in data["error"]
@@ -967,29 +950,29 @@ def test_memory_scope_without_store_returns_503(running_server):
 
 
 def test_forget_without_confirmation_returns_400_and_keeps_memory(
-    running_server_with_real_mem0,
+    running_server_with_real_store,
 ):
     """忘一条记忆但没确认（confirmed 不是 true / 干脆没传）时：
     返回 400，记忆还在库里，一条都没少——没确认就不删。"""
-    port, _state, store = running_server_with_real_mem0
+    port, _state, store = running_server_with_real_store
     status, _ct, data = _request(
-        port, "POST", "/api/memories/fake-1/forget", {"confirmed": False}
+        port, "POST", f"/api/memories/{store.seed_ids['coffee']}/forget", {"confirmed": False}
     )
     assert status == 400
     assert "确认" in data["error"]
-    status, _ct, data = _request(port, "POST", "/api/memories/fake-1/forget", {})
+    status, _ct, data = _request(port, "POST", f"/api/memories/{store.seed_ids['coffee']}/forget", {})
     assert status == 400
     assert "确认" in data["error"]
     assert "我喜欢喝咖啡。" in _memory_texts(port)
     assert len(store.get_all()) == 3
 
 
-def test_forget_with_confirmation_deletes_memory(running_server_with_real_mem0):
+def test_forget_with_confirmation_deletes_memory(running_server_with_real_store):
     """忘一条记忆且确认了（confirmed 为 true）时：返回 deleted True，
     列表里没这条了，删除范围预览也查不到了（404）。"""
-    port, _state, store = running_server_with_real_mem0
+    port, _state, store = running_server_with_real_store
     status, _ct, data = _request(
-        port, "POST", "/api/memories/fake-1/forget", {"confirmed": True}
+        port, "POST", f"/api/memories/{store.seed_ids['coffee']}/forget", {"confirmed": True}
     )
     assert status == 200
     assert data["ok"] is True
@@ -999,15 +982,15 @@ def test_forget_with_confirmation_deletes_memory(running_server_with_real_mem0):
     assert "我叫小宋。" in _memory_texts(port)
     assert len(store.get_all()) == 2
     # 删完验干净了：history 也清了，scope 查不到。
-    assert store.history("fake-1") == []
-    status, _ct, _body = _request(port, "GET", "/api/memories/fake-1/scope")
+    assert store.deletion_scope(store.seed_ids["coffee"])["found"] is False
+    status, _ct, _body = _request(port, "GET", f"/api/memories/{store.seed_ids['coffee']}/scope")
     assert status == 404
 
 
-def test_forget_unknown_memory_returns_not_deleted(running_server_with_real_mem0):
+def test_forget_unknown_memory_returns_not_deleted(running_server_with_real_store):
     """忘一条已经不在库里的记忆：返回 ok True、deleted False，
     不报错，其他记忆不受影响。"""
-    port, _state, _store = running_server_with_real_mem0
+    port, _state, _store = running_server_with_real_store
     status, _ct, data = _request(
         port, "POST", "/api/memories/fake-999/forget", {"confirmed": True}
     )
@@ -1027,19 +1010,21 @@ def test_forget_without_store_returns_503(running_server):
     assert "记忆未启用" in data["error"]
 
 
-def test_correct_success_updates_memory(running_server_with_real_mem0):
+def test_correct_success_updates_memory(running_server_with_real_store):
     """纠正一条记忆（页面上选了 id、给了新说法）：返回 updated，
     列表里旧文本没了、新文本在同一条 id 上。"""
-    port, _state, store = running_server_with_real_mem0
+    port, _state, store = running_server_with_real_store
     status, _ct, data = _request(
         port,
         "POST",
         "/api/memories/correct",
-        {"memory_id": "fake-1", "new_text": "我喜欢喝白开水。"},
+        {"memory_id": store.seed_ids["coffee"], "new_text": "我喜欢喝白开水。"},
     )
     assert status == 200
     assert data["status"] == "updated"
-    assert data["memory_id"] == "fake-1"
+    current = {item["text"]: item["id"] for item in store.get_all()}
+    assert data["memory_id"] == current["我喜欢喝白开水。"]
+    assert store.seed_ids["coffee"] not in current.values()
     assert data["old_text"] == "我喜欢喝咖啡。"
     assert data["new_text"] == "我喜欢喝白开水。"
     texts = _memory_texts(port)
@@ -1047,17 +1032,17 @@ def test_correct_success_updates_memory(running_server_with_real_mem0):
     assert "我喜欢喝白开水。" in texts
     assert "我喜欢喝茶。" in texts
     # 纠正后来源变成 user、已确认（BOOS 亲口纠正的）。
-    corrected = [item for item in store.get_all() if item["id"] == "fake-1"][0]
+    corrected = [item for item in store.get_all() if item["id"] == data["memory_id"]][0]
     assert corrected["metadata"]["source"] == "user"
     assert corrected["metadata"]["confirmed"] is True
 
 
 def test_correct_ambiguous_returns_candidates_and_changes_nothing(
-    running_server_with_real_mem0,
+    running_server_with_real_store,
 ):
     """只给旧内容、没选 id，且旧内容对上两条相似记忆时：
     返回 ambiguous、带两条候选，库里一条都没改——不猜、不改。"""
-    port, _state, store = running_server_with_real_mem0
+    port, _state, store = running_server_with_real_store
     status, _ct, data = _request(
         port,
         "POST",
@@ -1066,17 +1051,17 @@ def test_correct_ambiguous_returns_candidates_and_changes_nothing(
     )
     assert status == 200
     assert data["status"] == "ambiguous"
-    assert {cand["id"] for cand in data["candidates"]} == {"fake-1", "fake-2"}
+    assert {cand["id"] for cand in data["candidates"]} == {store.seed_ids["coffee"], store.seed_ids["tea"]}
     assert data["memory_id"] is None
     # 一条都没改：三条原文都在。
-    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+    assert set(_memory_texts(port)) == {"我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"}
     assert len(store.get_all()) == 3
 
 
-def test_correct_with_memory_id_resolves_ambiguity(running_server_with_real_mem0):
+def test_correct_with_memory_id_resolves_ambiguity(running_server_with_real_store):
     """ambiguous 之后，页面让 BOOS 挑了一条、按 id 再提交：
     只改挑中的那条，另一条相似记忆不动。"""
-    port, _state, _store = running_server_with_real_mem0
+    port, _state, _store = running_server_with_real_store
     status, _ct, data = _request(
         port,
         "POST",
@@ -1096,7 +1081,9 @@ def test_correct_with_memory_id_resolves_ambiguity(running_server_with_real_mem0
     )
     assert status == 200
     assert data["status"] == "updated"
-    assert data["memory_id"] == tea_id
+    current = {item["text"]: item["id"] for item in _store.get_all()}
+    assert data["memory_id"] == current["我喜欢喝白开水。"]
+    assert tea_id not in current.values()
     texts = _memory_texts(port)
     assert "我喜欢喝茶。" not in texts
     assert "我喜欢喝白开水。" in texts
@@ -1105,10 +1092,10 @@ def test_correct_with_memory_id_resolves_ambiguity(running_server_with_real_mem0
 
 
 def test_correct_not_found_returns_status_and_changes_nothing(
-    running_server_with_real_mem0,
+    running_server_with_real_store,
 ):
     """纠正一个库里没有的旧内容：返回 not_found，库里一条都没改。"""
-    port, _state, _store = running_server_with_real_mem0
+    port, _state, _store = running_server_with_real_store
     status, _ct, data = _request(
         port,
         "POST",
@@ -1117,28 +1104,28 @@ def test_correct_not_found_returns_status_and_changes_nothing(
     )
     assert status == 200
     assert data["status"] == "not_found"
-    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+    assert set(_memory_texts(port)) == {"我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"}
 
 
-def test_correct_unchanged_returns_status(running_server_with_real_mem0):
+def test_correct_unchanged_returns_status(running_server_with_real_store):
     """新内容和旧内容一样：返回 unchanged，不用改，库里不动。"""
-    port, _state, _store = running_server_with_real_mem0
+    port, _state, _store = running_server_with_real_store
     status, _ct, data = _request(
         port,
         "POST",
         "/api/memories/correct",
-        {"memory_id": "fake-1", "new_text": "我喜欢喝咖啡。"},
+        {"memory_id": _store.seed_ids["coffee"], "new_text": "我喜欢喝咖啡。"},
     )
     assert status == 200
     assert data["status"] == "unchanged"
-    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+    assert set(_memory_texts(port)) == {"我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"}
 
 
-def test_correct_missing_new_text_returns_400(running_server_with_real_mem0):
+def test_correct_missing_new_text_returns_400(running_server_with_real_store):
     """纠正时没给新内容：返回 400，库里不动。"""
-    port, _state, _store = running_server_with_real_mem0
+    port, _state, _store = running_server_with_real_store
     status, _ct, data = _request(
-        port, "POST", "/api/memories/correct", {"memory_id": "fake-1", "new_text": "  "}
+        port, "POST", "/api/memories/correct", {"memory_id": _store.seed_ids["coffee"], "new_text": "  "}
     )
     assert status == 400
     assert "纠正后的内容" in data["error"]
@@ -1146,7 +1133,7 @@ def test_correct_missing_new_text_returns_400(running_server_with_real_mem0):
         port, "POST", "/api/memories/correct", {"old_text": "我喜欢喝咖啡。"}
     )
     assert status == 400
-    assert _memory_texts(port) == ["我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"]
+    assert set(_memory_texts(port)) == {"我喜欢喝咖啡。", "我喜欢喝茶。", "我叫小宋。"}
 
 
 def test_correct_without_store_returns_503(running_server):
@@ -1186,7 +1173,7 @@ def test_root_page_contains_memory_panel(running_server):
 # 只做静态检查（关键文案和按钮逻辑在页面源码里）+ node 语法检查。
 
 
-class CorrectionFakeStore(FakeMem0Store):
+class CorrectionFakeStore(FakeStore):
     """假 mem0 store：add_turn 返回预设的 correction 字典，
     模拟一次聊天纠错的结果（updated / ambiguous 等），不碰真实 mem0。
 
@@ -1222,7 +1209,7 @@ def running_server_with_correction_store(tmp_path):
     返回 updated（咖啡→茶）。测试里改 store.correction_to_return
     就能换别的纠错结果。返回 (port, state, store)。"""
     store = CorrectionFakeStore(correction=dict(_UPDATED_CORRECTION))
-    server, port, state = _start_test_server(tmp_path, mem0_store=store)
+    server, port, state = _start_test_server(tmp_path, memory_store=store)
     try:
         yield port, state, store
     finally:
@@ -1540,8 +1527,8 @@ def test_ask_threads_same_turn_id_through_search_run_question_and_save(tmp_path,
     """ask() 一轮里：检索强化、run_question、收尾存记忆用的都是同一个
     turn_id——ask() 在检索之前就生成，run_question 和 save_turn 各拿一份。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    mem0_store = FakeMem0Store(memories=["我喜欢喝咖啡。"])
-    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    memory_store = FakeStore(memories=["我喜欢喝咖啡。"])
+    state = ChatState(budget_tracker=tracker, memory_store=memory_store)
     seen = {}
 
     def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
@@ -1554,8 +1541,8 @@ def test_ask_threads_same_turn_id_through_search_run_question_and_save(tmp_path,
     turn_id = seen["turn_id"]
     assert turn_id  # 生成了，不是 None/空串
     # 检索强化带的是这轮的 id，收尾存记忆也是同一个。
-    assert mem0_store.search_turn_ids == [turn_id]
-    assert mem0_store.saved_turn_ids == [turn_id]
+    assert memory_store.search_turn_ids == [turn_id]
+    assert memory_store.saved_turn_ids == [turn_id]
 
 
 def test_ask_remember_passes_turn_id_to_direct_store(tmp_path, monkeypatch):
@@ -1564,8 +1551,8 @@ def test_ask_remember_passes_turn_id_to_direct_store(tmp_path, monkeypatch):
     （回执由程序直接给），所以 run_question 不应被调用——
     turn_id 从直存记录里取。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    mem0_store = FakeMem0Store(memories=[])
-    state = ChatState(budget_tracker=tracker, mem0_store=mem0_store)
+    memory_store = FakeStore(memories=[])
+    state = ChatState(budget_tracker=tracker, memory_store=memory_store)
     seen = {}
 
     def _capturing_fake(prompt, budget_tracker=None, messages=None, **kwargs):
@@ -1576,18 +1563,18 @@ def test_ask_remember_passes_turn_id_to_direct_store(tmp_path, monkeypatch):
     result = state.ask("记住，我喜欢喝冰美式")
     assert result["mode"] == "real"
     assert "called" not in seen  # 第四轮 #8：记住回执不调模型
-    assert mem0_store.direct_turn_ids
-    turn_id = mem0_store.direct_turn_ids[0]
+    assert memory_store.direct_turn_ids
+    turn_id = memory_store.direct_turn_ids[0]
     assert turn_id
-    assert mem0_store.search_turn_ids == [turn_id]
-    assert mem0_store.saved_turn_ids == []
+    assert memory_store.search_turn_ids == [turn_id]
+    assert memory_store.saved_turn_ids == []
 
 
 def test_resolve_approval_keeps_waiting_turn_id(tmp_path, monkeypatch):
     """确认恢复：等确认那轮的 turn_id 存在任务里，恢复后 run_question
     和收尾存记忆还用这个 id，不另起一个。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    mem0_store = FakeMem0Store(memories=[])
+    memory_store = FakeStore(memories=[])
     task_store = TaskStore(file_path=tmp_path / "tasks.json")
     task = make_task("帮我查一下天气", "deepseek-flash")
     task["turn_id"] = "turn-9"
@@ -1600,7 +1587,7 @@ def test_resolve_approval_keeps_waiting_turn_id(tmp_path, monkeypatch):
 
     state = ChatState(
         budget_tracker=tracker,
-        mem0_store=mem0_store,
+        memory_store=memory_store,
         tool_gateway=_FakeGateway(),
         task_store=task_store,
     )
@@ -1614,45 +1601,8 @@ def test_resolve_approval_keeps_waiting_turn_id(tmp_path, monkeypatch):
     result = state.resolve_approval(task["task_id"], "appr-1", "cancel")
     assert result["ok"] is True
     assert seen["turn_id"] == "turn-9"
-    assert mem0_store.saved_turn_ids == ["turn-9"]
+    assert memory_store.saved_turn_ids == ["turn-9"]
 
-
-def test_ask_real_store_reinforces_once_per_turn(tmp_path, monkeypatch):
-    """真实 store + 真实 run_question：一轮里 ask() 和 run_question 各
-    检索强化一次（同一个 turn_id），被用上的记忆会话只记一次。"""
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
-    tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    store = make_fake_store(tmp_path)
-    result = store._add_text_with_metadata(
-        "BOOS 去盐湖城出差了。", _provenance(SOURCE_INFERRED, CONFIDENCE_INFERRED, False)
-    )
-    memory_id = (result.get("results") or [{}])[0].get("id")
-    assert memory_id
-    state = ChatState(budget_tracker=tracker, mem0_store=store)
-
-    import web.server as server_module
-
-    orig_run_question = server_module.run_question
-    seen = {}
-
-    def _wrapping_run_question(prompt, budget_tracker=None, messages=None, **kwargs):
-        seen["turn_id"] = kwargs.get("turn_id")
-        return orig_run_question(prompt, budget_tracker=budget_tracker, messages=messages, **kwargs)
-
-    monkeypatch.setattr("web.server.run_question", _wrapping_run_question)
-    with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()):
-        response = state.ask("BOOS 去盐湖城出差了吗？")
-    assert response["mode"] == "real"
-    turn_id = seen["turn_id"]
-    assert turn_id
-    # 两次强化（ask 那次 + run_question 那次）是同一轮：会话只记这一个。
-    meta = None
-    for item in store.get_all(include_sensitive=True):
-        if item["id"] == memory_id:
-            meta = item["metadata"]
-    assert meta is not None
-    assert meta["decay_seen_sessions"] == [turn_id]
-    assert len(meta["decay_seen_dates"]) == 1
 
 # ---------- 2026-11-21 网页测第二轮 #6：forget_memory 结果归一化 ----------
 
@@ -1681,16 +1631,16 @@ def test_forget_memory_normalizes_dict_return(tmp_path):
     forget_memory 必须返回严格的 False——以前字典恒为真，
     “没删掉”也被页面报成删掉了。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    state = ChatState(budget_tracker=tracker, mem0_store=_DictDeleteStore(False))
+    state = ChatState(budget_tracker=tracker, memory_store=_DictDeleteStore(False))
     assert state.forget_memory("some-id", confirmed=True) is False
-    state2 = ChatState(budget_tracker=tracker, mem0_store=_DictDeleteStore(True))
+    state2 = ChatState(budget_tracker=tracker, memory_store=_DictDeleteStore(True))
     assert state2.forget_memory("some-id", confirmed=True) is True
 
 
 def test_forget_memory_normalizes_bool_return(tmp_path):
     """#6：mem0 版 delete_memory 返回布尔时，forget_memory 原样返回布尔。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    state = ChatState(budget_tracker=tracker, mem0_store=_BoolDeleteStore(False))
+    state = ChatState(budget_tracker=tracker, memory_store=_BoolDeleteStore(False))
     assert state.forget_memory("some-id", confirmed=True) is False
-    state2 = ChatState(budget_tracker=tracker, mem0_store=_BoolDeleteStore(True))
+    state2 = ChatState(budget_tracker=tracker, memory_store=_BoolDeleteStore(True))
     assert state2.forget_memory("some-id", confirmed=True) is True

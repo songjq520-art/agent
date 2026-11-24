@@ -23,7 +23,6 @@ from tools.timing import Timer
 from tools.tool_gateway import ToolGateway
 from tasks.task_store import TaskStore
 
-from conftest import make_fake_store
 
 
 # ---------- 31 项基线表 ----------
@@ -196,7 +195,7 @@ def test_run_question_returns_timings(tmp_path, monkeypatch):
     outcome = run_question(
         "你好",
         budget_tracker=tracker,
-        mem0_store=_SleepyMem0Stub(),
+        memory_store=_SleepyMem0Stub(),
         tool_gateway=ToolGateway(),
         task_store=TaskStore(file_path=str(tmp_path / "tasks.json")),
         search_service=_StubSearchService(),
@@ -294,58 +293,5 @@ def test_30_date_injected_into_loop(tmp_path):
     assert f"{today.year} 年 {today.month} 月 {today.day} 日" in system_text
 
 
-def _install_fake_retraction_judge(store, retract=True):
-    """给假 store 装一个假撤回判（34 号测试用）：模型判永远回
-    {"retract": retract}。FakeMemory 本来没有 llm 属性，这里是测试
-    给它临时装一个，不影响其他测试。"""
-    import json
-    from types import SimpleNamespace
-
-    class _FakeCompletions:
-        def create(self, *args, **kwargs):
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(
-                            content=json.dumps(
-                                {"retract": retract}, ensure_ascii=False
-                            )
-                        ),
-                        finish_reason=None,
-                    )
-                ]
-            )
-
-    class _FakeChat:
-        completions = _FakeCompletions()
-
-    class _FakeLLM:
-        client = SimpleNamespace(chat=_FakeChat())
-
-    store._memory.llm = _FakeLLM()
 
 
-def test_34_retraction_with_clause_drops_pending(tmp_path):
-    """34 号：BOOS 说“我喜欢蓝色”，下一句“不不不，刚刚那句不算”，
-    蓝色那条绝不能进库——现在撤回先请模型判意图（假判回 retract=true），
-    带后半句的撤回也认得出来，待定区丢掉、已进库的软删除。”"""
-    store = make_fake_store(tmp_path)
-    _install_fake_retraction_judge(store, retract=True)
-    result = store.add_turn(
-        [
-            {"role": "user", "content": "我喜欢蓝色。"},
-            {"role": "assistant", "content": "记下了。"},
-        ]
-    )
-    assert result.get("pending") is True
-    result = store.add_turn(
-        [
-            {"role": "user", "content": "不不不，刚刚那句不算"},
-            {"role": "assistant", "content": "好的，我不记了。"},
-        ]
-    )
-    assert result.get("retracted") is True
-    assert result.get("dropped") == 1
-    assert not any("蓝色" in text for text in store._memory.all_texts())
-    store.flush_pending()
-    assert not any("蓝色" in text for text in store._memory.all_texts())

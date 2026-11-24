@@ -20,7 +20,6 @@ import pytest
 
 from memory import ledger as _ledger
 from memory import self_check as self_check_module
-from memory.mem0_store import Mem0Store
 from memory.sqlite_store import SQLiteStore
 from memory.timeutil import _now_iso
 from web.server import MemoryMaintenanceScheduler, start_memory_maintenance
@@ -63,14 +62,9 @@ def test_item4_start_memory_maintenance_default_weekly(tmp_path, monkeypatch):
 
 
 def test_item4_sample_size_defaults_20():
-    """三个入口的第 9 项抽查默认都是 20 条（原 10 条）。"""
+    """两个入口的第 9 项抽查默认都是 20 条（原 10 条；mem0 入口已随 Step 2 删除）。"""
     assert (
         inspect.signature(SQLiteStore.run_self_check)
-        .parameters["sample_size"].default
-        == 20
-    )
-    assert (
-        inspect.signature(Mem0Store.run_self_check)
         .parameters["sample_size"].default
         == 20
     )

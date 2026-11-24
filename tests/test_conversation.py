@@ -13,7 +13,7 @@ import pytest
 import requests
 
 from config import BudgetTracker
-from conftest import make_fake_store
+from conftest import make_sqlite_store
 from main import chat_loop, is_exit_command, main, run_question
 from providers.deepseek import DeepSeekProvider
 from providers.muse import MuseProvider
@@ -538,23 +538,23 @@ def test_budget_accumulates_across_turns_in_one_chat_loop(monkeypatch, tmp_path)
 # ---------- 连续对话接 mem0（新接口，见 tests/conftest.py 的 make_fake_store） ----------
 
 
-def test_chat_loop_with_mem0_store_saves_turn_after_answer(monkeypatch, tmp_path):
+def test_chat_loop_with_store_saves_turn_after_answer(monkeypatch, tmp_path):
     """连续对话 + mem0：成功回答后把本轮对话存进长期记忆（add_turn），
     FakeMemory 能从 user 消息里提出“我叫小宋”这条事实。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    store = make_fake_store(tmp_path)
+    store = make_sqlite_store(tmp_path)
     with (
         patch("builtins.input", side_effect=["我叫小宋。", "exit"]),
         patch("providers.deepseek.requests.post", return_value=_fake_ok_response()) as mock_post,
     ):
-        assert chat_loop(budget_tracker=tracker, mem0_store=store) == 0
+        assert chat_loop(budget_tracker=tracker, memory_store=store) == 0
         mock_post.assert_called_once()
     texts = [item["text"] for item in store.get_all()]
     assert any("小宋" in text for text in texts)
 
 
-def test_chat_loop_remember_command_saves_text_via_mem0(monkeypatch, tmp_path):
+def test_chat_loop_remember_command_saves_text_via_store(monkeypatch, tmp_path):
     """连续对话“记住：内容”：懒加载 get_mem0_store 后调 add_memory_text，
     原文存进长期记忆，不用再确认（mem0 自动存，BOOS 已同意）。
 
@@ -563,11 +563,11 @@ def test_chat_loop_remember_command_saves_text_via_mem0(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    store = make_fake_store(tmp_path)
+    store = make_sqlite_store(tmp_path)
     # main.py 里是 `from memory import mem0_store`（模块），再调模块上的
     # get_mem0_store() 懒加载；所以补丁要打在模块属性上，不是 main.get_mem0_store。
     monkeypatch.setattr(
-        "main.mem0_store.get_mem0_store", lambda budget_tracker=None: store
+        "memory.sqlite_store.create_sqlite_store", lambda budget_tracker=None, **kw: store
     )
     with patch("builtins.input", side_effect=["记住：我喜欢喝咖啡。", "exit", "exit"]):
         assert chat_loop(budget_tracker=tracker) == 0

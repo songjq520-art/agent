@@ -159,17 +159,6 @@ def test_run_self_check_empty_store(store):
 # ---------- 3c：store 工厂 ----------
 
 
-def test_factory_defaults_to_mem0(monkeypatch):
-    monkeypatch.delenv("SHIER_MEMORY_BACKEND", raising=False)
-    monkeypatch.setattr(
-        "memory.mem0_store.get_mem0_store", lambda bt=None: "MEM0-LAZY"
-    )
-    monkeypatch.setattr(
-        "memory.mem0_store.create_mem0_store",
-        lambda bt=None, **kw: "MEM0-NEW",
-    )
-    assert store_factory.get_store() == "MEM0-LAZY"
-    assert store_factory.create_store() == "MEM0-NEW"
 
 
 def test_factory_sqlite_backend(monkeypatch):

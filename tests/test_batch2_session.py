@@ -47,7 +47,7 @@ def _request(port, method, path, body=None):
     return resp.status, raw.decode("utf-8", errors="replace")
 
 
-def _start_batch2_server(tmp_path, mem0_store=None):
+def _start_batch2_server(tmp_path, memory_store=None):
     """用临时端口、临时预算/摘要/任务/全文文件启动一个测试服务。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
     config = ServerConfig(host="127.0.0.1", port=0)
@@ -59,7 +59,7 @@ def _start_batch2_server(tmp_path, mem0_store=None):
     server, state = create_server(
         config=config,
         budget_tracker=tracker,
-        mem0_store=mem0_store,
+        memory_store=memory_store,
         summary_store=summary_store,
         task_store=task_store,
         transcript_store=transcript_store,

@@ -18,7 +18,6 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from conftest import make_fake_store
 from router import route
 from tools.agent_loop import (
     LOOP_HISTORY_MAX_MESSAGES,
@@ -251,23 +250,6 @@ def test_loosened_constants():
 # ---------- 6. 明确“记住”时同步直存，不走后台 outbox ----------
 
 
-def test_add_memory_returns_only_after_entry_is_stored(tmp_path):
-    """明确“记住”时同步直存：_run_add_memory 返回时，条目必须已经在
-    库里（不用等、不 flush、不等后台线程）；而且根本没经过 outbox
-    （直存那条路不建 outbox，正常聊天的后台提取才走 outbox）。"""
-    store = make_fake_store(tmp_path)
-    with bound_memory_store(store):
-        result = _run_add_memory({"text": "我喜欢喝美式。"})
-    assert result["ok"] is True
-    memory_id = result["data"]["memory_id"]
-    # 返回时条目已经在库里：不用等。
-    items = store.get_all(include_sensitive=True)
-    texts = [item["text"] for item in items]
-    assert "我喜欢喝美式。" in texts
-    ids = [item["id"] for item in items]
-    assert memory_id in ids
-    # 直存没经过 outbox：outbox 是正常聊天收尾（save_turn）才懒建的。
-    assert store._outbox is None
 
 
 # ---------- 1 补丁：最后回答开思考时，工具轮的 assistant 消息要带 reasoning_content ----------

@@ -7,80 +7,23 @@
 
 import inspect
 
-from conftest import make_fake_store
 from memory.conversation_summary import build_summary_prompt, format_turns
-from memory.mem0_store import COMPUTER_TEXT, COMPUTER_VALUE, SLOT_COMPUTER
 
 
-def _seeded_store(tmp_path):
-    """造一个假记忆库并跑一次启动种子（名字 + SOUL + 电脑配置）。"""
-    store = make_fake_store(tmp_path)
-    outcomes = store.ensure_identity_memories()
-    return store, outcomes
 
 
-def _computer_memories(store):
-    return [
-        item
-        for item in store.get_all(include_sensitive=True)
-        if (item.get("metadata") or {}).get("slot") == SLOT_COMPUTER
-    ]
 
 
 # ---------- 17 号：电脑配置种子 ----------
 
-def test_computer_seed_added_once_with_config(tmp_path):
-    """17 号：启动时种下电脑配置，内容是 BOOS 发来的系统信息，不编硬盘容量。"""
-    _, outcomes = _seeded_store(tmp_path)
-    assert outcomes["computer"]["status"] == "added"
-    assert outcomes["computer"]["value"] == COMPUTER_VALUE
-    assert COMPUTER_TEXT.startswith("BOOS 的电脑配置")
 
 
-def test_computer_seed_text_and_confirmed(tmp_path):
-    """种子文本里有全部已知配置，记成 BOOS 已确认（来源 user、已确认）。"""
-    store, _ = _seeded_store(tmp_path)
-    items = _computer_memories(store)
-    assert len(items) == 1
-    text = items[0]["text"]
-    assert "Windows 11 Home 23H2" in text
-    assert "Vivobook K3402ZA" in text
-    assert "i5-12500H" in text
-    assert "16GB" in text
-    assert "Python 3.12.10" in text
-    assert "Git" in text
-    assert "VS Code" in text
-    assert "D:\\代码\\agent" in text
-    assert "D:\\代码\\十二的工作区" in text
-    # 硬盘容量截图里没显示，不要编。
-    assert "硬盘" not in text
-    assert "TB" not in text
-    meta = items[0]["metadata"]
-    assert meta["source"] == "user"
-    assert meta["user_confirmed"] is True
 
 
-def test_computer_seed_second_run_unchanged_no_duplicate(tmp_path):
-    """种子只加没有的：第二次启动不重复种，库里永远只有一条电脑配置。"""
-    store, _ = _seeded_store(tmp_path)
-    outcomes2 = store.ensure_identity_memories()
-    assert outcomes2["computer"]["status"] == "unchanged"
-    assert len(_computer_memories(store)) == 1
 
 
-def test_computer_seed_searchable(tmp_path):
-    """问“我的电脑是什么配置”能找回这条种子（重启后也一样，种子在库里）。"""
-    store, _ = _seeded_store(tmp_path)
-    found = store.search("我的电脑配置", top_k=5)
-    texts = [(item or {}).get("text") or "" for item in found]
-    assert any("Vivobook K3402ZA" in text for text in texts)
 
 
-def test_identity_seeds_still_seeded(tmp_path):
-    """17 号没动身份种子：名字和 SOUL 照样种下。"""
-    _, outcomes = _seeded_store(tmp_path)
-    assert outcomes["agent_name"]["status"] == "added"
-    assert outcomes["soul"]["status"] == "added"
 
 
 # ---------- 37 号：摘要防混轮 ----------

@@ -47,7 +47,7 @@ def _run_with_receipt(monkeypatch, tmp_path, receipt, capsys):
     store = _ReceiptStore(receipt)
     with patch("providers.deepseek.requests.post", return_value=_fake_ok_response()):
         outcome = run_question(
-            "你好", budget_tracker=tracker, messages=[], mem0_store=store
+            "你好", budget_tracker=tracker, messages=[], memory_store=store
         )
     return outcome, store, capsys.readouterr()
 

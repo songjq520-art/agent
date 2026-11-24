@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from config import BudgetTracker
-from conftest import make_fake_store
+from conftest import make_sqlite_store
 from main import chat_loop, run_question
 from memory.conversation_summary import (
     CONVERSATION_SUMMARY_TOKEN_LIMIT,
@@ -465,7 +465,7 @@ def test_run_question_injects_summary_but_not_into_mem0(monkeypatch, tmp_path):
     """提问时摘要拼进发给模型的问题；存 mem0 的消息里没有摘要原文。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    fake_store = make_fake_store(tmp_path=tmp_path, budget_tracker=tracker)
+    fake_store = make_sqlite_store(tmp_path=tmp_path, budget_tracker=tracker)
     stub = StubSummarizer()
     summary_store = _store(tmp_path, summarizer=stub)
     summary_store.flush(_messages(1, topic="之前聊过广州天气"))
@@ -480,7 +480,7 @@ def test_run_question_injects_summary_but_not_into_mem0(monkeypatch, tmp_path):
             "我叫BOOS",
             budget_tracker=tracker,
             messages=[],
-            mem0_store=fake_store,
+            memory_store=fake_store,
             summary_store=summary_store,
         )
     assert outcome["mode"] == "real"

@@ -352,7 +352,7 @@ def test_run_question_calculator_uses_original_prompt(tmp_path, monkeypatch):
     outcome = run_question(
         prefixed,
         budget_tracker=tracker,
-        mem0_store=_EightPercentMemory(),
+        memory_store=_EightPercentMemory(),
         tool_gateway=ToolGateway(),
         task_store=TaskStore(file_path=str(tmp_path / "tasks.json")),
         search_service=_StubSearchService(),

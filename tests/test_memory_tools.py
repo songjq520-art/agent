@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from conftest import make_fake_store
+from conftest import make_sqlite_store
 from tasks.task_store import TaskStore
 from tools.agent_loop import LOOP_SYSTEM_MESSAGE, AgentLoop, build_loop_system_message
 from tools.audit import AuditLog
@@ -85,7 +85,7 @@ class _NoSearchService:
 @pytest.fixture
 def mem_store(tmp_path):
     """一个有两条记忆的假记忆库（带名字种子，方便列/改/删）。"""
-    store = make_fake_store(tmp_path)
+    store = make_sqlite_store(tmp_path)
     store.add_memory_text("BOOS 喜欢喝冰美式", source="user")
     store.add_memory_text("BOOS 每月工具预算 5 美元", source="user")
     return store
@@ -214,8 +214,15 @@ def test_list_memories_counts_sensitive_without_showing(mem_store):
     敏感记忆直接从假库底层塞进去（正常存会脱敏，存不进去这种原文）。"""
     from tools.memory_tool import _run_list_memories
 
-    with mem_store._memory._lock:
-        mem_store._memory._store("我的密码是 abc123")
+    import uuid
+
+    with mem_store._lock:
+        mem_store._insert_memory_row(
+            uuid.uuid4().hex,
+            "我的密码是 abc123",
+            {"source": "user", "confidence": 1.0, "user_confirmed": True, "confirmed": True},
+            None,
+        )
     with bound_memory_store(mem_store):
         result = _run_list_memories({})
     assert result["ok"] is True

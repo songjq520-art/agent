@@ -1095,7 +1095,7 @@ def test_chat_state_resumed_turn_still_saved_to_memory(monkeypatch, store, gatew
     mem0.add_turn = Mock(return_value={})
     # 26 号：网页服务回答后走 save_turn（后台存）存记忆，不再直接调 add_turn。
     mem0.save_turn = Mock(return_value={})
-    state = ChatState(task_store=store, tool_gateway=gateway, mem0_store=mem0)
+    state = ChatState(task_store=store, tool_gateway=gateway, memory_store=mem0)
     state.messages.append({"role": "user", "content": "之前的问题"})
     state.messages.append({"role": "assistant", "content": "之前的回答"})
     monkeypatch.setattr(
@@ -2094,10 +2094,10 @@ def test_loop_records_search_date_range(store, gateway):
 def test_delete_same_memory_reuses_waiting_card(store, gateway, tmp_path):
     """#5：同一个记忆的删除确认卡已经在等 BOOS 点了，模型又调一次同样的
     删除时，不再建一张新卡——告诉模型等那张旧卡就行；等确认列表里始终只有一张卡。"""
-    from conftest import make_fake_store
+    from conftest import make_sqlite_store
     from tools.memory_tool import bound_memory_store
 
-    mem_store = make_fake_store(tmp_path)
+    mem_store = make_sqlite_store(tmp_path)
     mem_store.add_memory_text("我喜欢喝茶", source="user")
     tea_id = next(
         item["id"] for item in mem_store.get_all(include_sensitive=True)
@@ -2144,10 +2144,10 @@ def test_correction_turn_delete_is_intercepted(store, gateway, tmp_path):
     应直接完成（done），不建确认卡，旧记忆也不被删（等保存时由
     纠正取代）。
     """
-    from conftest import make_fake_store
+    from conftest import make_sqlite_store
     from tools.memory_tool import bound_memory_store
 
-    mem_store = make_fake_store(tmp_path)
+    mem_store = make_sqlite_store(tmp_path)
     mem_store.add_memory_text("我喜欢吃米饭", source="user")
     rice_id = next(
         item["id"] for item in mem_store.get_all(include_sensitive=True)
@@ -2172,10 +2172,10 @@ def test_correction_turn_delete_is_intercepted(store, gateway, tmp_path):
 
 def test_genuine_delete_still_needs_approval(store, gateway, tmp_path):
     """真正的删除意图（“忘记这个”，无新说法）照常弹确认卡。"""
-    from conftest import make_fake_store
+    from conftest import make_sqlite_store
     from tools.memory_tool import bound_memory_store
 
-    mem_store = make_fake_store(tmp_path)
+    mem_store = make_sqlite_store(tmp_path)
     mem_store.add_memory_text("我喜欢吃米饭", source="user")
     rice_id = next(
         item["id"] for item in mem_store.get_all(include_sensitive=True)

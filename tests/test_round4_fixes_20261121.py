@@ -74,7 +74,7 @@ def test_memory_block_no_date_mention_still_no_week_hint():
 # ---------- #8 “记住”回执只说记下了 ----------
 
 
-class _MiniMem0Store:
+class _MiniStore:
     """最小的假记忆库：只实现 ask() 的“记住”短路用到的三个方法。"""
 
     def __init__(self):
@@ -101,8 +101,8 @@ def test_ask_remember_receipt_is_one_sentence_no_model_call(tmp_path, monkeypatc
     """第四轮 #8：回执只说记下了（带解析出的日期），不调模型——
     模型会多嘴补一段无关内容（比如出差）。"""
     tracker = BudgetTracker(file_path=tmp_path / "budget_usage.json")
-    store = _MiniMem0Store()
-    state = ChatState(budget_tracker=tracker, mem0_store=store)
+    store = _MiniStore()
+    state = ChatState(budget_tracker=tracker, memory_store=store)
 
     def _must_not_be_called(*args, **kwargs):
         raise AssertionError("记住回执不该调模型")
