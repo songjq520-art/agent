@@ -17,6 +17,16 @@
 #   写 backup_state.json 的 last_success；
 # - 本模块所有入口都不抛异常给调用方（调度线程、服务主进程不能被
 #   备份拖垮），失败一律落在返回值和状态文件里。
+#
+# 备份总开关（BOOS 2026-11-24 补定）：backup_state.json 里的
+# backup_enabled 字段就是开关，**缺省为关**（状态文件里没有这个
+# 字段、或文件读不出来，都按关算）。调度器每圈先查
+# is_backup_enabled()，关着就整项跳过——不打包、不上传、不挂
+# pending。开关的唯一控制点就是这个字段（钥匙文件只管能不能传，
+# 不再兼职当开关）。
+# 十二以后想自己开备份，不需要十一帮忙：在自己的进程里调
+# set_backup_enabled(memory_dir, True) 把开关写开即可；想关同理
+# 传 False。set 只改这一个字段，last_success 等其余状态原样保留。
 
 import hashlib
 import json
@@ -194,6 +204,26 @@ def save_backup_state(memory_dir, state):
     except Exception:
         logger.warning("备份状态写不进去：%s", path, exc_info=True)
         return False
+
+
+def is_backup_enabled(memory_dir):
+    """备份总开关开没开：读 backup_state.json 的 backup_enabled。
+
+    没有这个字段（或状态文件读不出来）一律按关算——BOOS
+    2026-11-24 定：开关默认关着，要备份先把开关打开。
+    """
+    return bool(load_backup_state(memory_dir).get("backup_enabled"))
+
+
+def set_backup_enabled(memory_dir, enabled):
+    """把备份总开关写进 backup_state.json（十二自己开/关备份用）。
+
+    只改 backup_enabled 一个字段，last_success、sha256 等其余
+    状态原样保留。返回写没写成功（bool）。
+    """
+    state = load_backup_state(memory_dir)
+    state["backup_enabled"] = bool(enabled)
+    return save_backup_state(memory_dir, state)
 
 
 class DriveClient:

@@ -2424,6 +2424,13 @@ class MemoryMaintenanceScheduler:
         try:
             from memory import drive_backup
 
+            if not drive_backup.is_backup_enabled(self._state_path.parent):
+                # 备份总开关关着（BOOS 2026-11-24 定，缺省为关，开关
+                # 是 backup_state.json 的 backup_enabled）：整项跳过
+                # ——不打包、不上传、不挂 pending，只在维护状态里记
+                # 一笔跳过原因，下个 tick 再查开关。
+                state["backup_skip_reason"] = "disabled"
+                return
             backup_state = drive_backup.load_backup_state(
                 self._state_path.parent
             )
@@ -2434,6 +2441,7 @@ class MemoryMaintenanceScheduler:
         except Exception:
             logger.warning("备份到期判定失败，下个周期再试。", exc_info=True)
             return
+        state.pop("backup_skip_reason", None)
         if not pending and not due:
             return
         if self._network_probe is None:

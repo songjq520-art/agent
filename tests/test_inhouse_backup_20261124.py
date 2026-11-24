@@ -244,6 +244,10 @@ class _StubRunner:
 
 
 def _sched(tmp_path, runner, probe, state_name="maintenance_state.json"):
+    # 备份总开关缺省关：测到期/补跑逻辑的用例先把开关打开
+    # （开关本身的行为有专门用例在本文件末尾测）。
+    (tmp_path / "backup_state.json").write_text(
+        json.dumps({"backup_enabled": True}), encoding="utf-8")
     return MemoryMaintenanceScheduler(
         _BareStore(), tmp_path / state_name,
         decay_interval_seconds=100, self_check_interval_seconds=100,
@@ -312,3 +316,83 @@ def test_scheduler_without_backup_runner_shape_unchanged(tmp_path):
     )
     ran = sched.run_due(now=1_000)
     assert ran == {"decay": False, "self_check": False}
+# ---------- 备份总开关（BOOS 2026-11-24 补定：缺省关，十二能自己开） ----------
+
+def test_backup_switch_absent_means_disabled(tmp_path):
+    memory_dir = _make_memory_dir(tmp_path)
+    # 没有 backup_state.json → 关
+    assert drive_backup.is_backup_enabled(memory_dir) is False
+    # 有状态文件但没这个字段 → 还是关
+    drive_backup.save_backup_state(memory_dir, {"last_success": "x"})
+    assert drive_backup.is_backup_enabled(memory_dir) is False
+
+
+def test_backup_switch_set_roundtrip_preserves_state(tmp_path):
+    memory_dir = _make_memory_dir(tmp_path)
+    drive_backup.save_backup_state(memory_dir, {
+        "last_success": "2026-11-25T02:48:28+08:00",
+        "last_success_epoch": 1795546108.7,
+        "sha256": "abc123",
+        "pending_upload": False,
+    })
+    assert drive_backup.set_backup_enabled(memory_dir, True) is True
+    state = drive_backup.load_backup_state(memory_dir)
+    assert state["backup_enabled"] is True
+    assert drive_backup.is_backup_enabled(memory_dir) is True
+    # 其余字段原样保留
+    assert state["last_success"] == "2026-11-25T02:48:28+08:00"
+    assert state["last_success_epoch"] == 1795546108.7
+    assert state["sha256"] == "abc123"
+    assert state["pending_upload"] is False
+    assert drive_backup.set_backup_enabled(memory_dir, False) is True
+    state = drive_backup.load_backup_state(memory_dir)
+    assert state["backup_enabled"] is False
+    assert drive_backup.is_backup_enabled(memory_dir) is False
+    assert state["sha256"] == "abc123"
+
+
+def test_run_backup_preserves_switch_flag(tmp_path):
+    memory_dir = _make_memory_dir(tmp_path)
+    drive_backup.set_backup_enabled(memory_dir, True)
+    result = drive_backup.run_backup(memory_dir, drive_client=_StubClient())
+    assert result["status"] == "success"
+    state = drive_backup.load_backup_state(memory_dir)
+    assert state["backup_enabled"] is True
+
+
+def _sched_no_switch(tmp_path, runner, probe):
+    """不写 backup_state.json 的调度器：开关处于缺省（关）状态。"""
+    return MemoryMaintenanceScheduler(
+        _BareStore(), tmp_path / "maintenance_state.json",
+        decay_interval_seconds=100, self_check_interval_seconds=100,
+        tick_seconds=60, network_probe=probe,
+        probe_interval_seconds=900, backup_runner=runner,
+    )
+
+
+def test_scheduler_backup_disabled_never_runs(tmp_path):
+    # 开关缺省关：哪怕到期 + 在线，runner 一次都不许被叫到
+    runner = _StubRunner()
+    sched = _sched_no_switch(tmp_path, runner, probe=lambda: True)
+    ran = sched.run_due(now=_epoch(2026, 11, 24, 12))
+    assert ran["backup"] is False
+    assert runner.calls == []
+    state = json.loads(
+        (tmp_path / "maintenance_state.json").read_text(encoding="utf-8"))
+    assert state["backup_skip_reason"] == "disabled"
+    assert "backup_pending" not in state
+    assert "backup_last_success" not in state
+
+
+def test_scheduler_backup_disabled_ignores_pending(tmp_path):
+    # 开关关着时，之前挂账的 pending 也不许补传
+    runner = _StubRunner()
+    state_path = tmp_path / "maintenance_state.json"
+    state_path.write_text(
+        json.dumps({"backup_pending": True}), encoding="utf-8")
+    sched = _sched_no_switch(tmp_path, runner, probe=lambda: True)
+    ran = sched.run_due(now=_epoch(2026, 11, 24, 12))
+    assert ran["backup"] is False
+    assert runner.calls == []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["backup_skip_reason"] == "disabled"
