@@ -196,6 +196,16 @@ def test_correction_variant_jicha_recognized(store):
     assert correction.get("status") == "updated", correction
 
 
+def test_preference_candidates_include_mishang(store):
+    """偏好候选要认“迷上”：种子句“我最近迷上吃辣子鸡丁”必须能被
+    判官候选找到，后来的偏好变更句才有机会顶掉它（复测 #1 实测
+    漏找：回复说“不算了”，后端根本没顶）。"""
+    _plant_row(store, "我最近迷上吃辣子鸡丁，隔三差五就点一份",
+               source="user", user_confirmed=True)
+    cands = store._preference_judge_candidates("我只吃白灼虾")
+    assert any("辣子鸡丁" in c["text"] for c in cands), cands
+
+
 # ---------- 二、重要性护栏 + 语气落账 ----------
 
 
