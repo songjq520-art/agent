@@ -1673,13 +1673,15 @@ class SQLiteStore:
         """
         try:
             from memory import semantic_judge as _sj
-            return _sj.judge_same_fact(
+            verdict = _sj.judge_same_fact(
                 text_a, text_b, provider=self._judge_provider,
                 budget_tracker=self.budget_tracker,
             )
         except Exception as exc:
             logger.warning("同事实判断失败，降级不归并：%s", exc)
-            return None
+            verdict = None
+        self._note_judge_outcome(verdict is not None)
+        return verdict
 
     def _inherit_seen_evidence(self, old_meta, new_id, turn_id=None):
         """纠正/取代落盘后，把旧行攒下的出现证据（天数/会话）并给
@@ -2192,16 +2194,35 @@ class SQLiteStore:
                                        "去", "做", "买", "看", "听", "玩",
                                        "想", "要", "会", "能")):
             return fact
+        if "其实是" in value:
+            # G7 三道锁之三：值里带着“其实是”，说明它根本不是光秃
+            # 秃的值，而是“X 其实是 Y”这种带主语的整句被误认成了
+            # 碎片（事故原形：“慢慢其实是巴西红耳龟”）——主语是
+            # 第三者，更不许拿去拼任何一行，原样返回走老路。
+            return fact
         with self._lock:
             cands = []
             for row in self._conn.execute(
-                "SELECT id, text FROM memories"
+                "SELECT id, text, metadata_json FROM memories"
                 " WHERE voided=0 AND deleted=0 AND superseded=0"
             ).fetchall():
                 slot, old_value = _infer_fact_slot(row[1] or "")
                 if slot is None or old_value is None:
                     continue
                 if _normalize_memory_text(old_value) == _normalize_memory_text(value):
+                    continue
+                # G7 三道锁（一、三）：碎片补句不许拼核心行，也不许
+                # 拼名字槽行——碎片本身认不出主语，拿去改名字行必然
+                # 有改错对象的风险（事故原形就是把身份行拼了）。
+                # 名字纠正走 correct_memory，那里有核心护栏把关。
+                # 住处等普通槽位不受影响（“应该是深圳”照旧补）。
+                try:
+                    _meta = json.loads(row[2] or "{}")
+                except Exception:
+                    _meta = {}
+                if slot in ("agent_name", "user_name"):
+                    continue
+                if self._is_core_protected_row(_meta, slot):
                     continue
                 cands.append((row[1] or "", old_value))
         if len(cands) != 1:
@@ -2490,6 +2511,32 @@ class SQLiteStore:
             return True, "correction_uncertain", cands
         return True, "slot_none_preference", cands
 
+    def _note_judge_outcome(self, ok):
+        """记下最近一次真问判官的结果（G7 三道锁之二的运行时信号）：
+        问通了（拿到裁决）清降级标；没问通（None＝模型断了/没接好/
+        回的格式不对）置降级标。实例级打桩替换掉 _ask_* 的测试走不
+        到这里，不受影响。"""
+        self._judge_runtime_failed = not ok
+
+    def _judge_degraded(self):
+        """判官现在是不是降级状态（G7 三道锁之二的判定信号）：
+        - 配置层解析不出来：没接上/没启用/模型名不在配置里/没 Key
+          （resolve_judge_provider 抛 SemanticJudgeUnavailable）；
+        - 或本实例最近一次真问判官没问通（_note_judge_outcome 置标）。
+        注入了判官对象（测试 mock）时解析直接用它、算不降级，它答
+        不答得出走运行时信号。不真调模型，只解析配置。"""
+        if getattr(self, "_judge_runtime_failed", False):
+            return True
+        try:
+            from memory import semantic_judge as _sj
+            _sj.resolve_judge_provider(
+                provider=self._judge_provider,
+                budget_tracker=self.budget_tracker,
+            )
+            return False
+        except Exception:
+            return True
+
     def _ask_semantic_judge(self, text, candidates, context=None):
         """调大模型判官（只在触发后调）。返回 verdict dict。
 
@@ -2503,13 +2550,15 @@ class SQLiteStore:
         """
         try:
             from memory import semantic_judge as _sj
-            return _sj.judge_semantic(
+            verdict = _sj.judge_semantic(
                 text, candidates, provider=self._judge_provider,
                 budget_tracker=self.budget_tracker, context=context,
             )
         except Exception as exc:
             logger.warning("语义判断失败，降级走程序：%s", exc)
-            return None
+            verdict = None
+        self._note_judge_outcome(verdict is not None)
+        return verdict
 
     def _ask_importance_judge(self, text, context=None):
         """调大模型重要性判官（只在程序判不定时调）。返回 verdict dict。
@@ -2522,13 +2571,15 @@ class SQLiteStore:
         """
         try:
             from memory import semantic_judge as _sj
-            return _sj.judge_importance(
+            verdict = _sj.judge_importance(
                 text, provider=self._judge_provider,
                 budget_tracker=self.budget_tracker, context=context,
             )
         except Exception as exc:
             logger.warning("重要性判断失败，降级走程序：%s", exc)
-            return None
+            verdict = None
+        self._note_judge_outcome(verdict is not None)
+        return verdict
 
     def _decide_importance(self, text, slot=None, context=None):
         """重要性判定（对外口）：先过程序硬护栏，再走三段判。
@@ -2694,12 +2745,93 @@ class SQLiteStore:
             },
         )
 
+    def _queue_correction_hold_question(self, old_id, old_text, new_id,
+                                        new_text, turn_id=None,
+                                        hold_reason=None):
+        """G7 三道锁的挂起问题：纠正命中核心行 / 判官降级时程序路
+        纠正 / 名字主语对不上时，自动纠正停手，攒这条待问问题。
+        和推断保护的冲突问题同款（kind=conflict、选项“换成新的 /
+        不换”、回答走 _answer_conflict_question 的人工批准路），
+        只是正文按挂起原因写，extra 里多一个 hold_reason 供复核。
+        同一对已问过未答 → 返回已有的；已裁决“不换” → 返回
+        None（别反复问）。"""
+        if not old_id or not new_id or old_id == new_id:
+            return None
+        for q in self.pending_questions.find_questions(
+            kind=_pq.QUESTION_KIND_CONFLICT
+        ):
+            if q.get("old_id") != old_id or q.get("new_id") != new_id:
+                continue
+            if q.get("status") == _pq.QUESTION_STATUS_ANSWERED:
+                if q.get("answer") == "不换":
+                    return None
+            else:
+                return q
+        if hold_reason == "core_protected":
+            text = (
+                "有一条核心记忆和你刚说的新说法对不上。核心记忆按"
+                "规矩不能自动改，要不要换成新的？\n"
+                "旧的（核心）：%s\n新的：%s" % (old_text, new_text)
+            )
+            reason = (
+                "纠正命中核心/置顶记忆：任何自动纠正都不许碰，"
+                "先问你（G7 三道锁之一）。"
+            )
+        elif hold_reason == "subject_mismatch":
+            text = (
+                "你刚说的这条纠正，名字对不上对象，我没敢自动改。"
+                "要不要把旧的换成新的？\n"
+                "旧的：%s\n新的：%s" % (old_text, new_text)
+            )
+            reason = (
+                "名字槽纠正先核对主语：新说法的主语和目标行对不上"
+                "（G7 三道锁之三）。"
+            )
+        else:
+            text = (
+                "你刚纠正的一条记忆，因为现在判官（大模型）不可用，"
+                "我先挂起没有自动改。要不要把旧的换成新的？\n"
+                "旧的：%s\n新的：%s" % (old_text, new_text)
+            )
+            reason = (
+                "判官降级期间，程序路纠正只挂起不执行（G7 三道锁"
+                "之二）；判官恢复后也可复核。"
+            )
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_CONFLICT,
+            text,
+            _pq.CONFLICT_QUESTION_OPTIONS,
+            reason,
+            memory_id=old_id,
+            turn_id=turn_id,
+            extra={
+                "old_id": old_id, "new_id": new_id,
+                "old_text": old_text, "new_text": new_text,
+                "hold_reason": hold_reason,
+            },
+        )
+
     def _supersede_or_ask(self, old_id, old_text, old_meta, new_key,
                           new_text, turn_id=None):
         """取代的统一护栏：旧行是推断未确认的 → 不顶，攒待问问题，
         返回 "pending"；否则走 _supersede_row（账本先行），返回
         "superseded"。账本失败时 _supersede_row 自己抛，调用方按
         原有的失败处理走。"""
+        # G7 三道锁（一、二）：这条兜底取代路同样设防——核心行
+        # 不许碰、判官降级时程序路不许执行，都改挂问题等确认。
+        _slot = (old_meta or {}).get("slot") or _infer_fact_slot(old_text)[0]
+        if self._is_core_protected_row(old_meta, _slot):
+            self._queue_correction_hold_question(
+                old_id, old_text, new_key, new_text,
+                turn_id=turn_id, hold_reason="core_protected",
+            )
+            return "pending"
+        if self._judge_degraded():
+            self._queue_correction_hold_question(
+                old_id, old_text, new_key, new_text,
+                turn_id=turn_id, hold_reason="judge_degraded",
+            )
+            return "pending"
         if self._is_inferred_unconfirmed(old_meta):
             self._queue_conflict_question(
                 old_id, old_text, new_key, new_text, turn_id=turn_id
@@ -3921,6 +4053,54 @@ class SQLiteStore:
                     "audit": audit or {"source": source, "method": "correct_memory"},
                     "question_id": (question or {}).get("id"),
                 }
+            # G7 三道锁（2026-11-24，BOOS 批准）：取代落盘前的最后
+            # 护栏——所有纠正路（程序路、判官路）都从这里过：
+            # 一、目标是核心/置顶行：任何自动纠正不许碰。新说法上面
+            #     已存（留痕），这里只挂问题等 BOOS 点头；答“换成
+            #     新的”才走 _answer_conflict_question 的人工批准路
+            #     真顶。（事故形状：判官降级时名字槽纠正把身份行
+            #     “Agent 的名字是十二”顶掉了——这条路当时没设防，
+            #     其他路如槽位裁决/连带清扫/跨槽安全网都有核心过滤，
+            #     唯独纠正落盘口漏了。）
+            # 二、判官降级期间（_judge_degraded），程序路解析出的
+            #     纠正（layer 不是 judge/net）只挂起不执行；判官路
+            #     能走到这里说明判官刚答过，不在降级之列。
+            # （三、名字槽主语核对在碎片补句和目标选择处，见
+            # _complete_correction_fragment：名字行不许被碎片拼改。）
+            _hold_reason = None
+            _target_slot = (
+                (old_meta or {}).get("slot")
+                or _infer_fact_slot(old_text)[0]
+            )
+            if self._is_core_protected_row(old_meta, _target_slot):
+                _hold_reason = "core_protected"
+            elif layer not in ("judge", "net") and self._judge_degraded():
+                _hold_reason = "judge_degraded"
+            if _hold_reason is not None:
+                question = self._queue_correction_hold_question(
+                    old_id, old_text, new_key, new_fact,
+                    turn_id=turn_id, hold_reason=_hold_reason,
+                )
+                return {
+                    "status": "pending_question",
+                    "memory_id": new_key,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": (
+                        "目标是核心记忆，按规矩不自动改：新说法已存，"
+                        "已挂问题等你确认"
+                        if _hold_reason == "core_protected" else
+                        "判官暂时不可用，纠正先挂起：新说法已存，"
+                        "已挂问题等你确认（或判官恢复后复核）"
+                    ),
+                    "layer": layer,
+                    "resolution": "pending_question",
+                    "audit": audit or {
+                        "source": source, "method": "correct_memory"
+                    },
+                    "question_id": (question or {}).get("id"),
+                    "hold_reason": _hold_reason,
+                }
             try:
                 self._supersede_row(
                     old_id, old_text, old_meta, new_key, new_fact,
@@ -4187,6 +4367,12 @@ class SQLiteStore:
                     continue
                 meta = m["metadata"] or {}
                 if not meta.get("user_confirmed"):
+                    continue
+                # G7 三道锁之一：核心/置顶行不进同轮清扫——自动
+                # 纠正路径一律不碰核心行（与槽位裁决同一口径）。
+                if self._is_core_protected_row(
+                    meta, meta.get("slot") or _infer_fact_slot(m["text"] or "")[0]
+                ):
                     continue
                 old_text = m["text"] or ""
                 if _dedupe_key(old_text) == _dedupe_key(new_fact_text):
