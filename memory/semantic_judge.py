@@ -480,3 +480,104 @@ def judge_semantic(new_text, candidates, provider=None, model=None,
         verdict.get("should_supersede"), cost,
     )
     return verdict
+
+
+def build_same_fact_prompt(text_a, text_b):
+    """同事实判断提示词（2026-11-24，BOOS 拍板的设计扩展）：两句话
+    是不是在说同一件事——晋升计数归并用（同一件事换了个说法存成
+    两行时，出现证据该不该并到一起数）。
+
+    只判“是不是同一件事”，不判取代、不改内容。只回一行 JSON：
+    {"same_fact": true/false, "reason": "..."}。
+    """
+    lines = [
+        "你是记忆管家，只判断两句话是不是在说同一件事，只回 JSON，不要解释。",
+        f"句子一：{text_a}",
+        f"句子二：{text_b}",
+        "规则：同一件事 = 核心事实等价——同一个人、同一样东西、同一个"
+        "偏好对象或同一个习惯，只是说法、句式、用词不同，算同一件事；"
+        "对象不同（比如一个是纳斯达克100、一个是标普500；一个是鸡杂面、"
+        "一个是牛肉面）、数字或金额不同、一个肯定一个否定、一个是泛指"
+        "一个是具体所指（“喜欢吃面条”和“喜欢吃牛肉面”），都不算同一件事；"
+        "拿不准时判 false，不要硬凑。",
+        '只回这一行 JSON：{"same_fact": true/false, "reason": "一句话原因"}',
+    ]
+    return "\n".join(lines)
+
+
+def parse_same_fact_response(text):
+    """解析同事实判断回的 JSON（容错同 parse_judge_response）。
+
+    要求：same_fact 是 true/false（宽容转换）；reason 是字符串或
+    缺省。格式不对时抛 SemanticJudgeError（调用方降级不归并）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise SemanticJudgeError("同事实判断回了空内容")
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match is not None:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        raise SemanticJudgeError(f"同事实判断回的不是 JSON：{raw[:200]}")
+    same_fact = _as_bool(data.get("same_fact"), "same_fact")
+    reason = data.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        reason = str(reason)
+    return {
+        "same_fact": same_fact,
+        "reason": (reason or "").strip() or None,
+    }
+
+
+def judge_same_fact(text_a, text_b, provider=None, model=None,
+                    budget_tracker=None):
+    """问大模型判官：两句话是不是在说同一件事（晋升计数归并用）。
+
+    复用 judge_semantic 的分发层（provider/model/budget_tracker
+    同款入参，模型能换、断了抛错）。返回 {"same_fact": bool,
+    "reason", "provider", "model", "usage", "cost_usd"}。
+    模型断了或回的格式不对时抛 SemanticJudgeError /
+    SemanticJudgeUnavailable——调用方接到异常就降级为不归并
+    （走程序老路），别崩、别丢事实、别乱并。
+    """
+    provider_obj, provider_name, model_name = resolve_judge_provider(
+        provider, model, budget_tracker=budget_tracker
+    )
+    prompt = build_same_fact_prompt(text_a, text_b)
+    cfg = get_judge_config()
+    try:
+        result = provider_obj.chat_messages(
+            [{"role": "user", "content": prompt}],
+            ledger="chat", thinking="disabled",
+            max_tokens=cfg["max_tokens"],
+        )
+    except SemanticJudgeError:
+        raise
+    except Exception as exc:
+        logger.warning("同事实判断调用失败，降级不归并：%s", exc)
+        raise SemanticJudgeError(f"同事实判断调用失败：{exc}")
+    if not isinstance(result, dict):
+        raise SemanticJudgeError(f"同事实判断回的不是字典：{result!r}")
+    usage = result.get("usage")
+    cost = result.get("cost_usd")
+    if cost is None:
+        cost = estimate_judge_cost_usd(usage, provider_name, model_name)
+    verdict = parse_same_fact_response(result.get("text"))
+    verdict.update({
+        "provider": provider_name,
+        "model": model_name,
+        "usage": usage,
+        "cost_usd": cost,
+    })
+    logger.info(
+        "同事实判断：provider=%s model=%s same_fact=%s cost_usd=%s",
+        provider_name, model_name, verdict.get("same_fact"), cost,
+    )
+    return verdict

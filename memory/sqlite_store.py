@@ -1345,7 +1345,7 @@ class SQLiteStore:
         # 拖住（同文去重里“确认只往上提”是同一个道理）。
         try:
             for _cid, _ctext, _cmeta in self._fact_cluster_members(
-                memory_id, text, meta
+                memory_id, text, meta, allow_judge=True
             ):
                 if (_cmeta or {}).get("tone") in (
                     "joke", "test", "hypothesis"
@@ -1415,7 +1415,25 @@ class SQLiteStore:
     _CLUSTER_MIN_BIGRAM_OVERLAP = 0.8
     _CLUSTER_MIN_BIGRAM_JACCARD = 0.5
 
-    def _fact_cluster_members(self, memory_id, text, meta):
+    # 判官归并的预筛门槛（2026-11-24，BOOS 拍板“让判官多判是不是
+    # 同一件事”）：硬信号认不出的候选对，先过这道便宜的预筛才值得
+    # 问判官——向量余弦 ≥0.55，或内容二字组重合率 ≥0.2 且 Jaccard
+    # ≥0.05（“酸梅汤”三种说法只共享核心词：重合 0.22、Jaccard
+    # 0.08–0.09，刚好够问；毫不相干的两句重合是 0，问都不问；
+    # “定投纳指/标普”孪生句重合 0.71、照样进得来——是不是同一件
+    # 事由判官判，预筛只管“值不值得问”）。
+    _SAME_FACT_MIN_COSINE = 0.55
+    _SAME_FACT_MIN_BIGRAM_OVERLAP = 0.2
+    _SAME_FACT_MIN_BIGRAM_JACCARD = 0.05
+    # 一次计数最多问判官几对：防候选一多就烧钱/拖慢；按像的程度
+    # 从高到低问，剩下的下次出现再问（结论有缓存，不重复问）。
+    _SAME_FACT_MAX_JUDGE_PER_CALL = 3
+    # 判官归并结论存行 metadata 的键：{对方 id: {same, provider,
+    # model, at, reason, cost_usd}}，两行各存一份——既是缓存
+    # （同对不重复问），也是审计留痕（谁判的、何时判的）。
+    _SAME_FACT_META_KEY = "same_fact_judgments"
+
+    def _fact_cluster_members(self, memory_id, text, meta, allow_judge=False):
         """和本行是“同一件事、不同说法”的其他活行：[(id, text, meta)]。
 
         只认硬信号（和 _same_conflict_topic 一个标准，只认不猜）：
@@ -1426,6 +1444,12 @@ class SQLiteStore:
         粗槽不同且都认得出的（喜欢吃 vs 不喜欢吃）、和本行挂着
         未答冲突问题的（BOOS 没裁之前，两条不共享证据——推断
         保护的规矩）。向量缺失时只有槽位一路可用，照常工作。
+
+        allow_judge=True 时（只有晋升计数入口 _record_occurrence
+        传），硬信号认不出、但过了全部护栏的候选对再交给判官判
+        “是不是同一件事”（_judge_merge_candidates）：这是计数
+        归并——行都留着、不改内容、不触发取代，只把出现证据
+        并到一起数。护栏永远优先于判官，护栏挡掉的对问都不问。
         """
         text = text or ""
         if not text.strip():
@@ -1457,6 +1481,7 @@ class SQLiteStore:
             my_vec = None
         my_bigrams = self._content_bigrams(text)
         out = []
+        candidates = []
         for row in self._conn.execute(
             "SELECT id, text, metadata_json, embedding FROM memories"
             " WHERE voided=0 AND deleted=0 AND superseded=0 AND id != ?",
@@ -1480,15 +1505,25 @@ class SQLiteStore:
             other_topic = _correction_topic_slot(other_text)
             if my_topic and other_topic and my_topic != other_topic:
                 continue
-            matched = False
-            if (
-                my_slot is not None and other_slot == my_slot
-                and my_value is not None and other_value is not None
-                and _normalize_memory_text(my_value)
-                == _normalize_memory_text(other_value)
-            ):
-                matched = True
-            elif my_vec is not None and row[3] is not None and my_bigrams:
+            try:
+                other_meta = json.loads(row[2] or "{}")
+            except Exception:
+                other_meta = {}
+            # 相似度三件套（余弦 + 二字组重合率/Jaccard）：硬信号
+            # 判定和判官预筛共用，先一次算清。
+            cos = None
+            overlap = 0.0
+            jaccard = 0.0
+            if my_bigrams:
+                other_bigrams = self._content_bigrams(other_text)
+                if other_bigrams:
+                    inter = len(my_bigrams & other_bigrams)
+                    union = len(my_bigrams | other_bigrams)
+                    overlap = inter / min(
+                        len(my_bigrams), len(other_bigrams)
+                    )
+                    jaccard = inter / union if union else 0.0
+            if my_vec is not None and row[3] is not None:
                 try:
                     other_vec = _blob_to_vector(row[3])
                     if other_vec is not None and other_vec.shape == my_vec.shape:
@@ -1497,30 +1532,154 @@ class SQLiteStore:
                         )
                         if denom > 0:
                             cos = float(np.dot(my_vec, other_vec)) / denom
-                            if cos >= self._CLUSTER_MIN_COSINE:
-                                other_bigrams = self._content_bigrams(other_text)
-                                inter = len(my_bigrams & other_bigrams)
-                                union = len(my_bigrams | other_bigrams)
-                                overlap = (
-                                    inter / min(len(my_bigrams), len(other_bigrams))
-                                    if my_bigrams and other_bigrams else 0.0
-                                )
-                                jaccard = inter / union if union else 0.0
-                                if (
-                                    overlap >= self._CLUSTER_MIN_BIGRAM_OVERLAP
-                                    and jaccard >= self._CLUSTER_MIN_BIGRAM_JACCARD
-                                ):
-                                    matched = True
                 except Exception:
-                    matched = False
-            if not matched:
-                continue
-            try:
-                other_meta = json.loads(row[2] or "{}")
-            except Exception:
-                other_meta = {}
-            out.append((other_id, other_text, other_meta))
+                    cos = None
+            matched = False
+            if (
+                my_slot is not None and other_slot == my_slot
+                and my_value is not None and other_value is not None
+                and _normalize_memory_text(my_value)
+                == _normalize_memory_text(other_value)
+            ):
+                matched = True
+            elif (
+                cos is not None and cos >= self._CLUSTER_MIN_COSINE
+                and overlap >= self._CLUSTER_MIN_BIGRAM_OVERLAP
+                and jaccard >= self._CLUSTER_MIN_BIGRAM_JACCARD
+            ):
+                matched = True
+            if matched:
+                out.append((other_id, other_text, other_meta))
+            else:
+                candidates.append(
+                    (other_id, other_text, other_meta, cos, overlap, jaccard)
+                )
+        if allow_judge and candidates:
+            out.extend(
+                self._judge_merge_candidates(
+                    memory_id, text, meta, candidates
+                )
+            )
         return out
+
+    def _judge_merge_candidates(self, memory_id, text, meta, candidates):
+        """硬信号认不出的候选对，问判官“是不是同一件事”（2026-11-24，
+        BOOS 拍板的设计扩展）：判为同一件事的，出现证据才并进同一
+        簇计数。行都留着、不改内容、不触发取代。
+
+        护栏优先于判官（冲突话题/未答冲突问题的对在
+        _fact_cluster_members 里已挡掉，走不到这里）：带语气标记
+        （玩笑/测试/假设）的对不问——那种证据本来就不算数。
+        预筛不过（余弦和二字组都够不着）的对不问，省钱。
+        结论缓存进两行 metadata（_SAME_FACT_META_KEY），同对不
+        重复问；判官断了/回不明白 → 不归并、不缓存（下次再试），
+        绝不崩、绝不乱并。返回被判为同一件事的 [(id, text, meta)]。
+        """
+        merged = []
+        if (meta or {}).get("tone") in ("joke", "test", "hypothesis"):
+            return merged
+        my_cache = (meta or {}).get(self._SAME_FACT_META_KEY)
+        if not isinstance(my_cache, dict):
+            my_cache = {}
+        ordered = sorted(
+            candidates,
+            key=lambda c: (
+                c[3] if c[3] is not None else -1.0, c[4], c[5]
+            ),
+            reverse=True,
+        )
+        asked = 0
+        for other_id, other_text, other_meta, cos, overlap, jaccard in ordered:
+            if (other_meta or {}).get("tone") in (
+                "joke", "test", "hypothesis"
+            ):
+                continue
+            cached = my_cache.get(other_id)
+            if not isinstance(cached, dict):
+                other_cache = (other_meta or {}).get(self._SAME_FACT_META_KEY)
+                if isinstance(other_cache, dict):
+                    cached = other_cache.get(memory_id)
+            if isinstance(cached, dict) and "same" in cached:
+                if cached.get("same"):
+                    merged.append((other_id, other_text, other_meta))
+                continue
+            plausible = (
+                (cos is not None and cos >= self._SAME_FACT_MIN_COSINE)
+                or (
+                    overlap >= self._SAME_FACT_MIN_BIGRAM_OVERLAP
+                    and jaccard >= self._SAME_FACT_MIN_BIGRAM_JACCARD
+                )
+            )
+            if not plausible:
+                continue
+            if asked >= self._SAME_FACT_MAX_JUDGE_PER_CALL:
+                continue
+            verdict = self._ask_same_fact_judge(text, other_text)
+            asked += 1
+            if verdict is None:
+                # 判官不可用：这一轮别再问别的对了，全体降级不归并。
+                break
+            record = {
+                "same": bool(verdict.get("same_fact")),
+                "provider": verdict.get("provider"),
+                "model": verdict.get("model"),
+                "at": _now_iso(),
+                "reason": verdict.get("reason"),
+                "cost_usd": verdict.get("cost_usd"),
+            }
+            self._store_same_fact_verdict(
+                memory_id, meta, other_id, other_meta, record
+            )
+            if record["same"]:
+                merged.append((other_id, other_text, other_meta))
+        return merged
+
+    def _store_same_fact_verdict(self, memory_id, meta, other_id,
+                                 other_meta, record):
+        """把判官归并结论写进两行 metadata（缓存 + 审计留痕）。
+
+        本行写进传进来的 meta dict（_record_occurrence 收尾落盘）；
+        对方行现读现写（不提交，跟着调用方的提交一起走）。写失败
+        只记日志：结论丢了下次重问，不许拖垮计数主流程。
+        """
+        try:
+            mine = meta.get(self._SAME_FACT_META_KEY)
+            if not isinstance(mine, dict):
+                mine = {}
+                meta[self._SAME_FACT_META_KEY] = mine
+            mine[other_id] = record
+        except Exception:
+            logger.warning("判官归并结论写本行失败。", exc_info=True)
+        try:
+            theirs = other_meta.get(self._SAME_FACT_META_KEY)
+            if not isinstance(theirs, dict):
+                theirs = {}
+                other_meta[self._SAME_FACT_META_KEY] = theirs
+            theirs[memory_id] = record
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=? WHERE id=?",
+                (json.dumps(other_meta, ensure_ascii=False), other_id),
+            )
+        except Exception:
+            logger.warning("判官归并结论写对方行失败。", exc_info=True)
+
+    def _ask_same_fact_judge(self, text_a, text_b):
+        """调大模型判官判“是不是同一件事”（晋升计数归并用）。
+
+        模型断了/没接好/回的格式不对时返回 None——调用方降级为
+        不归并（走程序老路），别崩、别丢事实、别乱并。判官对象
+        同 _ask_semantic_judge：self._judge_provider（测试注入）
+        或配置解析（默认 DeepSeek flash，见 semantic_judge.py）。
+        """
+        try:
+            from memory import semantic_judge as _sj
+            return _sj.judge_same_fact(
+                text_a, text_b, provider=self._judge_provider,
+                budget_tracker=self.budget_tracker,
+            )
+        except Exception as exc:
+            logger.warning("同事实判断失败，降级不归并：%s", exc)
+            return None
 
     def _inherit_seen_evidence(self, old_meta, new_id, turn_id=None):
         """纠正/取代落盘后，把旧行攒下的出现证据（天数/会话）并给
