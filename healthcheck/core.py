@@ -110,6 +110,7 @@ class Config:
     repair_paths: list[str] = dataclasses.field(default_factory=list)
     protected_paths: list[str] = dataclasses.field(default_factory=list)
     weekly_interval_seconds: float = 7 * 24 * 3600
+    archive_keep_copies: int = 3
 
     @classmethod
     def load(cls, path):
@@ -134,6 +135,9 @@ class Config:
                 raise ValueError("预算必须是有限正数")
         if not isinstance(self.full_suite, bool):
             raise ValueError("full_suite 必须是布尔值")
+        if isinstance(self.archive_keep_copies, bool) or not isinstance(self.archive_keep_copies, int) \
+                or self.archive_keep_copies < 1:
+            raise ValueError("存档副本保留数必须是正整数")
         if self.archive == self.repo or self.archive.is_relative_to(self.repo):
             raise ValueError("存档目录必须位于目标仓库之外，防止副本递归")
         for path in self.permission_paths + self.repair_paths + self.protected_paths:

@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import uuid
@@ -12,6 +13,9 @@ from .core import Finding, Unconnected, emit, redact, utcnow, confined
 from .gates import Gates, GateConfigError, copy_repo
 
 ITEMS = ("记忆", "代码", "服务状态", "模型接口", "身体资源", "备份", "安全", "调度")
+
+
+_COPY_DIR = re.compile(r"^[a-z]+-[0-9a-f]{32}$")
 
 
 class Healthcheck:
@@ -89,8 +93,79 @@ class Healthcheck:
                 findings.append(Finding(item, "异常", "warning", {"kind": "adapter_error", "error": str(exc)}))
         return redact([dataclasses.asdict(f) for f in findings])
 
+    def _sandbox_copies(self):
+        """存档里现有的整仓副本目录：仅 sandboxes/ 直属、名字符合
+        「标签-32 位十六进制」规律的真目录；符号链接与其他条目一律不算。"""
+        root = self.config.archive / "sandboxes"
+        if not root.is_dir():
+            return []
+        copies = []
+        for entry in root.iterdir():
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not _COPY_DIR.match(entry.name):
+                continue
+            copies.append(entry)
+        # Windows 的 st_ctime 是创建时间，即运行先后；名字仅作同刻兜底排序。
+        copies.sort(key=lambda p: (p.stat().st_ctime, p.name))
+        return copies
+
+    @staticmethod
+    def _delete_copy(path):
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            # 副本里可能有只读文件（.venv 等）：放宽权限后再试一次。
+            for dirpath, dirnames, filenames in os.walk(path):
+                for name in dirnames + filenames:
+                    try:
+                        os.chmod(Path(dirpath) / name, 0o700)
+                    except OSError:
+                        pass
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+            shutil.rmtree(path)
+
+    def prune_sandbox_copies(self, protect=()):
+        """副本保留策略（BOOS 2026-11-24 定：只留最近若干份，默认 3）。
+
+        只处理 _sandbox_copies() 认定的整仓副本；体检报告、weekly 记录
+        和存档里其他任何条目都不碰。删除前复核路径严格落在 sandboxes
+        根内；protect 里的（本次运行刚建的副本）绝不删。清理失败只记
+        进返回结果、写进体检报告备注，绝不抛错拖垮体检本身，下轮再试。
+        """
+        result = {"keep": self.config.archive_keep_copies, "removed": [],
+                  "errors": [], "remaining": None}
+        try:
+            root = self.config.archive / "sandboxes"
+            copies = self._sandbox_copies()
+            protected = {Path(p).name for p in protect}
+            excess = len(copies) - result["keep"]
+            for path in copies:
+                if excess <= 0:
+                    break
+                if path.name in protected:
+                    continue
+                if path.resolve().parent != root.resolve():
+                    result["errors"].append({"name": path.name, "error": "路径不在存档副本根内，已跳过"})
+                    continue
+                try:
+                    self._delete_copy(path)
+                    result["removed"].append(path.name)
+                    excess -= 1
+                except OSError as exc:
+                    result["errors"].append({"name": path.name, "error": str(exc)})
+            result["remaining"] = len(self._sandbox_copies())
+        except Exception as exc:
+            result["errors"].append({"name": None, "error": str(exc)})
+        return result
     def report(self, repair=None):
+        known = {p.name for p in self._sandbox_copies()}
         findings = self.check()
+        created = [p for p in self._sandbox_copies() if p.name not in known]
+        retention = self.prune_sandbox_copies(protect=created)
         prior = None
         report_dir = self.config.archive / "reports"
         for path in sorted(report_dir.glob("*.json"), reverse=True):
@@ -108,7 +183,8 @@ class Healthcheck:
         data = {"kind": "healthcheck", "time": utcnow().isoformat(),
                 "headlines": [f for f in findings if f["severity"] == "critical"],
                 "findings": findings, "changes": changes, "previous_time": prior.get("time") if prior else None,
-                "repair": repair, "connection_note": "适配器未接通时标异常，不冒充实连"}
+                "repair": repair, "sandbox_retention": retention,
+                "connection_note": "适配器未接通时标异常，不冒充实连"}
         path = report_dir / (stamp + "-" + uuid.uuid4().hex + ".json")
         emit(path, data)
         return path, redact(data)

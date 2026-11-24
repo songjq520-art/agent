@@ -11,6 +11,9 @@
 #   按平台跳过该判据），密钥只查环境变量名在不在；
 # - max_seconds 给足 1800：一次完整体检 = 整仓复制 + 全套测试
 #   （约 3 分钟）+ 记忆自检的模型抽查，远超模块默认 120 秒。
+# - archive_keep_copies 默认 3：整仓副本只留最近 3 份（BOOS
+#   2026-11-24 定），体检运行收尾在进程内自动清超额旧副本；
+#   报告与 weekly 记录是小文件历史，不在清理范围。
 
 import os
 import sys
@@ -22,7 +25,7 @@ from .adapter import ShierHealthcheckAdapter
 
 
 def build_config(repo_root, archive_dir, python_executable=None,
-                 weekly_interval_seconds=None):
+                 weekly_interval_seconds=None, archive_keep_copies=None):
     exe = python_executable or sys.executable
     if weekly_interval_seconds is None:
         raw = os.environ.get("SHIER_HEALTHCHECK_INTERVAL_SECONDS", "")
@@ -30,6 +33,12 @@ def build_config(repo_root, archive_dir, python_executable=None,
             weekly_interval_seconds = float(raw) if raw.strip() else 7 * 24 * 3600
         except ValueError:
             weekly_interval_seconds = 7 * 24 * 3600
+    if archive_keep_copies is None:
+        raw = os.environ.get("SHIER_HEALTHCHECK_KEEP_COPIES", "")
+        try:
+            archive_keep_copies = int(raw) if raw.strip() else 3
+        except ValueError:
+            archive_keep_copies = 3
     suite = [exe, "-m", "pytest", "-q", "--tb=short", "-ra", "--no-header"]
     return Config(
         repo=Path(repo_root),
@@ -46,6 +55,7 @@ def build_config(repo_root, archive_dir, python_executable=None,
         repair_paths=[],
         protected_paths=["memory"],
         weekly_interval_seconds=float(weekly_interval_seconds),
+        archive_keep_copies=int(archive_keep_copies),
     )
 
 

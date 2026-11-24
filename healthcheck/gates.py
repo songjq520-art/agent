@@ -165,7 +165,8 @@ def capability_diff(original, candidate):
 
 def copy_repo(config, label):
     destination = config.archive / "sandboxes" / (label + "-" + uuid.uuid4().hex)
-    # 不复制 Git、密钥常见文件及符号链接；副本保留供追溯，不删除。
+    # 不复制 Git、密钥常见文件及符号链接；副本保留供追溯，由体检运行收尾
+    # 的保留策略只留最近 archive_keep_copies 份（默认 3，BOOS 2026-11-24 定）。
     # 移植补（2026-11-24）：.pytest_cache 一并跳过——它是测试运行
     # 的临时缓存（门里会重新全量跑，不依赖它），而 Windows 上它
     # 可能被其他会话的进程锁住/带特殊 ACL，实测整仓复制被它一个
