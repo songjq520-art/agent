@@ -336,6 +336,29 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
             f"{_money_suffix(metadata.get('money'))}{event_suffix}"
             f"{_budget_setting_suffix(item['text'])}"
         )
+    # 冲突提示（webfix 三）：检索层给同话题冲突的一组标了
+    # conflict_current（现行）/conflict_stale（旧说法）——这里明确
+    # 告诉模型以哪条为准。实测根因：问“我的口味”时块里几条面条
+    # 记录互相矛盾，模型把整个话题跳过、漏答了刚纠正完的鸡杂面。
+    _conflict_currents = []
+    _has_conflict_stale = False
+    for item, _suffix in kept:
+        _meta = (item or {}).get("metadata") or {}
+        if _meta.get("conflict_stale") is True:
+            _has_conflict_stale = True
+        if (
+            _meta.get("conflict_current") is True
+            and item["text"] not in _conflict_currents
+        ):
+            _conflict_currents.append(item["text"])
+    if _has_conflict_stale and _conflict_currents:
+        for _current_text in _conflict_currents:
+            lines.append(
+                "注意：上面有互相矛盾的记录——关于同一件事，"
+                f"以最新且经用户确认的说法为准：「{_current_text}」；"
+                "其余的是更早或未经确认的说法，不要当成现行事实；"
+                "用户问起时可以简短提一句后来改过。"
+            )
     lines.append(
         "回答时第一句必须是结论（一句话），不要先复述上面的记忆、不要先说“我这边记录是……”。"
     )

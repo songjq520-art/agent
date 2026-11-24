@@ -46,11 +46,14 @@ from memory.correction_text import (
     _detect_correction, _strip_correction_sentences,
     _detect_correction_fragment, _VAGUE_FRAGMENT_VALUES,
     _infer_fact_slot, _correction_topic_slot,
+    distill_correction_fact, is_correction_meta_sentence,
 )
 from memory.money_slots import extract_core_slots
 from memory.redaction import _contains_sensitive, _normalize_memory_text
 from memory.timeutil import _now_epoch, _now_iso, _next_write_seq, _seed_write_seq
-from memory.tone import local_tone_screen
+from memory.tone import (
+    local_tone_screen, parse_tone_judgment, tone_judgment_prompts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +423,13 @@ def _looks_like_fact(sentence):
     # 但句式就是提问——“我喜不喜欢吃鸡杂面”“有没有人来过”。
     # “我不知道他是谁”不含这些词，不受影响；“我不喜欢吃辣”含的是
     # “不喜欢”不是“喜不喜欢”，不受影响。
-    if re.search(r"(喜不喜欢|爱不爱|想不想|要不要|会不会|能不能|懂不懂|记不记得|知不知道)", s):
+    if re.search(r"(喜不喜欢|爱不爱|想不想|要不要|会不会|能不能|懂不懂|记不记得|知不知道|好不好|行不行|对不对)", s):
+        return False, "问句"
+    # “记得不”型句尾（2026-11-24 webfix 二）：没打问号、不是 A-不-A
+    # 全形——“我的口味你还记得不”句尾就一个“记得不”，旧模式只认
+    # “记不记得”，这句漏过去被当事实存了（stable+high 实测）。
+    # 只认句尾，句中的“记得不”（“我记得不能吃辣”）不受影响。
+    if s.endswith(("记得不", "知道不", "清楚不", "明白不")):
         return False, "问句"
     if re.match(r"^(有没有|是不是|能不能|会不会|要不要|想不想|喜不喜欢|爱不爱|懂不懂|记不记得|知不知道|为什么|怎么|如何|什么时候|什么地方|什么东西|什么人)", s):
         return False, "问句"
@@ -475,6 +484,55 @@ def _looks_like_fact(sentence):
         return False, "纠错指令"
     return True, ""
 
+
+
+def _is_question_sentence(text):
+    """一句话是不是问句（重要性护栏用，2026-11-24 webfix 二）。
+
+    复用 _looks_like_fact 的问句判定（同一个规矩源，不另立一套
+    模式）：它以“问句”为原因拒绝的，就是问句；另外带 ？/? 结尾
+    的也算（_looks_like_fact 会先剥句尾标点再看，这里直接认）。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s.endswith(("？", "?")):
+        return True
+    ok, reason = _looks_like_fact(s)
+    return (not ok) and reason == "问句"
+
+
+# 用户明确强调的说法（重要性护栏的例外，2026-11-24 webfix 二）：
+# 带这些词的单次提及，判官判 important 程序不封顶——BOOS 亲口
+# 说了“别忘了”，那就是要钉住的。光秃秃的“记住/记一下”不算强调
+# （那是“记住”命令的触发词，不是重要程度的表态）。
+_EMPHASIS_MARKERS = (
+    "很重要", "特别重要", "非常重要", "别忘了", "不要忘了",
+    "一定要记住", "千万别忘", "牢记", "记牢",
+)
+
+
+def _has_emphasis(text):
+    return any(marker in (text or "") for marker in _EMPHASIS_MARKERS)
+
+
+# 纠正信号词（save_turn 叠剥护栏用）：一截文本剥掉这些和标点后
+# 应该什么都不剩，才算“纯纠正信号”——剩了实词（如“不吃牛肉”）
+# 就是事实内容，不许当信号剥掉。
+_CORRECTION_SIGNAL_TOKENS = (
+    "更正一下", "纠正一下", "改一下", "其实是", "应该是",
+    "说错了", "记错了", "搞错了", "不对", "其实", "更正",
+    "不是", "错了", "我", "你", "他", "她", "这", "那",
+)
+
+
+def _correction_signal_only(text):
+    s = text or ""
+    for ch in "，。、：；,.:; \t\n":
+        s = s.replace(ch, "")
+    for token in _CORRECTION_SIGNAL_TOKENS:
+        s = s.replace(token, "")
+    return not s.strip()
 
 
 def _normalize_metadata(meta):
@@ -749,7 +807,11 @@ class SQLiteStore:
                 if _promoted or _touched or _mark or _slot:
                     meta = dict(meta)
                 if _promoted:
-                    for _field in ("source", "user_confirmed", "decay_kind", "importance"):
+                    for _field in ("source", "user_confirmed", "decay_kind", "importance",
+                                   # webfix 二：语气标也走 PROMOTE 写回
+                                   # （_tag_memory_tone），重建时一并带回，
+                                   # 不然重启对账会把标丢了。
+                                   "tone", "tone_evidence", "tone_source"):
                         if _promoted.get(_field) is not None:
                             meta[_field] = _promoted[_field]
                 if _slot and not meta.get("slot"):
@@ -929,6 +991,10 @@ class SQLiteStore:
             # 攒进 pending（下次聊天顺带问）。
             _importance_decision = None
             _importance_reason = ""
+            # 重要性护栏的封顶留痕（webfix 二）：调用方（save_turn）
+            # 已经判过重要性时把 clamped 透传进来；本路自己判时从
+            # judge_info 里取。落进 meta.importance_clamped。
+            _importance_clamped = kwargs.get("importance_clamped")
             if (
                 kwargs.get("judge_importance")
                 and not kwargs.get("decay_kind")
@@ -937,8 +1003,16 @@ class SQLiteStore:
                 _importance_decision, _importance_reason, _judge_info = (
                     self._decide_importance(text, slot)
                 )
+                if _importance_clamped is None:
+                    _importance_clamped = (_judge_info or {}).get("clamped")
                 if _importance_decision == "important":
                     decay_kind = _decay.DECAY_KIND_STABLE
+                if _is_question_sentence(text):
+                    # 问句护栏（webfix 二）：classify 对 user 来源
+                    # 默认 stable，问句走判官路存进来时按护栏压回
+                    # episodic——问句永远不许 stable（importance
+                    # 只在 important 时才 high，问句到不了那一步）。
+                    decay_kind = _decay.DECAY_KIND_EPISODIC
             # 同文去重（2026-11-22 Bug 2 治本）：只看归一化文本，不看来源——
             # 用户亲口说的（工具直存、save_turn）都记 source="user"（已确认），
             # 模型推断直存的才记 source="inferred"，来源不同不是两条事实。
@@ -1113,6 +1187,23 @@ class SQLiteStore:
                 "last_used_at": created_at,
                 "decay_state": _decay.DECAY_STATE_VERBATIM,
             }
+            # 语气落账（webfix 二）：本地筛当场能认出的语气（玩笑/
+            # 测试/假设的明确说法）直接写进 meta——以前 SQLite 路
+            # 从来不写 tone，§16 的“带标记不计晋升”在晋升侧认
+            # tone、却没人写，等于空转。本地认不出的（比如反话）
+            # 留给实时整理的模型判语气补标（见 _organize_turn_
+            # memories 的语气步）。带标记的当场压档：不许 stable、
+            # 不许 high（判官/类别判的也不行，语气优先）。
+            _tone, _tone_evidence = local_tone_screen(text)
+            if _tone:
+                metadata["tone"] = _tone
+                metadata["tone_evidence"] = _tone_evidence
+                metadata["tone_source"] = "local"
+                if _tone in ("joke", "test", "hypothesis"):
+                    metadata["decay_kind"] = _decay.DECAY_KIND_EPISODIC
+                    metadata["importance"] = "normal"
+            if _importance_clamped:
+                metadata["importance_clamped"] = _importance_clamped
             dates, sessions, _added = _decay.record_seen_occurrence(
                 None, None, today, turn_id
             )
@@ -1270,6 +1361,88 @@ class SQLiteStore:
         return promoted
 
     # ---------- 第 8 条：实时整理（2026-11-24，BOOS 定“尽量做成和十一一样”） ----------
+    def _judge_tone_with_router(self, text):
+        """用整理路由的大模型判一条记忆的语气（webfix 二）。
+
+        返回 (tone, evidence)；路由建不起来/模型没回/判不出来
+        返回 None——不猜，留着下次整理再判（拿不准按认真算，
+        是 tone_judgment_prompts 里给模型的规矩，也是这里的）。
+        """
+        router = self.organizing_router()
+        if router is None:
+            return None
+        system_prompt, user_prompt = tone_judgment_prompts(text)
+        try:
+            out = router.judge(
+                system_prompt, user_prompt,
+                max_tokens=300, purpose="tone", probe_primary=False,
+            )
+        except Exception:
+            logger.warning("判语气调用失败：本次不打标。", exc_info=True)
+            return None
+        if not out:
+            return None
+        tone, evidence = parse_tone_judgment(out.get("text"))
+        if tone is None:
+            return None
+        return tone, evidence
+
+    def _tag_memory_tone(self, memory_id, tone, evidence, source):
+        """给一条活记忆打语气标（webfix 二，§16 落账）。
+
+        账本先行：PROMOTE 事件带打标后的完整 meta（和晋升/去重
+        升级同一个记法，重建时 reconcile 按 PROMOTE 带回 tone
+        字段，不丢标）；账本写失败就不打，SQLite 不跑到账本
+        前面。判出非认真（joke/test/hypothesis）时同步压档：
+        stable → episodic、high → normal——反话/玩笑不许占着
+        稳定+高重要（实测“我可太喜欢加班了”就是这么进的核心）。
+        返回有没有打上。
+        """
+        if not memory_id or tone not in (
+            "serious", "joke", "test", "hypothesis",
+        ):
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json FROM memories WHERE id=?"
+                " AND voided=0 AND deleted=0 AND superseded=0",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            text = row[0] or ""
+            try:
+                meta = json.loads(row[1] or "{}")
+            except Exception:
+                meta = {}
+            meta["tone"] = tone
+            meta["tone_evidence"] = evidence
+            meta["tone_source"] = source
+            if tone in ("joke", "test", "hypothesis"):
+                if meta.get("decay_kind") == _decay.DECAY_KIND_STABLE:
+                    meta["decay_kind"] = _decay.DECAY_KIND_EPISODIC
+                if meta.get("importance") == "high":
+                    meta["importance"] = "normal"
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                     "memory_id": memory_id, "key": memory_id,
+                     "text": text, "meta": dict(meta)},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("语气打标记账失败：本次不打标。", exc_info=True)
+                return False
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, decay_kind=?"
+                " WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False),
+                 meta.get("decay_kind"), memory_id),
+            )
+            self._conn.commit()
+            return True
+
     def _organize_turn_memories(self, memory_ids, turn_id=None):
         """一轮对话的小范围整理：只碰本轮触碰到的记忆（本轮新存的、
         被纠正换上的、被同文引用计数的），不等定时调度：
@@ -1288,7 +1461,7 @@ class SQLiteStore:
         """
         summary = {
             "tagged": [], "promoted": [], "duplicates": [],
-            "conflicts": [], "checked": 0,
+            "conflicts": [], "checked": 0, "tone_tagged": [],
         }
         ids = [m for m in dict.fromkeys(memory_ids or []) if m]
         if not ids:
@@ -1313,6 +1486,42 @@ class SQLiteStore:
                     meta = {}
                 rows[mid] = (row[0] or "", meta)
             summary["checked"] = len(rows)
+            # 语气补标（webfix 二）：存的时候本地筛已标过明显的；
+            # 没标的（本地认不出，比如反话）在这里问整理路由的
+            # 大模型判——聊天/判官判出的语气必须落账，不然晋升
+            # 和偏好使用都认不到这个标。判完同步刷新手里的 rows，
+            # 后面的晋升复核按新标走（带标记的不计晋升）。
+            for mid, (text, meta) in list(rows.items()):
+                if meta.get("tone"):
+                    continue
+                try:
+                    judged = self._judge_tone_with_router(text)
+                except Exception:
+                    judged = None
+                if not judged:
+                    continue
+                _tone_value, _tone_evidence = judged
+                try:
+                    if self._tag_memory_tone(
+                        mid, _tone_value, _tone_evidence, "model"
+                    ):
+                        summary["tone_tagged"].append(mid)
+                        fresh = self._conn.execute(
+                            "SELECT metadata_json FROM memories"
+                            " WHERE id=?",
+                            (mid,),
+                        ).fetchone()
+                        try:
+                            rows[mid] = (
+                                text,
+                                json.loads((fresh or ["{}"])[0] or "{}"),
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    logger.warning(
+                        "实时整理语气补标失败：%s", mid, exc_info=True
+                    )
             # 晋升计数复核（先做：它会重写 metadata_json，后面的打标
             # 按库里最新值读，不拿旧 dict 覆盖）。
             for mid, (text, meta) in rows.items():
@@ -1851,6 +2060,12 @@ class SQLiteStore:
             # 纠正记录不是偏好，不进候选（见 _JUDGE_SKIP_MARKERS）。
             if any(marker in cand_text for marker in _JUDGE_SKIP_MARKERS):
                 continue
+            # 语气标记（webfix 二）：玩笑/测试/假设不作偏好使用，
+            # 不进判官候选（§16：带标记的记忆不当偏好）。
+            if (m["metadata"] or {}).get("tone") in (
+                "joke", "test", "hypothesis",
+            ):
+                continue
             out.append({"id": m["id"], "text": cand_text,
                         "meta": m["metadata"]})
             if len(out) >= _JUDGE_MAX_CANDIDATES:
@@ -1941,6 +2156,45 @@ class SQLiteStore:
             return None
 
     def _decide_importance(self, text, slot=None, context=None):
+        """重要性判定（对外口）：先过程序硬护栏，再走三段判。
+
+        护栏（2026-11-24 webfix 二，BOOS 拍板“判官提议、程序裁决”）：
+        - 问句永远不许 important（问句被判成 stable+high 是实测
+          毛病：“我的口味你还记得不”）——直接 episodic，不问判官；
+        - 判官提议的 important，对“单次提及的非核心内容”封顶成
+          episodic：非核心 = 没槽位（槽位在 _decide_importance_inner
+          里先行返回、judge_info 为 None，走不到这里）、非规则、
+          文本里没有用户明确强调的说法（_EMPHASIS_MARKERS）。
+          程序侧类别（槽位/偏好/决定句式）判的 important 不封顶
+          （那是既定的核心类别设计，judge_info 同样为 None）。
+        封顶留痕：judge_info["clamped"] 写明 from/to/reason，
+        存记忆时落进 meta.importance_clamped（见 add_memory_text）。
+        """
+        if _is_question_sentence(text):
+            return "episodic", "问句，不进核心（重要性护栏）", None
+        decision, reason, judge_info = self._decide_importance_inner(
+            text, slot, context=context
+        )
+        if (
+            decision == "important"
+            and judge_info is not None
+            and slot is None
+            and not _has_emphasis(text)
+        ):
+            judge_info = dict(judge_info)
+            judge_info["clamped"] = {
+                "from": "important", "to": "episodic",
+                "reason": "单次提及的非核心内容，程序封顶",
+            }
+            return (
+                "episodic",
+                (reason or "判官判为长期重要")
+                + "（程序护栏：单次提及的非核心内容，封顶为一次性经历）",
+                judge_info,
+            )
+        return decision, reason, judge_info
+
+    def _decide_importance_inner(self, text, slot=None, context=None):
         """重要性三段判（Phase 2 #2，混合法）：程序先判，难的问判官。
 
         返回 (decision, reason, judge_info)：decision 是 "important"
@@ -2518,6 +2772,17 @@ class SQLiteStore:
                 inner_fact = (inner.get("fact") or "").strip()
                 if not inner_fact or inner_fact == fact:
                     break
+                # 叠剥护栏（2026-11-24 webfix 一）：内层再剥只许剥掉
+                # 纯纠正信号——被剥掉的那截里带事实内容（否定从句
+                # “不吃牛肉”之类）时不许剥。实测根因：“我其实不吃
+                # 牛肉，我吃鸡杂面”被内层“其实”剥成“我吃鸡杂面”，
+                # 否定从句丢了，纠正只打中推断行、已确认的旧说法
+                # 留活。剥掉的前缀只能是信号词+标点+人称。
+                if not fact.endswith(inner_fact):
+                    break
+                dropped_prefix = fact[:len(fact) - len(inner_fact)]
+                if not _correction_signal_only(dropped_prefix):
+                    break
                 fact = inner_fact
             if fact:
                 # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
@@ -2604,6 +2869,14 @@ class SQLiteStore:
                 if sentence in live_texts:
                     receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
                     continue
+            # 纠正元句提炼（webfix 一）：整句是“刚才那句说错了，
+            # 我只吃鸡杂面”这种元句、又没被 _detect_correction
+            # 认成纠正时，先提炼成事实再走后面的存储/判官路——
+            # 原话整句不许当事实存进库。提炼不出就原样不动。
+            if is_correction_meta_sentence(sentence):
+                _distilled = distill_correction_fact(sentence)
+                if _distilled:
+                    sentence = _distilled
             ok, reason = _looks_like_fact(sentence)
             if not ok:
                 receipt["dropped"].append({"text": sentence, "reason": reason})
@@ -2675,6 +2948,13 @@ class SQLiteStore:
                 # 普通新陈述只存新行、不顶旧的。
                 allow_slot_supersede=is_correction_sentence,
                 **({"slot": slot} if slot else {}),
+                # 重要性护栏的封顶留痕透传（webfix 二）：判官被程序
+                # 压回去时，把 clamped 落进新记忆的 meta。
+                **(
+                    {"importance_clamped": _importance_judge["clamped"]}
+                    if (_importance_judge or {}).get("clamped")
+                    else {}
+                ),
             )
             if (saved or {}).get("event") == "ADD":
                 if live_texts is not None:
@@ -2705,6 +2985,59 @@ class SQLiteStore:
                 receipt["dropped"].append({"text": sentence, "reason": "槽位冲突未裁决"})
             else:
                 receipt["dropped"].append({"text": sentence, "reason": "账本写失败"})
+        # 已确认冲突同轮清扫（webfix 一）：明确纠正这一轮里，主目标
+        # 若被推断保护挂起（pending_question）或候选分不清
+        # （ambiguous 后新事实走逐句循环存下），新事实里带否定、
+        # 和某条“已确认”旧记忆正面冲突的，不许留活到下一轮再问
+        # ——同一轮一并顶掉（指向已存的新行）。实测根因：纠正
+        # “不吃牛肉”只打中推断来的“喜欢吃鸡杂面”，已确认的
+        # “喜欢吃牛肉面”留活，回复还反问“要我一并处理吗”。
+        if detected is not None and correction_fact_norm:
+            _new_row_id = None
+            _new_row_text = None
+            if (correction or {}).get("memory_id"):
+                _new_row_id = correction["memory_id"]
+            else:
+                for _r in receipt["results"]:
+                    if (
+                        isinstance(_r, dict)
+                        and _r.get("event") == "ADD"
+                        and _r.get("id")
+                        and _normalize_memory_text(_r.get("memory") or "")
+                        == correction_fact_norm
+                    ):
+                        _new_row_id = _r["id"]
+                        break
+            if _new_row_id:
+                try:
+                    _row = self._conn.execute(
+                        "SELECT text FROM memories WHERE id=?",
+                        (_new_row_id,),
+                    ).fetchone()
+                    _new_row_text = (_row or [""])[0] or ""
+                except Exception:
+                    _new_row_text = ""
+            if _new_row_id and _new_row_text:
+                try:
+                    _swept = self._supersede_confirmed_contradictions(
+                        _new_row_text, _new_row_id, turn_id=turn_id,
+                    )
+                except Exception:
+                    logger.warning("已确认冲突清扫失败。", exc_info=True)
+                    _swept = []
+                if _swept and correction is not None:
+                    correction["also_superseded"] = _swept
+                    if correction.get("status") in (
+                        "ambiguous", "pending_question",
+                    ):
+                        correction["reason"] = (
+                            (correction.get("reason") or "")
+                            + "；另有已确认的旧说法和新说法冲突，"
+                            "已一并改掉："
+                            + "、".join(
+                                s["old_text"] for s in _swept
+                            )
+                        )
         if receipt["stored"]:
             with self._lock:
                 self._last_stored_turn_id = turn_id
@@ -3052,6 +3385,17 @@ class SQLiteStore:
         correct_memory）取代成功后把同槽其余真冲突旧值走连带清扫
         （_sweep_extra_conflicts），清掉的 id 记进回执 swept_ids。
         """
+        # 提炼收口（webfix 一）：不管哪条路把纠正原话递进来
+        # （判官路曾把“我只吃鸡杂面”连着“刚才那句说错了”整句
+        # 当新事实），落盘前先提炼——元句不许成为 supersede 的
+        # 现行事实。提炼不出（剥完没事实）就保持原样走老流程，
+        # 不在这里拦（撤回类文本有自己的路）。
+        if any(marker in (new_fact or "") for marker in (
+            "说错了", "写错了", "讲错了", "记错了", "搞错了",
+        )):
+            _distilled = distill_correction_fact(new_fact)
+            if _distilled and _distilled != new_fact:
+                new_fact = _distilled
         with self._lock:
             # 回执里的 candidates 统一成带文本的字典（2026-11-22 Bug 1）：
             # 传进来的是 _find_correction_candidates 给的 ID 串列表，
@@ -3396,6 +3740,71 @@ class SQLiteStore:
             "layer": "already", "resolution": "already_corrected",
             "audit": {"source": "user", "method": "already_corrected"},
         }
+
+    @staticmethod
+    def _negation_conflicts(new_fact, old_text):
+        """新说法和旧说法是不是“否定式正面冲突”（webfix 一）。
+
+        程序信号，不猜语义：两边共享至少一个内容二字组；这个二字组
+        在新说法里落在否定辖域内（前面 3 字内有 不/没/别），在旧
+        说法里不在否定辖域内——新说法否定的正是旧说法肯定的东西
+        （“不吃牛肉” vs “喜欢吃牛肉面”）。旧说法自己也带否定的
+        （“不吃牛肉，吃鸡杂面”）不算冲突，那是同义/同向。
+        """
+        def _bigrams(s):
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+
+        new_fact = new_fact or ""
+        old_text = old_text or ""
+        for bigram in _bigrams(new_fact) & _bigrams(old_text):
+            i = new_fact.find(bigram)
+            if not any(c in "不没别" for c in new_fact[max(0, i - 3):i]):
+                continue
+            j = old_text.find(bigram)
+            if any(c in "不没别" for c in old_text[max(0, j - 3):j]):
+                continue
+            return True
+        return False
+
+    def _supersede_confirmed_contradictions(self, new_fact_text,
+                                            new_key, turn_id=None):
+        """同轮清扫已确认冲突（webfix 一）：把和新事实否定式冲突的
+        “已确认”活记忆一并顶掉，指向已存好的新行（不另存重复行）。
+
+        只顶 user_confirmed 的行：推断/未确认的行不在这里动——
+        它们有推断保护和待问问题管。返回顶掉的清单
+        [{"memory_id", "old_text"}]。单条失败只记日志，不拦其余。
+        """
+        out = []
+        if not new_key or not (new_fact_text or "").strip():
+            return out
+        if not re.search(r"[不没别无]", new_fact_text):
+            return out
+        with self._lock:
+            for m in self._all_live_memories():
+                mid = m["id"]
+                if mid == new_key:
+                    continue
+                meta = m["metadata"] or {}
+                if not meta.get("user_confirmed"):
+                    continue
+                old_text = m["text"] or ""
+                if _dedupe_key(old_text) == _dedupe_key(new_fact_text):
+                    continue
+                if not self._negation_conflicts(new_fact_text, old_text):
+                    continue
+                try:
+                    self._supersede_row(
+                        mid, old_text, meta, new_key, new_fact_text,
+                        turn_id=turn_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "已确认冲突清扫：取代 %s 失败。", mid, exc_info=True
+                    )
+                    continue
+                out.append({"memory_id": mid, "old_text": old_text})
+        return out
 
     def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True,
                        explicit_correction=False, turn_id=None):
@@ -3854,6 +4263,11 @@ class SQLiteStore:
         except Exception:
             logger.warning("SQLite 检索失败。", exc_info=True)
             return []
+        # 冲突通道（webfix 三）：对外检索（给回答用的）才做——
+        # 同话题冲突标注 + pending 新事实换入；内部候选检索
+        # （_search_inner 的其他调用方）不走这里，免得干扰纠错
+        # 候选逻辑。标注只改 metadata 里的冲突标记，不动返回形状。
+        results = self._annotate_search_conflicts(results)
         if reinforce and results:
             # 真用上了才强化（2026-11-24 3a，和 Mem0Store.search 的
             # reinforce 同款语义）：以前 SQLite 的 search 接了
@@ -4129,6 +4543,195 @@ class SQLiteStore:
                         seen.add(text)
                 except Exception:
                     logger.warning("历史检索失败。", exc_info=True)
+            return results
+
+    @staticmethod
+    def _content_bigrams(text):
+        """内容二字组：两个字都是汉字、且不含偏好脚手架字
+        （喜欢/爱/讨厌）——“BOOS 喜欢吃 X”里真正区分内容的是
+        X 部分的二字组（鸡杂、杂面），脚手架人人相同、不算数。"""
+        s = text or ""
+        out = set()
+        for i in range(len(s) - 1):
+            a, b = s[i], s[i + 1]
+            if not ("一" <= a <= "龥" and "一" <= b <= "龥"):
+                continue
+            if a in "喜欢爱讨厌" or b in "喜欢爱讨厌":
+                continue
+            out.add(s[i:i + 2])
+        return out
+
+    @classmethod
+    def _same_conflict_topic(cls, a, b):
+        """两条记忆是不是“同一件事的两种说法”（webfix 三成组用）。
+
+        只认硬信号，不猜：单值槽（住处/名字）同槽不同值；或否定式
+        正面冲突（_negation_conflicts 任一方向）。同是“喜欢吃”
+        槽但吃的东西不一样（冒菜 vs 火锅）不是冲突——那是两个
+        偏好，可以并存，不许标冲突。
+        """
+        slot_a, val_a = _infer_fact_slot(a)
+        slot_b, val_b = _infer_fact_slot(b)
+        if slot_a is not None and slot_a == slot_b:
+            return (
+                _normalize_memory_text(val_a or "")
+                != _normalize_memory_text(val_b or "")
+            )
+        return (
+            cls._negation_conflicts(a, b)
+            or cls._negation_conflicts(b, a)
+        )
+
+    def _annotate_search_conflicts(self, results):
+        """检索收尾的冲突通道（webfix 三，只改善不根治）。
+
+        1. pending 不隐身：未答冲突问题的新事实（new_id）不在
+           结果里、但旧行在结果里（或与结果任一条同话题/共享
+           内容二字组）时，把它换进来（挤掉最末一条非规则、
+           非历史的结果）——新事实已存活，就不许在回答里隐身
+           （实测漏答根因之一）。
+        2. 冲突标注，成组只认硬信号：
+           - 待问问题亲口认定的那一对（old_id/new_id）是种子组，
+             再把与新行共享内容二字组的其余结果并进来（同一件
+             事的其它说法）；
+           - 没有待问问题时，靠 _same_conflict_topic 的硬信号
+             （单值槽同槽不同值 / 否定式正面冲突）成组。
+           组内以（已确认优先、write_seq/created_at 最新）定
+           “现行”：现行标 conflict_current，其余标 conflict_stale
+           + conflict_with=<现行文本>。main._memory_block 据此
+           给模型加一句“以最新确认的为准”，不让它面对互相
+           矛盾的记录把整个话题跳过。
+        全程失败只记日志，照常返回原结果；不动返回形状。
+        """
+        try:
+            items = [
+                r for r in results
+                if not r.get("is_history") and (r.get("text") or "")
+            ]
+            try:
+                questions = self.pending_questions.list_unanswered()
+            except Exception:
+                questions = []
+            conflict_questions = [
+                q for q in questions
+                if q.get("kind") == _pq.QUESTION_KIND_CONFLICT
+            ]
+            present = {r.get("id") for r in items}
+            by_id = {r.get("id"): r for r in items}
+            # --- 1. pending 换入 ---
+            for q in conflict_questions:
+                new_id = q.get("new_id")
+                old_id = q.get("old_id")
+                if not new_id or new_id in present:
+                    continue
+                row = self._conn.execute(
+                    "SELECT text, metadata_json FROM memories WHERE id=?"
+                    " AND voided=0 AND deleted=0 AND superseded=0",
+                    (new_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                new_text = row[0] or ""
+                try:
+                    new_meta = json.loads(row[1] or "{}")
+                except Exception:
+                    new_meta = {}
+                new_bigrams = self._content_bigrams(new_text)
+                linked = old_id in present or any(
+                    self._same_conflict_topic(new_text, r["text"])
+                    or bool(new_bigrams & self._content_bigrams(r["text"]))
+                    for r in items
+                )
+                if not linked:
+                    continue
+                new_item = {
+                    "id": new_id, "text": new_text, "score": 0.0,
+                    "source": "pending_conflict",
+                    "metadata": _normalize_metadata(new_meta),
+                    "confirmed": bool(new_meta.get("user_confirmed")),
+                    "decay_weight": 1.0, "is_history": False,
+                }
+                for idx in range(len(results) - 1, -1, -1):
+                    cand = results[idx]
+                    if cand.get("is_history"):
+                        continue
+                    if (cand.get("metadata") or {}).get("is_rule") is True:
+                        continue
+                    del results[idx]
+                    break
+                results.append(new_item)
+                items.append(new_item)
+                by_id[new_id] = new_item
+                present.add(new_id)
+            # --- 2. 成组 ---
+            groups = []
+            grouped_ids = set()
+
+            def _add_to_group(group, item):
+                if item.get("id") in grouped_ids:
+                    return
+                grouped_ids.add(item.get("id"))
+                group.append(item)
+
+            for q in conflict_questions:
+                pair = [
+                    by_id[q.get("old_id")], by_id[q.get("new_id")],
+                ] if q.get("old_id") in by_id and q.get("new_id") in by_id else []
+                if len(pair) < 2:
+                    continue
+                group = []
+                for item in pair:
+                    _add_to_group(group, item)
+                new_bigrams = self._content_bigrams(pair[1]["text"])
+                for r in items:
+                    if r.get("id") in grouped_ids:
+                        continue
+                    if new_bigrams & self._content_bigrams(r["text"]):
+                        _add_to_group(group, r)
+                if len(group) >= 2:
+                    groups.append(group)
+            for r in items:
+                if r.get("id") in grouped_ids:
+                    continue
+                placed = False
+                for group in groups:
+                    if any(
+                        self._same_conflict_topic(g["text"], r["text"])
+                        for g in group
+                    ):
+                        _add_to_group(group, r)
+                        placed = True
+                        break
+                if not placed:
+                    group = [r]
+                    grouped_ids.add(r.get("id"))
+                    groups.append(group)
+
+            def _rank(g):
+                meta = g.get("metadata") or {}
+                return (
+                    1 if (g.get("confirmed")
+                          or meta.get("user_confirmed")) else 0,
+                    meta.get("write_seq") or 0,
+                    meta.get("created_at") or "",
+                )
+
+            for group in groups:
+                if len(group) < 2:
+                    continue
+                if len({_dedupe_key(g["text"]) for g in group}) < 2:
+                    continue
+                current = max(group, key=_rank)
+                for g in group:
+                    meta = g.setdefault("metadata", {})
+                    if g is current:
+                        meta["conflict_current"] = True
+                    else:
+                        meta["conflict_stale"] = True
+                        meta["conflict_with"] = current["text"]
+            return results
+        except Exception:
+            logger.warning("检索冲突标注失败：照常返回结果。", exc_info=True)
             return results
 
     def search_history(self, query, top_k=5):
