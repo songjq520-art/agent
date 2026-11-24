@@ -2516,15 +2516,104 @@ def _maintenance_interval_value(env_name, default):
 
 
 
-def _healthcheck_recovery_callback(store, memory_dir):
-    """全身体检周检的断网恢复补跑回调（2026-11-24 并入 healthcheck）。
+class _HealthcheckWakeup:
+    """全身体检的服务内唤醒器（2026-11-24 并入体检时只有断网恢复
+    一个触发点；同日晚补进程内定时唤醒，BOOS 定）。
 
-    只有环境变量 SHIER_HEALTHCHECK_CONFIG 存在且能解析时才启用，
-    内容是 JSON：{"archive": "<存档目录>", "base_url": "<服务地址>"}。
-    未设置/解析失败 → 返回 None，维护调度行为与之前完全一致。
-    启用后：判官自检在断网挂起、网络恢复补跑完成时，后台线程跑
-    一次 healthcheck.weekly()（周租约在适配器侧保证一周一次，
-    重复触发不会重复跑）。回调只起线程，绝不阻塞维护调度。
+    背景：体检跑不跑由 healthcheck.weekly() 的间隔门决定（生产
+    30 天），但得有人去「问」它到期没。原来只有维护调度在断网
+    挂起补跑完成时问一次——干净开机、长期不断网就永远没人问，
+    月度体检等于不会自己跑。补一个进程内定时器：服务启动先问
+    一次（错过补跑语义），之后每隔几小时再问一次。触发必须在
+    十二自己进程里（BOOS 自主性规矩），不用外部计划任务。
+
+    两个触发点（断网恢复回调、定时器）共用同一把锁：同一时刻
+    最多一份体检在跑，后到的触发直接跳过。体检在后台线程跑，
+    绝不阻塞聊天请求和维护调度。
+    """
+
+    def __init__(self, store, memory_dir, archive, base_url,
+                 run_weekly=None, timer_interval_seconds=6 * 3600):
+        self._store = store
+        self._memory_dir = memory_dir
+        self._archive = archive
+        self._base_url = base_url
+        self._run_weekly_override = run_weekly
+        self._timer_interval = max(1.0, float(timer_interval_seconds))
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._timer_thread = None
+
+    def _run_weekly(self):
+        if self._run_weekly_override is not None:
+            self._run_weekly_override()
+            return
+        try:
+            from healthcheck_integration import build_healthcheck
+
+            healthcheck, _adapter = build_healthcheck(
+                Path(__file__).resolve().parent.parent,
+                self._archive,
+                store=self._store,
+                memory_dir=self._memory_dir,
+                server_base_url=self._base_url,
+                budget_tracker=BudgetTracker(),
+            )
+            result = healthcheck.weekly()
+            logger.info("全身体检（服务内唤醒）：ran=%s", result.get("ran"))
+        except Exception:
+            logger.warning("全身体检服务内唤醒失败。", exc_info=True)
+
+    def trigger(self, source=""):
+        """非阻塞触发一次：已有体检在跑就跳过（防重入）。"""
+
+        def _work():
+            if not self._lock.acquire(blocking=False):
+                logger.info(
+                    "全身体检已在运行，跳过本次触发（%s）。", source)
+                return
+            try:
+                self._run_weekly()
+            finally:
+                self._lock.release()
+
+        threading.Thread(
+            target=_work, daemon=True, name="healthcheck-weekly"
+        ).start()
+
+    def on_network_recovered(self):
+        self.trigger("network-recovered")
+
+    def start_timer(self):
+        """启动定时唤醒线程：先查一次，之后每隔设定间隔再查一次。"""
+        if self._timer_thread is not None:
+            return self._timer_thread
+
+        def _loop():
+            self.trigger("startup")
+            while not self._stop.wait(self._timer_interval):
+                self.trigger("timer")
+
+        self._timer_thread = threading.Thread(
+            target=_loop, daemon=True, name="healthcheck-timer")
+        self._timer_thread.start()
+        logger.info(
+            "全身体检定时唤醒已启动：每 %.0f 秒检查一次是否到期。",
+            self._timer_interval)
+        return self._timer_thread
+
+    def stop_timer(self):
+        self._stop.set()
+
+
+def _healthcheck_wakeup(store, memory_dir, run_weekly=None,
+                        timer_interval_seconds=None):
+    """按 SHIER_HEALTHCHECK_CONFIG 装配全身体检唤醒器。
+
+    环境变量内容是 JSON：{"archive": "<存档目录>", "base_url":
+    "<服务地址>"}。未设置/解析失败 → 返回 None，维护调度行为与
+    之前完全一致、定时器也不启动。run_weekly 与
+    timer_interval_seconds 只供测试注入，生产不传。
     """
     raw = os.environ.get("SHIER_HEALTHCHECK_CONFIG")
     if not raw:
@@ -2535,35 +2624,31 @@ def _healthcheck_recovery_callback(store, memory_dir):
         base_url = cfg.get("base_url")
     except Exception:
         logger.warning(
-            "SHIER_HEALTHCHECK_CONFIG 解析失败，全身体检补跑未启用。",
+            "SHIER_HEALTHCHECK_CONFIG 解析失败，全身体检未启用。",
             exc_info=True,
         )
         return None
-    repo_root = Path(__file__).resolve().parent.parent
+    if timer_interval_seconds is None:
+        timer_interval_seconds = _maintenance_interval_value(
+            "SHIER_HEALTHCHECK_TIMER_SECONDS", 6 * 3600
+        )
+    return _HealthcheckWakeup(
+        store,
+        memory_dir,
+        archive,
+        base_url,
+        run_weekly=run_weekly,
+        timer_interval_seconds=timer_interval_seconds,
+    )
 
-    def _run_weekly():
-        try:
-            from healthcheck_integration import build_healthcheck
 
-            healthcheck, _adapter = build_healthcheck(
-                repo_root,
-                archive,
-                store=store,
-                memory_dir=memory_dir,
-                server_base_url=base_url,
-                budget_tracker=BudgetTracker(),
-            )
-            result = healthcheck.weekly()
-            logger.info("全身体检周检（网络恢复补跑）：ran=%s", result.get("ran"))
-        except Exception:
-            logger.warning("全身体检周检补跑失败。", exc_info=True)
+def _healthcheck_recovery_callback(store, memory_dir):
+    """兼容旧入口：只取断网恢复回调，不启动定时器。
 
-    def _on_recovered():
-        threading.Thread(
-            target=_run_weekly, daemon=True, name="healthcheck-weekly"
-        ).start()
-
-    return _on_recovered
+    正式接线走 start_memory_maintenance 里的 _healthcheck_wakeup
+    （回调与定时器共用同一个唤醒器、同一把锁）。"""
+    wakeup = _healthcheck_wakeup(store, memory_dir)
+    return wakeup.on_network_recovered if wakeup is not None else None
 
 
 def start_memory_maintenance(store):
@@ -2584,6 +2669,7 @@ def start_memory_maintenance(store):
 
         return drive_backup.run_backup(memory_dir, allow_upload=upload)
 
+    healthcheck_wakeup = _healthcheck_wakeup(store, memory_dir)
     scheduler = MemoryMaintenanceScheduler(
         store,
         state_path,
@@ -2601,13 +2687,19 @@ def start_memory_maintenance(store):
             "SHIER_MAINTENANCE_PROBE_SECONDS", 900
         ),
         backup_runner=_backup_runner,
-        on_network_recovered=_healthcheck_recovery_callback(store, memory_dir),
+        on_network_recovered=(
+            healthcheck_wakeup.on_network_recovered
+            if healthcheck_wakeup is not None
+            else None
+        ),
         backup_hour=int(_maintenance_interval_value("SHIER_BACKUP_HOUR", 3)),
         backup_minute=int(
             _maintenance_interval_value("SHIER_BACKUP_MINUTE", 51)
         ),
     )
     scheduler.start()
+    if healthcheck_wakeup is not None:
+        healthcheck_wakeup.start_timer()
     return scheduler
 
 
