@@ -1335,6 +1335,34 @@ class SQLiteStore:
         dates, sessions, _added = _decay.record_seen_occurrence(
             meta.get("seen_dates"), meta.get("seen_sessions"), today, turn_id
         )
+        # 晋升聚合（2026-11-24，BOOS 定“晋升规则再优化”）：同一件事
+        # 换个说法存成了另一行时，出现证据碎在各行上、谁也凑不满
+        # 3 天 3 次——以前只会数自己这行的，是晋升“笨”的根。晋升
+        # 判断前，把“同一事实的其他说法”（_fact_cluster_members，
+        # 只认硬信号）的出现集合并进来：只并集合、不删不顶；带
+        # 语气标记的成员证据不算数（带标记本来就不计晋升）。
+        # 已确认成员的证据照常全额计——确认过的事实别被推断版
+        # 拖住（同文去重里“确认只往上提”是同一个道理）。
+        try:
+            for _cid, _ctext, _cmeta in self._fact_cluster_members(
+                memory_id, text, meta
+            ):
+                if (_cmeta or {}).get("tone") in (
+                    "joke", "test", "hypothesis"
+                ):
+                    continue
+                for _d in _decay._parse_seen_list(
+                    (_cmeta or {}).get("seen_dates")
+                ):
+                    if _d not in dates:
+                        dates.append(_d)
+                for _s in _decay._parse_seen_list(
+                    (_cmeta or {}).get("seen_sessions")
+                ):
+                    if _s not in sessions:
+                        sessions.append(_s)
+        except Exception:
+            logger.warning("晋升聚合失败：按本行证据继续。", exc_info=True)
         meta["seen_dates"] = _decay._dump_seen_list(dates)
         meta["seen_sessions"] = _decay._dump_seen_list(sessions)
         meta["last_used_at"] = _now_iso()
@@ -1377,6 +1405,176 @@ class SQLiteStore:
         )
         self._conn.commit()
         return promoted
+
+    # 晋升聚合的相似门槛（2026-11-24）：余弦和内容二字组都要够高
+    # 才算“同一件事换了个说法”。门槛定高是故意的——认错（把两件
+    # 事的证据并到一起）比认漏（晋升慢一点）危险：“每天定投5块
+    # 买纳指”和“买标普”只差两个字，二字组重合率 0.75、进不来；
+    # “喜欢吃面条”和“爱吃面条”二字组全同、进得来。
+    _CLUSTER_MIN_COSINE = 0.85
+    _CLUSTER_MIN_BIGRAM_OVERLAP = 0.8
+    _CLUSTER_MIN_BIGRAM_JACCARD = 0.5
+
+    def _fact_cluster_members(self, memory_id, text, meta):
+        """和本行是“同一件事、不同说法”的其他活行：[(id, text, meta)]。
+
+        只认硬信号（和 _same_conflict_topic 一个标准，只认不猜）：
+        - 同一单值槽 + 同一归一化值（“我住广州”/“我住在广州”）；或
+        - 向量余弦 ≥0.85 且内容二字组高度重合（重合率 ≥0.8 且
+          Jaccard ≥0.5）。
+        排除：和本行正冲突的（同槽不同值、否定式正面冲突）、话题
+        粗槽不同且都认得出的（喜欢吃 vs 不喜欢吃）、和本行挂着
+        未答冲突问题的（BOOS 没裁之前，两条不共享证据——推断
+        保护的规矩）。向量缺失时只有槽位一路可用，照常工作。
+        """
+        text = text or ""
+        if not text.strip():
+            return []
+        my_slot, my_value = _infer_fact_slot(text)
+        my_topic = _correction_topic_slot(text)
+        disputed = set()
+        try:
+            for q in self.pending_questions.list_unanswered():
+                if q.get("kind") != _pq.QUESTION_KIND_CONFLICT:
+                    continue
+                pair = frozenset(
+                    (q.get("old_id"), q.get("new_id"))
+                )
+                if memory_id in pair and len(pair) == 2:
+                    disputed.add(pair)
+        except Exception:
+            disputed = set()
+        my_vec = None
+        try:
+            import numpy as np
+
+            row = self._conn.execute(
+                "SELECT embedding FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                my_vec = _blob_to_vector(row[0])
+        except Exception:
+            my_vec = None
+        my_bigrams = self._content_bigrams(text)
+        out = []
+        for row in self._conn.execute(
+            "SELECT id, text, metadata_json, embedding FROM memories"
+            " WHERE voided=0 AND deleted=0 AND superseded=0 AND id != ?",
+            (memory_id,),
+        ).fetchall():
+            other_id, other_text = row[0], row[1] or ""
+            if not other_text.strip():
+                continue
+            if frozenset((memory_id, other_id)) in disputed:
+                continue
+            if self._same_conflict_topic(text, other_text):
+                continue
+            other_slot, other_value = _infer_fact_slot(other_text)
+            if (
+                my_slot is not None and other_slot == my_slot
+                and my_value is not None and other_value is not None
+                and _normalize_memory_text(my_value)
+                != _normalize_memory_text(other_value)
+            ):
+                continue
+            other_topic = _correction_topic_slot(other_text)
+            if my_topic and other_topic and my_topic != other_topic:
+                continue
+            matched = False
+            if (
+                my_slot is not None and other_slot == my_slot
+                and my_value is not None and other_value is not None
+                and _normalize_memory_text(my_value)
+                == _normalize_memory_text(other_value)
+            ):
+                matched = True
+            elif my_vec is not None and row[3] is not None and my_bigrams:
+                try:
+                    other_vec = _blob_to_vector(row[3])
+                    if other_vec is not None and other_vec.shape == my_vec.shape:
+                        denom = float(
+                            np.linalg.norm(my_vec) * np.linalg.norm(other_vec)
+                        )
+                        if denom > 0:
+                            cos = float(np.dot(my_vec, other_vec)) / denom
+                            if cos >= self._CLUSTER_MIN_COSINE:
+                                other_bigrams = self._content_bigrams(other_text)
+                                inter = len(my_bigrams & other_bigrams)
+                                union = len(my_bigrams | other_bigrams)
+                                overlap = (
+                                    inter / min(len(my_bigrams), len(other_bigrams))
+                                    if my_bigrams and other_bigrams else 0.0
+                                )
+                                jaccard = inter / union if union else 0.0
+                                if (
+                                    overlap >= self._CLUSTER_MIN_BIGRAM_OVERLAP
+                                    and jaccard >= self._CLUSTER_MIN_BIGRAM_JACCARD
+                                ):
+                                    matched = True
+                except Exception:
+                    matched = False
+            if not matched:
+                continue
+            try:
+                other_meta = json.loads(row[2] or "{}")
+            except Exception:
+                other_meta = {}
+            out.append((other_id, other_text, other_meta))
+        return out
+
+    def _inherit_seen_evidence(self, old_meta, new_id, turn_id=None):
+        """纠正/取代落盘后，把旧行攒下的出现证据（天数/会话）并给
+        新行，再按合并后的证据复核一次晋升（2026-11-24，BOOS 定
+        “晋升规则再优化”：新事实不许从零开始数）。
+
+        旧行带语气标记（玩笑/测试/假设）时不继承——那种证据本来
+        就不算数。失败只记日志：纠正本身已经落盘，不能被继承
+        拖垮。返回有没有并上。"""
+        try:
+            if not old_meta or not new_id:
+                return False
+            if old_meta.get("tone") in ("joke", "test", "hypothesis"):
+                return False
+            old_dates = _decay._parse_seen_list(old_meta.get("seen_dates"))
+            old_sessions = _decay._parse_seen_list(
+                old_meta.get("seen_sessions")
+            )
+            if not old_dates and not old_sessions:
+                return False
+            row = self._conn.execute(
+                "SELECT text, metadata_json FROM memories WHERE id=?"
+                " AND voided=0 AND deleted=0 AND superseded=0",
+                (new_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                new_meta = json.loads(row[1] or "{}")
+            except Exception:
+                new_meta = {}
+            merged_dates = _decay._parse_seen_list(new_meta.get("seen_dates"))
+            merged_sessions = _decay._parse_seen_list(
+                new_meta.get("seen_sessions")
+            )
+            for _d in old_dates:
+                if _d not in merged_dates:
+                    merged_dates.append(_d)
+            for _s in old_sessions:
+                if _s not in merged_sessions:
+                    merged_sessions.append(_s)
+            new_meta["seen_dates"] = _decay._dump_seen_list(merged_dates)
+            new_meta["seen_sessions"] = _decay._dump_seen_list(merged_sessions)
+            # _record_occurrence 把合并后的 meta 写回并复核晋升；
+            # 纠正轮本身也算新事实的一次出现（turn 已在集合里时
+            # 不重复计，record_seen_occurrence 的规矩）。
+            self._record_occurrence(
+                new_id, new_meta, _shanghai_today().isoformat(), turn_id,
+                row[0] or "",
+            )
+            return True
+        except Exception:
+            logger.warning("纠正继承出现证据失败：新行证据未合并。", exc_info=True)
+            return False
 
     # ---------- 第 8 条：实时整理（2026-11-24，BOOS 定“尽量做成和十一一样”） ----------
     def _judge_tone_with_router(self, text):
@@ -2351,6 +2549,9 @@ class SQLiteStore:
         self._supersede_row(
             old_id, old_text, old_meta, new_key, new_text, turn_id=turn_id
         )
+        # 晋升证据继承（2026-11-24）：同 _apply_correction_result
+        # 的成功路——旧行攒的天数/会话并给新行，别从零开始数。
+        self._inherit_seen_evidence(old_meta, new_key, turn_id=turn_id)
         return "superseded"
 
     def list_pending_questions(self):
@@ -2550,6 +2751,12 @@ class SQLiteStore:
                     "question_id": question_id, "memory_id": old_id,
                 }
             self.pending_questions.answer(question_id, choice)
+            # 晋升证据继承（2026-11-24）：批准换成新的这一刻才算
+            # 真顶——旧行攒的天数/会话这时并给新行（裁“不换”时
+            # 走不到这里，一点不并）。
+            self._inherit_seen_evidence(
+                old_meta, new_id, turn_id=question.get("turn_id")
+            )
         return {
             "ok": True, "applied": "superseded",
             "question_id": question_id, "memory_id": old_id,
@@ -3506,7 +3713,14 @@ class SQLiteStore:
                     "last_used_at": created_at,
                     "decay_state": _decay.DECAY_STATE_VERBATIM,
                 }
-                dates, sessions, _added = _decay.record_seen_occurrence(None, None, today, None)
+                # 出现证据只记本轮（纠正轮本身是新事实的一次
+                # 出现）：旧行攒的天数/会话不在这里预支——“取代
+                # 后才继承”（2026-11-24 晋升优化），推断保护挂起
+                # 时 BOOS 还没裁，预支了裁“不换”就并错了。真顶
+                # 成功后由 _inherit_seen_evidence 统一并入+复核。
+                dates, sessions, _added = _decay.record_seen_occurrence(
+                    None, None, today, turn_id
+                )
                 metadata["seen_dates"] = _decay._dump_seen_list(dates)
                 metadata["seen_sessions"] = _decay._dump_seen_list(sessions)
                 try:
@@ -3564,6 +3778,11 @@ class SQLiteStore:
                     "resolution": "failed",
                     "audit": audit or {"source": source, "method": "correct_memory"},
                 }
+            # 晋升证据继承（2026-11-24）：真顶成功了，旧行攒的
+            # 天数/会话并给新行并复核晋升——新事实不从零开始数。
+            # 失败只记日志（_inherit_seen_evidence 内部处理），
+            # 不拖垮已经落盘的纠正。
+            self._inherit_seen_evidence(old_meta, new_key, turn_id=turn_id)
             result = {
                 "status": status, "memory_id": new_key,
                 "old_text": old_text, "new_text": new_fact,
@@ -4607,6 +4826,9 @@ class SQLiteStore:
     def _annotate_search_conflicts(self, results):
         """检索收尾的冲突通道（webfix 三，只改善不根治）。
 
+        0. 槽位二次整理（2026-11-24 漏答优化）：见 _slot_recompose
+           ——某槽的现行条没进结果、同槽旧冲突行进了，把现行条
+           换进来；现行条在结果里也不许排在旧行后面。
         1. pending 不隐身：未答冲突问题的新事实（new_id）不在
            结果里、但旧行在结果里（或与结果任一条同话题/共享
            内容二字组）时，把它换进来（挤掉最末一条非规则、
@@ -4640,6 +4862,20 @@ class SQLiteStore:
             ]
             present = {r.get("id") for r in items}
             by_id = {r.get("id"): r for r in items}
+            # --- 0. 槽位二次整理（2026-11-24，BOOS 定“漏答再
+            # 优化”）：按话题粗槽分组——某槽的现行条（已确认优先、
+            # 同级最新）没进结果、同槽的旧冲突行却进了，就把现行
+            # 条换进来占旧行的位置；现行条在结果里但排在旧行后面
+            # 的，提到旧行前面。已取代的行本来就不在活行里，这里
+            # 管的是“还活着但已经输了”的旧行（待问挂起、没纠正
+            # 词的新旧并存）：它们不许压过现行条。失败只记日志，
+            # 不连累后面的 pending 换入和冲突标注。
+            try:
+                self._slot_recompose(
+                    results, items, by_id, present, conflict_questions
+                )
+            except Exception:
+                logger.warning("槽位二次整理失败：照常返回结果。", exc_info=True)
             # --- 1. pending 换入 ---
             for q in conflict_questions:
                 new_id = q.get("new_id")
@@ -4755,6 +4991,142 @@ class SQLiteStore:
         except Exception:
             logger.warning("检索冲突标注失败：照常返回结果。", exc_info=True)
             return results
+
+    def _slot_recompose(self, results, items, by_id, present,
+                        conflict_questions):
+        """槽位二次整理（2026-11-24）：见 _annotate_search_conflicts
+        第 0 步。只就地改 results/items/by_id/present，不改返回形状。
+
+        成组只认硬信号（和 _same_conflict_topic 一个标准）：
+        - 单值槽（slot: 住处/名字…）：同槽不同值天然互斥，全槽一组；
+        - 偏好话题（pref: 喜欢吃…）：同话题不同食物可以并存，不算
+          冲突——只认未答冲突问题亲口认定的对子成组。否定式链接
+          不用来成组：“纠正了鸡杂面”那种备注行靠否定词和半个
+          话题的二字组就能和并存偏好攀上关系，拿它换入/重排会
+          把冒菜这种并存偏好误当现行条（全套回归实测：Q3 排序
+          被打乱、webfix 口味场景换错行）。
+        组内现行 = 已确认优先、同级按 write_seq/created_at 最新
+        （和第 2 步标注同一个 _rank 口径）。现行不在结果里时，
+        换掉组内最旧的那条占它的位置（规则行不换）；现行在结果
+        里但排在旧行后面的，挪到本组最靠前的旧行前面。
+        """
+        def _rank_of(item):
+            meta = item.get("metadata") or {}
+            return (
+                1 if (item.get("confirmed")
+                      or meta.get("user_confirmed")) else 0,
+                meta.get("write_seq") or 0,
+                meta.get("created_at") or "",
+            )
+
+        linked_pairs = set()
+        for q in conflict_questions or []:
+            _o, _n = q.get("old_id"), q.get("new_id")
+            if _o and _n and _o != _n:
+                linked_pairs.add(frozenset((_o, _n)))
+
+        topics = {}
+        for item in items:
+            topic = _correction_topic_slot(item.get("text") or "")
+            if topic:
+                topics.setdefault(topic, []).append(item)
+        if not topics:
+            return
+        live_by_topic = {}
+        for row in self._conn.execute(
+            "SELECT id, text, metadata_json FROM memories"
+            " WHERE voided=0 AND deleted=0 AND superseded=0"
+        ).fetchall():
+            topic = _correction_topic_slot(row[1] or "")
+            if not topic or topic not in topics:
+                continue
+            try:
+                _meta = json.loads(row[2] or "{}")
+            except Exception:
+                _meta = {}
+            live_by_topic.setdefault(topic, []).append({
+                "id": row[0], "text": row[1] or "", "metadata": _meta,
+                "confirmed": bool(_meta.get("user_confirmed")),
+            })
+
+        for topic, group_items in topics.items():
+            live_rows = live_by_topic.get(topic) or []
+            if len(live_rows) < 2:
+                continue
+            clusters = []
+            if topic.startswith("slot:"):
+                clusters = [live_rows]
+            else:
+                # 偏好话题只认待问问题认定的对子（见 docstring）。
+                by_id_live = {c["id"]: c for c in live_rows}
+                grouped_live = set()
+                for pair in linked_pairs:
+                    members = [
+                        by_id_live[i] for i in pair if i in by_id_live
+                    ]
+                    if len(members) < 2:
+                        continue
+                    if any(m["id"] in grouped_live for m in members):
+                        continue
+                    grouped_live.update(m["id"] for m in members)
+                    clusters.append(members)
+            for cluster in clusters:
+                member_ids = {c["id"] for c in cluster}
+                in_results = [
+                    it for it in group_items if it.get("id") in member_ids
+                ]
+                if not in_results:
+                    continue
+                current = max(cluster, key=_rank_of)
+                if current["id"] in present:
+                    # 现行在结果里：不许排在任何同组旧行后面。
+                    cur_item = by_id.get(current["id"])
+                    if cur_item is None or cur_item not in results:
+                        continue
+                    stale_idxs = [
+                        results.index(it) for it in in_results
+                        if it.get("id") != current["id"] and it in results
+                    ]
+                    if stale_idxs and results.index(cur_item) > min(stale_idxs):
+                        results.pop(results.index(cur_item))
+                        results.insert(min(stale_idxs), cur_item)
+                    continue
+                # 现行不在结果里：换掉组内最旧的一条（规则行不换；
+                # 单值槽里和现行同值的说法不算旧行，不换它）。
+                _cur_value = _infer_fact_slot(current["text"])[1]
+                victims = []
+                for it in in_results:
+                    if (it.get("metadata") or {}).get("is_rule") is True:
+                        continue
+                    if topic.startswith("slot:") and _cur_value is not None:
+                        _v_value = _infer_fact_slot(it.get("text") or "")[1]
+                        if (
+                            _v_value is not None
+                            and _normalize_memory_text(_v_value)
+                            == _normalize_memory_text(_cur_value)
+                        ):
+                            continue
+                    victims.append(it)
+                if not victims:
+                    continue
+                victim = min(victims, key=_rank_of)
+                new_item = {
+                    "id": current["id"], "text": current["text"],
+                    "score": victim.get("score") or 0.0,
+                    "source": "slot_current",
+                    "metadata": _normalize_metadata(current["metadata"]),
+                    "confirmed": bool(
+                        current["metadata"].get("user_confirmed")
+                    ),
+                    "decay_weight": 1.0, "is_history": False,
+                }
+                results[results.index(victim)] = new_item
+                items[items.index(victim)] = new_item
+                group_items[group_items.index(victim)] = new_item
+                by_id.pop(victim.get("id"), None)
+                by_id[new_item["id"]] = new_item
+                present.discard(victim.get("id"))
+                present.add(new_item["id"])
 
     def search_history(self, query, top_k=5):
         return self.search(query, top_k=top_k, include_history=True)
