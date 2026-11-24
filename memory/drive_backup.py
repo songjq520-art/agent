@@ -68,7 +68,7 @@ DRIVE_UPLOAD_URL = (
     "?uploadType=media"
 )
 DRIVE_DOWNLOAD_URL = "https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 
 
 def resolve_key_path(key_path=None):
