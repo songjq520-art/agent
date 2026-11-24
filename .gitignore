@@ -60,3 +60,6 @@ Thumbs.db
 .coverage
 htmlcov/
 memory/*.sqlite3*
+
+# 十二自备份的本地 zip（memory/drive_backup.py 生成，只在本机和网盘）
+memory/backups/

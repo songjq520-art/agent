@@ -2193,7 +2193,8 @@ class MemoryMaintenanceScheduler:
     def __init__(self, store, state_path, decay_interval_seconds=24 * 3600,
                  self_check_interval_seconds=7 * 24 * 3600,
                  tick_seconds=3600, now_fn=None, network_probe=None,
-                 probe_interval_seconds=900):
+                 probe_interval_seconds=900, backup_runner=None,
+                 backup_hour=3, backup_minute=51):
         self._store = store
         self._state_path = Path(state_path)
         self._decay_interval = float(decay_interval_seconds)
@@ -2209,6 +2210,13 @@ class MemoryMaintenanceScheduler:
         self._network_probe = network_probe
         self._probe_interval = max(1.0, float(probe_interval_seconds))
         self._pending_known = False
+        # 备份任务（2026-11-24，十二自己备份自己）：backup_runner 由
+        # start_memory_maintenance 注入（内部走 memory/drive_backup），
+        # 没注入就是没这项任务——旧的构造方式不受影响，run_due 的
+        # 返回值也不会多出 backup 键（旧测试按原样断言）。
+        self._backup_runner = backup_runner
+        self._backup_hour = int(backup_hour)
+        self._backup_minute = int(backup_minute)
 
     def _load_state(self):
         try:
@@ -2239,9 +2247,14 @@ class MemoryMaintenanceScheduler:
         now = float(now if now is not None else self._now_fn())
         state = self._load_state()
         ran = {"decay": False, "self_check": False}
+        if self._backup_runner is not None:
+            ran["backup"] = False
         self._run_decay_due(state, now, ran)
         self._run_self_check_due(state, now, ran)
-        self._pending_known = bool(state.get("self_check_pending"))
+        self._run_backup_due(state, now, ran)
+        self._pending_known = bool(state.get("self_check_pending")) or bool(
+            state.get("backup_pending")
+        )
         self._save_state(state)
         return ran
 
@@ -2391,6 +2404,85 @@ class MemoryMaintenanceScheduler:
         self._thread.start()
         return self._thread
 
+    def _run_backup_due(self, state, now, ran):
+        """备份（十二自己备份自己，2026-11-24）：每天 03:51（上海）
+        一次，到期判定走 memory/drive_backup.is_backup_due（上次成功
+        早于最近一个每日时点就是到期）——服务启动后第一圈 run_due
+        就会把错过的那次补上，开机补跑和衰减/自检同一套路。
+
+        断网半条照自检的模式：到期但没网时先只打包（runner
+        upload=False，打包不需要网），state.backup_pending 挂账、
+        不写 backup_last_success；之后每 probe_interval 探一次网，
+        网络一恢复立刻补传。runner 自己保证不抛（打包/上传/验真
+        失败都落在返回值里），这里再兜一层：备份出任何岔子只记
+        日志，绝不许拖垮调度线程和服务主进程。
+        """
+        runner = self._backup_runner
+        if runner is None:
+            return
+        pending = bool(state.get("backup_pending"))
+        try:
+            from memory import drive_backup
+
+            backup_state = drive_backup.load_backup_state(
+                self._state_path.parent
+            )
+            due = drive_backup.is_backup_due(
+                state, backup_state, now,
+                self._backup_hour, self._backup_minute,
+            )
+        except Exception:
+            logger.warning("备份到期判定失败，下个周期再试。", exc_info=True)
+            return
+        if not pending and not due:
+            return
+        if self._network_probe is None:
+            self._apply_backup_result(state, now, ran, runner)
+            return
+        last_probe = state.get("backup_last_probe")
+        if (
+            pending
+            and isinstance(last_probe, (int, float))
+            and now - float(last_probe) < self._probe_interval
+        ):
+            return  # 探网节流：还没到下次探网时间
+        try:
+            online = bool(self._network_probe())
+        except Exception:
+            online = False  # 探针自己出错就当没网，宁可晚传不可误传
+        state["backup_last_probe"] = now
+        if not online:
+            if not pending:
+                try:
+                    runner(upload=False)
+                except Exception:
+                    logger.warning("备份离线打包失败。", exc_info=True)
+                state["backup_pending"] = True
+                state.setdefault("backup_pending_since", now)
+                ran["backup"] = True
+            return
+        self._apply_backup_result(state, now, ran, runner)
+
+    def _apply_backup_result(self, state, now, ran, runner):
+        """在线时跑完整备份（打包+上传+验真），按结果落状态：
+        成功写 backup_last_run / backup_last_success 并清挂账；
+        没成功（没密钥、上传失败、验真不过）只挂 pending，不写
+        成功时间，等网络/密钥条件好了再补跑。"""
+        try:
+            result = runner(upload=True) or {}
+        except Exception:
+            logger.warning("备份 runner 抛错，记为待补跑。", exc_info=True)
+            result = {}
+        ran["backup"] = True
+        if result.get("status") == "success":
+            state["backup_last_run"] = now
+            state["backup_last_success"] = now
+            state.pop("backup_pending", None)
+            state.pop("backup_pending_since", None)
+        else:
+            state["backup_pending"] = True
+            state.setdefault("backup_pending_since", now)
+
     def stop(self):
         self._stop.set()
 
@@ -2418,6 +2510,13 @@ def start_memory_maintenance(store):
             Path(__file__).resolve().parent.parent
             / "memory" / "maintenance_state.json"
         )
+    memory_dir = state_path.parent
+
+    def _backup_runner(upload=True):
+        from memory import drive_backup
+
+        return drive_backup.run_backup(memory_dir, allow_upload=upload)
+
     scheduler = MemoryMaintenanceScheduler(
         store,
         state_path,
@@ -2433,6 +2532,11 @@ def start_memory_maintenance(store):
         network_probe=_default_network_probe,
         probe_interval_seconds=_maintenance_interval_value(
             "SHIER_MAINTENANCE_PROBE_SECONDS", 900
+        ),
+        backup_runner=_backup_runner,
+        backup_hour=int(_maintenance_interval_value("SHIER_BACKUP_HOUR", 3)),
+        backup_minute=int(
+            _maintenance_interval_value("SHIER_BACKUP_MINUTE", 51)
         ),
     )
     scheduler.start()
