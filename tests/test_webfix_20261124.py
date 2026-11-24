@@ -182,6 +182,20 @@ def test_negation_conflict_signal(store):
     assert not f("我吃鸡杂面", "BOOS 喜欢吃鸡杂面。")
 
 
+def test_correction_variant_jicha_recognized(store):
+    """纠正说法要通用：“记岔了”和“记错了”同义，必须走纠正路
+    当轮顶掉旧的（复测 #1 实测：“记岔了”没被认出来，新事实存了、
+    旧的留活，回复还反问要不要删）。"""
+    _turn(store, "我每天睡前都要喝一杯酸奶", "j1")
+    assert "我每天睡前都要喝一杯酸奶" in _live_texts(store)
+    receipt = _turn(store, "记岔了，我睡前喝的是温水，酸奶是早上才喝的", "j2")
+    assert _is_superseded(store, "我每天睡前都要喝一杯酸奶")
+    live = _live_texts(store)
+    assert any("温水" in t for t in live), live
+    correction = receipt.get("correction") or {}
+    assert correction.get("status") == "updated", correction
+
+
 # ---------- 二、重要性护栏 + 语气落账 ----------
 
 
