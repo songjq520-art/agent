@@ -785,3 +785,67 @@ def _parse_judge_choice(content, candidates):
             return (candidates[n - 1] or {}).get("id"), None
     return None, "similar"
 
+
+
+# ---------- 纠正原话提炼（2026-11-24 webfix 一） ----------
+# 实测毛病：用户纠正的原话/元句（“刚才那句说错了，我只吃鸡杂面”）
+# 被整句当成新事实存成现行记忆——账本里躺着一句“刚才那句说错了”
+# 当事实，既难看又污染检索。规矩：supersede 的新文本必须是提炼后
+# 的事实；原话可以作为 verbatim 记录存在，但不许成为现行事实。
+# 提炼只认句首的元话语（说错了/记错了这类“关于上一句的话”），
+# 不是元句开头的文本原样返回，不猜、不改写事实内容本身。
+
+_META_LEAD_RE = re.compile(
+    r"^(?:我)?(?:刚才|刚刚|之前)?(?:那句|这句|那句话|这句话)?(?:话)?"
+    r"(?:说错了|写错了|讲错了|记错了|搞错了)[，,：:\s]*"
+)
+_META_MARKERS = ("说错了", "写错了", "讲错了", "记错了", "搞错了")
+
+
+def is_correction_meta_sentence(text):
+    """一句话是不是纠正的元句（句首在说“上一句说错了”这类话）。
+    只认句首元话语开头；事实内容里提到“记错了”（“他记错了时间”）
+    不算。"""
+    if not isinstance(text, str):
+        return False
+    return _META_LEAD_RE.match(text.strip()) is not None
+
+
+def distill_correction_fact(text):
+    """把纠正原话提炼成事实本身；不是元句时原样返回（去首尾空白）。
+
+    提炼动作只有三样，都是确定性剥离，不改写内容：
+    1. 剥句首元话语前缀（“刚才那句说错了，”→ 空），可叠两层；
+    2. 剩下的还带纠正信号（“不对，……”）时走 _detect_correction
+       取它的新说法；
+    3. _clean_correction_fact 收尾（剥“其实是/是”等引导词、截句尾
+       挂着的否定）。
+    剥完为空/太短/前几个字里还留着元标记 → 返回 None（提炼不出，
+    调用方别拿原话顶替现行事实）。
+    """
+    if not isinstance(text, str):
+        return None
+    t = text.strip()
+    if not t:
+        return None
+    changed = False
+    for _ in range(2):
+        match = _META_LEAD_RE.match(t)
+        if match is None or match.end() == 0:
+            break
+        t = t[match.end():].lstrip("，,：: \t")
+        changed = True
+    if not changed:
+        return t
+    detected = _detect_correction(t)
+    if detected is not None and (detected.get("fact") or "").strip():
+        t = detected["fact"].strip()
+    cleaned = _clean_correction_fact(t)
+    if cleaned:
+        t = cleaned
+    t = t.strip().rstrip("。").strip()
+    if len(t) < 2:
+        return None
+    if any(marker in t[:8] for marker in _META_MARKERS):
+        return None
+    return t
