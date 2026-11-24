@@ -35,6 +35,7 @@ from memory.mem0_store import (
     _detect_correction,
     _parse_judge_choice,
 )
+from memory.sqlite_store import SQLiteStore
 from web.server import ChatState
 
 
@@ -391,6 +392,31 @@ def test_cli_print_correction_lines(capsys):
     assert "纠正失败，原记忆没动" in printed
 
 
+def test_print_correction_result_handles_string_and_dict_candidates(tmp_path, monkeypatch, capsys):
+    """Bug 1 回归（2026-11-22）：ambiguous 的纠正结果里 candidates 不管是
+    字典列表还是 ID 字符串列表，_print_correction_result 都不抛异常、
+    正常返回；字典的印文本，字符串的印 ID 本身。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
+    store = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    store.add_memory_text("我喜欢吃冒菜", source="inferred")
+    out = store.correct_memory("我喜欢吃辣的", "我喜欢吃米线")
+    assert out.get("status") == "ambiguous"
+    cands = out.get("candidates") or []
+    assert len(cands) == 2
+    assert all(isinstance(c, dict) and c.get("text") for c in cands)
+    assert _print_correction_result({"correction": out}) == out
+    printed = capsys.readouterr().out
+    assert "我喜欢吃火锅" in printed and "我喜欢吃冒菜" in printed
+    # 老格式（光秃秃的 ID 字符串）也要认：印 ID 本身，不崩。
+    ids = [c["id"] for c in cands]
+    assert _print_correction_result(
+        {"correction": {"status": "ambiguous", "candidates": ids}}
+    ) == {"status": "ambiguous", "candidates": ids}
+    printed = capsys.readouterr().out
+    assert ids[0] in printed and ids[1] in printed
+
+
 def test_web_ask_returns_correction_field(monkeypatch, tmp_path):
     """网页入口：ChatState.ask() 的返回里带 "correction" 键，
     原来的 reply/model/mode/cost_usd/usage 五个键不动。"""
@@ -416,7 +442,9 @@ def test_web_ask_returns_correction_field(monkeypatch, tmp_path):
     monkeypatch.setattr("web.server.run_question", _fake_run_question)
     result = state.ask("你记错了，我喜欢用 Go 写代码。")
     assert result["mode"] == "real"
-    assert result["reply"] == "好的，我帮你改。"
+    # 2026-11-23 model fix #3（BOOS 定）：纠正执行完直接说“已经改好了”，
+    # 不再原样返回模型那句“好的，我帮你改。”。
+    assert result["reply"] == "已经改好了：把“我喜欢用 Python 写代码”改成了“我喜欢用 Go 写代码。”。"
     assert result["model"] == "deepseek-flash"
     assert result["correction"]["status"] == "updated"
     assert result["correction"]["old_text"] == "我喜欢用 Python 写代码"

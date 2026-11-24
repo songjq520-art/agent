@@ -98,6 +98,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -128,6 +129,7 @@ from memory.conversation_transcript import (  # noqa: E402
 )
 from memory.mem0_store import create_mem0_store  # noqa: E402
 from memory.redaction import _redact_sensitive  # noqa: E402
+from memory.correction_text import _infer_fact_slot  # noqa: E402
 from memory.sqlite_store import resolve_event_date  # noqa: E402
 
 logger = logging.getLogger("agent")
@@ -273,6 +275,43 @@ def _redacted_messages(messages):
             item["content"] = _redact_sensitive(item["content"])
         out.append(item)
     return out
+
+
+def _correction_reply_text(correction):
+    """纠正执行完后的确定性回复（2026-11-23 model fix #3，措辞）：
+    改好了就直接说“已经改好了”，不提确认、不事后反问“要不要改”。
+    correction 不是 updated 时返回 None（调用方保留模型原回复）。
+    模型回答是存记忆之前生成的，不知道纠正已经改好了，才会说
+    “等你确认后，我会把……存成新的说法”这种过时的话。"""
+    if not isinstance(correction, dict):
+        return None
+    if correction.get("status") != "updated":
+        return None
+    old_text = (correction.get("old_text") or "").strip()
+    new_text = (correction.get("new_text") or "").strip()
+    if old_text and new_text and old_text != new_text:
+        return f"已经改好了：把“{old_text}”改成了“{new_text}”。"
+    if new_text:
+        return f"已经改好了：{new_text}。"
+    return "已经改好了。"
+
+
+def _slot_conflict_reply_text(store, stored):
+    """无纠正词的新陈述存成新行、同槽旧行还在时的回复（2026-11-23
+    model fix #3，措辞）：只认记下了，不反问“要不要改”。
+    stored 是本轮存下的句子列表；没有同槽冲突时返回 None（调用方
+    保留模型原回复）。store 没有 _find_same_slot_conflicts 时返回 None。"""
+    for sent in stored or []:
+        slot, value = _infer_fact_slot(sent)
+        if slot is None:
+            continue
+        try:
+            conflicts = store._find_same_slot_conflicts(slot, value)
+        except Exception:
+            return None
+        if conflicts:
+            return f"记下了：{sent.rstrip('。！')}。"
+    return None
 
 
 class ChatState:
@@ -704,7 +743,8 @@ class ChatState:
                 if content:
                     try:
                         result = self.mem0_store.add_memory_text(
-                            content, source="user", turn_id=turn_id
+                            content, source="user", turn_id=turn_id,
+                            semantic_judge=True,
                         )
                         remember_stored = bool(result)
                     except Exception:
@@ -899,6 +939,51 @@ class ChatState:
             removed = before_len - len(self.messages)
             if removed > 0:
                 self._shift_waiting_history_index(removed)
+        # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
+        # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
+        # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
+        # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
+        # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
+        # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
+        # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
+        # 先存记忆、再写全文记录：纠正执行完要改回复措辞时，全文记录里
+        # 拿到的就是改好后的回复，和历史、页面一致。
+        correction = None
+        questions = None
+        saved = None
+        if self.mem0_store is not None and not skip_memory_save:
+            recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
+            if insert_at is not None and not any(
+                msg is user_msg for msg in recent
+            ):
+                # 恢复的那轮插在中间、又被后面的轮次挤出最近 6 条时，
+                # 把它放进要存记忆的窗口最前面（它比窗口里的消息更早，
+                # 顺序仍是时间顺序），别让它丢了记忆。
+                recent = [user_msg, assistant_msg] + self.messages[
+                    -(_MEMORY_SAVE_HISTORY_MAX - 2):
+                ]
+            with timer.measure("memory_save_ms"):
+                # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
+                # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
+                saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
+            if isinstance(saved, dict):
+                correction = saved.get("correction")
+                questions = saved.get("questions")
+        # 2026-11-23 model fix #3（措辞）：纠正已经执行完了，回复就直接
+        # 说“已经改好了”，不提确认、不事后反问“要不要改”——模型回答是
+        # 存记忆之前生成的，不知道纠正已经改好了，才会说“等你确认后…”
+        # /“要不要我把……改成……？”这种过时的话。覆盖掉它（历史里的助手
+        # 回复、全文记录、返回都用改好后的这句，保持一致）。
+        reply_override = _correction_reply_text(correction)
+        if reply_override is None and isinstance(saved, dict):
+            # 无纠正词的新陈述存成了新行、同槽旧行还在时（E 组 T1 那种），
+            # 也只认记下了，不反问“要不要改”。
+            reply_override = _slot_conflict_reply_text(
+                self.mem0_store, saved.get("stored")
+            )
+        if reply_override is not None:
+            reply_text = reply_override
+            assistant_msg["content"] = reply_override
         # 38 号：全文存盘——本轮两条新消息追加进这场对话的全文记录。
         # 只追加新消息（恢复回来的旧消息不经过这里，不重复写）；
         # 摘要压缩裁掉历史前面时不影响这里，全文已经在文件里了。
@@ -928,31 +1013,6 @@ class ChatState:
                     )
             except Exception:
                 logger.warning("对话全文存盘失败。", exc_info=True)
-        # 回答成功后存记忆：只带本轮及最近的消息（含刚追加的新问答）。
-        # 聊天纠错（“你记错了”接线）：add_turn 里已经改好/问好了，
-        # 这里只把纠错结果放进返回里（"correction" 键），供页面展示：
-        # 改好了（updated）、已经记对了（unchanged）、分不清改哪条
-        # （ambiguous，带候选列表、等 BOOS 下一句挑）、改失败了
-        # （failed，原记忆没动）、没找到旧记忆（not_found，新说法
-        # 已当新记忆存下）。没纠错时不加这个键，原来的五个键不动。
-        correction = None
-        if self.mem0_store is not None and not skip_memory_save:
-            recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
-            if insert_at is not None and not any(
-                msg is user_msg for msg in recent
-            ):
-                # 恢复的那轮插在中间、又被后面的轮次挤出最近 6 条时，
-                # 把它放进要存记忆的窗口最前面（它比窗口里的消息更早，
-                # 顺序仍是时间顺序），别让它丢了记忆。
-                recent = [user_msg, assistant_msg] + self.messages[
-                    -(_MEMORY_SAVE_HISTORY_MAX - 2):
-                ]
-            with timer.measure("memory_save_ms"):
-                # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
-                # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
-                saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
-            if isinstance(saved, dict):
-                correction = saved.get("correction")
         response = {
             "reply": reply_text,
             "model": model_name,
@@ -968,6 +1028,10 @@ class ChatState:
             response["searches"] = searches
         if correction is not None:
             response["correction"] = correction
+        # Phase 2 #4：本轮拿不准的问题（带原文、给选项、说原因），
+        # 没问题时不加这个键，原来的返回形状不动。
+        if questions:
+            response["questions"] = questions
         logger.info(
             "timing | web round total=%.1fms %s",
             timer.total_ms(),
@@ -1542,6 +1606,29 @@ class ChatState:
                 old_text = item["text"]
             return self.mem0_store.correct_memory(old_text, new_text)
 
+    def list_pending_questions(self):
+        """还没回答的待问问题（Phase 2 #4），按创建时间从旧到新。
+
+        记忆未启用时返回空列表；读失败时也返回空列表，不拦页面。
+        """
+        if self.mem0_store is None:
+            return []
+        try:
+            return self.mem0_store.list_pending_questions()
+        except Exception:
+            logger.warning("读待问问题失败。", exc_info=True)
+            return []
+
+    def answer_question(self, question_id, choice):
+        """回答一个待问问题（Phase 2 #4），按答案改库。
+
+        choice 只能是“进核心 / 当一次性经历 / 不存”（见
+        SQLiteStore.answer_question）。记忆未启用时 ok=False。
+        """
+        if self.mem0_store is None:
+            return {"ok": False, "reason": "记忆未启用。"}
+        return self.mem0_store.answer_question(question_id, choice)
+
 
 def make_handler(state, authenticator=None):
     """按给定的对话状态，生成一个请求处理类。
@@ -1565,7 +1652,8 @@ def make_handler(state, authenticator=None):
         任务：GET /api/tasks/active、GET /api/tasks/unresolved、
         POST /api/tasks/<id>/resume、POST /api/tasks/<id>/discard；
         记忆管理：GET /api/memories、GET /api/memories/<id>/scope、
-        POST /api/memories/<id>/forget、POST /api/memories/correct。
+        POST /api/memories/<id>/forget、POST /api/memories/correct、
+        GET /api/questions/pending、POST /api/questions/answer。
         """
 
         # 日志只写到 Python 的 logging（不往页面里写），保持安静：
@@ -1707,6 +1795,10 @@ def make_handler(state, authenticator=None):
                         "memories": state.list_memories(),
                     }
                 )
+            elif path == "/api/questions/pending":
+                # 待问 BOOS 的问题（Phase 2 #4）：还没回答的都列出来，
+                # 页面据此显示“待问”列表。记忆未启用时列表为空。
+                self._send_json({"questions": state.list_pending_questions()})
             elif path == "/api/protection-events":
                 # 保护记录：快照失败、恢复失败这些事的可见留痕，新的在前。
                 # 记忆未启用时列表为空，页面显示“暂无保护记录”。
@@ -1932,6 +2024,25 @@ def make_handler(state, authenticator=None):
                 result = state.correct_memory(old_text, new_text, memory_id=memory_id)
                 self._send_json(result)
                 return
+            if path == "/api/questions/answer":
+                # 回答一个待问问题：POST /api/questions/answer，请求
+                # {"question_id": id, "choice": "进核心" / "当一次性经历" / "不存"}。
+                # choice 不在这三个里时回 400、什么都不改。
+                payload, error, status = self._read_json_body()
+                if error is not None:
+                    self._send_json({"error": error}, status=status)
+                    return
+                question_id = str(payload.get("question_id") or "").strip()
+                choice = str(payload.get("choice") or "").strip()
+                if not question_id or choice not in ("进核心", "当一次性经历", "不存"):
+                    self._send_json(
+                        {"error": "请选一个问题，并选：进核心 / 当一次性经历 / 不存。"},
+                        status=400,
+                    )
+                    return
+                result = state.answer_question(question_id, choice)
+                self._send_json(result)
+                return
             if path != "/api/chat":
                 self._send_json({"error": "没有这个地址。"}, status=404)
                 return
@@ -2029,6 +2140,297 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
     return ThreadingHTTPServer((config.host, config.port), handler), state
 
 
+def _default_network_probe():
+    """轻量连通性探针（错过补跑用）：能连上任一常用 HTTPS 端点
+    就算有网。只判连通、不发业务请求；全失败才算离线。判官的
+    主力端点排第一（它通了判官基本就能跑），再加一个通用端点
+    兜底（判官换供应商时也不至于误判离线）。"""
+    import socket
+
+    for host, port in (("api.deepseek.com", 443), ("www.baidu.com", 443)):
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+class MemoryMaintenanceScheduler:
+    """记忆维护调度（R-5，2026-11-24）：衰减清扫每天一次、记忆自检
+    每周一次（缺点清单第 4 条加密，2026-11-24），进程内轻量守护
+    线程，不加新依赖。
+
+    背景：sweep_decay / run_self_check 以前没有任何生产调用方——
+    函数都在，服务跑起来也永远不会执行，记忆不会沉底、自检不出
+    报告（P1 重查 R-5）。这里把它们挂上真正的节奏：
+    - 上次运行时间存一个小 JSON 文件（state_path），重启不重复
+      跑、到期才跑；启动时已到期（或从没跑过）就补跑一次；
+    - 每个任务独立 try/except：调度出任何异常只记日志，绝不把
+      服务带崩；任务本身失败时也记下本次时间，下个间隔再试，
+      不会每个 tick 重试刷屏/烧钱；
+    - 间隔可调（构造参数；main 里从环境变量读）：
+      SHIER_DECAY_SWEEP_INTERVAL_HOURS（默认 24）、
+      SHIER_SELF_CHECK_INTERVAL_DAYS（默认 7）、
+      SHIER_MAINTENANCE_TICK_SECONDS（默认 3600，内部检查节奏）。
+    - 错过补跑（2026-11-24，BOOS 补定）：关机错过的靠上面的
+      “启动时到期就补跑”；断网错过的靠探网待跑——自检到期时
+      没网，本地部分照常跑、判官部分挂成待跑（不记已跑、不推
+      满周期），进程内每 15 分钟探一次网（SHIER_MAINTENANCE_
+      PROBE_SECONDS 可调），网络一恢复立刻补跑完整自检。
+    自检走 store.run_self_check（SQLite 后端内部已接整理路由判官，
+    R-6）；衰减走 store.sweep_decay。store 没这方法就跳过该任务。
+    """
+
+    def __init__(self, store, state_path, decay_interval_seconds=24 * 3600,
+                 self_check_interval_seconds=7 * 24 * 3600,
+                 tick_seconds=3600, now_fn=None, network_probe=None,
+                 probe_interval_seconds=900):
+        self._store = store
+        self._state_path = Path(state_path)
+        self._decay_interval = float(decay_interval_seconds)
+        self._self_check_interval = float(self_check_interval_seconds)
+        self._tick = max(1.0, float(tick_seconds))
+        self._now_fn = now_fn or time.time
+        self._stop = threading.Event()
+        self._thread = None
+        # 错过补跑（2026-11-24，BOOS 补定）：network_probe 是无参
+        # 连通性探针（返回 True/False）；不传（None）时自检走
+        # R-5 原有语义。probe_interval_seconds 是待跑期间的探网
+        # 节奏（默认 15 分钟）。
+        self._network_probe = network_probe
+        self._probe_interval = max(1.0, float(probe_interval_seconds))
+        self._pending_known = False
+
+    def _load_state(self):
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_state(self, state):
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning(
+                "维护调度状态写不进去：下次启动可能重复跑一次。",
+                exc_info=True,
+            )
+
+    def run_due(self, now=None):
+        """到期才跑到期的任务；返回 {"decay": 有没有跑, "self_check": ...}。
+
+        任何单个任务的异常都在这里吞掉记日志——调用方（调度线程、
+        测试）永远不会因为维护任务失败而出错。
+        """
+        now = float(now if now is not None else self._now_fn())
+        state = self._load_state()
+        ran = {"decay": False, "self_check": False}
+        self._run_decay_due(state, now, ran)
+        self._run_self_check_due(state, now, ran)
+        self._pending_known = bool(state.get("self_check_pending"))
+        self._save_state(state)
+        return ran
+
+    def _run_decay_due(self, state, now, ran):
+        """衰减：纯本地活，断网也照常跑。到期才跑、异常只记日志、
+        记下本次时间下个间隔再试（R-5 原有语义，一字未改）。"""
+        key = "decay_last_run"
+        last = state.get(key)
+        if isinstance(last, (int, float)) and now - float(last) < self._decay_interval:
+            return
+        fn = getattr(self._store, "sweep_decay", None)
+        if fn is None:
+            state[key] = now
+            return
+        try:
+            result = fn()
+            logger.info("记忆维护：衰减清扫已跑，结果 %s。", result)
+        except Exception:
+            logger.warning(
+                "记忆维护：decay 跑失败，下个间隔再试。", exc_info=True
+            )
+        state[key] = now
+        ran["decay"] = True
+
+    def _run_self_check_local(self, fn):
+        """离线时只跑自检的本地部分：store 的 run_self_check 支持
+        include_model_judge 参数才调（判官项跳过、报告里标
+        deferred）；不支持就不跑（整个自检挂待跑）。返回有没有
+        跑成；跑失败只记日志、返回 False（仍挂待跑）。"""
+        try:
+            import inspect
+
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "include_model_judge" not in params:
+            return False
+        try:
+            fn(include_model_judge=False)
+        except Exception:
+            logger.warning("记忆维护：自检本地部分跑失败。", exc_info=True)
+            return False
+        return True
+
+    def _run_self_check_due(self, state, now, ran):
+        """自检：本地项不依赖网络，判官项（第 9/10 项）要联网。
+
+        - 没配探针：R-5 原有语义（到期就跑、失败记本次时间）。
+        - 配了探针（错过补跑，2026-11-24，BOOS 补定）：到期时先
+          探网——离线就只跑本地部分，判官部分挂成待跑
+          （state.self_check_pending），不写 self_check_last_run
+          （不许记成已尝试、更不许把下次时间推满一个周期）；
+          待跑期间每 probe_interval 秒探一次网，网络一恢复立刻
+          补跑完整自检，跑完才记 last_run、清待跑标记。
+        """
+        key = "self_check_last_run"
+        fn = getattr(self._store, "run_self_check", None)
+        pending = bool(state.get("self_check_pending"))
+        last = state.get(key)
+        due = not (
+            isinstance(last, (int, float))
+            and now - float(last) < self._self_check_interval
+        )
+        if not pending and not due:
+            return
+        if self._network_probe is None:
+            if fn is None:
+                state[key] = now
+                return
+            try:
+                fn()
+                logger.info("记忆维护：定期自检已跑完（报告见自检日志）。")
+            except Exception:
+                logger.warning(
+                    "记忆维护：self_check 跑失败，下个间隔再试。",
+                    exc_info=True,
+                )
+            state[key] = now
+            ran["self_check"] = True
+            return
+        if fn is None:
+            state[key] = now
+            state.pop("self_check_pending", None)
+            state.pop("self_check_pending_since", None)
+            return
+        last_probe = state.get("self_check_last_probe")
+        if (
+            pending
+            and isinstance(last_probe, (int, float))
+            and now - float(last_probe) < self._probe_interval
+        ):
+            return  # 待跑中，还没到下次探网时间
+        try:
+            online = bool(self._network_probe())
+        except Exception:
+            online = False  # 探针自己出错按离线算，宁可晚跑也不误报已跑
+        state["self_check_last_probe"] = now
+        if not online:
+            if not pending:
+                if self._run_self_check_local(fn):
+                    ran["self_check_local"] = True
+                state["self_check_pending"] = True
+                state.setdefault("self_check_pending_since", now)
+                logger.info(
+                    "记忆维护：自检到期但离线——本地部分已跑，"
+                    "判官部分挂待跑，等网络恢复补跑。"
+                )
+            return
+        try:
+            fn()
+            logger.info("记忆维护：定期自检已跑完（报告见自检日志）。")
+        except Exception:
+            logger.warning(
+                "记忆维护：self_check 跑失败，下个间隔再试。", exc_info=True
+            )
+            if not pending:
+                state[key] = now
+                ran["self_check"] = True
+            # 待跑补跑失败：继续挂着，下次探网再试，不记已跑。
+            return
+        state[key] = now
+        state.pop("self_check_pending", None)
+        state.pop("self_check_pending_since", None)
+        ran["self_check"] = True
+
+    def start(self):
+        """起守护线程：先补跑到期的，再按 tick 节奏巡回。重复调不重复起。"""
+        if self._thread is not None:
+            return self._thread
+
+        def _loop():
+            while not self._stop.is_set():
+                try:
+                    self.run_due()
+                except Exception:
+                    logger.warning("记忆维护调度一圈失败。", exc_info=True)
+                wait = self._tick
+                if getattr(self, "_pending_known", False):
+                    # 有判官部分挂着待跑：按探网节奏醒来看网络
+                    # 恢复了没有，别等满一个 tick（默认 1 小时）。
+                    wait = min(wait, self._probe_interval)
+                self._stop.wait(wait)
+
+        self._thread = threading.Thread(
+            target=_loop, daemon=True, name="memory-maintenance"
+        )
+        self._thread.start()
+        return self._thread
+
+    def stop(self):
+        self._stop.set()
+
+
+def _maintenance_interval_value(env_name, default):
+    """读间隔环境变量（个数值，单位由调用方定）：没设/写错/非正数都用默认。"""
+    raw = os.environ.get(env_name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else float(default)
+
+
+def start_memory_maintenance(store):
+    """给服务挂记忆维护调度（R-5）：状态文件放记忆库旁边——SQLite
+    后端是账本同目录，其他后端放仓库的 memory 目录。返回调度器。"""
+    ledger_path = getattr(store, "ledger_path", None)
+    if ledger_path:
+        state_path = Path(ledger_path).parent / "maintenance_state.json"
+    else:
+        state_path = (
+            Path(__file__).resolve().parent.parent
+            / "memory" / "maintenance_state.json"
+        )
+    scheduler = MemoryMaintenanceScheduler(
+        store,
+        state_path,
+        decay_interval_seconds=_maintenance_interval_value(
+            "SHIER_DECAY_SWEEP_INTERVAL_HOURS", 24
+        ) * 3600,
+        self_check_interval_seconds=_maintenance_interval_value(
+            "SHIER_SELF_CHECK_INTERVAL_DAYS", 7
+        ) * 24 * 3600,
+        tick_seconds=_maintenance_interval_value(
+            "SHIER_MAINTENANCE_TICK_SECONDS", 3600
+        ),
+        network_probe=_default_network_probe,
+        probe_interval_seconds=_maintenance_interval_value(
+            "SHIER_MAINTENANCE_PROBE_SECONDS", 900
+        ),
+    )
+    scheduler.start()
+    return scheduler
+
+
 def main(argv=None):
     """命令行入口：解析端口参数，启动服务，按 Ctrl+C 停止。"""
     parser = argparse.ArgumentParser(description="个人多模型 Agent 本地网页入口")
@@ -2062,13 +2464,11 @@ def main(argv=None):
     # SHIER_MEMORY_BACKEND=sqlite 时走 memory/sqlite_store.py
     # （JSONL 账本仍是真相源，SQLite WAL 只做索引）。
     # 切换只看环境变量，不改默认行为；测试服务在启动脚本里设。
-    _backend = os.environ.get("SHIER_MEMORY_BACKEND", "mem0").strip().lower()
-    if _backend == "sqlite":
-        from memory.sqlite_store import create_sqlite_store
+    # 2026-11-24 3c：选后端的逻辑收进 memory/store_factory，
+    # 命令行（main.py 的“记住……”）和网页共用一个入口，不再各选各的。
+    from memory.store_factory import create_store
 
-        mem0_store = create_sqlite_store(tracker)
-    else:
-        mem0_store = create_mem0_store(tracker)
+    mem0_store = create_store(tracker)
     if mem0_store is None:
         print("⚠️ 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
     else:
@@ -2148,6 +2548,16 @@ def main(argv=None):
             )
     except Exception:
         logger.warning("启动时流转对话全文失败。", exc_info=True)
+    # R-5（2026-11-24）：记忆维护调度——衰减清扫每天一次、每月自检
+    # 每月一次（到期才跑，上次运行时间落盘，启动时到期就补跑）。
+    # 以前这两个函数没有任何调用方，记忆永远不会沉底、自检永远
+    # 不出报告。调度挂不上只记日志，绝不拦服务启动。
+    if mem0_store is not None:
+        try:
+            start_memory_maintenance(mem0_store)
+            print("记忆维护调度已启动：衰减每天一次、自检每月一次（到期才跑）。", flush=True)
+        except Exception:
+            logger.warning("记忆维护调度启动失败：衰减/自检暂不自动跑。", exc_info=True)
     print(f"本地网页入口已启动：http://{config.host}:{config.port}", flush=True)
     print("在浏览器打开上面的地址就能对话，按 Ctrl+C 停止服务。", flush=True)
     try:

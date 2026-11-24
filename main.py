@@ -336,6 +336,29 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
             f"{_money_suffix(metadata.get('money'))}{event_suffix}"
             f"{_budget_setting_suffix(item['text'])}"
         )
+    # 冲突提示（webfix 三）：检索层给同话题冲突的一组标了
+    # conflict_current（现行）/conflict_stale（旧说法）——这里明确
+    # 告诉模型以哪条为准。实测根因：问“我的口味”时块里几条面条
+    # 记录互相矛盾，模型把整个话题跳过、漏答了刚纠正完的鸡杂面。
+    _conflict_currents = []
+    _has_conflict_stale = False
+    for item, _suffix in kept:
+        _meta = (item or {}).get("metadata") or {}
+        if _meta.get("conflict_stale") is True:
+            _has_conflict_stale = True
+        if (
+            _meta.get("conflict_current") is True
+            and item["text"] not in _conflict_currents
+        ):
+            _conflict_currents.append(item["text"])
+    if _has_conflict_stale and _conflict_currents:
+        for _current_text in _conflict_currents:
+            lines.append(
+                "注意：上面有互相矛盾的记录——关于同一件事，"
+                f"以最新且经用户确认的说法为准：「{_current_text}」；"
+                "其余的是更早或未经确认的说法，不要当成现行事实；"
+                "用户问起时可以简短提一句后来改过。"
+            )
     lines.append(
         "回答时第一句必须是结论（一句话），不要先复述上面的记忆、不要先说“我这边记录是……”。"
     )
@@ -404,8 +427,10 @@ def remember_content(text):
 def handle_remember(budget_tracker, text):
     """处理“记住……”命令：懒加载 mem0 记忆库，原文存一条记忆，不用确认。
 
-    记忆内容是“记住”后面的文字。命令行默认不加载 mem0（启动要约 25 秒），
-    只有用户明确说“记住”时才懒加载一次（get_mem0_store，建好后一直复用）。
+    记忆内容是“记住”后面的文字。命令行默认不加载记忆库（启动要约 25 秒），
+    只有用户明确说“记住”时才懒加载一次（store_factory.get_store，
+    默认 mem0 单例、建好后一直复用；后端按 SHIER_MEMORY_BACKEND
+    选，和网页服务同一个入口，2026-11-24 3c）。
     拿不到记忆库（没配 DEEPSEEK_API_KEY 或没装 mem0）时直接提示，不保存。
     保存失败时也只打印提示，不抛异常、不影响对话。
     """
@@ -413,7 +438,9 @@ def handle_remember(budget_tracker, text):
     if not content:
         print("要记住什么？用法：记住：内容（例如“记住：我喜欢喝咖啡”）。")
         return
-    store = mem0_store.get_mem0_store(budget_tracker)
+    from memory import store_factory as _store_factory
+
+    store = _store_factory.get_store(budget_tracker)
     if store is None:
         print("记忆未启用：请先配置 DEEPSEEK_API_KEY 并安装 mem0。")
         return
@@ -489,7 +516,11 @@ def _print_correction_result(saved):
     - failed：说清楚改失败了、原记忆没动；
     - not_found：新说法已经当新记忆正常存了，不用多说。
     """
-    correction = (saved or {}).get("correction") or {}
+    if not isinstance(saved, dict):
+        return None
+    correction = saved.get("correction") or {}
+    if not isinstance(correction, dict):
+        return None
     status = correction.get("status")
     if not status:
         return None
@@ -503,7 +534,16 @@ def _print_correction_result(saved):
         candidates = correction.get("candidates") or []
         print(f"有 {len(candidates)} 条相似的记忆，分不清改哪条：")
         for i, cand in enumerate(candidates, 1):
-            print(f"  {i}. {(cand or {}).get('text')}")
+            # 候选两种形状都认（2026-11-22 Bug 1）：字典取 text，
+            # 字符串是内存 ID（老数据/别的 store 交过来的），这里拿不到
+            # store 查文本，直接印 ID 本身，绝不崩。
+            if isinstance(cand, dict):
+                text = cand.get("text") or cand.get("id") or ""
+            elif isinstance(cand, str):
+                text = cand
+            else:
+                text = str(cand)
+            print(f"  {i}. {text}")
         print("请回复第几条（比如“第 1 条”），我再帮你改。")
     elif status == "failed":
         print(
@@ -896,8 +936,10 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # （save_turn 内部已把异常吞掉，只记日志；后台线程里的失败也一样）。
     # 26 号：save_turn 是后台存——回答先回、记忆后存；纠错/撤回的轮次
     # 在 save_turn 里自动走同步（结果要立刻告诉 BOOS）。
-    # 注意：这是每轮唯一一次 save_turn——chat_loop 和网页服务都不再
-    # 另外调（run_question 已存过，重复调等于每轮多付几次提取费用）。
+    # 注意：网页服务那条路每轮会调两次 save_turn——run_question 这里一次、
+    # ask() 收尾一次，同一 turn_id；第二次直接返回上次的回执（含
+    # correction），不重复存。chat_loop 不再另外调（run_question 已存过，
+    # 重复调等于每轮多付几次提取费用）。
     # 只带最近 6 条（约 3 轮）：每轮都把全部历史发去提取又贵又慢，
     # 最近的就够提取理解本轮了；和网页服务（web/server.py）一致。
     # 聊天纠错：add_turn 里已经改好/问好了，这里只把结果用人话告诉
@@ -916,8 +958,17 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
         )[-6:]
         with timer.measure("memory_save_ms"):
             saved = mem0_store.save_turn(recent, turn_id=turn_id)
-        correction = _print_correction_result(saved)
-        _print_protection_result(saved)
+        try:
+            correction = _print_correction_result(saved)
+        except Exception:
+            # 显示步骤绝不能把一次聊天变成 500（2026-11-22 Bug 1）：
+            # 打印崩了只记日志，纠错结果本身照常放进返回。
+            logger.warning("打印纠错结果失败。", exc_info=True)
+            correction = (saved or {}).get("correction")
+        try:
+            _print_protection_result(saved)
+        except Exception:
+            logger.warning("打印保护结果失败。", exc_info=True)
         # Plan C 撤回：本轮只有撤回信号、待定区里的上一轮已被丢掉时，
         # 告诉 BOOS 一声（dropped 为空且 dropped_count 是 0 时什么都没丢，不用多说）。
         # 撤回后回消息崩（2026-11-21 网页测第二轮 #1）：dropped 是句子列表，

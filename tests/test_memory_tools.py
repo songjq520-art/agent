@@ -129,7 +129,8 @@ def _texts(mem_store):
 
 def test_memory_tools_registered_with_right_flags():
     """45 号：四个记忆工具都登记了——列是低风险只读、可重跑；
-    记是中风险不重跑；改和删是中风险、要确认卡、不重跑。"""
+    记是中风险不重跑；改是中风险、不确认卡（纠正直接改）、不重跑；
+    删是中风险、要确认卡、不重跑（2026-11-22，BOOS 定：纠正不用确认）。"""
     register_memory_tools()
     listed = get_tool("list_memories")
     assert listed is not None
@@ -143,7 +144,7 @@ def test_memory_tools_registered_with_right_flags():
     assert added["replay_safe"] is False
     updated = get_tool("update_memory")
     assert updated["risk_level"] == "medium"
-    assert updated["needs_confirmation"] is True
+    assert updated["needs_confirmation"] is False
     assert updated["replay_safe"] is False
     deleted = get_tool("delete_memory")
     assert deleted["risk_level"] == "medium"
@@ -164,10 +165,11 @@ def test_register_memory_tools_idempotent():
 
 def test_loop_system_message_has_memory_rule():
     """45 号：循环的系统消息里有第 8 条——长期记忆用记忆工具，
-    改删过确认卡；55 号：记新事不再只认“记住”两个字——BOOS 明确表达的
+    改直接改、删过确认卡；55 号：记新事不再只认“记住”两个字——BOOS 明确表达的
     事实/偏好/决定/习惯都调 add_memory 存。"""
     assert "8. BOOS 让你看/改/删长期记忆时，用记忆工具" in LOOP_SYSTEM_MESSAGE
-    assert "改和删要先过确认卡" in LOOP_SYSTEM_MESSAGE
+    assert "改直接改、改完告诉 BOOS" in LOOP_SYSTEM_MESSAGE
+    assert "删要先过确认卡" in LOOP_SYSTEM_MESSAGE
     assert "明确表达的事实/偏好/决定/习惯" in LOOP_SYSTEM_MESSAGE
     assert "不只认“记住”两个字" in LOOP_SYSTEM_MESSAGE
     # 追加的那条（相对日期换算）现在是第 9 条。
@@ -322,10 +324,12 @@ def test_memory_tool_without_store_reports_not_enabled():
     assert "没启用" in result["error"]
 
 
-# ---------- 网关：改删要确认卡，列和记不用 ----------
+# ---------- 网关：删要确认卡，改直接改，列和记不用 ----------
 
-def test_gateway_needs_approval_for_update_delete_not_for_list_add(mem_store, gateway):
-    """45 号：网关层面——改和删要确认卡（没确认不执行），列和记不用。"""
+def test_gateway_update_executes_directly_delete_still_needs_approval(mem_store, gateway):
+    """S8（2026-11-22，BOOS 定：纠正不用确认，直接改）：网关层面——
+    改（update_memory）直接执行、不建确认卡，旧事实被取代、新事实入库；
+    删仍要确认卡（没确认不执行），列和记不用。"""
     register_memory_tools()
     budget_id = _mem_id(mem_store, "BOOS 每月工具预算 5 美元")
     coffee_id = _mem_id(mem_store, "BOOS 喜欢喝冰美式")
@@ -340,18 +344,21 @@ def test_gateway_needs_approval_for_update_delete_not_for_list_add(mem_store, ga
                 "new_text": "BOOS 每月工具预算 10 美元",
             },
         )
-        assert update["decision"] == "needs_approval"
+        assert update["decision"] == "ok"
+        assert update["approval"] is None
+        assert (update["result"] or {}).get("ok") is True
         delete = gateway.execute(
             "delete_memory",
             {"memory_id": coffee_id, "text": "BOOS 喜欢喝冰美式", "anchor_text": "冰美式"},
         )
         assert delete["decision"] == "needs_approval"
-    # 没确认之前，库里一条没动。
-    assert "BOOS 每月工具预算 5 美元" in _texts(mem_store)
+    # 改直接生效：旧的没了、新的进了库；删没确认之前一条没动。
+    assert "BOOS 每月工具预算 10 美元" in _texts(mem_store)
+    assert "BOOS 每月工具预算 5 美元" not in _texts(mem_store)
     assert "BOOS 喜欢喝冰美式" in _texts(mem_store)
 
 
-# ---------- 循环：模型能调记忆工具，改删走确认卡全流程 ----------
+# ---------- 循环：模型能调记忆工具，改直接改、删走确认卡全流程 ----------
 
 def test_loop_lists_memories_via_tool(mem_store, gateway, store):
     """45 号：聊天里模型调 list_memories，拿到库里的记忆再回答。"""
@@ -433,9 +440,9 @@ def test_loop_delete_via_approval_then_resume(mem_store, gateway, store):
     assert resumed["reply"] == "删掉了。"
 
 
-def test_loop_update_via_approval_then_resume(mem_store, gateway, store):
-    """45 号全流程（改）：模型调 update_memory → 循环停在确认卡（没改）→
-    BOOS 点确认 → 真改了 → 恢复循环 → 模型回答。"""
+def test_loop_update_executes_directly_without_approval(mem_store, gateway, store):
+    """S8（2026-11-22，BOOS 定：纠正不用确认）：模型调 update_memory →
+    直接改、循环正常结束、不停在确认卡，改完模型回答。"""
     budget_id = _mem_id(mem_store, "BOOS 每月工具预算 5 美元")
     provider = ScriptedProvider(
         script=[
@@ -458,29 +465,12 @@ def test_loop_update_via_approval_then_resume(mem_store, gateway, store):
     loop = _make_loop(provider, gateway, store)
     with bound_memory_store(mem_store):
         outcome = loop.run("把每月工具预算改成 10 美元")
-    # 第一步：停在确认卡，库里还没改。
-    assert outcome["mode"] == "waiting_approval"
-    assert outcome["approval"]["tool"] == "update_memory"
-    assert "BOOS 每月工具预算 5 美元" in _texts(mem_store)
-    task = outcome["task"]
-    # 第二步：BOOS 点确认，网关执行修改。
-    with bound_memory_store(mem_store):
-        resolved = gateway.resolve_approval(
-            store, task["task_id"], outcome["approval"]["approval_id"], "confirm"
-        )
-    assert resolved["decision"] == "ok"
-    assert resolved["result"]["ok"] is True
+    # 直接改、循环正常结束：不停在确认卡，改完模型回答。
+    assert outcome["mode"] == "done"
+    assert outcome.get("approval") is None
+    assert outcome["reply"] == "改好了。"
     assert "BOOS 每月工具预算 10 美元" in _texts(mem_store)
     assert "BOOS 每月工具预算 5 美元" not in _texts(mem_store)
-    # 第三步：恢复循环，模型回答。
-    with bound_memory_store(mem_store):
-        resumed = loop.run(
-            "把每月工具预算改成 10 美元",
-            resume_task=resolved["task"],
-            pending_tool_result=resolved["result"],
-        )
-    assert resumed["mode"] == "done"
-    assert resumed["reply"] == "改好了。"
 
 
 def test_loop_delete_cancel_keeps_memory(mem_store, gateway, store):

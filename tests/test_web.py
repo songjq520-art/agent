@@ -63,7 +63,7 @@ class FakeMem0Store:
         self.search_turn_ids = []
         self.saved_turn_ids = []
 
-    def add_memory_text(self, text, source="user", turn_id=None):
+    def add_memory_text(self, text, source="user", turn_id=None, **kwargs):
         """25 号直存：记下来，放进 memories 里让下一轮 search() 能找到
         （和真实库“存完下一句就能查到”一致），返回非空表示存成了。
         turn_id（2026-11-19）：本轮的 id，另记在 direct_turn_ids 里，
@@ -1241,7 +1241,9 @@ def test_chat_response_carries_correction_updated(
     )
     assert status == 200
     assert data["mode"] == "real"
-    assert data["reply"] == "假回答"
+    # 2026-11-23 model fix #3（BOOS 定）：纠正执行完直接说“已经改好了”，
+    # 不再原样返回模型那句“假回答”。
+    assert data["reply"] == "已经改好了：把“我喜欢喝咖啡。”改成了“我喜欢喝茶。”。"
     corr = data["correction"]
     assert corr["status"] == "updated"
     assert corr["memory_id"] == "fake-1"

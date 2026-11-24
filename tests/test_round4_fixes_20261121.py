@@ -1,6 +1,7 @@
 # tests/test_round4_fixes_20261121.py（第四轮网页测 5 项修复，2026-11-21）
 # 只测修复点本身；全部离线，不碰真实账本、不联网、不调真实模型。
 from datetime import date as _date
+from datetime import datetime as _datetime
 from pathlib import Path
 
 from config import BudgetTracker
@@ -35,9 +36,19 @@ def test_mentions_date_or_weekday():
     assert _mentions_date_or_weekday("明天去体检") is False  # 相对日子词走 event_date，不触发文本兜底
 
 
-def test_memory_block_outdated_memories_still_get_week_hint():
+def test_memory_block_outdated_memories_still_get_week_hint(monkeypatch):
     """已经存进去的老记忆没有 event_date，但正文提到“下周三”，
-    星期对照也要给出来——不然模型会把 11 月 25 日说成“这周三”。"""
+    星期对照也要给出来——不然模型会把 11 月 25 日说成“这周三”。
+
+    星期对照是按运行当天的日期现算的（main 里取上海时间），所以把
+    “今天”钉在 2026-11-22（周日）再测：这样“下周三”恒等于
+    2026-11-25，断言在哪一天跑都成立，不随运行日期漂移。"""
+    class _PinnedDatetime(_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 22, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr("main.datetime", _PinnedDatetime)
     mems = [
         {"text": "下周三我要出差", "metadata": {"source": "inferred"}},
         {"text": "公司临时又不要我去了", "metadata": {"source": "inferred"}},
@@ -70,7 +81,7 @@ class _MiniMem0Store:
         self.direct_stored = []
         self.memories = []
 
-    def add_memory_text(self, text, source="user", turn_id=None):
+    def add_memory_text(self, text, source="user", turn_id=None, **kwargs):
         self.direct_stored.append({"text": text, "source": source})
         if text not in self.memories:
             self.memories.append(text)

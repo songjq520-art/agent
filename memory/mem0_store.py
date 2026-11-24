@@ -5213,8 +5213,9 @@ class Mem0Store:
             return {"ok": False, "reason": "update_failed"}
         return {"ok": True, "memory_id": memory_id}
 
-    def run_self_check(self, now=None, sample_size=10):
-        """跑一次每月自检（见 memory/self_check.py 的九项表）。
+    def run_self_check(self, now=None, sample_size=20):
+        """跑一次定期自检（见 memory/self_check.py 的十项表；
+        第 9 项抽查 20 条，缺点清单第 4 条）。
         只查、只报告，不直接改库；要改的在报告每项的 actions 里，
         由调用方决定做不做。第 9 项模型抽查走 organizing_router
         （判官是大模型，费用记进整理记忆的预算）；路由不可用时
@@ -5943,8 +5944,13 @@ class Mem0Store:
             "consensus": False,
         }
 
-    def add_memory_text(self, text, layers=None, source="user", turn_id=None):
+    def add_memory_text(self, text, layers=None, source="user", turn_id=None,
+                        **kwargs):
         """手动存一条记忆原文（CLI“记住：内容”用，不经过提取）。
+
+        semantic_judge（kwargs 里）：调用方传进来时这里只接受、不处理——
+        混合语义判断只接在 SQLite 那条路（见 memory/sqlite_store.py），
+        mem0 这条路保持自己的提取流程，不在这里调模型。
 
         参数 text：记忆内容原文；layers：保留给以后用；
         turn_id：这条记忆是哪一轮里写进去的（add_turn 传进来；
@@ -7278,7 +7284,8 @@ class Mem0Store:
             return (items[0] or {}).get("id")
         return None
 
-    def correct_memory(self, old_text, new_text, exclude_identical_to_new=False):
+    def correct_memory(self, old_text, new_text, exclude_identical_to_new=False,
+                       explicit_correction=False):
         """纠错：把一条记错的记忆换成正确的（原地替换，同一 id）。
 
         什么时候调：BOOS 说“你记错了”并给出正确说法时（或以后网页端/
@@ -7289,6 +7296,11 @@ class Mem0Store:
         说法相同的候选是新说法自己，不是该改的那条，匹配前排除它；
         网页/命令行明确指旧条时不传，old_text 和 new_text 相同就是
         unchanged（别把另一条相似记忆改了）。
+        explicit_correction（2026-11-23 model fix #2，工具路传 True）：
+        模型按 BOOS 的话改记忆时是显式纠正。mem0 这路没有 0.70 预筛
+        （多候选走模型判官 _judge_correction 按槽位挑），所以这个标记
+        在这里只接住、不另起流程；为的是和 SQLiteStore.correct_memory
+        接口一致，工具路两边都能调。
         流程：
         1. 先找候选（_find_correction_candidates）。
            - 候选里有和 old_text 规整后完全相同的，先认它（哪怕还有

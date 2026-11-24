@@ -7,15 +7,18 @@
 #   1. save_turn 原样存事实、留回执（饺子/豆浆案的根治）
 #   2. 问句/闲聊不存；同一 turn_id 只存一次
 #   3. 日期换算：昨天/今天/前天/明天按 Asia/Shanghai 的今天算
-#   4. 来源标签：原样存的事实是 inferred（提取所得），不是 unconfirmed——
+#   4. 来源标签：原样存的事实是 user（已确认），不是 unconfirmed——
 #      标错了问答提示词会把它当“没来源”处理、问起来只说不知道
-#      （第一轮线上验收就是这么卡住的）；confirmed 键对齐 mem0 _provenance
+#      （第一轮线上验收就是这么卡住的）；confirmed 键对齐 mem0 _provenance。
+#      2026-11-22 BOOS 定选 A：save_turn 只存用户亲口说的话，一律按已确认算
+#      （之前标 inferred，S10 里新事实赢不了已确认旧行、被 pending_new 拦掉）。
 #   5. 对账只重建当前态（被取代/删了的不进索引）
 #   6. Chroma 一次性迁移幂等、跳过已删
-#   7. 检索原样匹配在前；correct_memory 明确报未实现、不悄悄猜
+#   7. 检索原样匹配在前；correct_memory 已接线（2026-11-22，见第 13 节）
 #   8. 账本是真相源：删库重建后能从账本对账恢复
 
 from datetime import date, timedelta
+import json
 import threading
 
 import numpy as np
@@ -40,6 +43,14 @@ def _ledger_lines(store):
 
 def _live_texts(store):
     return [item["text"] for item in store.get_all()]
+
+
+def _is_superseded(store, text):
+    """某条文本的行是不是已被取代（superseded=1）。"""
+    row = store._conn.execute(
+        "SELECT superseded FROM memories WHERE text=?", (text,)
+    ).fetchone()
+    return bool(row and row[0])
 
 
 # ---------- 1. 原样存事实 ----------
@@ -121,19 +132,23 @@ def test_save_turn_writes_event_date(store):
 
 
 # ---------- 3. 来源标签（第一轮验收卡住的根因） ----------
+# 2026-11-22 BOOS 定选 A 之后：save_turn 只存用户亲口说的话，来源是
+# user（已确认），不再是 inferred。
 
 
-def test_save_turn_source_is_inferred_not_unconfirmed(store):
-    """原样存的事实来源是 inferred（提取所得），出处完整（turn_id 在）；
-    unconfirmed 是留给“完全没来源信息”的旧记忆的桶，标错了问起来
-    模型只能说不知道。"""
+def test_save_turn_source_is_user_confirmed(store):
+    """S10（2026-11-22，BOOS 定选 A）：save_turn 只存用户本轮直接说的
+    话，来源是 user（已确认），不是 inferred——之前标 inferred/0.7，
+    新事实赢不了已确认的旧行，会被槽位裁决 pending_new 拦掉（郑州案）。
+    unconfirmed 仍是留给“完全没来源信息”的旧记忆的桶；模型推断的
+    事实不走 save_turn，仍按 inferred 存（见低可信度挂起的测试）。"""
     store.save_turn(
         [{"role": "user", "content": "我今天晚上吃了米线"}],
         turn_id="t-src",
     )
     meta = store.search("米线", top_k=1)[0]["metadata"]
-    assert meta["source"] == "inferred"
-    assert meta["confirmed"] is False
+    assert meta["source"] == "user"
+    assert meta["confirmed"] is True
     assert meta["turn_id"] == "t-src"
 
 
@@ -168,6 +183,13 @@ def test_ledger_is_truth_source_rebuild_after_db_deleted(store, tmp_path):
         [{"role": "user", "content": "我今天晚上吃了米线"}],
         turn_id="t-rebuild",
     )
+    # 2026-11-24 适配：save_turn 现在会起后台实时整理线程（第 8
+    # 条），它另开连接读同一个库文件；模拟删库前先等它跑完关掉
+    # 连接，不然 Windows 不让删正被打开的库文件。生产里删库也
+    # 得先停后台工作，同理。
+    _org = getattr(store, "_turn_organize_thread", None)
+    if _org is not None:
+        _org.join(timeout=30)
     store._conn.close()
     for suffix in ("", "-wal", "-shm"):
         try:
@@ -269,13 +291,151 @@ def test_search_semantic_with_fake_vectors(tmp_path, monkeypatch):
     assert hits[0]["text"] == "我今天晚上吃了米线"
 
 
-def test_correct_memory_not_yet_implemented(store):
-    """纠错还没接：明确报未实现，不悄悄猜着改。"""
-    store.add_memory_text("我喜欢吃火锅", source="inferred")
+def test_correct_memory_updates_exact_match(store):
+    """纠错已接线（2026-11-22）：原样在库里时直接改那条。
+    追加式：旧行标被取代、新说法另存一条，原话留在账本里。
+    （2026-11-24 适配：旧行改用亲口来源播种——推断未确认的旧行
+    按 BOOS 新裁决要先问、回执是 pending_question，不再立即顶；
+    那条路有 fx8prot 专项测试管，本测只管纠正机制本身。）"""
+    store.add_memory_text("我喜欢吃火锅", source="user")
     out = store.correct_memory("我喜欢吃火锅", "我喜欢吃冒菜")
-    assert out.get("status") == "failed"
-    assert out.get("reason") == "sqlite_correct_not_yet"
+    assert out.get("status") == "updated"
+    assert out.get("old_text") == "我喜欢吃火锅"
+    assert out.get("new_text") == "我喜欢吃冒菜"
+    assert out.get("layer") == "exact"
+    assert _live_texts(store) == ["我喜欢吃冒菜"]
+    assert "我喜欢吃火锅" not in _live_texts(store)
+    lines = _ledger_lines(store)
+    assert any('"type": "supersede"' in line for line in lines)
+    assert any("我喜欢吃火锅" in line for line in lines)
+
+
+def test_correct_memory_not_found(store):
+    """纠错找不到旧记忆时报 not_found，原记忆不动、不瞎改。"""
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    out = store.correct_memory("我住北京", "我住上海")
+    assert out.get("status") == "not_found"
+    assert out.get("layer") == "none"
+    assert _live_texts(store) == ["我喜欢吃火锅"]
+
+
+def test_correct_memory_unchanged_when_already_correct(store):
+    """新说法和旧的一样时报 unchanged，不重复存。"""
+    store.add_memory_text("我喜欢吃冒菜", source="inferred")
+    out = store.correct_memory("我喜欢吃冒菜", "我喜欢吃冒菜")
+    assert out.get("status") == "unchanged"
+    assert _live_texts(store) == ["我喜欢吃冒菜"]
+    assert len(_ledger_lines(store)) == 1  # 只一笔 add，没多写 supersede
+
+
+def test_correct_memory_ambiguous_with_two_candidates(store):
+    """两条都像、没有原样时报 ambiguous，不猜改哪条。"""
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    store.add_memory_text("我喜欢吃冒菜", source="inferred")
+    out = store.correct_memory("我喜欢吃辣的", "我喜欢吃米线")
+    assert out.get("status") == "ambiguous"
+    assert len(out.get("candidates") or []) == 2
+    assert set(_live_texts(store)) == {"我喜欢吃火锅", "我喜欢吃冒菜"}
+
+
+def test_save_turn_correction_updates_old_memory(store):
+    """save_turn 端到端纠错：先存“我住北京”，再说“你记错了，我住上海”，
+    旧的被取代、新的存下来，回执里带 correction（2026-11-22 接线）。"""
+    r1 = store.save_turn(
+        [{"role": "user", "content": "我住北京"}], turn_id="t-home-1",
+    )
+    assert r1["stored"] == ["我住北京"]
+    r2 = store.save_turn(
+        [{"role": "user", "content": "你记错了，我住上海"}],
+        turn_id="t-home-2",
+    )
+    assert (r2.get("correction") or {}).get("status") == "updated"
+    assert r2["stored"] == []
+    assert _live_texts(store) == ["我住上海"]
+
+
+def test_save_turn_correction_not_found_saves_new_fact(store):
+    """纠错找不到旧记忆时（not_found）：新说法当新记忆存下来，
+    回执里同样带 correction（mem0 同款）。"""
+    r = store.save_turn(
+        [{"role": "user", "content": "你记错了，我住上海"}],
+        turn_id="t-home-nf",
+    )
+    assert (r.get("correction") or {}).get("status") == "not_found"
+    assert r["stored"] == ["我住上海"]
+    assert _live_texts(store) == ["我住上海"]
+
+
+def test_save_turn_same_turn_id_returns_cached_receipt_with_correction(store):
+    """根因 a（2026-11-22）：同一 turn_id 调两次 save_turn，第二次返回
+    上次的回执（含 correction），不重复存、纠正结果不丢。"""
+    store.save_turn(
+        [{"role": "user", "content": "我住北京"}], turn_id="t-dup-corr-1",
+    )
+    first = store.save_turn(
+        [{"role": "user", "content": "你记错了，我住上海"}],
+        turn_id="t-dup-corr-2",
+    )
+    assert (first.get("correction") or {}).get("status") == "updated"
+    second = store.save_turn(
+        [{"role": "user", "content": "你记错了，我住上海"}],
+        turn_id="t-dup-corr-2",
+    )
+    assert second.get("duplicate_turn") is True
+    assert (second.get("correction") or {}).get("status") == "updated"
+    assert _live_texts(store) == ["我住上海"]
+
+
+def test_save_turn_ambiguous_correction_still_stores_new_fact(store):
+    """根因 c（2026-11-22）：纠正判 ambiguous 时，新说法仍当新事实存下来，
+    回执里 correction 状态照实是 ambiguous（不是 updated，也不是丢了）。"""
+    store.add_memory_text("我喜欢吃火锅", source="inferred")
+    store.add_memory_text("我喜欢吃冒菜", source="inferred")
+    r = store.save_turn(
+        [{"role": "user", "content": "不对，我喜欢吃米线"}],
+        turn_id="t-amb-new",
+    )
+    assert (r.get("correction") or {}).get("status") == "ambiguous"
+    assert "我喜欢吃米线" in _live_texts(store)
     assert "我喜欢吃火锅" in _live_texts(store)
+    assert "我喜欢吃冒菜" in _live_texts(store)
+
+
+def _tea_fake_embed(self, text):
+    """测试用假向量：茶类（红/绿/花）同向，其余正交。"""
+    if any(word in (text or "") for word in ("红茶", "绿茶", "花茶")):
+        return [1.0, 0.1]
+    return [0.0, 1.0]
+
+
+def test_correct_memory_multi_candidate_filters_by_similarity(store, monkeypatch):
+    """根因 b（2026-11-22）：多候选时按相似度筛——只留 ≥0.70 的；
+    筛后剩 1 条就取代它，不再一刀切判 ambiguous。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _tea_fake_embed)
+    # 2026-11-24 适配：播种改亲口来源（推断旧行按新裁决先问再顶，
+    # 见 test_correct_memory_updates_exact_match 的注释）。
+    store.add_memory_text("我喜欢喝红茶", source="user")
+    store.add_memory_text("我喜欢喝咖啡", source="user")
+    store.add_memory_text("我喜欢吃包子", source="user")
+    store.add_memory_text("我喜欢去爬山", source="user")
+    out = store.correct_memory("我喜欢喝绿茶", "我喜欢喝绿茶")
+    assert out.get("status") == "updated"
+    assert out.get("old_text") == "我喜欢喝红茶"
+    assert len(out.get("candidates") or []) >= 2  # 确实走了多候选那条路
+    assert "我喜欢喝绿茶" in _live_texts(store)
+    assert "我喜欢喝红茶" not in _live_texts(store)
+    assert "我喜欢喝咖啡" in _live_texts(store)
+
+
+def test_correct_memory_multi_candidate_all_high_similarity_is_ambiguous(store, monkeypatch):
+    """根因 b：多条候选都 ≥0.70 时仍判 ambiguous，不猜改哪条。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _tea_fake_embed)
+    store.add_memory_text("我喜欢喝红茶", source="inferred")
+    store.add_memory_text("我喜欢喝花茶", source="inferred")
+    out = store.correct_memory("我喜欢喝绿茶", "我喜欢喝绿茶")
+    assert out.get("status") == "ambiguous"
+    assert len(out.get("candidates") or []) == 2
+    assert set(_live_texts(store)) == {"我喜欢喝红茶", "我喜欢喝花茶"}
 
 
 # ---------- 7. BM25 + RRF 融合检索（第二步第一段，2026-11-21） ----------
@@ -328,7 +488,7 @@ def test_rrf_fusion_order_differs_from_each_road(tmp_path, monkeypatch):
     s.add_memory_text("爱吃饺子", source="inferred")
     hits = s.search("我爱吃什么", top_k=3)
     assert [h["text"] for h in hits] == ["我爱吃火锅", "我爱的是冒菜", "爱吃饺子"]
-    assert all(h["decay_weight"] == 1.0 for h in hits)
+    assert all(h["decay_weight"] == pytest.approx(1.0, abs=1e-3) for h in hits)
 
 
 def test_verbatim_still_first_with_rrf(tmp_path, monkeypatch):
@@ -399,14 +559,16 @@ def test_q4_both_fund_rows_in_top5(tmp_path, monkeypatch):
 
 def test_search_result_shape_unchanged(store):
     """返回形状不变：还是 {"id","text","score","source","metadata",
-    "confirmed","decay_weight","is_history"} 这 8 个键，decay_weight 是 1.0。"""
+    "confirmed","decay_weight","is_history"} 这 8 个键，decay_weight 是 1.0。
+    2026-11-22 decay 接线后权重是真算出来的：刚存的记忆闲置约 0 天，
+    权重 ≈1.0（不是字面 1.0），所以用 approx 断言。"""
     store.add_memory_text("我今天晚上吃了米线", source="inferred")
     hit = store.search("米线", top_k=1)[0]
     assert set(hit.keys()) == {
         "id", "text", "score", "source", "metadata",
         "confirmed", "decay_weight", "is_history",
     }
-    assert hit["decay_weight"] == 1.0
+    assert hit["decay_weight"] == pytest.approx(1.0, abs=1e-3)
     assert hit["is_history"] is False
 
 
@@ -472,7 +634,7 @@ def test_q3_correction_row_back_in_top5(tmp_path, monkeypatch):
         "用户表示其实也不是很喜欢吃鸡杂面，纠正了此前“喜欢吃鸡杂面”的说法。",
         "BOOS 喜欢吃鸡杂面。",
     ]
-    assert all(h["decay_weight"] == 1.0 for h in hits)
+    assert all(h["decay_weight"] == pytest.approx(1.0, abs=1e-3) for h in hits)
 
 
 def test_event_question_not_swamped_by_preference_boost(tmp_path, monkeypatch):
@@ -570,19 +732,65 @@ def test_delete_memory_supports_ledger_only_key_and_rejects_missing(store):
     }
 
 
-def test_save_turn_skips_correction_utterance_before_wired(store):
-    """纠错未接线前，'你记错了...' 不当成事实污染进库；句中含'记错了'的正常陈述仍保留。"""
+def test_revive_memory_restores_superseded_row(store):
+    """被错取代的记忆能恢复：revive 后行重新变活，账本里有一笔 REVIVE 事件。"""
+    added = store.add_memory_text("我住广州", source="user")
+    gid = added.get("id")
+    assert gid
+    out = store.correct_memory("我住广州", "我住杭州")
+    assert out.get("status") == "updated"
+    assert "我住广州" not in _live_texts(store)
+    revived = store.revive_memory(gid)
+    assert revived.get("status") == "revived"
+    assert revived.get("seq") is not None
+    assert "我住广州" in _live_texts(store)
+    assert "我住杭州" in _live_texts(store)
+    lines = _ledger_lines(store)
+    assert any('"type": "revive"' in line for line in lines)
+    assert store.revive_memory(gid).get("status") == "unchanged"
+    assert store.revive_memory("no-such-id").get("status") == "not_found"
+
+
+def test_slot_conflict_no_correction_keeps_both(store):
+    """2026-11-23 model fix #1（BOOS 定，取代 S1 2026-11-22“同可信度新的赢”）：
+    没纠正词的新陈述只存新行、不顶旧的——哪怕旧行写序号比新探测大
+    （服务重启后 _WRITE_SEQ 归零的真实情形），南京也留着，苏州另存一条。"""
+    store.add_memory_text("我住在南京", source="inferred")
+    row = store._conn.execute(
+        "SELECT id, metadata_json FROM memories WHERE text=?", ("我住在南京",)
+    ).fetchone()
+    meta = json.loads(row[1] or "{}")
+    meta["write_seq"] = 10 ** 9
+    store._conn.execute(
+        "UPDATE memories SET metadata_json=? WHERE id=?",
+        (json.dumps(meta, ensure_ascii=False), row[0]),
+    )
+    store._conn.commit()
+    r = store.save_turn(
+        [{"role": "user", "content": "我住在苏州"}], turn_id="t-slot-s1",
+    )
+    assert set(_live_texts(store)) == {"我住在苏州", "我住在南京"}
+    assert r["stored"] == ["我住在苏州"]
+    assert r.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_save_turn_correction_utterance_goes_through_correction(store):
+    """纠错已接线（2026-11-22）：“你记错了，我住上海”走 correct_memory，
+    不当成事实污染进库；句中含“记错了”的正常陈述仍照常存。"""
     r1 = store.save_turn(
         [{"role": "user", "content": "你记错了，我住上海"}],
         turn_id="t-corr",
     )
-    assert r1["stored"] == []
-    assert _live_texts(store) == []
+    assert (r1.get("correction") or {}).get("status") == "not_found"
+    assert r1["stored"] == ["我住上海"]
+    assert _live_texts(store) == ["我住上海"]
 
     r2 = store.save_turn(
         [{"role": "user", "content": "我昨天记错了开会时间"}],
         turn_id="t-normal",
     )
+    assert "correction" not in r2
     assert r2["stored"] == ["我昨天记错了开会时间"]
 # ---------- 10. Gemini 第二轮：敏感信息拦截（#1）+ 单连接多线程锁（#2） ----------
 
@@ -794,24 +1002,31 @@ def test_save_turn_without_turn_id_retracts_whole_turn(store):
     assert _live_texts(store) == []
 
 
-def test_correction_with_prefix_is_blocked(store):
-    """“不对/不是”开头的纠错句也被拦下；句中含“记错了”的正常陈述仍存。"""
+def test_correction_with_prefix_goes_through_correction(store):
+    """“不对/不是”开头的纠错句也走 correct_memory（2026-11-22 接线）；
+    句中含“记错了”的正常陈述仍照常存。"""
     r1 = store.save_turn(
         [{"role": "user", "content": "不对，你记错了，我住上海"}],
         turn_id="t-round3-corr1",
     )
-    assert r1["stored"] == []
+    assert (r1.get("correction") or {}).get("status") == "not_found"
+    assert r1["stored"] == ["我住上海"]
     r2 = store.save_turn(
         [{"role": "user", "content": "不是，记错了，我住广州"}],
         turn_id="t-round3-corr2",
     )
+    # “记错了”已补进 _detect_correction 的说法里：裸“记错了”也认作纠错，
+    # 新说法“我住广州”走 correct_memory，取代“我住上海”。
+    assert "correction" in r2
+    assert (r2.get("correction") or {}).get("status") == "updated"
     assert r2["stored"] == []
-    assert _live_texts(store) == []
+    assert set(_live_texts(store)) == {"我住广州"}
 
     r3 = store.save_turn(
         [{"role": "user", "content": "我昨天记错了开会时间"}],
         turn_id="t-round3-corr3",
     )
+    assert "correction" not in r3
     assert r3["stored"] == ["我昨天记错了开会时间"]
 
 
@@ -838,11 +1053,13 @@ def test_import_from_mem0_skips_sensitive(store):
 
 
 def test_search_prefers_confirmed_copy_over_inferred(store):
-    """包子两条同文本：已确认版赢过推断版，search 只返回确认版（#2）。
+    """包子同文本：已确认版赢过推断版，search 只返回确认版（#2）。
 
     生产现状：seq 117 是 BOOS 确认过的“我今天早上吃了俩包子”，
     另有一行同文本的推断版；以前先到先得，推断版抢了名额，
     问起来还加一句“没逐条确认过”。
+    2026-11-22 Bug 2 去重改了行为：同文只留一行（确认版），不再两行
+    并存、只在检索层聚合——断言改成 1 行。
     """
     saved = store.add_memory_text("我今天早上吃了俩包子", source="user")
     store.confirm_memory(saved["id"])
@@ -850,7 +1067,7 @@ def test_search_prefers_confirmed_copy_over_inferred(store):
         [{"role": "user", "content": "我今天早上吃了俩包子"}],
         turn_id="t-baozi-dup",
     )
-    assert len(_live_texts(store)) == 2  # 两行都在库里，只在检索层聚合
+    assert len(_live_texts(store)) == 1  # Bug 2 去重：同文只留一行（确认版）
     results = store.search("我今天早上吃了什么", top_k=5)
     assert results, "包子该搜得到"
     assert results[0]["text"] == "我今天早上吃了俩包子"
@@ -863,13 +1080,12 @@ def test_search_confirmed_beats_identical_unconfirmed(store):
 
     两行除了基金名以外一字不差、等长，BM25 分数相等，排位只由确认
     优先（平局裁决）决定——万家（确认）必须在恒生（未确认）前面。
-    """
+    未确认行直接用 inferred 直存来种：2026-11-22 BOOS 定选 A 之后
+    save_turn 存的都是已确认版，搭不出“一个确认、一个未确认”的对照
+    （见 test_save_turn_source_is_user_confirmed）。"""
     saved = store.add_memory_text("我每天定投 5 块买万家纳指", source="user")
     store.confirm_memory(saved["id"])
-    store.save_turn(
-        [{"role": "user", "content": "我每天定投 5 块买恒生指数"}],
-        turn_id="t-hs-ding",
-    )
+    store.add_memory_text("我每天定投 5 块买恒生指数", source="inferred")
     results = store.search("我每天定投 5 块买什么", top_k=5)
     assert [r["text"] for r in results] == [
         "我每天定投 5 块买万家纳指",
@@ -1010,3 +1226,641 @@ def test_bare_remember_command_dropped(store):
     )
     assert receipt["stored"] == []
     assert _live_texts(store) == []
+
+
+# ---------- 13. correct_memory + decay 接线（2026-11-22） ----------
+# Gemini 第二轮 #4（同文去重 / slot 覆盖）+ #5（历史查询）+ decay.py 接线
+# + _looks_like_fact 临时纠错过滤移除 + deletion_scope 账本历史 bug 修。
+
+
+def _meta_of(store, memory_id):
+    for item in store.get_all(include_sensitive=True):
+        if item["id"] == memory_id:
+            return item["metadata"]
+    raise AssertionError(f"库里没有 {memory_id}")
+
+
+def _age_memory(store, memory_id, days):
+    """把一条记忆的 last_used_at 拨到几天前（模拟“很久没用”）。"""
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    row = store._conn.execute(
+        "SELECT metadata_json FROM memories WHERE id=?", (memory_id,)
+    ).fetchone()
+    meta = _json.loads(row[0])
+    old = datetime.now(timezone.utc) - timedelta(days=days)
+    meta["last_used_at"] = old.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    store._conn.execute(
+        "UPDATE memories SET metadata_json=? WHERE id=?",
+        (_json.dumps(meta, ensure_ascii=False), memory_id),
+    )
+    store._conn.commit()
+
+
+def test_add_same_text_same_source_returns_unchanged(store):
+    """Gemini #4 同文去重：同一原文、同一来源再存一次，不存第二行，
+    返回 UNCHANGED；账本不另写 add。"""
+    first = store.add_memory_text("我喜欢吃火锅", source="inferred")
+    assert first.get("event") == "ADD"
+    second = store.add_memory_text("我喜欢吃火锅", source="inferred")
+    assert second.get("event") == "UNCHANGED"
+    assert second.get("id") == first.get("id")
+    assert _live_texts(store) == ["我喜欢吃火锅"]
+    assert len(_ledger_lines(store)) == 1
+
+
+def test_add_same_text_different_source_keeps_one_row(store):
+    """同文、来源不同（已确认版 vs 推断版）时只留一行（2026-11-22
+    Bug 2 去重改了行为：同文去重只看归一化文本，不看来源；以前两行
+    并存的旧断言已作废）：检索层只剩确认版那一行。"""
+    store.add_memory_text("我喜欢吃火锅", source="user")
+    second = store.add_memory_text("我喜欢吃火锅", source="inferred")
+    assert second.get("event") == "UNCHANGED"
+    assert len(_live_texts(store)) == 1
+    results = store.search("我喜欢吃什么", top_k=5)
+    assert [r["text"] for r in results] == ["我喜欢吃火锅"]
+    assert results[0]["confirmed"] is True
+
+
+def test_add_same_slot_no_correction_keeps_both(store):
+    """2026-11-23 model fix #1（BOOS 定，取代 Gemini #4 同槽自动顶旧）：
+    无纠正词的直存只存新行、不顶旧的——“我叫大明”和“我叫小宋”并存，
+    账本只有 add、没有 supersede。"""
+    store.add_memory_text("我叫小宋", source="user", slot="user_name")
+    out = store.add_memory_text("我叫大明", source="user", slot="user_name")
+    assert out.get("event") == "ADD"
+    assert _live_texts(store) == ["我叫大明", "我叫小宋"]
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_add_same_slot_lower_credibility_stores_new_row(store):
+    """2026-11-23 model fix #1（BOOS 定）：无纠正词的新说法不裁决取代、
+    也不挂起——直接存成新行（ADD），新旧并存。待确认（PENDING）只在
+    “要不要取代旧的”这个决定本身拿不准时才出现；不取代就没什么可挂的。"""
+    store.add_memory_text("我叫小宋", source="user", slot="user_name")
+    out = store.add_memory_text("我叫大明", source="inferred", slot="user_name")
+    assert out.get("event") == "ADD"
+    assert _live_texts(store) == ["我叫大明", "我叫小宋"]
+
+
+def test_search_history_returns_superseded_versions(store):
+    """Gemini #5 历史查询：默认只返回活记忆；include_history=True 时，
+    在活记忆后面补账本里被取代的旧版本（is_history=True）。"""
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
+    store.correct_memory("我住北京", "我住上海")
+    live = store.search("我住", top_k=5)
+    assert [h["text"] for h in live] == ["我住上海"]
+    assert all(h["is_history"] is False for h in live)
+    hist = store.search("我住", top_k=5, include_history=True)
+    texts = [h["text"] for h in hist]
+    assert texts[0] == "我住上海"
+    assert "我住北京" in texts
+    old = [h for h in hist if h["text"] == "我住北京"][0]
+    assert old["is_history"] is True
+    assert old["source"] == "history"
+    assert store.search_history("我住", top_k=5) == hist
+
+
+def test_deletion_scope_history_after_correction(store):
+    """修 bug：deletion_scope 的账本历史不再报 AttributeError，
+    纠错后能看到 add + supersede 两笔事件。"""
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
+    out = store.correct_memory("我住北京", "我住上海")
+    scope = store.deletion_scope(out.get("memory_id"))
+    assert scope["found"] is True
+    assert scope["history_count"] == 2
+    types = [(e or {}).get("type") for e in scope["history_entries"]]
+    assert "add" in types
+    assert "supersede" in types
+
+
+def test_bare_correction_signal_still_dropped(store):
+    """_looks_like_fact 的临时宽过滤已移除（2026-11-22），但光秃秃的
+    纠错信号（“你记错了”后面没跟新说法）仍不是事实，不存。"""
+    r = store.save_turn(
+        [{"role": "user", "content": "你记错了"}],
+        turn_id="t-bare-corr",
+    )
+    assert r["stored"] == []
+    assert _live_texts(store) == []
+
+
+def test_decay_weight_ages_episodic_memory_to_floor(store):
+    """decay 接线：60 天没用的一次性经历，权重掉到下限 0.10，
+    但照常搜得到（权重只管排位、不管资格）。"""
+    saved = store.add_memory_text("我喜欢吃火锅", source="inferred")
+    _age_memory(store, saved["id"], 60)
+    hits = store.search("我喜欢吃火锅", top_k=5)
+    assert [h["text"] for h in hits] == ["我喜欢吃火锅"]
+    assert hits[0]["decay_weight"] == pytest.approx(0.10)
+
+
+def test_occurrence_promotes_after_three_distinct_days(store):
+    """同文在不同天、不同会话出现 3 次就晋升成稳定事实（decay.py 的规矩）。"""
+    saved = store.add_memory_text("我去盐湖城出差了", source="inferred", turn_id="t-day1")
+    mid = saved["id"]
+    assert _meta_of(store, mid)["decay_kind"] == "episodic"
+    store._record_occurrence(mid, _meta_of(store, mid), "2026-11-14", "t-day2")
+    assert _meta_of(store, mid)["decay_kind"] == "episodic"
+    promoted = store._record_occurrence(mid, _meta_of(store, mid), "2026-11-15", "t-day3")
+    assert promoted is True
+    assert _meta_of(store, mid)["decay_kind"] == "stable"
+    assert any('"type": "promote"' in line for line in _ledger_lines(store))
+
+
+def test_sweep_decay_marks_dormant_and_delete_due(store):
+    """sweep_decay：40 天没用的一次性经历标沉底，200 天的标待删，
+    核心记忆不动；只打标、不删，库里条数不变。"""
+    episodic = store.add_memory_text("我上周去了一趟盐湖城出差", source="inferred")
+    old = store.add_memory_text("我去年去了一趟广州出差", source="inferred")
+    core = store.add_memory_text("我爱吃火锅", source="user")
+    _age_memory(store, episodic["id"], 40)
+    _age_memory(store, old["id"], 200)
+    _age_memory(store, core["id"], 200)
+    out = store.sweep_decay()
+    assert out == {"dormant": 1, "delete_due": 1}
+    assert _meta_of(store, episodic["id"])["decay_state"] == "dormant"
+    assert _meta_of(store, old["id"])["decay_state"] == "decay_delete_due"
+    assert _meta_of(store, core["id"])["decay_state"] == "verbatim"
+    assert len(_live_texts(store)) == 3
+    assert any('"type": "dormant"' in line for line in _ledger_lines(store))
+
+
+def test_note_context_revives_dormant_memory(store):
+    """沉底的记忆被用上（note_context）就回到原话态，账本记 REVIVE。"""
+    saved = store.add_memory_text("我上周去了一趟盐湖城出差", source="inferred")
+    _age_memory(store, saved["id"], 40)
+    store.sweep_decay()
+    assert _meta_of(store, saved["id"])["decay_state"] == "dormant"
+    store.note_context([{"id": saved["id"]}])
+    assert _meta_of(store, saved["id"])["decay_state"] == "verbatim"
+    assert any('"type": "revive"' in line for line in _ledger_lines(store))
+
+
+# ---------- 14. 待补测试（2026-11-22，第二轮 review） ----------
+# 待补清单见 ~/workspace/十二correct-memory-decay-待补测试-2026-11-22.md。
+# 第 4 条按 BOOS 已定行为断言：取代失败时返回 failed、新记忆保留、
+# 旧记忆仍活着（不回滚删新行）。
+
+
+def test_correction_repeat_same_fact_is_unchanged_no_dup(store):
+    """待补 1a：库里只有“我住广州”，再说“不对，我住广州”，
+    报 unchanged，不产生重复行（账本只有最初那一笔 add）。"""
+    store.add_memory_text("我住广州", source="inferred")
+    r = store.save_turn(
+        [{"role": "user", "content": "不对，我住广州"}],
+        turn_id="t-corr-repeat-1",
+    )
+    assert (r.get("correction") or {}).get("status") == "unchanged"
+    assert r["stored"] == []
+    assert _live_texts(store) == ["我住广州"]
+    assert len(_ledger_lines(store)) == 1
+
+
+def test_correction_to_existing_fact_reuses_row(store):
+    """待补 1b：库里同时有“我住上海”和“我住广州”，说“不对，我住广州”，
+    最终只有 1 条“我住广州”：复用已有行、不新插，旧的上海被取代。"""
+    # 前置态是“库里已有两条同槽位活行”：add_memory_text 现在会按槽位
+    # 裁决（S10 修法 2），走正常入口第二条会直接取代第一条、搭不出这个
+    # 前置态；所以用 _plant_memory_row 绕开入口直接插行（模拟修复前
+    # 工具路直存留下的旧数据）。测的是 correct_memory 的复用逻辑本身。
+    _plant_memory_row(store, "我住上海")
+    _plant_memory_row(store, "我住广州")
+    # 2026-11-24 适配：_plant_memory_row 播的是推断未确认行，按
+    # BOOS 新裁决纠正它要先问（pending_question）；本测管的是
+    # 复用行机制，前置态改成两条已确认行（推断版有 fx8prot
+    # 专项测试管）。直接把两行的来源标成亲口已确认。
+    for _t in ("我住上海", "我住广州"):
+        _m = json.loads(
+            store._conn.execute(
+                "SELECT metadata_json FROM memories WHERE text=?", (_t,)
+            ).fetchone()[0] or "{}"
+        )
+        _m.update({"source": "user", "user_confirmed": True, "confidence": 1.0})
+        store._conn.execute(
+            "UPDATE memories SET metadata_json=? WHERE text=?",
+            (json.dumps(_m, ensure_ascii=False), _t),
+        )
+    store._conn.commit()
+    r = store.save_turn(
+        [{"role": "user", "content": "不对，我住广州"}],
+        turn_id="t-corr-reuse-1",
+    )
+    assert (r.get("correction") or {}).get("status") == "updated"
+    assert r["stored"] == []
+    assert _live_texts(store) == ["我住广州"]
+    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+    assert len([t for t in _live_texts(store) if t == "我住广州"]) == 1
+
+
+def test_correction_safety_net_blocks_cross_topic_supersede(tmp_path, monkeypatch):
+    """待补 2：库里只有“我喜欢科幻电影”，用户说“不对，我住广州”
+    （save_turn 走 correct_memory(fact, fact)），安全网用库里旧向量
+    old_vec 算相似度：科幻 [1, 0] vs 广州 [0.6, 0.8] 相似度 0.6 < 0.70，
+    拦截误取代，报 ambiguous，旧行原样不动、不被取代。2026-11-22
+    修复 3 之后：ambiguous 时新说法不再丢，当新事实存下来。"""
+    def _fake_embed(self, text):
+        if "科幻" in (text or ""):
+            return np.array([1.0, 0.0], dtype="float32")
+        if "广州" in (text or ""):
+            return np.array([0.6, 0.8], dtype="float32")
+        return np.array([0.0, 1.0], dtype="float32")
+
+    monkeypatch.setattr(SQLiteStore, "_embed_text", _fake_embed)
+    s = SQLiteStore(memory_dir=str(tmp_path / "memory"))
+    s.add_memory_text("我喜欢科幻电影", source="inferred")
+    r = s.save_turn(
+        [{"role": "user", "content": "不对，我住广州"}],
+        turn_id="t-corr-safetynet-1",
+    )
+    correction = r.get("correction") or {}
+    assert correction.get("status") == "ambiguous"
+    assert (correction.get("audit") or {}).get("method") == "safety_net"
+    assert (correction.get("audit") or {}).get("similarity") == pytest.approx(0.6)
+    # 修复 3：ambiguous 时新说法当新事实存下来，不再丢。
+    assert r["stored"] == ["我住广州"]
+    assert set(_live_texts(s)) == {"我喜欢科幻电影", "我住广州"}
+    # 安全网的本职还在：旧行没被取代，账本里没多写 supersede。
+    assert len(_ledger_lines(s)) == 2  # 科幻 add + 广州 add
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(s))
+
+
+def test_decay_delete_due_revive_and_double_sweep_idempotent(store):
+    """待补 3：decay_delete_due 的记忆被用上就复活回 verbatim；
+    已是 delete_due 的记忆再扫两次也不重复改写、不重复记账。"""
+    revive = store.add_memory_text("我去年去了一趟广州出差", source="inferred")
+    stale = store.add_memory_text("我去年去了一趟深圳出差", source="inferred")
+    _age_memory(store, revive["id"], 200)
+    _age_memory(store, stale["id"], 200)
+    out1 = store.sweep_decay()
+    assert out1 == {"dormant": 0, "delete_due": 2}
+    assert _meta_of(store, revive["id"])["decay_state"] == "decay_delete_due"
+    assert _meta_of(store, stale["id"])["decay_state"] == "decay_delete_due"
+    # 复活：note_context 后回 verbatim，账本记一笔 REVIVE。
+    store.note_context([{"id": revive["id"]}])
+    assert _meta_of(store, revive["id"])["decay_state"] == "verbatim"
+    assert sum(1 for line in _ledger_lines(store) if '"type": "revive"' in line) == 1
+    # 再扫两次：已是 delete_due 的那条不再改写、不再记账；
+    # 复活过的那条刚被用过，也不再动。
+    before = _ledger_lines(store)
+    out2 = store.sweep_decay()
+    out3 = store.sweep_decay()
+    assert out2 == {"dormant": 0, "delete_due": 0}
+    assert out3 == {"dormant": 0, "delete_due": 0}
+    assert _ledger_lines(store) == before
+    assert _meta_of(store, stale["id"])["decay_state"] == "decay_delete_due"
+    assert _meta_of(store, revive["id"])["decay_state"] == "verbatim"
+    assert len(_live_texts(store)) == 2
+
+
+def test_correction_supersede_failure_keeps_new_and_old_alive(store, monkeypatch):
+    """待补 4（按 BOOS 已定行为断言）：mock _supersede_row 抛异常，
+    _apply_correction_result 返回 failed；取代失败时保留新记忆、
+    诚实报 failed（新记忆已进账本，不删），旧记忆仍活着。"""
+    # 2026-11-24 适配：播种改亲口来源——本测要测的正是 _supersede_row
+    # 被调用且失败的路；推断旧行按新裁决根本不会走到 _supersede_row
+    # （先挂待问），测不到这条路。
+    store.add_memory_text("我住北京", source="user")
+
+    def _boom(self, *args, **kwargs):
+        raise RuntimeError("supersede 记账炸了")
+
+    monkeypatch.setattr(SQLiteStore, "_supersede_row", _boom)
+    out = store.correct_memory("我住北京", "我住上海")
+    assert out.get("status") == "failed"
+    assert out.get("reason") == "新记忆已存，但旧记忆未被取代"
+    assert out.get("memory_id") is not None
+    # 新记忆保留：活记忆里新旧两条都在（不回滚删新行）。
+    assert set(_live_texts(store)) == {"我住北京", "我住上海"}
+    # 新记忆已进账本；旧记忆仍活着：没有 supersede 事件。
+    lines = _ledger_lines(store)
+    assert any('"type": "add"' in line and "我住上海" in line for line in lines)
+    assert not any('"type": "supersede"' in line for line in lines)
+
+
+# ---------- 15. Bug 2 回归（2026-11-22）：去重只看归一化文本，不看来源 ----------
+
+
+def test_add_same_text_user_then_inferred_is_one_row(store):
+    """同一文本先 user（已确认）再 inferred 存：只留一条活行，仍是已确认。"""
+    r1 = store.add_memory_text("我住广州", source="user")
+    assert r1.get("event") == "ADD"
+    r2 = store.add_memory_text("我住广州", source="inferred")
+    assert r2.get("event") == "UNCHANGED"
+    assert r2.get("id") == r1["id"]
+    assert _live_texts(store) == ["我住广州"]
+    assert _meta_of(store, r1["id"]).get("user_confirmed") is True
+    assert len(_ledger_lines(store)) == 1  # 没多写 add
+
+
+def test_add_same_text_inferred_then_user_upgrades_to_confirmed(store):
+    """同一文本先 inferred 再 user 存：只留一条活行，且升级成已确认
+    （source 改 user、decay_kind 改 stable）；升级补一笔账本 PROMOTE
+    （P1-4，2026-11-23：不记账本的话，对账重建会把升级丢掉、变回
+    推断版/episodic——账本是唯一真相）。"""
+    r1 = store.add_memory_text("我住广州", source="inferred")
+    assert r1.get("event") == "ADD"
+    assert _meta_of(store, r1["id"]).get("user_confirmed") is False
+    r2 = store.add_memory_text("我住广州", source="user")
+    assert r2.get("event") == "UNCHANGED"
+    assert r2.get("id") == r1["id"]
+    assert _live_texts(store) == ["我住广州"]
+    meta = _meta_of(store, r1["id"])
+    assert meta.get("user_confirmed") is True
+    assert meta.get("source") == "user"
+    assert meta.get("decay_kind") == "stable"
+    lines = _ledger_lines(store)
+    assert len(lines) == 2  # 最初一笔 add + 升级补的一笔 promote
+    promote = json.loads(lines[1])
+    assert promote.get("type") == "promote"
+    assert promote.get("memory_id") == r1["id"]
+    assert (promote.get("meta") or {}).get("decay_kind") == "stable"
+    assert (promote.get("meta") or {}).get("user_confirmed") is True
+
+
+# ---------- 16. 通用纠正（2026-11-22）：纠正检测扩到所有常见说法，
+#       save_turn 纠错路由走通，同槽位隐式更新也取代 ----------
+
+
+def test_detect_correction_general_phrases():
+    """纠正检测通用：任务清单里的每种说法都要认出来，并取对新说法；
+    不是纠正的（犹豫/词的一部分/过去时叙述/光秃秃指令）不认。"""
+    from memory.correction_text import _detect_correction
+
+    cases = [
+        ("不对，我住深圳", "我住深圳"),
+        ("错了，我住深圳", "我住深圳"),
+        ("不是北京，我住深圳", "我住深圳"),
+        ("我住深圳，不是北京", "我住深圳"),
+        ("不是北京，是深圳", "深圳"),
+        ("记错了，我住深圳", "我住深圳"),
+        ("我之前说错了，我住深圳", "我住深圳"),
+        ("我记错了，我住深圳", "我住深圳"),
+        ("说错了，我住深圳", "我住深圳"),
+        ("改一下，我住深圳", "我住深圳"),
+        ("纠正一下，我住深圳", "我住深圳"),
+        ("更正，我住深圳", "我住深圳"),
+        ("其实我住深圳", "我住深圳"),
+        ("其实是深圳", "深圳"),
+        ("应该是深圳", "深圳"),
+        ("不对，应该是深圳", "深圳"),
+        ("我现在住深圳了", "我住深圳了"),
+        ("搬到深圳了", "深圳了"),
+        ("换成深圳了", "深圳了"),
+        ("我不是住北京，我住深圳", "我住深圳"),
+        ("其实不是北京，我住深圳", "我住深圳"),
+        ("不对，不是北京，我住深圳", "我住深圳"),
+        ("你记错了，我住深圳", "我住深圳"),
+        ("不对，我喜欢喝茶", "我喜欢喝茶"),
+    ]
+    for message, expected in cases:
+        detected = _detect_correction(message)
+        assert detected is not None, message
+        assert detected["fact"] == expected, message
+    negatives = [
+        "我不是很确定",
+        "我觉得不对劲",
+        "我昨天记错了开会时间",
+        "我昨天说错了开会时间",
+        "改一下名字",
+        "你记错了",
+        "不对",
+        "我之前说错了",
+        "我现在喜欢用 Go 写代码。",
+        "其实也不是很喜欢吃。",
+        "不对，不是北京",
+        # “我现在”只认带单值槽位的“……了”：数据库改配置不是槽位事实，
+        # 得走待确认守卫，不能短路进纠正分支。
+        "我现在把数据库改成 PostgreSQL 了。",
+        # 新说法本身是撤回指令时不算纠正（撤回那条路处理）。
+        "说错了，前面那句不算",
+    ]
+    for message in negatives:
+        assert _detect_correction(message) is None, message
+
+
+def _correction_store(tmp_path, monkeypatch):
+    """一块干净的 SQLiteStore（向量打桩，和 store fixture 同款）。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
+    return SQLiteStore(memory_dir=str(tmp_path / "memory"))
+
+
+def test_save_turn_correction_e2e_shenzhen(tmp_path, monkeypatch):
+    """端到端：库里有“我住北京”，说“不对，我住深圳”→ 回复带
+    correction（updated）、账本有 supersede、新事实入库、旧事实被取代。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "不对，我住深圳"}],
+        turn_id="t-corr-e2e",
+    )
+    correction = receipt.get("correction") or {}
+    assert correction.get("status") == "updated", receipt
+    assert correction.get("old_text") == "我住北京"
+    assert correction.get("new_text") == "我住深圳"
+    assert _live_texts(store) == ["我住深圳"]
+    lines = _ledger_lines(store)
+    assert sum(1 for line in lines if '"type": "add"' in line) == 2
+    assert any('"type": "supersede"' in line for line in lines)
+
+
+def test_save_turn_correction_general_phrases_e2e(tmp_path, monkeypatch):
+    """端到端：每种纠正说法走 save_turn 都要真换掉旧记忆（不只“不对”）。"""
+    monkeypatch.setattr(SQLiteStore, "_embed_text", lambda self, text: None)
+    cases = [
+        ("我之前说错了，我住深圳", "我住深圳"),
+        ("其实我住深圳", "我住深圳"),
+        ("我住深圳，不是北京", "我住深圳"),
+        ("不是北京，我住深圳", "我住深圳"),
+        ("改一下，我住深圳", "我住深圳"),
+        ("说错了，我住深圳", "我住深圳"),
+        ("我现在住深圳了", "我住深圳了"),
+        ("搬到深圳了", "我住深圳"),
+        ("换成深圳了", "我住深圳"),
+        ("不对，应该是深圳", "我住深圳"),
+    ]
+    for i, (message, expected_live) in enumerate(cases):
+        store = SQLiteStore(memory_dir=str(tmp_path / ("m%d" % i)))
+        # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+        store.add_memory_text("我住北京", source="user")
+        receipt = store.save_turn(
+            [{"role": "user", "content": message}],
+            turn_id="t-corr-gen-%d" % i,
+        )
+        correction = receipt.get("correction") or {}
+        assert correction.get("status") == "updated", (message, receipt)
+        assert _live_texts(store) == [expected_live], message
+        assert any(
+            '"type": "supersede"' in line for line in _ledger_lines(store)
+        ), message
+
+
+def test_save_turn_implicit_update_keeps_old(tmp_path, monkeypatch):
+    """2026-11-23 model fix #1（BOOS 定）：没说纠正词、直接说新事实
+    “我住深圳”，库里“我住北京”照样活着——新说法只存新行，不取代
+    同槽位旧值；不相关的“我喜欢喝咖啡”不动。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我住北京", source="inferred")
+    store.add_memory_text("我喜欢喝咖啡", source="inferred")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我住深圳"}],
+        turn_id="t-implicit-1",
+    )
+    assert set(_live_texts(store)) == {"我住深圳", "我住北京", "我喜欢喝咖啡"}
+    assert receipt["stored"] == ["我住深圳"]
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_save_turn_implicit_update_name_slot_keeps_old(tmp_path, monkeypatch):
+    """2026-11-23 model fix #1（BOOS 定）：隐式更新（名字槽）：库里
+    “我叫小宋”，新说“我叫大明”→ 两条并存，大明不取代小宋；
+    不同槽位（喝咖啡）不互相取代。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我叫小宋", source="inferred")
+    store.add_memory_text("我喜欢喝咖啡", source="inferred")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我叫大明"}],
+        turn_id="t-implicit-name",
+    )
+    assert set(_live_texts(store)) == {"我叫大明", "我叫小宋", "我喜欢喝咖啡"}
+    assert receipt["stored"] == ["我叫大明"]
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_save_turn_implicit_update_keeps_confirmed_old(tmp_path, monkeypatch):
+    """2026-11-23 model fix #1（BOOS 定，取代 S10 2026-11-22 选 A）：
+    库里“我叫小宋”是已确认版，用户亲口说新说“我叫大明”同样算已确认，
+    但没纠正词就不取代旧的——两条并存。已确认不等于自动取代旧事实；
+    模型推断的新事实同样只存新行，见
+    test_add_same_slot_lower_credibility_stores_new_row。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我叫小宋", source="user")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我叫大明"}],
+        turn_id="t-implicit-pending",
+    )
+    assert _live_texts(store) == ["我叫大明", "我叫小宋"]
+    assert _is_superseded(store, "我叫小宋") is False
+    assert receipt["stored"] == ["我叫大明"]
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_save_turn_correction_ambiguous_slot_retry(tmp_path, monkeypatch):
+    """纠错分不清改哪条时按槽位再筛：候选有“我住北京”（住处）和
+    “我喜欢深圳菜”（偏好），新说法“我住深圳”带住处槽位，恰好只有
+    北京同槽，就改北京那条，不用问 BOOS；深圳菜不动。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    # 2026-11-24 适配：播种改亲口来源（理由同 exact_match 测）。
+    store.add_memory_text("我住北京", source="user")
+    store.add_memory_text("我喜欢深圳菜", source="user")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "不对，我住深圳"}],
+        turn_id="t-corr-slot-retry",
+    )
+    correction = receipt.get("correction") or {}
+    assert correction.get("status") == "updated", receipt
+    assert correction.get("old_text") == "我住北京"
+    assert set(_live_texts(store)) == {"我住深圳", "我喜欢深圳菜"}
+
+
+def test_bare_new_correction_signals_still_dropped(tmp_path, monkeypatch):
+    """光秃秃的新纠错信号（后面没跟新说法）仍不是事实，不存：
+    “我之前说错了”“改一下”单独说时不进库。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    for i, message in enumerate(["我之前说错了", "改一下", "说错了"]):
+        receipt = store.save_turn(
+            [{"role": "user", "content": message}],
+            turn_id="t-bare-new-%d" % i,
+        )
+        assert receipt["stored"] == [], message
+    assert _live_texts(store) == []
+    assert _ledger_lines(store) == []
+
+# ---------- 16. S10（2026-11-22，BOOS 定选 A；取代部分 2026-11-23 已废止） ----------
+# 用户亲口说的新事实直接算已确认（user/1.0）——这一半不变；
+# 但“能取代已确认的旧事实”这一半已由 2026-11-23 model fix #1（BOOS 定）
+# 废止：没纠正词的新陈述只存新行、不顶旧的。工具路 add_memory_text
+# 没传 slot 时仍按文本推断 slot（新行照常打槽位标），但同样只存新行。
+# 模型推断的事实仍按 inferred/0.7 直存（已覆盖：
+# test_add_same_slot_lower_credibility_stores_new_row）。
+
+
+def test_s10_user_spoken_new_fact_keeps_confirmed_old(tmp_path, monkeypatch):
+    """S10(a) 改：库里“我住长沙”是已确认版，用户直接说新事实“我住郑州”
+    （没说纠正词）→ 2026-11-23 model fix #1（BOOS 定）起不再取代旧的：
+    两条并存，长沙活着，回执没有 correction。修之前新事实按 inferred/0.7
+    探针，被 _resolve_conflict 判 pending_new、进 dropped，郑州没入库——
+    那是旧行为，现在郑州照常入库、长沙也不被顶掉。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我住长沙", source="user")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我住郑州"}],
+        turn_id="t-s10-user-1",
+    )
+    assert _live_texts(store) == ["我住郑州", "我住长沙"]
+    assert _is_superseded(store, "我住长沙") is False
+    assert receipt["stored"] == ["我住郑州"]
+    assert receipt.get("correction") is None
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_s10_user_spoken_now_living_in_zhengzhou(tmp_path, monkeypatch):
+    """S10(a) 原句：库里“我住长沙”是已确认版，用户说“我现在住在郑州了”
+    → 走纠正分支，新说法入库、长沙被取代，不丢。"""
+    store = _correction_store(tmp_path, monkeypatch)
+    store.add_memory_text("我住长沙", source="user")
+    receipt = store.save_turn(
+        [{"role": "user", "content": "我现在住在郑州了"}],
+        turn_id="t-s10-user-2",
+    )
+    assert _live_texts(store) == ["我住在郑州了"]
+    assert _is_superseded(store, "我住长沙")
+    assert (receipt.get("correction") or {}).get("status") == "updated"
+    assert any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_s10_tool_path_add_memory_text_infers_slot(store):
+    """S10(b) 改：工具路 add_memory_text 不传 slot（模型只传文本），
+    source="user" 存“我住西安”，库里已有已确认的“我住长沙”→ 2026-11-23
+    model fix #1（BOOS 定）起不取代：两条活住址并存，西安这行照常按文本
+    推断出 slot 标。修之前不推断 slot、裁决不跑，西安直存、两条活住址
+    并存——现在行为上也是并存，但西安行有 slot 标、且是新规则有意为之。"""
+    store.add_memory_text("我住长沙", source="user")
+    out = store.add_memory_text("我住西安", source="user")
+    assert out.get("event") == "ADD"
+    assert _live_texts(store) == ["我住西安", "我住长沙"]
+    assert _is_superseded(store, "我住长沙") is False
+    assert not any('"type": "supersede"' in line for line in _ledger_lines(store))
+
+
+def test_s10_tool_path_keeps_unstamped_legacy_row(store):
+    """S10(b) 改：旧行没打 slot 标，工具路再存“我住西安”时按文本现认
+    槽位能查到长沙，但 2026-11-23 model fix #1（BOOS 定）起无纠正词
+    不取代——长沙留着，西安另存一条，两条活住址并存。"""
+    _plant_memory_row(store, "我住长沙")
+    # 旧行改成工具路已确认版、但 slot 列保持为空（修复前的真实状态）：
+    # 只改来源/确认位，不动其他字段。
+    row = store._conn.execute(
+        "SELECT metadata_json FROM memories WHERE text=?", ("我住长沙",)
+    ).fetchone()
+    meta = json.loads(row[0] or "{}")
+    meta["source"] = "user"
+    meta["confidence"] = 1.0
+    meta["user_confirmed"] = True
+    store._conn.execute(
+        "UPDATE memories SET source='user', user_confirmed=1,"
+        " metadata_json=? WHERE text=?",
+        (json.dumps(meta, ensure_ascii=False), "我住长沙"),
+    )
+    store._conn.commit()
+    out = store.add_memory_text("我住西安", source="user")
+    assert out.get("event") == "ADD"
+    assert _live_texts(store) == ["我住西安", "我住长沙"]
+    assert _is_superseded(store, "我住长沙") is False

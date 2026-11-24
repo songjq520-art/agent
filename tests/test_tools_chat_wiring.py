@@ -2131,3 +2131,66 @@ def test_delete_same_memory_reuses_waiting_card(store, gateway, tmp_path):
     # 始终只有第一张卡在等确认，没多建一张；那条记忆也还没删。
     assert len(store.list_waiting()) == 1
     assert "我喜欢喝茶" in [i["text"] for i in mem_store.get_all(include_sensitive=True)]
+
+
+# ---------- R2 后续②：纠正轮删除拦截 ----------
+
+
+def test_correction_turn_delete_is_intercepted(store, gateway, tmp_path):
+    """纠正轮里模型调 delete_memory 不弹确认卡，直接回“已处理”。
+
+    2026-11-23 R2 后续②：用户说“不对，我喜欢吃面条”时，模型调
+    delete_memory 删旧米饭记忆会弹确认卡、抢占纠正路。拦截后本轮
+    应直接完成（done），不建确认卡，旧记忆也不被删（等保存时由
+    纠正取代）。
+    """
+    from conftest import make_fake_store
+    from tools.memory_tool import bound_memory_store
+
+    mem_store = make_fake_store(tmp_path)
+    mem_store.add_memory_text("我喜欢吃米饭", source="user")
+    rice_id = next(
+        item["id"] for item in mem_store.get_all(include_sensitive=True)
+        if item["text"] == "我喜欢吃米饭"
+    )
+    delete_args = {"memory_id": rice_id, "text": "我喜欢吃米饭", "anchor_text": "米饭"}
+    with bound_memory_store(mem_store):
+        provider = ScriptedProvider(
+            script=[
+                _tool_response(tool_calls=[_tool_call("call_del", "delete_memory", delete_args)]),
+                _tool_response(text="记下了，你现在喜欢吃面条。"),
+            ]
+        )
+        loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                         search_service=FakeSearchService())
+        outcome = loop.run("不对，我喜欢吃面条")
+    assert outcome["mode"] == "done"
+    assert outcome["reply"] == "记下了，你现在喜欢吃面条。"
+    assert len(store.list_waiting()) == 0
+    assert "我喜欢吃米饭" in [i["text"] for i in mem_store.get_all(include_sensitive=True)]
+
+
+def test_genuine_delete_still_needs_approval(store, gateway, tmp_path):
+    """真正的删除意图（“忘记这个”，无新说法）照常弹确认卡。"""
+    from conftest import make_fake_store
+    from tools.memory_tool import bound_memory_store
+
+    mem_store = make_fake_store(tmp_path)
+    mem_store.add_memory_text("我喜欢吃米饭", source="user")
+    rice_id = next(
+        item["id"] for item in mem_store.get_all(include_sensitive=True)
+        if item["text"] == "我喜欢吃米饭"
+    )
+    delete_args = {"memory_id": rice_id, "text": "我喜欢吃米饭", "anchor_text": "米饭"}
+    with bound_memory_store(mem_store):
+        provider = ScriptedProvider(
+            script=[
+                _tool_response(tool_calls=[_tool_call("call_del", "delete_memory", delete_args)]),
+            ]
+        )
+        loop = AgentLoop(provider, gateway=gateway, task_store=store,
+                         search_service=FakeSearchService())
+        outcome = loop.run("忘记我喜欢吃米饭")
+    assert outcome["mode"] == "waiting_approval"
+    assert outcome["approval"]["tool"] == "delete_memory"
+    assert len(store.list_waiting()) == 1

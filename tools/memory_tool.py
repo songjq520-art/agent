@@ -7,8 +7,9 @@
 #       ContextVar 绑记忆库（每轮/每次请求有自己的绑定，不串线），
 #       register_memory_tools() 登记四个工具，网关按登记执行。
 #       列是只读（low、不确认）；记是 BOOS 当轮明确让记的（medium、
-#       不确认，和“记住”直存同一条路）；改和删是 medium、要确认——
-#       模型调了先弹确认卡，BOOS 点了确认才执行，取消了就不执行。
+#       不确认，和“记住”直存同一条路）；改是 medium、不确认（纠正直接
+#       改，改完告诉 BOOS 改了什么）；删是 medium、要确认——模型调了先
+#       弹确认卡，BOOS 点了确认才执行，取消了就不执行。
 #       删的守卫（mem0_store.delete_memory 的三道关：归属校验、
 #       BOOS 同意、验干净）一个不少——工具里 approve=True 只是
 #       “网关确认过了”的意思，确认卡没点之前网关根本不会调到这里；
@@ -569,7 +570,8 @@ def _run_add_memory(args):
             "error": None,
         }
     try:
-        result = store.add_memory_text(text, source="user")
+        result = store.add_memory_text(text, source="user",
+                                       semantic_judge=True)
     except Exception as exc:  # noqa: BLE001 - 存失败也算执行失败
         return {"ok": False, "data": None, "error": f"存记忆失败：{exc}"}
     # mem0 那条路的旧形状（{"results": [...]}）还留着兼容。
@@ -672,7 +674,11 @@ def _run_update_memory(args):
             "请先列出全部记忆，照原文再改。",
         }
     try:
-        outcome = store.correct_memory(stored_text, new_text)
+        # 模型按 BOOS 的话改记忆，是显式纠正：按槽位找目标，不走
+        # 相似度 0.70 阈值（2026-11-23 model fix #2）。
+        outcome = store.correct_memory(
+            stored_text, new_text, explicit_correction=True
+        )
     except Exception as exc:  # noqa: BLE001 - 改失败也算执行失败
         return {"ok": False, "data": None, "error": f"改记忆失败：{exc}"}
     status = (outcome or {}).get("status")
@@ -1188,8 +1194,9 @@ def _register_one(name, description, parameters, output, risk_level,
 def register_memory_tools():
     """把记忆管理工具登记进工具注册表（已登记过时什么都不做，
     重复调不会报错）。列是只读（low、不确认、可重跑）；记是 BOOS
-    当轮明确让记的（medium、不确认、会改东西、不可重跑）；改和删
-    是 medium、要确认、会改东西、不可重跑——确认卡没点之前不执行，
+    当轮明确让记的（medium、不确认、会改东西、不可重跑）；改是
+    medium、不确认、会改东西、不可重跑（纠正直接改，改完告诉 BOOS）；
+    删是 medium、要确认、会改东西、不可重跑——确认卡没点之前不执行，
     执行过一次也绝不重执行（恢复时喂存下来的结果）。恢复和批量删
     和单条删同一条规矩：要确认、会改东西、不可重跑；列已删是只读。"""
     _register_one(
@@ -1249,12 +1256,12 @@ def register_memory_tools():
     _register_one(
         name="update_memory",
         description=(
-            "改一条长期记忆里的说法。先调 list_memories 列出全部，找到要改的"
+            "改一条长期记忆里的说法（纠正）。先调 list_memories 列出全部，找到要改的"
             "那条，把 memory_id、old_text（列出来的旧原文，一字不差地抄）、"
             "new_text（新说法）一起传来；旧原文对不上库里的就不改。"
-            "程序会先核对：挑的这条原文和 old_text 完全一致才建确认卡，"
-            "对不上、多条候选挑的不是唯一精确的那条时直接拒绝、不建卡；"
-            "改之前会先弹确认卡，BOOS 点了确认才执行，取消了就不改。"
+            "程序会先核对：挑的这条原文和 old_text 完全一致才改，"
+            "对不上、多条候选挑的不是唯一精确的那条时直接拒绝；"
+            "改完直接生效，不用等确认——改完要告诉 BOOS 改了什么（旧说法改成新说法）。"
             "返回 {memory_id, old_text, new_text}。"
         ),
         parameters={
@@ -1290,7 +1297,7 @@ def register_memory_tools():
             "失败时 ok 为 false，error 里写原因。"
         ),
         risk_level="medium",
-        needs_confirmation=True,
+        needs_confirmation=False,
         func=_run_update_memory,
         replay_safe=False,
         side_effect_free=False,

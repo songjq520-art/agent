@@ -26,6 +26,7 @@
 #   - 撤回目前只认光秃秃的“不不不/算了”这类整句信号，带后半句的撤回
 #     （要模型判意图）还没接，用时会先存下来、再由 BOOS 删，不悄悄丢。
 
+import copy
 import hashlib
 import json
 import logging
@@ -36,9 +37,23 @@ import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from memory import decay as _decay
 from memory import ledger as _ledger
-from memory.redaction import _contains_sensitive
-from memory.timeutil import _now_epoch, _now_iso, _next_write_seq
+from memory import pending_questions as _pq
+from memory import provenance as _provenance
+from memory.correction_text import (
+    _CORRECTION_PHRASES,
+    _detect_correction, _strip_correction_sentences,
+    _detect_correction_fragment, _VAGUE_FRAGMENT_VALUES,
+    _infer_fact_slot, _correction_topic_slot,
+    distill_correction_fact, is_correction_meta_sentence,
+)
+from memory.money_slots import extract_core_slots
+from memory.redaction import _contains_sensitive, _normalize_memory_text
+from memory.timeutil import _now_epoch, _now_iso, _next_write_seq, _seed_write_seq
+from memory.tone import (
+    local_tone_screen, parse_tone_judgment, tone_judgment_prompts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +90,139 @@ _TYPE_WEIGHT_STABLE_PREFERENCE = 1.25
 # 名单故意收得窄：只认这几个动词，不猜“想 / 希望 / 要”（那些是计划，
 # 不是偏好）；“可爱”这类词不含这几个动词，不会误认。
 _PREFERENCE_WORDS = ("喜欢", "爱吃", "爱喝", "爱的是", "不爱", "讨厌")
+
+# 语义判断的触发标记（2026-11-22 混合法）：程序推不出槽位的偏好句式。
+# “喜欢”已覆盖“喜欢吃/喝/看”，“爱看/爱听/爱玩”补“爱……”系的其余动词。
+_JUDGE_PREFERENCE_MARKERS = (
+    "喜欢", "爱吃", "爱喝", "爱看", "爱听", "爱玩", "不爱", "讨厌",
+    # webfix 一补（复测 #1 实测）：“我最近迷上吃辣子鸡丁”不在表里，
+    # 后来“我只吃白灼虾”触发判官时找不到这条候选、顶不掉，
+    # 回复却说“不算了”——说的和存的对不上。迷上/爱上和爱吃同族。
+    "迷上", "爱上",
+)
+# 一次判断最多带几条旧偏好候选（提示词要短，超了只带最近的）。
+_JUDGE_MAX_CANDIDATES = 10
+
+# 轮次回执缓存上限（2026-11-24）：去重回执要查 _turn_receipts，
+# 无上限会一直长；只留最近 200 轮，超了删插入顺序最旧的。
+_TURN_RECEIPTS_MAX = 200
+
+# 偏好改变说法（2026-11-23 R2 后续①）：明确表达偏好变了的说法。
+# “改吃/只吃/改喝/只喝/改看/只看……”——前缀“改/只/改成”+动词
+# （吃/喝/看/听/玩）。不含“换成”等泛词，避免“改成明天”这类
+# 非偏好句也触发。触发只决定“问不问判官”，判官才是裁决者；
+# 边界说法（如“我只吃了一口”）判官会判不取代，所以宁可多问
+# 一次判官，也别漏掉真正的偏好改变。
+_JUDGE_CHANGE_MARKERS = tuple(
+    prefix + verb
+    for prefix in ("改", "只", "改成")
+    for verb in ("吃", "喝", "看", "听", "玩")
+)
+
+# 判官候选里不要纠正记录（2026-11-23 R2 后续③收窄）：写着“纠正了此前……”
+# 的便条是纠正的记录、不是一条活偏好，绝不能当取代目标（之前判官两次
+# 把 72cc 那条纠正便条当成同类偏好取代了）。程序过滤是确定性的，
+# 不管判官怎么判，这类记忆都不会被它取代。
+_JUDGE_SKIP_MARKERS = ("纠正", "更正")
+
+# 主食词（R2 后续③收窄）：天天吃的主食。判官目标合理性检查用——
+# 新说法在换主食（米饭/面条这类）时，取代目标也必须是另一条主食记忆；
+# 火锅/冒菜/烤鸡这类具体菜式或吃法不是主食，不能当目标。
+_STAPLE_FOODS = (
+    "米饭", "面条", "米粉", "米线", "馒头", "包子", "饺子", "面包", "粥", "主食",
+)
+
+
+def _judge_target_is_staple_plausible(new_text, target_text):
+    """判官目标合理性：新说法含主食词时，目标也必须含主食词。
+
+    主食换主食（面条换米饭）才合理；新说法在换主食、目标却是火锅/
+    冒菜/牛肉面这类非主食时，判不取代（返回 False）。新说法不含主食词
+    （饮品等）时不受这条限制，返回 True。注意这是判官路的守卫，
+    程序纠正路不受影响——守卫拦下后，纠正路仍可正常取代米饭。
+    """
+    if not any(word in (new_text or "") for word in _STAPLE_FOODS):
+        return True
+    return any(word in (target_text or "") for word in _STAPLE_FOODS)
+
+
+def _dedupe_key(text):
+    """去重用的比对键：归一化后截掉句尾补充说明、再去掉全部标点。
+
+    模型改写同一事实时标点不固定——“（主食偏好是面条）”和
+    “，主食偏好是面条”都是句尾补充说明，截掉后与原句“改吃面条了”
+    是同一串字，算同一条。只用于去重比对，不改原文；否定词
+    （不/没）是汉字，不受影响。
+    逗号只截“改写补充”那种尾巴（2026-11-24 2a，Gemini Bug 3）：
+    以前无条件截掉最后一个逗号后的部分，“每天定投5块，买纳指”
+    和“买标普”算出同一个 key，第二条被当重复静默吞掉。现在只当
+    尾巴是“……是X”、且 X 已在前半句出现过（把前半句的内容换个
+    说法重述，如“，主食偏好是面条”）时才截；普通多分句（买纳指/
+    买标普、不喜欢吃米饭、也喜欢吃饺子）一律不截，两条都存得下。
+    末尾括号和逗号同一条规矩（2026-11-24 R-3）：以前无条件截掉，
+    “定投5块（买纳指）”和“（买标普）”算出同一个 key，同样静默
+    吞第二条；现在只有括号里是“……是X”、且 X 已在括号前出现过
+    （改写重述，如“（主食偏好是面条）”）时才截，内容性括号一律
+    保留。
+    """
+    norm = _normalize_memory_text(text or "")
+    # 末尾括号补充：只截改写重述（见 docstring），内容性括号不截。
+    if norm.endswith(")"):
+        idx = norm.rfind("(")
+        if idx > 0:
+            inner = norm[idx + 1:-1]
+            if "是" in inner:
+                stated = inner.rsplit("是", 1)[-1].strip()
+                if stated and stated in norm[:idx]:
+                    norm = norm[:idx]
+    # 逗号补充：只截改写重述尾巴（见 docstring），普通分句不截。
+    if "," in norm:
+        head, _sep, tail = norm.rpartition(",")
+        if "是" in tail:
+            stated = tail.rsplit("是", 1)[-1].strip()
+            if stated and stated in head:
+                norm = head
+    return re.sub(r"[^\w]", "", norm, flags=re.UNICODE)
+
+def _extract_note_old_fact(note_text):
+    """从模型写的纠正备注行里提被纠正掉的旧说法（2026-11-23 A 组修复）。
+    备注行形如“BOOS 喜欢吃面条（纠正：不是喜欢吃米饭）”——
+    “纠正：不是”后面就是旧说法的主干（“喜欢吃米饭”），前面那半句
+    的主语（“BOOS”/“我”）拼上去就是整句旧说法。
+    提不出来返回 None（调用方用整条备注行当 old_text，不硬编）。"""
+    if not isinstance(note_text, str) or not note_text:
+        return None
+    marker_idx = -1
+    marker_len = 0
+    for marker in ("纠正：不是", "纠正:不是", "纠正：", "纠正:"):
+        idx = note_text.find(marker)
+        if idx >= 0:
+            marker_idx = idx
+            marker_len = len(marker)
+            break
+    if marker_idx < 0:
+        return None
+    old_core = note_text[marker_idx + marker_len:].strip()
+    old_core = old_core.rstrip("）)。！").strip()
+    if old_core.startswith("不是"):
+        old_core = old_core[len("不是"):].strip()
+    if not old_core or len(old_core) > 40:
+        return None
+    if any(w in old_core for w in ("之前", "是错的", "错了", "不对")):
+        return None
+    head = note_text[:marker_idx].rstrip("（(").strip()
+    subject = ""
+    if head:
+        if head.startswith("BOOS"):
+            subject = "BOOS"
+        elif head.startswith("我"):
+            subject = "我"
+        elif head.startswith("用户"):
+            subject = "用户"
+    if subject:
+        return subject + " " + old_core
+    return old_core
+
 
 # 问句不存：以这些结尾的用户话是提问，不是陈述事实。
 _QUESTION_ENDINGS = ("?", "？", "吗", "么", "呢", "吧", "嘛")
@@ -160,6 +308,45 @@ def _split_sentences(text):
     return [p.strip() for p in parts if p.strip()]
 
 
+# 一句话分两条发时的续接碎片判据（缺点清单第 11 条，2026-11-24）。
+# 判据保守：单独的语气词、以标点开头、或极短（≤2 字）且不是能独立
+# 成句的回复词。像“好/好的/行/嗯/谢谢”这种本身就是完整回复的，
+# 永远不算碎片——拼错一句话比漏拼一句代价大。
+_FRAGMENT_PARTICLES = "吗呢吧啊么嘛哦呀哇"
+_FRAGMENT_TRAILING_PUNCT = "。！？.!?~～…、，,；;：:"
+_FRAGMENT_STANDALONE = {
+    "好", "好的", "行", "嗯", "对", "是", "可以", "没错", "不", "不要",
+    "没事", "谢谢", "知道了", "继续", "嗯嗯", "好吧", "算了", "不用",
+    "没了", "就这", "完了",
+}
+
+
+def _is_continuation_fragment(text, prev_text=""):
+    """text 是不是上一条 user 消息的续接碎片（判据见上方注释）。
+
+    prev_text 只用于一条护栏：极短规则（≤2 字）要求上一条没以句号/
+    问号/感叹号收尾——上一句已经说完了，短消息多半是新话题，不拼。
+    语气词和标点开头两条不看 prev：它们本身就成不了句。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t[0] in "，。、；：？！,.!?;:":
+        return True
+    core = t.rstrip(_FRAGMENT_TRAILING_PUNCT).strip()
+    if not core:
+        return True
+    if core in _FRAGMENT_STANDALONE:
+        return False
+    if len(core) <= 2 and all(ch in _FRAGMENT_PARTICLES for ch in core):
+        return True
+    if len(core) <= 2:
+        prev = (prev_text or "").strip()
+        if prev and prev[-1] in "。！？!?":
+            return False
+        return True
+    return False
+
+
 # “记住”类前缀（2026-11-21 网页测第二轮 #8）：save_turn 逐句循环里
 # 先剥掉再存——“记住后天要去体检”要存成“后天要去体检”，不能把
 # “记住”两个字也存进记忆。顺序按最长优先；main.py 的
@@ -212,6 +399,12 @@ def _looks_like_fact(sentence):
     之前就是存不存看运气（有的问句存了、有的没存）。
     """
     s = (sentence or "").strip()
+    # 2026-11-23 Phase 2 #2 线上实测根因：分句留着句尾标点（问句判断
+    # 要靠 ？），但 endswith 类规则认不出带 。！的句子——“我想喝茶了。”
+    # 句尾是 。不是了，当下的想法规则没拦住，线上 seq 494 就这么存进
+    # 去了（单测的句子没带句号，所以没抓到）。这里先剥掉句尾的 。！，？
+    # 留着（问句判断要靠它）；存的时候调用方还会再剥一遍，不影响原文。
+    s = s.rstrip("。！")
     if len(s) < 4:
         return False, "太短"
     if s in _SMALL_TALK:
@@ -234,7 +427,13 @@ def _looks_like_fact(sentence):
     # 但句式就是提问——“我喜不喜欢吃鸡杂面”“有没有人来过”。
     # “我不知道他是谁”不含这些词，不受影响；“我不喜欢吃辣”含的是
     # “不喜欢”不是“喜不喜欢”，不受影响。
-    if re.search(r"(喜不喜欢|爱不爱|想不想|要不要|会不会|能不能|懂不懂|记不记得|知不知道)", s):
+    if re.search(r"(喜不喜欢|爱不爱|想不想|要不要|会不会|能不能|懂不懂|记不记得|知不知道|好不好|行不行|对不对)", s):
+        return False, "问句"
+    # “记得不”型句尾（2026-11-24 webfix 二）：没打问号、不是 A-不-A
+    # 全形——“我的口味你还记得不”句尾就一个“记得不”，旧模式只认
+    # “记不记得”，这句漏过去被当事实存了（stable+high 实测）。
+    # 只认句尾，句中的“记得不”（“我记得不能吃辣”）不受影响。
+    if s.endswith(("记得不", "知道不", "清楚不", "明白不")):
         return False, "问句"
     if re.match(r"^(有没有|是不是|能不能|会不会|要不要|想不想|喜不喜欢|爱不爱|懂不懂|记不记得|知不知道|为什么|怎么|如何|什么时候|什么地方|什么东西|什么人)", s):
         return False, "问句"
@@ -278,12 +477,80 @@ def _looks_like_fact(sentence):
         w in s for w in ("以后", "明天", "后天", "下周", "下个月", "打算", "决定", "计划", "从今天起", "每天", "每周")
     ):
         return False, "当下的想法"
-    # 纠错前缀（2026-11-21 Gemini 第三轮）：“不对/不是/哎”开头的也是纠错指令，
-    # 同样不存。注意：等 SQLite 纠错正式接线时要移除这一条拦截，否则
+    # 纠错信号本身（2026-11-22 correct_memory 接线后）：带新说法的纠错句
+    # 由 save_turn 经 correct_memory 处理，不到这里；这里只拦光秃秃的
+    # 纠错信号（“你记错了”后面没跟新说法），那不是一条事实。
+    # 原来的宽拦截（句首是纠错说法就整句丢）已随接线移除，否则
     # “你记错了，我住上海”会把后半句纠错新事实一并丢弃。
-    if re.match(r"^(?:(?:不对|不是|哎)[，,、\s]*)?(?:你)?(?:记错了|说错了|搞错了)[，,。！!、\s]?", s):
-        return False, "纠错指令（SQLite 纠错未接线）"
+    if re.match(r"^(?:(?:不对|不是|哎)[，,、\s]*)?(?:你|我)?(?:之前|刚才)?(?:记错了|说错了|搞错了|记岔了)[，,。！!、\s]*$", s):
+        return False, "纠错指令"
+    if re.match(r"^(?:纠正一下|更正一下|更正|改一下|不对|错了|不是)[，,。！!、\s]*$", s):
+        return False, "纠错指令"
     return True, ""
+
+
+
+def _is_question_sentence(text):
+    """一句话是不是问句（重要性护栏用，2026-11-24 webfix 二）。
+
+    复用 _looks_like_fact 的问句判定（同一个规矩源，不另立一套
+    模式）：它以“问句”为原因拒绝的，就是问句；另外带 ？/? 结尾
+    的也算（_looks_like_fact 会先剥句尾标点再看，这里直接认）。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s.endswith(("？", "?")):
+        return True
+    ok, reason = _looks_like_fact(s)
+    return (not ok) and reason == "问句"
+
+
+# 用户明确强调的说法（重要性护栏的例外，2026-11-24 webfix 二）：
+# 带这些词的单次提及，判官判 important 程序不封顶——BOOS 亲口
+# 说了“别忘了”，那就是要钉住的。光秃秃的“记住/记一下”不算强调
+# （那是“记住”命令的触发词，不是重要程度的表态）。
+_EMPHASIS_MARKERS = (
+    "很重要", "特别重要", "非常重要", "别忘了", "不要忘了",
+    "一定要记住", "千万别忘", "牢记", "记牢",
+)
+
+
+def _has_emphasis(text):
+    return any(marker in (text or "") for marker in _EMPHASIS_MARKERS)
+
+
+# 重复性/习惯标记（重要性护栏的另一类例外）：句子本身在陈述一个
+# 反复发生的习惯/规律（“我每天下班去游泳”），不是“单次提及”——
+# 判官判 important 时程序不封顶（Phase 2 #2 既有行为：习惯类
+# 判重要就进核心）。“睡前/晚上”这类时段词不算重复性标记。
+_RECURRENCE_MARKERS = (
+    "每天", "每日", "天天", "每周", "每月", "每年",
+    "总是", "老是", "经常", "习惯", "定期", "日常",
+)
+
+
+def _has_recurrence(text):
+    return any(marker in (text or "") for marker in _RECURRENCE_MARKERS)
+
+
+# 纠正信号词（save_turn 叠剥护栏用）：一截文本剥掉这些和标点后
+# 应该什么都不剩，才算“纯纠正信号”——剩了实词（如“不吃牛肉”）
+# 就是事实内容，不许当信号剥掉。
+_CORRECTION_SIGNAL_TOKENS = (
+    "更正一下", "纠正一下", "改一下", "其实是", "应该是",
+    "说错了", "记错了", "搞错了", "不对", "其实", "更正",
+    "不是", "错了", "我", "你", "他", "她", "这", "那",
+)
+
+
+def _correction_signal_only(text):
+    s = text or ""
+    for ch in "，。、：；,.:; \t\n":
+        s = s.replace(ch, "")
+    for token in _CORRECTION_SIGNAL_TOKENS:
+        s = s.replace(token, "")
+    return not s.strip()
 
 
 def _normalize_metadata(meta):
@@ -307,13 +574,19 @@ class SQLiteStore:
     和 Mem0Store 同样的外观，供 web/server.py、main.py 直接用。
     """
 
-    def __init__(self, memory_dir=None, budget_tracker=None, **kwargs):
+    def __init__(self, memory_dir=None, budget_tracker=None,
+                 judge_provider=None, **kwargs):
         self.memory_dir = Path(memory_dir or _default_memory_dir())
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.ledger_path = self.memory_dir / "memory_events.jsonl"
         self.snapshot_path = self.memory_dir / "graph_snapshot.json"
         self.db_path = self.memory_dir / "memories.sqlite3"
         self.budget_tracker = budget_tracker
+        # 语义判官对象（2026-11-22 混合法）：测试注入 mock 用；
+        # None 时每次判断按 config.py 的 SEMANTIC_JUDGE 解析（默认 DeepSeek flash）。
+        self._judge_provider = judge_provider
+        # 待问 BOOS 的问题（Phase 2 #4）：攒批 + 回答，落盘不丢。
+        self.pending_questions = _pq.PendingQuestions(memory_dir=self.memory_dir)
         self.user_id = kwargs.get("user_id", "boos")
         self._lock = threading.RLock()
         self._ledger_lock = threading.Lock()
@@ -322,11 +595,30 @@ class SQLiteStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        # 写序号播种（2026-11-22，S1 根因）：_WRITE_SEQ 是进程内自增、重启
+        # 归零；不播种时新说法拿到的序号比旧行还小，同级裁决会误判成
+        # “迟到的旧写入”而 keep_old。启动时抬到库里最大的 write_seq。
+        try:
+            max_seq = 0
+            for (seq,) in self._conn.execute(
+                "SELECT write_seq FROM memories"
+            ).fetchall():
+                if isinstance(seq, int) and not isinstance(seq, bool) and seq > max_seq:
+                    max_seq = seq
+            if max_seq:
+                _seed_write_seq(max_seq)
+        except Exception:
+            logger.warning("写序号播种失败：本次不播种。", exc_info=True)
         self._embedder = None
         self._embedder_failed = False
         self._seen_turn_ids = set()
+        self._turn_receipts = {}
         self._last_context_ids = []
         self._last_stored_turn_id = None
+        # 当前轮登记（2026-11-24 1b）：ask() 检索/存轮时把本轮 turn_id
+        # 登记在这；本轮内工具调 correct_memory 没带 turn_id 时按它记账，
+        # “已纠正过”护栏靠它认本轮（不再靠 5 分钟墙钟）。
+        self._active_turn_id = None
 
     # ---------- 建库 ----------
 
@@ -362,6 +654,12 @@ class SQLiteStore:
             """
         )
         self._conn.commit()
+        # superseded 列（2026-11-22 correct_memory 接线）：被取代的记忆
+        # 在索引里标 superseded=1，不再进活记忆；旧库没有这列时补上。
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "superseded" not in cols:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0")
+            self._conn.commit()
 
     def available(self):
         return True
@@ -436,6 +734,13 @@ class SQLiteStore:
                     "decay_kind": metadata.get("decay_kind"),
                     "importance": metadata.get("importance"),
                     "event_date": metadata.get("event_date"),
+                    # 衰减字段（2026-11-22 decay 接线）：账本是真相，
+                    # 对账重建（reconcile_ledger_index）直接拿这里的
+                    # meta 当 metadata_json，不写进来重建就丢了。
+                    "last_used_at": metadata.get("last_used_at"),
+                    "decay_state": metadata.get("decay_state"),
+                    "seen_dates": metadata.get("seen_dates"),
+                    "seen_sessions": metadata.get("seen_sessions"),
                 },
             },
             lock=self._ledger_lock,
@@ -460,6 +765,43 @@ class SQLiteStore:
         with self._lock:
             state = self.ledger_state()
             key_states = (state or {}).get("key_states") or {}
+            # P1-4（2026-11-23）：PROMOTE 事件带升级后的完整 meta——
+            # 去重升级（add_memory_text）、3 天 3 次晋升、回答问题进核心
+            # 都记 PROMOTE。重建缺失行时按最新一笔 PROMOTE 的 meta 覆盖
+            # 升级过的字段，否则重建出来的还是 add 那笔的旧 meta
+            #（推断版/episodic），升级就丢了。只覆盖这 4 个晋升字段，
+            # 不碰 last_used_at / seen_*（那是后来的使用记录，PROMOTE
+            # 那一刻的值是旧的）。
+            promote_meta = {}
+            decay_marks = {}
+            slot_map = {}
+            try:
+                _events, _info = _ledger.read_events(self.ledger_path)
+                for _event in _events:
+                    _etype = _event.get("type")
+                    _key = _event.get("key") or _event.get("memory_id")
+                    if _etype == _ledger.LEDGER_EVENT_PROMOTE:
+                        _meta = _event.get("meta") or {}
+                        if _key and _meta:
+                            promote_meta[_key] = _meta
+                    elif _etype == _ledger.LEDGER_EVENT_SLOT and _key:
+                        # R-7（2026-11-24）：补槽位标的账本事件，
+                        # 重建缺失行时把 slot 一并带回来（最新一笔赢）。
+                        if _event.get("slot"):
+                            slot_map[_key] = _event["slot"]
+                    elif _etype == _ledger.LEDGER_EVENT_DORMANT and _key:
+                        # 3b（2026-11-24）：沉底/待删标记在账本里有
+                        # 事件，重建时把 decay_state 一并带回来。
+                        decay_marks[_key] = (
+                            _decay.DECAY_STATE_DELETE_DUE
+                            if _event.get("delete_due")
+                            else _decay.DECAY_STATE_DORMANT
+                        )
+                    elif _etype == _ledger.LEDGER_EVENT_REVIVE and _key:
+                        decay_marks.pop(_key, None)
+            except Exception:
+                logger.warning("读账本 PROMOTE 事件失败：重建时不应用晋升。", exc_info=True)
+            touch_map = (state or {}).get("last_touched") or {}
             added = 0
             for record in (state or {}).get("adds") or []:
                 key = record.get("key")
@@ -476,6 +818,30 @@ class SQLiteStore:
                     "SELECT 1 FROM memories WHERE id=?", (key,)
                 ).fetchone():
                     continue
+                _promoted = promote_meta.get(key) or {}
+                _touched = touch_map.get(key)
+                _mark = decay_marks.get(key)
+                _slot = slot_map.get(key)
+                if _promoted or _touched or _mark or _slot:
+                    meta = dict(meta)
+                if _promoted:
+                    for _field in ("source", "user_confirmed", "decay_kind", "importance",
+                                   # webfix 二：语气标也走 PROMOTE 写回
+                                   # （_tag_memory_tone），重建时一并带回，
+                                   # 不然重启对账会把标丢了。
+                                   "tone", "tone_evidence", "tone_source"):
+                        if _promoted.get(_field) is not None:
+                            meta[_field] = _promoted[_field]
+                if _slot and not meta.get("slot"):
+                    # R-7：add 那笔还没有槽位标，按 SLOT 事件补上
+                    # （_insert_memory_row 会把 meta 里的 slot 写进列）。
+                    meta["slot"] = _slot
+                if _touched and _touched > str(meta.get("last_used_at") or ""):
+                    # 3a（2026-11-24）：TOUCH 事件记着最后使用时间，
+                    # 重建时带回来，不退回 add 时的值（P1-6 修掉）。
+                    meta["last_used_at"] = _touched
+                if _mark:
+                    meta["decay_state"] = _mark
                 vec = self._embed_text(text)
                 self._insert_memory_row(key, text, meta, vec)
                 added += 1
@@ -507,7 +873,7 @@ class SQLiteStore:
             existing_texts = {
                 (row[0] or "").strip()
                 for row in self._conn.execute(
-                    "SELECT text FROM memories WHERE voided=0 AND deleted=0"
+                    "SELECT text FROM memories WHERE voided=0 AND deleted=0 AND superseded=0"
                 ).fetchall()
             }
             imported = skipped_existing = skipped_deleted = skipped_sensitive = 0
@@ -595,7 +961,15 @@ class SQLiteStore:
         """原文存一条记忆（“记住”直存、种子、规则都走这里）。
 
         先写账本、再写 SQLite；账本写不进去就返回 {}、不写索引。
-        库里已有同一 key 时不重复存，返回已有的那条（unchanged）。
+        同文去重（2026-11-22，Bug 2 治本）：同一归一化文本的活记忆
+        已在库里时，不再存第二行，返回 UNCHANGED，并记一笔“又出现一次”
+        （出现集合 + 晋升检查）；来源不看——已确认版和推断版是同一事实，
+        确认状态只往上提（推断版在库、已确认版后到时，把已有行升级成
+        已确认；已确认版在库、推断版后到时，只记出现，不降级）。
+        同槽位（2026-11-22，Gemini #4）：slot 相同、文本不同的活记忆
+        是同一件事的新版本，按 provenance._resolve_conflict 裁决：
+        supersede_old 就取代旧行再存新行；pending_new/keep_old/ask
+        都不存新行（分别返回 PENDING/STALE/ASK）。
         """
         text = (text or "").strip()
         if not text:
@@ -612,42 +986,2089 @@ class SQLiteStore:
             }
         with self._lock:
             created_at = _now_iso()
+            today = _shanghai_today().isoformat()
+            slot = kwargs.get("slot")
+            # S10（2026-11-22，BOOS 定选 A）：没传 slot 时按文本推断——
+            # 模型调 add_memory 只传文本、不传 slot，不推断就走不到下面
+            # 的槽位裁决，工具路会直存出两条活住址（西安 + 长沙案）。
+            inferred_slot, inferred_value = _infer_fact_slot(text)
+            if not slot:
+                slot = inferred_slot
+            is_rule = bool(kwargs.get("is_rule", False))
+            curated = bool(kwargs.get("curated", False))
+            user_confirmed = source == "user"
+            write_seq = _next_write_seq()
+            decay_kind = kwargs.get("decay_kind") or _decay.classify_decay_kind(
+                source, False, is_rule
+            )
+            # 重要性判断（Phase 2 #2，opt-in）：直存路（“记住”/工具）显式
+            # 打开 judge_importance=True 时才问——默认不开，直存原语要
+            # 确定、不花钱（和 semantic_judge 一个规矩）。有槽位的不问
+            # （槽位就是核心类别，见 _decide_importance）；已传 decay_kind
+            # 的不问（调用方已经定了）。判不准时先当一次性经历存，问题
+            # 攒进 pending（下次聊天顺带问）。
+            _importance_decision = None
+            _importance_reason = ""
+            # 重要性护栏的封顶留痕（webfix 二）：调用方（save_turn）
+            # 已经判过重要性时把 clamped 透传进来；本路自己判时从
+            # judge_info 里取。落进 meta.importance_clamped。
+            _importance_clamped = kwargs.get("importance_clamped")
+            if (
+                kwargs.get("judge_importance")
+                and not kwargs.get("decay_kind")
+                and not slot
+            ):
+                _importance_decision, _importance_reason, _judge_info = (
+                    self._decide_importance(text, slot)
+                )
+                if _importance_clamped is None:
+                    _importance_clamped = (_judge_info or {}).get("clamped")
+                if _importance_decision == "important":
+                    decay_kind = _decay.DECAY_KIND_STABLE
+                if _is_question_sentence(text):
+                    # 问句护栏（webfix 二）：classify 对 user 来源
+                    # 默认 stable，问句走判官路存进来时按护栏压回
+                    # episodic——问句永远不许 stable（importance
+                    # 只在 important 时才 high，问句到不了那一步）。
+                    decay_kind = _decay.DECAY_KIND_EPISODIC
+            # 同文去重（2026-11-22 Bug 2 治本）：只看归一化文本，不看来源——
+            # 用户亲口说的（工具直存、save_turn）都记 source="user"（已确认），
+            # 模型推断直存的才记 source="inferred"，来源不同不是两条事实。
+            # 归一化比对要在 Python 里做
+            # （_normalize_memory_text 剥标点/空白/主语，SQL 精确匹配认不出
+            # “我住广州。”和“我住广州”是同一句），所以扫一遍活行逐条比。
+            norm_text = _normalize_memory_text(text)
+            if norm_text:
+                for row in self._conn.execute(
+                    "SELECT id, text, metadata_json FROM memories"
+                    " WHERE voided=0 AND deleted=0 AND superseded=0"
+                ).fetchall():
+                    # 去重键比对（R2 后续③）：归一化+去全部标点。
+                    # 改写句“（主食偏好是面条）”与“，主食偏好是面条”
+                    # 去标点后是同一串字，算同一条，不存两份。
+                    if _dedupe_key(row[1] or "") != _dedupe_key(text):
+                        continue
+                    try:
+                        old_meta = json.loads(row[2] or "{}")
+                    except Exception:
+                        old_meta = {}
+                    if user_confirmed and not old_meta.get("user_confirmed"):
+                        # 确认状态只往上提：推断版在库、已确认版后到时，
+                        # 把已有行升级成已确认（source 改 "user"、确认位
+                        # 置 1、decay_kind 改 stable——用户亲口确认的事实
+                        # 应该是稳定的）。
+                        # P1-4（2026-11-23）：升级要补一笔账本 PROMOTE
+                        #（复用已有事件类型，meta 带升级后的完整 meta）。
+                        # 不记账本的话，对账重建（reconcile_ledger_index）
+                        # 会按账本里旧的 add 元数据把这条重建成推断版/
+                        # episodic，升级就丢了——账本是唯一真相。
+                        new_meta = dict(old_meta)
+                        new_meta["source"] = "user"
+                        new_meta["user_confirmed"] = True
+                        new_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                        self._conn.execute(
+                            "UPDATE memories SET metadata_json=?, source=?,"
+                            " user_confirmed=1, decay_kind=? WHERE id=?",
+                            (json.dumps(new_meta, ensure_ascii=False), "user",
+                             _decay.DECAY_KIND_STABLE, row[0]),
+                        )
+                        self._conn.commit()
+                        try:
+                            _ledger.append_event(
+                                self.ledger_path,
+                                {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                                 "memory_id": row[0], "key": row[0],
+                                 "text": row[1] or "",
+                                 "meta": dict(new_meta)},
+                                lock=self._ledger_lock,
+                            )
+                        except Exception:
+                            # 账本写不进去：把 SQLite 的升级撤回来再继续
+                            #（只记出现，不升确认），两边要一致，账本是真相。
+                            logger.warning("去重升级记账失败：升级已撤回。", exc_info=True)
+                            self._conn.execute(
+                                "UPDATE memories SET metadata_json=?, source=?,"
+                                " user_confirmed=?, decay_kind=? WHERE id=?",
+                                (json.dumps(old_meta, ensure_ascii=False),
+                                 old_meta.get("source", "inferred"),
+                                 1 if old_meta.get("user_confirmed") else 0,
+                                 old_meta.get("decay_kind"), row[0]),
+                            )
+                            self._conn.commit()
+                        else:
+                            old_meta = new_meta
+                    # 同一条事实又出现一次：记出现集合，够 3 天 + 3 会就晋升。
+                    self._record_occurrence(row[0], old_meta, today, turn_id, text)
+                    return {"id": row[0], "memory": text, "event": "UNCHANGED"}
+            # 同槽位裁决：slot 相同、文本不同的活记忆是同一件事的新版本。
+            # 先只裁决、不取代：pending/keep/ask 都直接返回不存；全是
+            # supersede_old 时才继续存，存好新行再取代旧行（新 key 要
+            # 先存在，supersede 事件的 current_key 才有东西可指）。
+            to_supersede = []
+            # 2026-11-23 model fix #1（D 组根因）：新陈述无纠正词时，不自动
+            # supersede 同槽旧记忆——直接存成新行。只带明确纠正词的才算纠正，
+            # 那种调用方显式传 allow_slot_supersede=True 才走槽位裁决。
+            # 默认 False：直存原语（"记住"/工具/逐句循环）一律只存不顶。
+            if slot and kwargs.get("allow_slot_supersede", False):
+                # 槽位裁决的候选：slot 列上打过标的行（SQL 查）+ 按文本
+                # 现认槽位的行（_find_same_slot_conflicts 扫全部活行）——
+                # 修复前工具路存的行没打 slot 标（西安案），只查 SQL 会
+                # 漏掉它们，两条活住址就并存了。两边按 id 去重；扫描行
+                # 的 metadata 是字典，先转回 JSON 串再进同一条裁决循环。
+                conflict_rows = list(self._conn.execute(
+                    "SELECT id, text, metadata_json FROM memories"
+                    " WHERE slot=? AND voided=0 AND deleted=0 AND superseded=0"
+                    " AND text!=?",
+                    (slot, text),
+                ).fetchall())
+                if inferred_value is not None:
+                    seen_ids = {row[0] for row in conflict_rows}
+                    for row in self._find_same_slot_conflicts(
+                        slot, inferred_value
+                    ):
+                        if row[0] not in seen_ids and row[1] != text:
+                            conflict_rows.append(
+                                (row[0], row[1],
+                                 json.dumps(row[2] or {}, ensure_ascii=False))
+                            )
+                # R-1 护栏：核心/置顶行不进槽位裁决名单——不顶，
+                # 也不让它拦住新行落存，留着走问 BOOS 的路径。
+                _kept_rows = []
+                for _r in conflict_rows:
+                    try:
+                        _m = json.loads(_r[2] or "{}")
+                    except Exception:
+                        _m = {}
+                    if not self._is_core_protected_row(_m, slot):
+                        _kept_rows.append(_r)
+                conflict_rows = _kept_rows
+                for row in conflict_rows:
+                    old_meta = json.loads(row[2] or "{}")
+                    new_meta_probe = {
+                        "source": source,
+                        "user_confirmed": user_confirmed,
+                        "confidence": 1.0 if source == "user" else 0.7,
+                        "created_at": created_at,
+                        "write_seq": write_seq,
+                        "slot": slot,
+                    }
+                    verdict = _provenance._resolve_conflict(old_meta, new_meta_probe)
+                    action = (verdict or {}).get("action")
+                    if action == "supersede_old":
+                        to_supersede.append((row[0], row[1], old_meta))
+                    elif action == "pending_new":
+                        return {"event": "PENDING", "memory": text,
+                                "reason": (verdict or {}).get("reason", ""),
+                                "supersedes_id": row[0]}
+                    elif action == "keep_old":
+                        return {"event": "STALE", "memory": text,
+                                "reason": (verdict or {}).get("reason", ""),
+                                "supersedes_id": row[0]}
+                    else:  # ask
+                        return {"event": "ASK", "memory": text,
+                                "reason": (verdict or {}).get("reason", ""),
+                                "supersedes_id": row[0]}
+            # 混合判断（2026-11-22，BOOS 定）：程序推不出槽位（slot 为 None）
+            # 的偏好句，工具直存路也可以问大模型判官——该取代就把目标加进
+            # to_supersede（下面存好新行再统一取代）；模型断了/说不取代
+            # 就照常直存。默认不开（opt-in，semantic_judge=True 才问）：
+            # add_memory_text 是存储原语，测试/迁移/种子直存都要确定、
+            # 不花钱——默认调模型会把 Q3 排名测坏（2026-11-23 真回归：
+            # 直存“BOOS 喜欢吃鸡杂面。”时模型取代了纠正行，前 5 乱了）。
+            # 用户当面让记的两个位置显式打开（见 tools/memory_tool.py
+            # 的 add_memory、web/server.py 的“记住”直存）；save_turn
+            # 逐句循环里已经判过了，调这里时传 semantic_judge=False，
+            # 不重复问。
+            if not slot and kwargs.get("semantic_judge", False):
+                _judged, _verdict, _trig = self._judge_preference_supersede(text)
+                if _judged is not None:
+                    to_supersede.append(_judged)
             metadata = {
                 "source": source,
                 "confidence": 1.0 if source == "user" else 0.7,
                 # confirmed 不存在这里：它是 user_confirmed 的短名字，
                 # 读时由 _normalize_metadata 现算（和 mem0 的规矩一致）；
                 # 存两份以后会打架，只留 user_confirmed 一个真相。
-                "user_confirmed": source == "user",
+                "user_confirmed": user_confirmed,
                 "created_at": created_at,
-                "write_seq": _next_write_seq(),
+                "write_seq": write_seq,
                 "turn_id": turn_id,
-                "slot": kwargs.get("slot"),
-                "is_rule": bool(kwargs.get("is_rule", False)),
-                "curated": bool(kwargs.get("curated", False)),
-                "decay_kind": kwargs.get("decay_kind", "episodic"),
-                "importance": kwargs.get("importance", "normal"),
+                "slot": slot,
+                "is_rule": is_rule,
+                "curated": curated,
+                "decay_kind": decay_kind,
+                "importance": kwargs.get(
+                    "importance",
+                    "high" if _importance_decision == "important" else "normal",
+                ),
                 "event_date": event_date or resolve_event_date(text),
+                "last_used_at": created_at,
+                "decay_state": _decay.DECAY_STATE_VERBATIM,
             }
-            key = _ledger.ledger_event_key(text, created_at)
-            state = self.ledger_state()
-            if key in ((state or {}).get("key_states") or {}):
-                return {"id": key, "memory": text, "event": "UNCHANGED"}
-            try:
-                self._ledger_append_add(text, metadata)
-            except Exception:
-                logger.warning("账本写不进去：本次记忆没存。", exc_info=True)
+            # 语气落账（webfix 二）：本地筛当场能认出的语气（玩笑/
+            # 测试/假设的明确说法）直接写进 meta——以前 SQLite 路
+            # 从来不写 tone，§16 的“带标记不计晋升”在晋升侧认
+            # tone、却没人写，等于空转。本地认不出的（比如反话）
+            # 留给实时整理的模型判语气补标（见 _organize_turn_
+            # memories 的语气步）。带标记的当场压档：不许 stable、
+            # 不许 high（判官/类别判的也不行，语气优先）。
+            _tone, _tone_evidence = local_tone_screen(text)
+            if _tone:
+                metadata["tone"] = _tone
+                metadata["tone_evidence"] = _tone_evidence
+                metadata["tone_source"] = "local"
+                if _tone in ("joke", "test", "hypothesis"):
+                    metadata["decay_kind"] = _decay.DECAY_KIND_EPISODIC
+                    metadata["importance"] = "normal"
+            if _importance_clamped:
+                metadata["importance_clamped"] = _importance_clamped
+            dates, sessions, _added = _decay.record_seen_occurrence(
+                None, None, today, turn_id
+            )
+            metadata["seen_dates"] = _decay._dump_seen_list(dates)
+            metadata["seen_sessions"] = _decay._dump_seen_list(sessions)
+            key = self._append_new_memory(text, metadata)
+            if key is None:
                 return {}
-            try:
-                vec = self._embed_text(text)
-            except Exception:
-                vec = None
-            self._insert_memory_row(key, text, metadata, vec)
+            if _importance_decision == "unsure":
+                # 判不准的问题攒进 pending，下次聊天顺带问（见 save_turn）。
+                self._queue_importance_question(
+                    text, key, _importance_reason, turn_id
+                )
+            if len(to_supersede) > 1:
+                to_supersede = sorted(
+                    to_supersede,
+                    key=lambda c: (
+                        (c[2] or {}).get("write_seq") or 0,
+                        (c[2] or {}).get("created_at") or "",
+                    ),
+                    reverse=True,
+                )
+            # R-1（2026-11-24，BOOS 定“像十一”）：裁决判该顶的不再
+            # 只顶最新一条——主目标（最新那条）照旧直接顶；其余走
+            # 连带清扫的门槛（只清对话里亲口说过的，防广州式误伤：
+            # 旧写法无差别全顶曾连带顶掉真记忆，只顶一条又是矫枉
+            # 过正——现在主目标全顶、连带清扫带门槛）。
+            for old_id, old_text, old_meta in to_supersede[:1]:
+                try:
+                    # 推断记忆保护：主目标是推断未确认行时不直接顶，
+                    # 攒待问问题（_supersede_or_ask 内部处理）。
+                    self._supersede_or_ask(old_id, old_text, old_meta, key, text)
+                except Exception:
+                    logger.warning("槽位取代记账失败：旧行未取代。", exc_info=True)
+            if len(to_supersede) > 1:
+                self._sweep_extra_conflicts(
+                    slot, to_supersede[1:], key, text, turn_id=turn_id,
+                    probe_source=source, probe_confirmed=user_confirmed,
+                )
             # 直存不走 save_turn：刚写的新记忆不再属于上一轮，撤回标记清掉，
             # 否则下一次“撤回”会误作废上一轮（2026-11-21 Gemini 第三轮真 Bug）。
             # save_turn 内部也调这里，但它在循环结束后才重设标记，顺序不冲突。
             self._last_stored_turn_id = None
             return {"id": key, "memory": text, "event": "ADD"}
+
+    def _append_new_memory(self, text, metadata):
+        """写一条新记忆：先写账本 add，再写 SQLite 行。返回 key；
+        账本写不进去返回 None（索引那步也不写）。"""
+        try:
+            self._ledger_append_add(text, metadata)
+        except Exception:
+            logger.warning("账本写不进去：本次记忆没存。", exc_info=True)
+            return None
+        try:
+            vec = self._embed_text(text)
+        except Exception:
+            vec = None
+        key = _ledger.ledger_event_key(text, metadata.get("created_at"))
+        self._insert_memory_row(key, text, metadata, vec)
+        return key
+
+    def _supersede_row(self, old_id, old_text, old_meta, new_key, new_text,
+                       turn_id=None):
+        """把旧行标成被取代：先标 SQLite superseded=1，再写账本 supersede 事件。
+        账本写失败时把 SQLite 的标记撤回来再抛——两边要一致，账本是真相。
+        old_id 就是旧 key（SQLite id 就是账本 key）；new_key 是新记忆的 key。
+        turn_id 传了就记进 supersede 事件（2026-11-24 1b）：“已纠正过”
+        护栏按它认本轮，不再靠 5 分钟墙钟猜。
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE memories SET superseded=1 WHERE id=?", (old_id,)
+            )
+            self._conn.commit()
+            try:
+                _event = {"type": _ledger.LEDGER_EVENT_SUPERSEDE,
+                          "memory_id": new_key,
+                          "supersedes_id": old_id,
+                          "old_text": old_text,
+                          "text": new_text,
+                          "key": old_id,
+                          "current_key": new_key}
+                if turn_id is not None:
+                    _event["turn_id"] = turn_id
+                _ledger.append_event(
+                    self.ledger_path, _event, lock=self._ledger_lock,
+                )
+            except Exception:
+                self._conn.execute(
+                    "UPDATE memories SET superseded=0 WHERE id=?", (old_id,)
+                )
+                self._conn.commit()
+                raise
+
+    def _record_occurrence(self, memory_id, metadata, today, turn_id, text=None):
+        """同一条事实又出现一次：记进出现集合（不同天、不同会话），
+        够 3 天 + 3 会就晋升成稳定事实（decay.py 的规矩）。
+        同时把 last_used_at 拨到现在（刚被提到 = 刚被用上）。
+        返回有没有晋升。调用方在同文去重（UNCHANGED）那条路上调。
+        text 没传时从库里取（晋升事件要带原话）。
+        """
+        meta = dict(metadata or {})
+        if text is None:
+            try:
+                row = self._conn.execute(
+                    "SELECT text FROM memories WHERE id=?", (memory_id,)
+                ).fetchone()
+                text = (row or [""])[0] or ""
+            except Exception:
+                text = ""
+        dates, sessions, _added = _decay.record_seen_occurrence(
+            meta.get("seen_dates"), meta.get("seen_sessions"), today, turn_id
+        )
+        # 晋升聚合（2026-11-24，BOOS 定“晋升规则再优化”）：同一件事
+        # 换个说法存成了另一行时，出现证据碎在各行上、谁也凑不满
+        # 3 天 3 次——以前只会数自己这行的，是晋升“笨”的根。晋升
+        # 判断前，把“同一事实的其他说法”（_fact_cluster_members，
+        # 只认硬信号）的出现集合并进来：只并集合、不删不顶；带
+        # 语气标记的成员证据不算数（带标记本来就不计晋升）。
+        # 已确认成员的证据照常全额计——确认过的事实别被推断版
+        # 拖住（同文去重里“确认只往上提”是同一个道理）。
+        try:
+            for _cid, _ctext, _cmeta in self._fact_cluster_members(
+                memory_id, text, meta, allow_judge=True
+            ):
+                if (_cmeta or {}).get("tone") in (
+                    "joke", "test", "hypothesis"
+                ):
+                    continue
+                for _d in _decay._parse_seen_list(
+                    (_cmeta or {}).get("seen_dates")
+                ):
+                    if _d not in dates:
+                        dates.append(_d)
+                for _s in _decay._parse_seen_list(
+                    (_cmeta or {}).get("seen_sessions")
+                ):
+                    if _s not in sessions:
+                        sessions.append(_s)
+        except Exception:
+            logger.warning("晋升聚合失败：按本行证据继续。", exc_info=True)
+        meta["seen_dates"] = _decay._dump_seen_list(dates)
+        meta["seen_sessions"] = _decay._dump_seen_list(sessions)
+        meta["last_used_at"] = _now_iso()
+        promoted = False
+        if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and _decay.should_promote(
+            dates, sessions,
+            # 2026-11-23 Phase 2 #2 根因：is_core 不能按“已确认”认——
+            # save_turn 存的用户亲口说的事实都是已确认的（含一次性经历），
+            # 按 _is_core_memory（confirmed 或有槽位）认，会把已确认的
+            # 一次性经历也当核心，3 天 3 次兜底永远走不到。核心记忆本来
+            # 就是稳定的（见 should_promote），这里 decay_kind 已保证
+            # 不是 stable，is_core 恒为 False。
+            is_core=False,
+            tone=meta.get("tone"),
+        ):
+            # R-4（2026-11-24）：账本先行——PROMOTE 写不进去就
+            # 不晋升，SQLite 不许跑到账本前面。以前写失败只警告、
+            # 照样把 decay_kind 改成 stable，账本里没有这笔晋升，
+            # 两边静默分叉（对账只补缺失行、不修已有行）。出现
+            # 记录（seen_*）照常写回，下次出现时再试晋升。
+            promoted_meta = dict(meta)
+            promoted_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                     "memory_id": memory_id, "key": memory_id,
+                     "text": text,
+                     "meta": promoted_meta},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("晋升记账失败：本次不晋升（账本为准）。", exc_info=True)
+            else:
+                meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                promoted = True
+        self._conn.execute(
+            "UPDATE memories SET metadata_json=?, decay_kind=? WHERE id=?",
+            (json.dumps(meta, ensure_ascii=False), meta.get("decay_kind"), memory_id),
+        )
+        self._conn.commit()
+        return promoted
+
+    # 晋升聚合的相似门槛（2026-11-24）：余弦和内容二字组都要够高
+    # 才算“同一件事换了个说法”。门槛定高是故意的——认错（把两件
+    # 事的证据并到一起）比认漏（晋升慢一点）危险：“每天定投5块
+    # 买纳指”和“买标普”只差两个字，二字组重合率 0.75、进不来；
+    # “喜欢吃面条”和“爱吃面条”二字组全同、进得来。
+    _CLUSTER_MIN_COSINE = 0.85
+    _CLUSTER_MIN_BIGRAM_OVERLAP = 0.8
+    _CLUSTER_MIN_BIGRAM_JACCARD = 0.5
+
+    # 判官归并的预筛门槛（2026-11-24，BOOS 拍板“让判官多判是不是
+    # 同一件事”）：硬信号认不出的候选对，先过这道便宜的预筛才值得
+    # 问判官——向量余弦 ≥0.55，或内容二字组重合率 ≥0.2 且 Jaccard
+    # ≥0.05（“酸梅汤”三种说法只共享核心词：重合 0.22、Jaccard
+    # 0.08–0.09，刚好够问；毫不相干的两句重合是 0，问都不问；
+    # “定投纳指/标普”孪生句重合 0.71、照样进得来——是不是同一件
+    # 事由判官判，预筛只管“值不值得问”）。
+    _SAME_FACT_MIN_COSINE = 0.55
+    _SAME_FACT_MIN_BIGRAM_OVERLAP = 0.2
+    _SAME_FACT_MIN_BIGRAM_JACCARD = 0.05
+    # 一次计数最多问判官几对：防候选一多就烧钱/拖慢；按像的程度
+    # 从高到低问，剩下的下次出现再问（结论有缓存，不重复问）。
+    _SAME_FACT_MAX_JUDGE_PER_CALL = 3
+    # 判官归并结论存行 metadata 的键：{对方 id: {same, provider,
+    # model, at, reason, cost_usd}}，两行各存一份——既是缓存
+    # （同对不重复问），也是审计留痕（谁判的、何时判的）。
+    _SAME_FACT_META_KEY = "same_fact_judgments"
+
+    def _fact_cluster_members(self, memory_id, text, meta, allow_judge=False):
+        """和本行是“同一件事、不同说法”的其他活行：[(id, text, meta)]。
+
+        只认硬信号（和 _same_conflict_topic 一个标准，只认不猜）：
+        - 同一单值槽 + 同一归一化值（“我住广州”/“我住在广州”）；或
+        - 向量余弦 ≥0.85 且内容二字组高度重合（重合率 ≥0.8 且
+          Jaccard ≥0.5）。
+        排除：和本行正冲突的（同槽不同值、否定式正面冲突）、话题
+        粗槽不同且都认得出的（喜欢吃 vs 不喜欢吃）、和本行挂着
+        未答冲突问题的（BOOS 没裁之前，两条不共享证据——推断
+        保护的规矩）。向量缺失时只有槽位一路可用，照常工作。
+
+        allow_judge=True 时（只有晋升计数入口 _record_occurrence
+        传），硬信号认不出、但过了全部护栏的候选对再交给判官判
+        “是不是同一件事”（_judge_merge_candidates）：这是计数
+        归并——行都留着、不改内容、不触发取代，只把出现证据
+        并到一起数。护栏永远优先于判官，护栏挡掉的对问都不问。
+        """
+        text = text or ""
+        if not text.strip():
+            return []
+        my_slot, my_value = _infer_fact_slot(text)
+        my_topic = _correction_topic_slot(text)
+        disputed = set()
+        try:
+            for q in self.pending_questions.list_unanswered():
+                if q.get("kind") != _pq.QUESTION_KIND_CONFLICT:
+                    continue
+                pair = frozenset(
+                    (q.get("old_id"), q.get("new_id"))
+                )
+                if memory_id in pair and len(pair) == 2:
+                    disputed.add(pair)
+        except Exception:
+            disputed = set()
+        my_vec = None
+        try:
+            import numpy as np
+
+            row = self._conn.execute(
+                "SELECT embedding FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                my_vec = _blob_to_vector(row[0])
+        except Exception:
+            my_vec = None
+        my_bigrams = self._content_bigrams(text)
+        out = []
+        candidates = []
+        for row in self._conn.execute(
+            "SELECT id, text, metadata_json, embedding FROM memories"
+            " WHERE voided=0 AND deleted=0 AND superseded=0 AND id != ?",
+            (memory_id,),
+        ).fetchall():
+            other_id, other_text = row[0], row[1] or ""
+            if not other_text.strip():
+                continue
+            if frozenset((memory_id, other_id)) in disputed:
+                continue
+            if self._same_conflict_topic(text, other_text):
+                continue
+            other_slot, other_value = _infer_fact_slot(other_text)
+            if (
+                my_slot is not None and other_slot == my_slot
+                and my_value is not None and other_value is not None
+                and _normalize_memory_text(my_value)
+                != _normalize_memory_text(other_value)
+            ):
+                continue
+            other_topic = _correction_topic_slot(other_text)
+            if my_topic and other_topic and my_topic != other_topic:
+                continue
+            try:
+                other_meta = json.loads(row[2] or "{}")
+            except Exception:
+                other_meta = {}
+            # 相似度三件套（余弦 + 二字组重合率/Jaccard）：硬信号
+            # 判定和判官预筛共用，先一次算清。
+            cos = None
+            overlap = 0.0
+            jaccard = 0.0
+            if my_bigrams:
+                other_bigrams = self._content_bigrams(other_text)
+                if other_bigrams:
+                    inter = len(my_bigrams & other_bigrams)
+                    union = len(my_bigrams | other_bigrams)
+                    overlap = inter / min(
+                        len(my_bigrams), len(other_bigrams)
+                    )
+                    jaccard = inter / union if union else 0.0
+            if my_vec is not None and row[3] is not None:
+                try:
+                    other_vec = _blob_to_vector(row[3])
+                    if other_vec is not None and other_vec.shape == my_vec.shape:
+                        denom = float(
+                            np.linalg.norm(my_vec) * np.linalg.norm(other_vec)
+                        )
+                        if denom > 0:
+                            cos = float(np.dot(my_vec, other_vec)) / denom
+                except Exception:
+                    cos = None
+            matched = False
+            if (
+                my_slot is not None and other_slot == my_slot
+                and my_value is not None and other_value is not None
+                and _normalize_memory_text(my_value)
+                == _normalize_memory_text(other_value)
+            ):
+                matched = True
+            elif (
+                cos is not None and cos >= self._CLUSTER_MIN_COSINE
+                and overlap >= self._CLUSTER_MIN_BIGRAM_OVERLAP
+                and jaccard >= self._CLUSTER_MIN_BIGRAM_JACCARD
+            ):
+                matched = True
+            if matched:
+                out.append((other_id, other_text, other_meta))
+            else:
+                candidates.append(
+                    (other_id, other_text, other_meta, cos, overlap, jaccard)
+                )
+        if allow_judge and candidates:
+            out.extend(
+                self._judge_merge_candidates(
+                    memory_id, text, meta, candidates
+                )
+            )
+        return out
+
+    def _judge_merge_candidates(self, memory_id, text, meta, candidates):
+        """硬信号认不出的候选对，问判官“是不是同一件事”（2026-11-24，
+        BOOS 拍板的设计扩展）：判为同一件事的，出现证据才并进同一
+        簇计数。行都留着、不改内容、不触发取代。
+
+        护栏优先于判官（冲突话题/未答冲突问题的对在
+        _fact_cluster_members 里已挡掉，走不到这里）：带语气标记
+        （玩笑/测试/假设）的对不问——那种证据本来就不算数。
+        预筛不过（余弦和二字组都够不着）的对不问，省钱。
+        结论缓存进两行 metadata（_SAME_FACT_META_KEY），同对不
+        重复问；判官断了/回不明白 → 不归并、不缓存（下次再试），
+        绝不崩、绝不乱并。返回被判为同一件事的 [(id, text, meta)]。
+        """
+        merged = []
+        if (meta or {}).get("tone") in ("joke", "test", "hypothesis"):
+            return merged
+        my_cache = (meta or {}).get(self._SAME_FACT_META_KEY)
+        if not isinstance(my_cache, dict):
+            my_cache = {}
+        ordered = sorted(
+            candidates,
+            key=lambda c: (
+                c[3] if c[3] is not None else -1.0, c[4], c[5]
+            ),
+            reverse=True,
+        )
+        asked = 0
+        for other_id, other_text, other_meta, cos, overlap, jaccard in ordered:
+            if (other_meta or {}).get("tone") in (
+                "joke", "test", "hypothesis"
+            ):
+                continue
+            cached = my_cache.get(other_id)
+            if not isinstance(cached, dict):
+                other_cache = (other_meta or {}).get(self._SAME_FACT_META_KEY)
+                if isinstance(other_cache, dict):
+                    cached = other_cache.get(memory_id)
+            if isinstance(cached, dict) and "same" in cached:
+                if cached.get("same"):
+                    merged.append((other_id, other_text, other_meta))
+                continue
+            plausible = (
+                (cos is not None and cos >= self._SAME_FACT_MIN_COSINE)
+                or (
+                    overlap >= self._SAME_FACT_MIN_BIGRAM_OVERLAP
+                    and jaccard >= self._SAME_FACT_MIN_BIGRAM_JACCARD
+                )
+            )
+            if not plausible:
+                continue
+            if asked >= self._SAME_FACT_MAX_JUDGE_PER_CALL:
+                continue
+            verdict = self._ask_same_fact_judge(text, other_text)
+            asked += 1
+            if verdict is None:
+                # 判官不可用：这一轮别再问别的对了，全体降级不归并。
+                break
+            record = {
+                "same": bool(verdict.get("same_fact")),
+                "provider": verdict.get("provider"),
+                "model": verdict.get("model"),
+                "at": _now_iso(),
+                "reason": verdict.get("reason"),
+                "cost_usd": verdict.get("cost_usd"),
+            }
+            self._store_same_fact_verdict(
+                memory_id, meta, other_id, other_meta, record
+            )
+            if record["same"]:
+                merged.append((other_id, other_text, other_meta))
+        return merged
+
+    def _store_same_fact_verdict(self, memory_id, meta, other_id,
+                                 other_meta, record):
+        """把判官归并结论写进两行 metadata（缓存 + 审计留痕）。
+
+        本行写进传进来的 meta dict（_record_occurrence 收尾落盘）；
+        对方行现读现写（不提交，跟着调用方的提交一起走）。写失败
+        只记日志：结论丢了下次重问，不许拖垮计数主流程。
+        """
+        try:
+            mine = meta.get(self._SAME_FACT_META_KEY)
+            if not isinstance(mine, dict):
+                mine = {}
+                meta[self._SAME_FACT_META_KEY] = mine
+            mine[other_id] = record
+        except Exception:
+            logger.warning("判官归并结论写本行失败。", exc_info=True)
+        try:
+            theirs = other_meta.get(self._SAME_FACT_META_KEY)
+            if not isinstance(theirs, dict):
+                theirs = {}
+                other_meta[self._SAME_FACT_META_KEY] = theirs
+            theirs[memory_id] = record
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=? WHERE id=?",
+                (json.dumps(other_meta, ensure_ascii=False), other_id),
+            )
+        except Exception:
+            logger.warning("判官归并结论写对方行失败。", exc_info=True)
+
+    def _ask_same_fact_judge(self, text_a, text_b):
+        """调大模型判官判“是不是同一件事”（晋升计数归并用）。
+
+        模型断了/没接好/回的格式不对时返回 None——调用方降级为
+        不归并（走程序老路），别崩、别丢事实、别乱并。判官对象
+        同 _ask_semantic_judge：self._judge_provider（测试注入）
+        或配置解析（默认 DeepSeek flash，见 semantic_judge.py）。
+        """
+        try:
+            from memory import semantic_judge as _sj
+            return _sj.judge_same_fact(
+                text_a, text_b, provider=self._judge_provider,
+                budget_tracker=self.budget_tracker,
+            )
+        except Exception as exc:
+            logger.warning("同事实判断失败，降级不归并：%s", exc)
+            return None
+
+    def _inherit_seen_evidence(self, old_meta, new_id, turn_id=None):
+        """纠正/取代落盘后，把旧行攒下的出现证据（天数/会话）并给
+        新行，再按合并后的证据复核一次晋升（2026-11-24，BOOS 定
+        “晋升规则再优化”：新事实不许从零开始数）。
+
+        旧行带语气标记（玩笑/测试/假设）时不继承——那种证据本来
+        就不算数。失败只记日志：纠正本身已经落盘，不能被继承
+        拖垮。返回有没有并上。"""
+        try:
+            if not old_meta or not new_id:
+                return False
+            if old_meta.get("tone") in ("joke", "test", "hypothesis"):
+                return False
+            old_dates = _decay._parse_seen_list(old_meta.get("seen_dates"))
+            old_sessions = _decay._parse_seen_list(
+                old_meta.get("seen_sessions")
+            )
+            if not old_dates and not old_sessions:
+                return False
+            row = self._conn.execute(
+                "SELECT text, metadata_json FROM memories WHERE id=?"
+                " AND voided=0 AND deleted=0 AND superseded=0",
+                (new_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                new_meta = json.loads(row[1] or "{}")
+            except Exception:
+                new_meta = {}
+            merged_dates = _decay._parse_seen_list(new_meta.get("seen_dates"))
+            merged_sessions = _decay._parse_seen_list(
+                new_meta.get("seen_sessions")
+            )
+            for _d in old_dates:
+                if _d not in merged_dates:
+                    merged_dates.append(_d)
+            for _s in old_sessions:
+                if _s not in merged_sessions:
+                    merged_sessions.append(_s)
+            new_meta["seen_dates"] = _decay._dump_seen_list(merged_dates)
+            new_meta["seen_sessions"] = _decay._dump_seen_list(merged_sessions)
+            # _record_occurrence 把合并后的 meta 写回并复核晋升；
+            # 纠正轮本身也算新事实的一次出现（turn 已在集合里时
+            # 不重复计，record_seen_occurrence 的规矩）。
+            self._record_occurrence(
+                new_id, new_meta, _shanghai_today().isoformat(), turn_id,
+                row[0] or "",
+            )
+            return True
+        except Exception:
+            logger.warning("纠正继承出现证据失败：新行证据未合并。", exc_info=True)
+            return False
+
+    # ---------- 第 8 条：实时整理（2026-11-24，BOOS 定“尽量做成和十一一样”） ----------
+    def _judge_tone_with_router(self, text):
+        """用整理路由的大模型判一条记忆的语气（webfix 二）。
+
+        返回 (tone, evidence)；路由建不起来/模型没回/判不出来
+        返回 None——不猜，留着下次整理再判（拿不准按认真算，
+        是 tone_judgment_prompts 里给模型的规矩，也是这里的）。
+        """
+        router = self.organizing_router()
+        if router is None:
+            return None
+        system_prompt, user_prompt = tone_judgment_prompts(text)
+        try:
+            out = router.judge(
+                system_prompt, user_prompt,
+                max_tokens=300, purpose="tone", probe_primary=False,
+            )
+        except Exception:
+            logger.warning("判语气调用失败：本次不打标。", exc_info=True)
+            return None
+        if not out:
+            return None
+        tone, evidence = parse_tone_judgment(out.get("text"))
+        if tone is None:
+            return None
+        return tone, evidence
+
+    def _tag_memory_tone(self, memory_id, tone, evidence, source):
+        """给一条活记忆打语气标（webfix 二，§16 落账）。
+
+        账本先行：PROMOTE 事件带打标后的完整 meta（和晋升/去重
+        升级同一个记法，重建时 reconcile 按 PROMOTE 带回 tone
+        字段，不丢标）；账本写失败就不打，SQLite 不跑到账本
+        前面。判出非认真（joke/test/hypothesis）时同步压档：
+        stable → episodic、high → normal——反话/玩笑不许占着
+        稳定+高重要（实测“我可太喜欢加班了”就是这么进的核心）。
+        返回有没有打上。
+        """
+        if not memory_id or tone not in (
+            "serious", "joke", "test", "hypothesis",
+        ):
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json FROM memories WHERE id=?"
+                " AND voided=0 AND deleted=0 AND superseded=0",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            text = row[0] or ""
+            try:
+                meta = json.loads(row[1] or "{}")
+            except Exception:
+                meta = {}
+            meta["tone"] = tone
+            meta["tone_evidence"] = evidence
+            meta["tone_source"] = source
+            if tone in ("joke", "test", "hypothesis"):
+                if meta.get("decay_kind") == _decay.DECAY_KIND_STABLE:
+                    meta["decay_kind"] = _decay.DECAY_KIND_EPISODIC
+                if meta.get("importance") == "high":
+                    meta["importance"] = "normal"
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                     "memory_id": memory_id, "key": memory_id,
+                     "text": text, "meta": dict(meta)},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("语气打标记账失败：本次不打标。", exc_info=True)
+                return False
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, decay_kind=?"
+                " WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False),
+                 meta.get("decay_kind"), memory_id),
+            )
+            self._conn.commit()
+            return True
+
+    def _organize_turn_memories(self, memory_ids, turn_id=None):
+        """一轮对话的小范围整理：只碰本轮触碰到的记忆（本轮新存的、
+        被纠正换上的、被同文引用计数的），不等定时调度：
+        - 晋升计数复核：按已存的出现集合复核晋升（_record_occurrence
+          同款，账本先行；同一个 turn_id 不重复计数）；
+        - 打标：活行还没槽位标的，按原文推断补上（_set_memory_slot，
+          账本先行、已有标不动）；
+        - 去重检查：集合内、以及集合与集合外活行之间归一化同文的，
+          只记进汇总，不删不顶（删改内容要 BOOS 点头）；
+        - 冲突扫描：集合内同槽不同值的两两过 _resolve_conflict，
+          只记进汇总，不执行（本轮真要顶的，存储路径已经顶了；
+          这里是复核网，捞到的留给自检/BOOS 看）。
+        每条独立 try/except：单条失败只记日志，不影响其他条。
+        幂等：同一批重复跑，结果收敛（标已补、晋升已完成）。
+        返回汇总 dict。调用方在后台线程里跑（_schedule_turn_organize）。
+        """
+        summary = {
+            "tagged": [], "promoted": [], "duplicates": [],
+            "conflicts": [], "checked": 0, "tone_tagged": [],
+        }
+        ids = [m for m in dict.fromkeys(memory_ids or []) if m]
+        if not ids:
+            return summary
+        today = _shanghai_today().isoformat()
+        with self._lock:
+            rows = {}
+            for mid in ids:
+                try:
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json, superseded, deleted,"
+                        " voided FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                except Exception:
+                    continue
+                if row is None or row[2] or row[3] or row[4]:
+                    continue
+                try:
+                    meta = json.loads(row[1] or "{}")
+                except Exception:
+                    meta = {}
+                rows[mid] = (row[0] or "", meta)
+            summary["checked"] = len(rows)
+            # 语气补标（webfix 二）：存的时候本地筛已标过明显的；
+            # 没标的（本地认不出，比如反话）在这里问整理路由的
+            # 大模型判——聊天/判官判出的语气必须落账，不然晋升
+            # 和偏好使用都认不到这个标。判完同步刷新手里的 rows，
+            # 后面的晋升复核按新标走（带标记的不计晋升）。
+            for mid, (text, meta) in list(rows.items()):
+                if meta.get("tone"):
+                    continue
+                try:
+                    judged = self._judge_tone_with_router(text)
+                except Exception:
+                    judged = None
+                if not judged:
+                    continue
+                _tone_value, _tone_evidence = judged
+                try:
+                    if self._tag_memory_tone(
+                        mid, _tone_value, _tone_evidence, "model"
+                    ):
+                        summary["tone_tagged"].append(mid)
+                        fresh = self._conn.execute(
+                            "SELECT metadata_json FROM memories"
+                            " WHERE id=?",
+                            (mid,),
+                        ).fetchone()
+                        try:
+                            rows[mid] = (
+                                text,
+                                json.loads((fresh or ["{}"])[0] or "{}"),
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    logger.warning(
+                        "实时整理语气补标失败：%s", mid, exc_info=True
+                    )
+            # 晋升计数复核（先做：它会重写 metadata_json，后面的打标
+            # 按库里最新值读，不拿旧 dict 覆盖）。
+            for mid, (text, meta) in rows.items():
+                try:
+                    if self._record_occurrence(
+                        mid, meta, today, turn_id, text
+                    ):
+                        summary["promoted"].append(mid)
+                except Exception:
+                    logger.warning(
+                        "实时整理晋升复核失败：%s", mid, exc_info=True
+                    )
+            # 打标（槽位标）：按库里当前 metadata 判断有没有标。
+            for mid, (text, _meta) in rows.items():
+                try:
+                    fresh = self._conn.execute(
+                        "SELECT metadata_json FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                    fresh_meta = json.loads((fresh or ["{}"])[0] or "{}")
+                    if not fresh_meta.get("slot"):
+                        slot, _value = _infer_fact_slot(text)
+                        if slot:
+                            self._set_memory_slot(mid, slot)
+                            summary["tagged"].append(mid)
+                except Exception:
+                    logger.warning(
+                        "实时整理打标失败：%s", mid, exc_info=True
+                    )
+            # 去重检查（只报告，不删不顶）。
+            try:
+                seen_keys = {}
+                for mid, (text, _meta) in rows.items():
+                    k = _dedupe_key(text)
+                    if not k:
+                        continue
+                    if k in seen_keys:
+                        summary["duplicates"].append(
+                            {"id": mid, "duplicate_of": seen_keys[k]}
+                        )
+                    else:
+                        seen_keys[k] = mid
+                if seen_keys:
+                    for row in self._conn.execute(
+                        "SELECT id, text FROM memories WHERE voided=0"
+                        " AND deleted=0 AND superseded=0"
+                    ).fetchall():
+                        if row[0] in rows:
+                            continue
+                        k = _dedupe_key(row[1] or "")
+                        if k and k in seen_keys:
+                            summary["duplicates"].append(
+                                {"id": seen_keys[k], "duplicate_of": row[0]}
+                            )
+            except Exception:
+                logger.warning("实时整理去重检查失败。", exc_info=True)
+            # 冲突扫描（只报告，不执行）。
+            try:
+                items = list(rows.items())
+                for i in range(len(items)):
+                    for j in range(i + 1, len(items)):
+                        id_a, (text_a, meta_a) = items[i]
+                        id_b, (text_b, meta_b) = items[j]
+                        slot_a, val_a = _infer_fact_slot(text_a)
+                        slot_b, val_b = _infer_fact_slot(text_b)
+                        if not slot_a or slot_a != slot_b:
+                            continue
+                        if _normalize_memory_text(
+                            val_a or ""
+                        ) == _normalize_memory_text(val_b or ""):
+                            continue
+                        verdict = _provenance._resolve_conflict(
+                            meta_a, meta_b
+                        )
+                        summary["conflicts"].append(
+                            {
+                                "a": id_a, "b": id_b, "slot": slot_a,
+                                "action": (verdict or {}).get("action"),
+                            }
+                        )
+            except Exception:
+                logger.warning("实时整理冲突扫描失败。", exc_info=True)
+        return summary
+
+    def _schedule_turn_organize(self, memory_ids, turn_id=None):
+        """把本轮整理放后台线程跑：不拖慢回复；整理出任何异常只
+        记日志，绝不影响本轮对话。返回线程对象（测试可 join 等它
+        跑完验效果）；没有可整理的返回 None。
+
+        线程里不用本 store 的连接：另开一个同目录的 store 实例
+        （独立 SQLite 连接，靠 WAL 的文件级并发）——跨线程共用
+        一条连接在全套测试里触发过原生层 access violation
+        （2026-11-24 全套崩溃定位），独立连接 + 实例被线程帧
+        持有（不会被提前回收）才稳。整理线程之间串行：新线程
+        先等上一条整理完，不堆积。"""
+        ids = [m for m in dict.fromkeys(memory_ids or []) if m]
+        if not ids:
+            return None
+        prev = getattr(self, "_turn_organize_thread", None)
+
+        def _run():
+            worker = None
+            try:
+                if prev is not None and prev.is_alive():
+                    prev.join(timeout=30)
+                worker = SQLiteStore(memory_dir=str(self.memory_dir))
+                self._last_turn_organize_summary = (
+                    worker._organize_turn_memories(ids, turn_id=turn_id)
+                )
+            except Exception:
+                logger.warning("实时整理后台执行失败。", exc_info=True)
+            finally:
+                # 用完立刻关连接：不长期占着库文件（Windows 下开着
+                # 的库文件删不掉、搬不走）。
+                if worker is not None:
+                    try:
+                        worker._conn.close()
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(
+            target=_run, daemon=True, name="turn-organize"
+        )
+        self._turn_organize_thread = thread
+        thread.start()
+        return thread
+
+    def _find_same_slot_conflicts(self, slot, value):
+        """找同槽位、不同值的活记忆：[(id, text, metadata)]。
+        按每条原文重新认槽位（老行存的时候还没打 slot 标，只能从文本认）。"""
+        with self._lock:
+            norm_value = _normalize_memory_text(value or "")
+            out = []
+            for row in self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall():
+                old_slot, old_value = _infer_fact_slot(row[1] or "")
+                if old_slot != slot or old_value is None:
+                    continue
+                if _normalize_memory_text(old_value) == norm_value:
+                    continue
+                try:
+                    old_meta = json.loads(row[2] or "{}")
+                except Exception:
+                    old_meta = {}
+                out.append((row[0], row[1] or "", old_meta))
+            return out
+
+    def _is_core_protected_row(self, old_meta, slot=None):
+        """核心/置顶记忆：身份槽位（名字/SOUL/电脑配置）、规则、精选
+        置顶。这类记忆的内容变更永远要 BOOS 点头（项目红线），自动
+        裁决/连带清扫一律不碰——要改只能走 BOOS 点名纠正的路。"""
+        meta = old_meta or {}
+        if slot in _provenance.KNOWN_SLOTS:
+            return True
+        if meta.get("slot") in _provenance.KNOWN_SLOTS:
+            return True
+        return bool(meta.get("is_rule") or meta.get("curated"))
+
+    def _sweep_extra_conflicts(self, slot, conflicts, new_key, new_text,
+                               turn_id=None, probe_source="user",
+                               probe_confirmed=True):
+        """R-1 连带清扫（2026-11-24，BOOS 定“像十一”）：一次纠正的
+        主目标之外，同槽还有别的真冲突旧值时，逐条一并清掉——不清
+        的话单值槽里更早的错误值永远留着（P1 重查 R-1）。
+
+        清扫的门槛（防广州式误伤的护栏，一条都不许放宽）：
+        - 核心/置顶不碰（_is_core_protected_row，走问 BOOS 的路径）；
+        - 只清 BOOS 在对话里亲口说过的（metadata 带 turn_id）——
+          系统直存、迁移、推断来的行不连带：真记忆“用户住在广州”
+          就是迁移来的推断行（turn_id 为空），它只能被点名纠正
+          （correct_memory 主路），不许被成批清扫误伤；
+        - 每条仍走 _resolve_conflict 裁决，不是 supersede_old 不顶；
+        - 取代走 _supersede_row：账本先行、记 SUPERSEDE 事件，
+          是标记不是删除；记账失败只警告、跳过这条，新记忆不回滚
+          （取代失败留新记忆是既定规矩）。
+        返回清掉的 id 列表。调用方需持锁。"""
+        swept = []
+        probe = {
+            "source": probe_source,
+            "user_confirmed": probe_confirmed,
+            "confidence": 1.0 if probe_confirmed else 0.7,
+            "created_at": _now_iso(),
+            "write_seq": _next_write_seq(),
+            "slot": slot,
+        }
+        for old_id, old_text, old_meta in conflicts or []:
+            if not old_id or old_id == new_key:
+                continue
+            if self._is_core_protected_row(old_meta, slot):
+                continue
+            if not (old_meta or {}).get("turn_id"):
+                continue
+            if self._is_inferred_unconfirmed(old_meta):
+                # 推断记忆保护（2026-11-24）：带 turn_id 的推断行
+                # （模型在一轮里推断直存的）也不许连带悄悄顶——
+                # 攒待问问题，BOOS 点头才换。
+                self._queue_conflict_question(
+                    old_id, old_text, new_key, new_text, turn_id=turn_id,
+                )
+                continue
+            row = self._conn.execute(
+                "SELECT superseded, deleted, voided FROM memories"
+                " WHERE id=?",
+                (old_id,),
+            ).fetchone()
+            if row is None or row[0] or row[1] or row[2]:
+                continue  # 已不是活行（被主路顺带处理了），不重复顶
+            verdict = _provenance._resolve_conflict(old_meta, probe)
+            if (verdict or {}).get("action") != "supersede_old":
+                continue
+            try:
+                self._supersede_row(
+                    old_id, old_text, old_meta, new_key, new_text,
+                    turn_id=turn_id,
+                )
+            except Exception:
+                logger.warning(
+                    "R-1 连带清扫取代记账失败：旧行未取代。", exc_info=True
+                )
+                continue
+            swept.append(old_id)
+        return swept
+
+    def _set_memory_slot(self, memory_id, slot):
+        """给一条记忆补槽位标（列 + metadata_json 里都写），以后按槽位
+        找它就不用再从文本现认。找不到行、或已有槽位标时什么都不做，不抛异常。"""
+        if not memory_id or not slot:
+            return
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata_json FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                meta = json.loads(row[0] or "{}")
+            except Exception:
+                meta = {}
+            if meta.get("slot"):
+                return
+            # R-7（2026-11-24）：槽位标也记一笔账本（SLOT 事件），
+            # 对账重建缺失行时按它把标带回来——以前只写 SQLite，
+            # add 事件的 meta 里没有槽位标，重建出来标就丢了。
+            # 账本先行：写不进去就先不补标（本函数是尽力而为的
+            # 补标、不抛异常，下次用到这条时还会再试）。
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_SLOT,
+                     "memory_id": memory_id, "key": memory_id,
+                     "slot": slot},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("补槽位记账失败：本次先不补标。", exc_info=True)
+                return
+            meta["slot"] = slot
+            self._conn.execute(
+                "UPDATE memories SET slot=?, metadata_json=? WHERE id=?",
+                (slot, json.dumps(meta, ensure_ascii=False), memory_id),
+            )
+            self._conn.commit()
+
+    def _complete_correction_fragment(self, fact):
+        """碎片纠正补句（确定性版，不调模型）：新说法是个碎片值（“深圳”）
+        时，看库里是不是恰好只有一条单值属性记忆——是就把它的旧值换
+        成碎片值拼回整句（“我住北京”+“深圳”→“我住深圳”）；不是
+        （没有、或有多条、或值含糊）就原样返回，调用方走老路，绝不硬编。
+        只认 residence / user_name / agent_name 三个槽。"""
+        if not isinstance(fact, str) or not fact.strip():
+            return fact
+        value = _detect_correction_fragment(fact)
+        if value is None:
+            return fact
+        # 碎片值收尾：去句首的引导词/住/在（“应该是深圳”→“深圳”，
+        # “住深圳了”→“深圳了”）、去句尾语气词；带事实动词的不是值
+        # （“喜欢喝茶”），不补。
+        value = (value or "").strip()
+        for prefix in ("应该是", "其实是", "其实"):
+            if value.startswith(prefix):
+                value = value[len(prefix):].strip()
+                break
+        if value[:1] in ("住", "在", "是"):
+            value = value[1:].strip()
+        value = value.rstrip("了呢啊吧哦嘛").strip()
+        if not value or value in _VAGUE_FRAGMENT_VALUES:
+            return fact
+        if len(value) > 20:
+            return fact
+        if any(ch in value for ch in ("喜", "欢", "爱", "吃", "喝", "叫",
+                                       "去", "做", "买", "看", "听", "玩",
+                                       "想", "要", "会", "能")):
+            return fact
+        with self._lock:
+            cands = []
+            for row in self._conn.execute(
+                "SELECT id, text FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall():
+                slot, old_value = _infer_fact_slot(row[1] or "")
+                if slot is None or old_value is None:
+                    continue
+                if _normalize_memory_text(old_value) == _normalize_memory_text(value):
+                    continue
+                cands.append((row[1] or "", old_value))
+        if len(cands) != 1:
+            return fact
+        old_text, old_value = cands[0]
+        if old_value not in old_text:
+            return fact
+        return old_text.replace(old_value, value, 1)
+
+    def _retry_correction_by_slot(self, correction, fact, turn_id=None):
+        """纠错分不清改哪条（ambiguous）时，按单值槽位再筛一次：新说法
+        带槽位、且候选里恰好只有一条同槽位（值不同）时，就改那条。
+        筛不出来返回 None（调用方保留 ambiguous，等 BOOS 挑）。"""
+        slot, value = _infer_fact_slot(fact)
+        if slot is None or value is None:
+            return None
+        cands = (correction or {}).get("candidates") or []
+        same_slot = []
+        for cand in cands:
+            text = (cand or {}).get("text") if isinstance(cand, dict) else None
+            if not text:
+                continue
+            cand_slot, cand_value = _infer_fact_slot(text)
+            if cand_slot != slot or cand_value is None:
+                continue
+            if _normalize_memory_text(cand_value) == _normalize_memory_text(value):
+                continue
+            same_slot.append(cand)
+        if len(same_slot) != 1:
+            return None
+        old_text = same_slot[0].get("text") or ""
+        if not old_text:
+            return None
+        retry = self.correct_memory(
+            old_text, fact, exclude_identical_to_new=True,
+            explicit_correction=True, turn_id=turn_id,
+        )
+        if (retry or {}).get("status") == "updated":
+            return retry
+        return None
+
+    def _apply_same_slot_update(self, sentence, slot, value, receipt,
+                                turn_id, event_date, is_correction=False):
+        """同槽位新值进库前的裁决（save_turn 逐句循环里调）：
+        - 没同槽位旧值 → 返回 False，调用方照常存；
+        - 无纠正词的新陈述（is_correction=False）→ 返回 False，调用方
+          照常存成新行、不顶旧的（2026-11-23 model fix #1，D 组根因：
+          只有带明确纠正词的才算纠正；不问 BOOS、不顶旧）；
+        - 带明确纠正词（is_correction=True）→ 裁决最新的一条同槽位
+          旧值（被纠正的那条，主目标）；裁决 supersede_old 时走
+          correct_memory 取代，correct_memory 没换成的那条改走直存 +
+          _supersede_row 兜底。主目标之外同槽其余真冲突旧值走连带
+          清扫（R-1，2026-11-24，_sweep_extra_conflicts，带护栏）。
+        """
+        conflicts = self._find_same_slot_conflicts(slot, value)
+        if not conflicts:
+            return False
+        if not is_correction:
+            # D 组根因：无纠正词的新陈述不自动顶掉同槽旧记忆——直接存成
+            # 新行（调用方继续走正常存储），不问、不顶。只带明确纠正词
+            # 的才算纠正（is_correction=True 那条路）。
+            return False
+        # R-1（2026-11-24，BOOS 定“像十一”）：带明确纠正词时不再
+        # 只顶最新一条——主目标仍是最新那条同槽冲突（被纠正的那条，
+        # 照旧逐条裁决、裁决不过整句不存）；其余冲突旧值在主目标
+        # 顶成之后走连带清扫（_sweep_extra_conflicts：只清对话里
+        # 亲口说过的、非核心的——旧写法无差别全顶，曾把真记忆广州
+        # 连带顶掉，护栏改在清扫的门槛上，不再靠只顶一条）。
+        # 核心/置顶行先剔出裁决名单：不顶、不拦，留着走问 BOOS 的路。
+        conflicts = [
+            c for c in conflicts
+            if not self._is_core_protected_row(c[2], slot)
+        ]
+        if not conflicts:
+            return False
+        conflicts = sorted(
+            conflicts,
+            key=lambda c: (
+                (c[2] or {}).get("write_seq") or 0,
+                (c[2] or {}).get("created_at") or "",
+            ),
+            reverse=True,
+        )
+        primary_conflicts = conflicts[:1]
+        extra_conflicts = conflicts[1:]
+        # S10（2026-11-22，BOOS 定选 A）：_apply_same_slot_update 只在
+        # save_turn 的逐句循环里调，句子都来自用户本轮直接说的话——新事实
+        # 按已确认算（user/1.0），不再按推断（inferred/0.7）。推断赢不了
+        # 已确认的旧行，新事实会被 pending_new 拦掉、进 dropped（郑州案）。
+        # 模型自己推断的事实不走这里，仍按 inferred/0.7 直存
+        # （add_memory_text(source="inferred")，见低可信度挂起的回归测试）。
+        new_probe = {
+            "source": "user",
+            "user_confirmed": True,
+            "confidence": 1.0,
+            "created_at": _now_iso(),
+            "write_seq": _next_write_seq(),
+            "slot": slot,
+        }
+        to_supersede = []
+        for old_id, old_text, old_meta in primary_conflicts:
+            verdict = _provenance._resolve_conflict(old_meta, new_probe)
+            action = (verdict or {}).get("action")
+            if action == "supersede_old":
+                to_supersede.append((old_id, old_text, old_meta))
+            elif action == "pending_new":
+                receipt["dropped"].append(
+                    {"text": sentence, "reason": "槽位冲突待确认"}
+                )
+                return True
+            else:  # keep_old / ask：新说法不存，旧的留着。
+                receipt["dropped"].append(
+                    {"text": sentence, "reason": "槽位冲突未裁决"}
+                )
+                return True
+        # 全是 supersede_old：逐条取代。
+        first_outcome = None
+        new_key = None
+        remaining = []
+        for old_id, old_text, old_meta in to_supersede:
+            outcome = self.correct_memory(
+                old_text, sentence, exclude_identical_to_new=True,
+                explicit_correction=True, turn_id=turn_id,
+            )
+            if (outcome or {}).get("status") == "updated":
+                if first_outcome is None:
+                    first_outcome = outcome
+                new_key = (outcome or {}).get("memory_id") or new_key
+            elif (outcome or {}).get("status") == "pending_question":
+                # 推断记忆保护：新说法已存、旧的挂待问——这条算
+                # 处理完了，不进兜底（兜底会再存一遍/硬顶）。
+                if first_outcome is None:
+                    first_outcome = outcome
+                new_key = (outcome or {}).get("memory_id") or new_key
+            else:
+                remaining.append((old_id, old_text, old_meta))
+        if remaining:
+            # correct_memory 没换成的（候选检索没找着旧条等）：新说法先
+            # 直存，再按裁决直接取代旧行——裁决已说该换，不并存两条。
+            if new_key is None:
+                saved = self.add_memory_text(
+                    sentence, source="user", turn_id=turn_id,
+                    event_date=event_date, decay_kind="episodic", slot=slot,
+                    # 下面循环会显式 _supersede_row 顶掉 remaining 这一条，
+                    # 这里别再让直存自己裁决顶旧（会顶两遍）。
+                    allow_slot_supersede=False,
+                )
+                if (saved or {}).get("event") != "ADD":
+                    receipt["dropped"].append(
+                        {"text": sentence, "reason": "账本写失败"}
+                    )
+                    return True
+                new_key = saved.get("id")
+            _fb_superseded = False
+            for old_id, old_text, old_meta in remaining:
+                try:
+                    # 推断记忆保护：兜底硬顶也先过护栏——推断未确认
+                    # 的旧行改挂待问，不算顶成。
+                    if self._supersede_or_ask(
+                        old_id, old_text, old_meta, new_key, sentence
+                    ) == "superseded":
+                        _fb_superseded = True
+                except Exception:
+                    logger.warning("槽位取代记账失败：旧行未取代。", exc_info=True)
+            if first_outcome is None:
+                first_outcome = {
+                    "status": "updated" if _fb_superseded else "pending_question",
+                    "memory_id": new_key,
+                    "old_text": remaining[0][1], "new_text": sentence,
+                    "candidates": [
+                        {"id": oid, "text": ot} for oid, ot, _m in remaining
+                    ],
+                    "reason": "已更正" if _fb_superseded else "旧记忆是推断来的、还没确认过，等你确认再换",
+                    "layer": "slot",
+                    "resolution": "updated" if _fb_superseded else "pending_question",
+                    "audit": {"source": "user", "method": "slot_conflict"},
+                }
+        if (
+            extra_conflicts and new_key is not None
+            and (first_outcome or {}).get("status") == "updated"
+        ):
+            # 主目标已顶成：其余同槽冲突旧值走连带清扫（门槛见
+            # _sweep_extra_conflicts）。清不掉的不影响本次纠正结果。
+            # 主目标被推断保护挂起（pending_question）时不扫——
+            # 纠正本身还没经 BOOS 确认，其余的更不许先顶。
+            self._sweep_extra_conflicts(
+                slot, extra_conflicts, new_key, sentence,
+                turn_id=turn_id,
+            )
+        if first_outcome is not None:
+            slot2, _v = _infer_fact_slot(sentence)
+            if slot2:
+                self._set_memory_slot(first_outcome.get("memory_id"), slot2)
+            receipt["stored"].append(sentence)
+            receipt["results"].append(
+                {"id": first_outcome.get("memory_id"), "memory": sentence,
+                 "event": (
+                     "SUPERSEDE"
+                     if first_outcome.get("status") == "updated"
+                     else "CONFLICT_PENDING"
+                 ),
+                 "old_text": first_outcome.get("old_text"),
+                 "supersedes_id": ((first_outcome.get("candidates") or [{}])[0] or {}).get("id")}
+            )
+            if "correction" not in receipt:
+                receipt["correction"] = first_outcome
+            return True
+        return False
+
+    # ---------- 混合语义判断（2026-11-22，BOOS 定） ----------
+    # 主控是十二自己（本地程序）：下面的 _needs_semantic_judge 只做分流，
+    # 用程序能直接算出来的触发条件（slot 是不是 None、句式是不是偏好、
+    # 库里有没有同类活记忆、含不含纠错说法），不调模型、不让模型决定
+    # “要不要问模型”。大模型是判官：只在触发后被调来做语义判断。
+    # 程序能判定的路（住处/名字/Agent 名）不动，仍走程序，不变慢、不变贵。
+
+    def _preference_judge_candidates(self, text):
+        """程序算的判官候选：活记忆里同类偏好句（同文的除外），最近的在前。
+
+        只看句式里含不含偏好标记，不猜意思；同文（归一化后相同）的不算
+        候选——那是去重的活，判官不用判。
+        """
+        norm = _normalize_memory_text(text)
+        out = []
+        for m in self._all_live_memories():
+            cand_text = m["text"] or ""
+            if _normalize_memory_text(cand_text) == norm:
+                continue
+            if not any(marker in cand_text for marker in _JUDGE_PREFERENCE_MARKERS):
+                continue
+            # 纠正记录不是偏好，不进候选（见 _JUDGE_SKIP_MARKERS）。
+            if any(marker in cand_text for marker in _JUDGE_SKIP_MARKERS):
+                continue
+            # 语气标记（webfix 二）：玩笑/测试/假设不作偏好使用，
+            # 不进判官候选（§16：带标记的记忆不当偏好）。
+            if (m["metadata"] or {}).get("tone") in (
+                "joke", "test", "hypothesis",
+            ):
+                continue
+            out.append({"id": m["id"], "text": cand_text,
+                        "meta": m["metadata"]})
+            if len(out) >= _JUDGE_MAX_CANDIDATES:
+                break
+        return out
+
+    def _needs_semantic_judge(self, sentence, slot):
+        """主控分流（纯程序逻辑，不调模型）：该不该问大模型判官。
+
+        返回 (trigger, reason, candidates)，trigger 为 True 才问。
+        触发条件（至少满足一条，且都要有候选可判）：
+        (a) slot 是 None + 偏好句式 + 库里有同类偏好活记忆；
+        (c) 含纠错说法 + 有候选（2026-11-23 model fix #4 放宽：不要求
+            偏好标记——“我现在喝豆奶了”这种没“喜欢”也没槽位的，程序
+            判不定，交给判官；“我现在喜欢喝豆奶了”仍是这条）。
+        slot 能推出来时走程序路，这里永远返回不触发。
+        (b) 纠正候选多条分不清不在这里——那是 correct_memory 报 ambiguous
+        之后的事，见 _judge_ambiguous_correction。
+        """
+        if slot is not None:
+            return False, None, []
+        # 2026-11-23 R2 后续①：偏好改变说法（改吃/只吃类）也触发判官。
+        # 这类说法没有“喜欢”等偏好标记，但明确表达偏好变了；只认
+        # _JUDGE_CHANGE_MARKERS 里的表达，避免过度触发。
+        has_marker = any(
+            marker in sentence for marker in _JUDGE_PREFERENCE_MARKERS
+        )
+        has_change = any(
+            marker in sentence for marker in _JUDGE_CHANGE_MARKERS
+        )
+        has_correction_phrase = any(
+            phrase in sentence for phrase in _CORRECTION_PHRASES
+        )
+        # 2026-11-23 model fix #4（模型优先）：程序只判明显 case——
+        # 槽位能推出来的走程序路（上面已返回 False）、库里没同类候选的
+        # 直接存（下面）；其余（带偏好标记/改变说法/纠正说法、且库里有
+        # 同类活记忆）都问模型判官，程序不替模型做语义判断。
+        if not has_marker and not has_change and not has_correction_phrase:
+            return False, None, []
+        cands = self._preference_judge_candidates(sentence)
+        if not cands:
+            return False, None, []
+        # 改变标记是更明确的信号，优先于通用纠正短语匹配（如“我现在”）。
+        if has_change and not has_marker:
+            return True, "preference_change", cands
+        if has_correction_phrase:
+            return True, "correction_uncertain", cands
+        return True, "slot_none_preference", cands
+
+    def _ask_semantic_judge(self, text, candidates, context=None):
+        """调大模型判官（只在触发后调）。返回 verdict dict。
+
+        模型断了（超时、API 报错、没 Key、没接好）或回的格式不对时
+        返回 None——调用方按程序 fallback 走（照常存、不崩、不丢事实），
+        失败记一条 warning 日志，方便查。
+        判官对象：self._judge_provider（测试注入）或配置解析
+        （默认 DeepSeek flash，见 memory/semantic_judge.py）。
+        context 是整段对话上下文（最近几轮消息，2026-11-23 model fix
+        #4）：判官只看一句话分不清“在纠正哪条”时，对话能定锚。
+        """
+        try:
+            from memory import semantic_judge as _sj
+            return _sj.judge_semantic(
+                text, candidates, provider=self._judge_provider,
+                budget_tracker=self.budget_tracker, context=context,
+            )
+        except Exception as exc:
+            logger.warning("语义判断失败，降级走程序：%s", exc)
+            return None
+
+    def _ask_importance_judge(self, text, context=None):
+        """调大模型重要性判官（只在程序判不定时调）。返回 verdict dict。
+
+        模型断了或回的格式不对时返回 None——调用方按程序 fallback 走
+        （当一次性经历存，不崩、不丢事实），失败记一条 warning 日志。
+        判官对象：self._judge_provider（测试注入）或配置解析
+        （默认 DeepSeek flash，见 memory/semantic_judge.py）。
+        context 是整段对话上下文（2026-11-23 model fix #4）。
+        """
+        try:
+            from memory import semantic_judge as _sj
+            return _sj.judge_importance(
+                text, provider=self._judge_provider,
+                budget_tracker=self.budget_tracker, context=context,
+            )
+        except Exception as exc:
+            logger.warning("重要性判断失败，降级走程序：%s", exc)
+            return None
+
+    def _decide_importance(self, text, slot=None, context=None):
+        """重要性判定（对外口）：先过程序硬护栏，再走三段判。
+
+        护栏（2026-11-24 webfix 二，BOOS 拍板“判官提议、程序裁决”）：
+        - 问句永远不许 important（问句被判成 stable+high 是实测
+          毛病：“我的口味你还记得不”）——直接 episodic，不问判官；
+        - 判官提议的 important，对“单次提及的非核心内容”封顶成
+          episodic：非核心 = 没槽位（槽位在 _decide_importance_inner
+          里先行返回、judge_info 为 None，走不到这里）、非规则、
+          文本里没有用户明确强调的说法（_EMPHASIS_MARKERS）、
+          也不带重复性/习惯标记（_RECURRENCE_MARKERS——“我每天
+          去游泳”是习惯陈述，不是单次提及，判重要就进核心，
+          是 Phase 2 #2 的既有行为）。
+          程序侧类别（槽位/偏好/决定句式）判的 important 不封顶
+          （那是既定的核心类别设计，judge_info 同样为 None）。
+        封顶留痕：judge_info["clamped"] 写明 from/to/reason，
+        存记忆时落进 meta.importance_clamped（见 add_memory_text）。
+        """
+        if _is_question_sentence(text):
+            return "episodic", "问句，不进核心（重要性护栏）", None
+        decision, reason, judge_info = self._decide_importance_inner(
+            text, slot, context=context
+        )
+        if (
+            decision == "important"
+            and judge_info is not None
+            and slot is None
+            and not _has_emphasis(text)
+            and not _has_recurrence(text)
+        ):
+            judge_info = dict(judge_info)
+            judge_info["clamped"] = {
+                "from": "important", "to": "episodic",
+                "reason": "单次提及的非核心内容，程序封顶",
+            }
+            return (
+                "episodic",
+                (reason or "判官判为长期重要")
+                + "（程序护栏：单次提及的非核心内容，封顶为一次性经历）",
+                judge_info,
+            )
+        return decision, reason, judge_info
+
+    def _decide_importance_inner(self, text, slot=None, context=None):
+        """重要性三段判（Phase 2 #2，混合法）：程序先判，难的问判官。
+
+        返回 (decision, reason, judge_info)：decision 是 "important"
+        （进核心，长期钉住）/ "episodic"（当一次性经历，3 天 3 次
+        兜底还能晋升）/ "unsure"（拿不准，问 BOOS）；reason 是一句
+        话原因；judge_info 是判官回的信息（没问模型时 None）。
+        程序段（免费、确定性，先判）：语气非认真（本地筛命中
+        joke/test/hypothesis）→ episodic；有槽位（住处/名字，
+        核心类别）→ important；偏好句式（喜欢/爱吃/爱喝/爱看/
+        爱听/爱玩/不爱/讨厌）→ important；决定句式（决定/打算/
+        计划/准备/定投，“我”和动词之间可插时间词）→ important；带过去时间词（昨天/前天/
+        今天/刚才/刚刚/上次/这次）→ episodic。都没命中才问判官：
+        判 important→important，false→episodic，"unsure"→unsure；
+        模型断了→episodic（不问 BOOS，兜底还能晋升）。
+        """
+        tone, tone_evidence = local_tone_screen(text or "")
+        if tone in ("joke", "test", "hypothesis"):
+            return (
+                "episodic",
+                "语气是%s（%s），不进核心" % (tone, tone_evidence),
+                None,
+            )
+        if slot is not None:
+            return "important", "带槽位 %s，是核心类别" % slot, None
+        if any(m in (text or "") for m in _JUDGE_PREFERENCE_MARKERS):
+            return "important", "是偏好句式，长期偏好进核心", None
+        # P1-2（2026-11-23）：“我”和动词之间可插时间词——旧正则要求“我”紧贴
+        # 动词，“我今天决定去北京”“我明天打算去上海”都漏判，掉到后面的
+        # 过去时间词分支里被当成一次性经历。
+        if re.search(r"(我(?:今天|明天|下周|下个月|刚才)?(?:决定|打算|计划|准备)|定投)", text or ""):
+            return "important", "是决定/计划，长期决定进核心", None
+        if re.search(r"(昨天|前天|今天|刚才|刚刚|上次|这次)", text or ""):
+            return "episodic", "带过去时间词，是一次性经历", None
+        verdict = self._ask_importance_judge(text, context=context)
+        if verdict is None:
+            return (
+                "episodic",
+                "判官没接通，先当一次性经历（3 天 3 次兜底还能晋升）",
+                None,
+            )
+        important = verdict.get("important")
+        reason = verdict.get("reason") or ""
+        judge_info = {
+            key: verdict.get(key)
+            for key in ("provider", "model", "reason", "cost_usd", "usage")
+            if verdict.get(key) is not None
+        }
+        if important is True:
+            return "important", reason or "判官判为长期重要", judge_info
+        if important is False:
+            return "episodic", reason or "判官判为一次性经历", judge_info
+        return "unsure", reason or "判官拿不准", judge_info
+
+    def _queue_importance_question(self, text, memory_id, reason, turn_id=None):
+        """为一条拿不准重要性的新记忆攒一个问题（Phase 2 #4）。
+        返回问题 dict；同一条记忆已有未回答的问题时返回已有的那条。"""
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_IMPORTANCE,
+            text,
+            _pq.IMPORTANCE_QUESTION_OPTIONS,
+            reason,
+            memory_id=memory_id,
+            turn_id=turn_id,
+        )
+
+    # ---------- 推断记忆保护（2026-11-24，BOOS 裁决） ----------
+    # 背景：E 组重跑里，推断来源、未确认的旧记忆（可信度 0.7）被
+    # 亲口新事实（1.0）在主目标裁决里直接顶掉。BOOS 定：“类似的
+    # 事情别再犯”——这类旧记忆不许再被悄悄顶掉：新事实照常存，
+    # 旧的先留着，攒一个待问问题，BOOS 点头才换；说不换就两条
+    # 都留、这对冲突标为已裁决，不再反复问。亲口确认过的旧记忆
+    # 不受保护，照旧最新赢、不问。
+
+    @staticmethod
+    def _is_inferred_unconfirmed(old_meta):
+        """旧记忆是不是“推断来源、未确认”：没有 user_confirmed
+        标记、且来源不是用户亲口陈述（source != "user"）。"""
+        meta = old_meta or {}
+        if meta.get("user_confirmed"):
+            return False
+        return meta.get("source") != "user"
+
+    def _queue_conflict_question(self, old_id, old_text, new_id, new_text,
+                                 turn_id=None):
+        """为一对“推断旧记忆 vs 新事实”冲突攒待问问题（带新旧原文）。
+
+        同一对已问过未答 → 返回已有的那条；已裁决“不换” → 返回
+        None（别反复问）；其余新建。问题正文带新旧两条原文，
+        BOOS 看着原文答。
+        """
+        if not old_id or not new_id or old_id == new_id:
+            return None
+        for q in self.pending_questions.find_questions(
+            kind=_pq.QUESTION_KIND_CONFLICT
+        ):
+            if q.get("old_id") != old_id or q.get("new_id") != new_id:
+                continue
+            if q.get("status") == _pq.QUESTION_STATUS_ANSWERED:
+                if q.get("answer") == "不换":
+                    return None
+            else:
+                return q
+        text = (
+            "有一条我之前推断的记忆和你刚说的新事实对不上，"
+            "要不要换成新的？\n旧的（推断，未确认）：%s\n新的：%s"
+            % (old_text, new_text)
+        )
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_CONFLICT,
+            text,
+            _pq.CONFLICT_QUESTION_OPTIONS,
+            "旧记忆是推断来的、没有确认过，按规矩不能悄悄顶掉，先问你。",
+            memory_id=old_id,
+            turn_id=turn_id,
+            extra={
+                "old_id": old_id, "new_id": new_id,
+                "old_text": old_text, "new_text": new_text,
+            },
+        )
+
+    def _supersede_or_ask(self, old_id, old_text, old_meta, new_key,
+                          new_text, turn_id=None):
+        """取代的统一护栏：旧行是推断未确认的 → 不顶，攒待问问题，
+        返回 "pending"；否则走 _supersede_row（账本先行），返回
+        "superseded"。账本失败时 _supersede_row 自己抛，调用方按
+        原有的失败处理走。"""
+        if self._is_inferred_unconfirmed(old_meta):
+            self._queue_conflict_question(
+                old_id, old_text, new_key, new_text, turn_id=turn_id
+            )
+            return "pending"
+        self._supersede_row(
+            old_id, old_text, old_meta, new_key, new_text, turn_id=turn_id
+        )
+        # 晋升证据继承（2026-11-24）：同 _apply_correction_result
+        # 的成功路——旧行攒的天数/会话并给新行，别从零开始数。
+        self._inherit_seen_evidence(old_meta, new_key, turn_id=turn_id)
+        return "superseded"
+
+    def list_pending_questions(self):
+        """还没回答的问题（pending + asked），按创建时间从旧到新。"""
+        return self.pending_questions.list_unanswered()
+
+    def answer_question(self, question_id, choice):
+        """BOOS 回答了一个待问问题，按答案改库（Phase 2 #4）。
+
+        choice 只能是“进核心 / 当一次性经历 / 不存”：
+          进核心：把那条记忆的 decay_kind 改 stable、importance 改 high
+            （账本记一笔 PROMOTE，和 3 天 3 次晋升同款）；
+          当一次性经历：不动（已经是 episodic，兜底还能晋升）；
+          不存：delete_memory(approve=True) 删掉那条记忆。
+        返回 {"ok", "applied", ...}；问题不存在/已回答/选项不对/记忆
+        不在库里时 ok=False，什么都不改。
+        """
+        # P1-5（2026-11-23）：先只看问题、不消耗——账本写失败时问题
+        # 还留着可再答，SQLite 也一动不动；以前是先消耗问题、再先改
+        # SQLite 后写账本，账本失败只记 warning，SQLite 的改动不回滚，
+        # 重建后记忆又变回 episodic。
+        question = self.pending_questions.get(question_id)
+        if question is None or question.get("status") == _pq.QUESTION_STATUS_ANSWERED:
+            return {"ok": False, "reason": "问题不存在或已经回答过了。"}
+        if question.get("kind") == _pq.QUESTION_KIND_CONFLICT:
+            # 推断记忆保护的冲突问题（2026-11-24）：选项和处理都
+            # 不一样，单独走 _answer_conflict_question。
+            return self._answer_conflict_question(question, choice)
+        if choice not in ("进核心", "当一次性经历", "不存"):
+            return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
+        if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
+            return {"ok": False, "reason": "未知的问题种类。"}
+        memory_id = question.get("memory_id")
+        if choice == "当一次性经历":
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "episodic",
+                "question_id": question_id, "memory_id": memory_id,
+            }
+        if choice == "不存":
+            if not memory_id:
+                return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+            # R-10（2026-11-24）：和「进核心」同款顺序（P1-5 标准）
+            # ——先删成功、再消耗问题。以前先把问题标已答再删，删除
+            # 因账本失败时问题已经没了、记忆还在，这条问题再也没
+            # 机会重答。现在删不掉就如实报 ok=False，问题留着。
+            deleted = self.delete_memory(memory_id, approve=True)
+            deleted_ok = (
+                deleted.get("deleted") is True
+                if isinstance(deleted, dict)
+                else bool(deleted)
+            )
+            if not deleted_ok:
+                return {
+                    "ok": False,
+                    "reason": "没删掉（%s），问题先留着，可以再答。"
+                    % (
+                        (deleted.get("reason") or "未知原因")
+                        if isinstance(deleted, dict)
+                        else "未知原因"
+                    ),
+                    "question_id": question_id, "memory_id": memory_id,
+                    "deleted": False,
+                }
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "dropped",
+                "question_id": question_id, "memory_id": memory_id,
+                "deleted": True,
+            }
+        if not memory_id:
+            return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "reason": "这条记忆已经不在库里了。"}
+            if row[2] or row[3] or row[4]:
+                return {"ok": False, "reason": "这条记忆已被取代/删除/作废，不能进核心。"}
+            meta = json.loads(row[1] or "{}")
+            if meta.get("decay_kind") == _decay.DECAY_KIND_STABLE:
+                self.pending_questions.answer(question_id, choice)
+                return {
+                    "ok": True, "applied": "core",
+                    "question_id": question_id, "memory_id": memory_id,
+                    "already_core": True,
+                }
+            # 先写账本、再改 SQLite（和 _append_new_memory 同款顺序）：
+            # 账本写不进去就直接返回，SQLite 不动，问题也不消耗。
+            new_meta = dict(meta)
+            new_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+            new_meta["importance"] = "high"
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {
+                        "type": _ledger.LEDGER_EVENT_PROMOTE,
+                        "memory_id": memory_id, "key": memory_id,
+                        "text": row[0] or "", "meta": dict(new_meta),
+                    },
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("回答问题晋升记账失败：记忆没进核心。", exc_info=True)
+                return {"ok": False, "reason": "账本写失败，记忆没进核心。"}
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, decay_kind=?,"
+                " importance=? WHERE id=?",
+                (
+                    json.dumps(new_meta, ensure_ascii=False),
+                    _decay.DECAY_KIND_STABLE,
+                    new_meta.get("importance"),
+                    memory_id,
+                ),
+            )
+            self._conn.commit()
+            self.pending_questions.answer(question_id, choice)
+        return {
+            "ok": True, "applied": "core",
+            "question_id": question_id, "memory_id": memory_id,
+        }
+
+    def _answer_conflict_question(self, question, choice):
+        """BOOS 回答推断保护的冲突问题（2026-11-24）：
+        “换成新的”→ 走 _supersede_row 真顶（账本先行；写失败不
+        消耗问题、如实报 ok=False）；“不换”→ 两条都留着，问题
+        记录本身就是“已裁决”的凭据（_queue_conflict_question
+        认它、同一对不再重问）。旧行已被别的路处理掉时，问题
+        已无意义，消耗掉并如实报 already_gone。"""
+        question_id = question.get("id")
+        if choice not in _pq.CONFLICT_QUESTION_OPTIONS:
+            return {
+                "ok": False,
+                "reason": "选项不对，只能选：换成新的 / 不换。",
+                "question_id": question_id,
+            }
+        old_id = question.get("old_id") or question.get("memory_id")
+        new_id = question.get("new_id")
+        if choice == "不换":
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "kept_old",
+                "question_id": question_id, "memory_id": old_id,
+            }
+        if not old_id or not new_id:
+            return {
+                "ok": False,
+                "reason": "这个问题缺新旧记忆的指向，没法执行。",
+                "question_id": question_id,
+            }
+        with self._lock:
+            old_row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (old_id,),
+            ).fetchone()
+            if old_row is None:
+                return {
+                    "ok": False, "reason": "旧记忆已经不在库里了。",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            if old_row[2] or old_row[3] or old_row[4]:
+                self.pending_questions.answer(question_id, choice)
+                return {
+                    "ok": True, "applied": "already_gone",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            new_row = self._conn.execute(
+                "SELECT text, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (new_id,),
+            ).fetchone()
+            if new_row is None or new_row[1] or new_row[2] or new_row[3]:
+                return {
+                    "ok": False, "reason": "新记忆已经不在了，先不换。",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            try:
+                old_meta = json.loads(old_row[1] or "{}")
+            except Exception:
+                old_meta = {}
+            try:
+                self._supersede_row(
+                    old_id, old_row[0] or "", old_meta,
+                    new_id, new_row[0] or "",
+                )
+            except Exception:
+                logger.warning(
+                    "冲突问题批准后取代记账失败：没换成。", exc_info=True
+                )
+                return {
+                    "ok": False,
+                    "reason": "账本写失败，没换成，问题先留着，可以再答。",
+                    "question_id": question_id, "memory_id": old_id,
+                }
+            self.pending_questions.answer(question_id, choice)
+            # 晋升证据继承（2026-11-24）：批准换成新的这一刻才算
+            # 真顶——旧行攒的天数/会话这时并给新行（裁“不换”时
+            # 走不到这里，一点不并）。
+            self._inherit_seen_evidence(
+                old_meta, new_id, turn_id=question.get("turn_id")
+            )
+        return {
+            "ok": True, "applied": "superseded",
+            "question_id": question_id, "memory_id": old_id,
+            "new_memory_id": new_id,
+        }
+
+    def _judge_preference_supersede(self, text, context=None):
+        """问判官：这句偏好新事实该不该取代某条同类活偏好。
+
+        返回 ((old_id, old_text, old_meta), verdict, trigger)；不取代/
+        模型断了/没候选/目标不在候选里时返回 (None, None, None)。
+        trigger 是触发原因（slot_none_preference / correction_uncertain）。
+        目标校验在判官解析层已做过一次（target_id 必须在候选里），
+        这里再按 id 对一次候选，对不上就不取代，不猜。
+        """
+        _trigger, _reason, cands = self._needs_semantic_judge(text, None)
+        if not _trigger:
+            return None, None, None
+        verdict = self._ask_semantic_judge(text, cands, context=context)
+        if not verdict or not verdict.get("should_supersede"):
+            return None, None, None
+        target = next(
+            (c for c in cands if c["id"] == verdict.get("target_id")), None
+        )
+        if target is None:
+            logger.warning("语义判断目标不在候选里，不取代。")
+            return None, None, None
+        # 主食守卫（R2 后续③）：新说法在换主食、目标却不是主食时不取代——
+        # 目标可能已被另一条路取代过，判官硬挑了火锅/冒菜这类当目标。
+        if not _judge_target_is_staple_plausible(text, target["text"]):
+            logger.warning("语义判断目标不是主食，不取代：%s", target["text"])
+            return None, None, None
+        return (target["id"], target["text"], target["meta"]), verdict, _reason
+
+    def _apply_semantic_judge_update(self, sentence, receipt, turn_id,
+                                     event_date, context=None):
+        """save_turn 逐句循环里的模型判官路：触发后问模型，该取代就走
+        correct_memory 同款落盘（_apply_correction_result：新说法存一条，
+        账本记 supersede，旧行标 superseded=1）。
+
+        回执记 stored + SUPERSEDE 结果（route="model"）+ correction
+        （route="model"，带判官的 provider/model/用量/成本），页面和
+        /api/chat 的返回里能看到走了模型。返回 True=已处理，
+        False=没处理（调用方照常走 add_memory_text 直存，不丢事实）。
+        """
+        target, verdict, trigger = self._judge_preference_supersede(
+            sentence, context=context
+        )
+        if target is None:
+            return False
+        old_id, old_text, old_meta = target
+        outcome = self._apply_correction_result(
+            sentence, old_id, old_text, old_meta, same_text=False,
+            candidates=[old_id], status="updated",
+            resolution="semantic_judge",
+            audit={"source": "user", "method": "semantic_judge",
+                   "provider": verdict.get("provider"),
+                   "model": verdict.get("model"),
+                   "judge_slot": verdict.get("slot")},
+            layer="judge", turn_id=turn_id,
+        )
+        if (outcome or {}).get("status") != "updated":
+            return False
+        outcome = dict(outcome)
+        outcome["route"] = "model"
+        outcome["judge"] = {
+            key: verdict.get(key)
+            for key in ("provider", "model", "slot", "reason",
+                        "cost_usd", "usage")
+            if verdict.get(key) is not None
+        }
+        outcome["judge"]["trigger"] = trigger
+        receipt["stored"].append(sentence)
+        receipt["results"].append(
+            {"id": outcome.get("memory_id"), "memory": sentence,
+             "event": "SUPERSEDE", "old_text": old_text,
+             "supersedes_id": old_id, "route": "model"}
+        )
+        if "correction" not in receipt:
+            receipt["correction"] = outcome
+        receipt.setdefault("judge_calls", []).append(outcome["judge"])
+        return True
+
+    def _judge_ambiguous_correction(self, correction, fact, context=None,
+                                    turn_id=None):
+        """触发条件 (b)：correct_memory 报 ambiguous 后，再问大模型判官挑一条。
+
+        挑出来就按那条落盘（_apply_correction_result，route="model"）；
+        挑不出来（判官说不取代/目标不在候选里）或模型断了时返回 None——
+        调用方保持 ambiguous，不猜（新说法照常当新记忆存）。
+        """
+        cands = (correction or {}).get("candidates") or []
+        cand_list = [
+            {"id": c.get("id"), "text": c.get("text")}
+            for c in cands if c.get("id") and c.get("text")
+        ]
+        # 纠正记录不是偏好，不进候选（见 _JUDGE_SKIP_MARKERS）。
+        cand_list = [
+            c for c in cand_list
+            if not any(m in (c.get("text") or "") for m in _JUDGE_SKIP_MARKERS)
+        ]
+        if len(cand_list) < 2:
+            return None
+        verdict = self._ask_semantic_judge(fact, cand_list, context=context)
+        if not verdict or not verdict.get("should_supersede"):
+            return None
+        target = next(
+            (c for c in cand_list if c["id"] == verdict.get("target_id")), None
+        )
+        if target is None:
+            return None
+        # 主食守卫（R2 后续③）：同 _judge_preference_supersede。
+        if not _judge_target_is_staple_plausible(fact, target["text"]):
+            logger.warning("语义判断目标不是主食，不取代：%s", target["text"])
+            return None
+        row = self._conn.execute(
+            "SELECT metadata_json FROM memories WHERE id=?", (target["id"],)
+        ).fetchone()
+        old_meta = json.loads((row or [None])[0] or "{}")
+        # R-1：判官路只从 save_turn 的槽位型纠正（old==new）进来，
+        # 挑中一条落盘后，同槽其余真冲突旧值同样走连带清扫。
+        outcome = self._apply_correction_result(
+            fact, target["id"], target["text"], old_meta, same_text=False,
+            candidates=[target["id"]], status="updated",
+            resolution="semantic_judge",
+            audit={"source": "user", "method": "semantic_judge",
+                   "provider": verdict.get("provider"),
+                   "model": verdict.get("model"),
+                   "judge_slot": verdict.get("slot")},
+            layer="judge", turn_id=turn_id, slot_sweep=True,
+        )
+        if (outcome or {}).get("status") != "updated":
+            return None
+        outcome = dict(outcome)
+        outcome["route"] = "model"
+        outcome["judge"] = {
+            key: verdict.get(key)
+            for key in ("provider", "model", "slot", "reason",
+                        "cost_usd", "usage")
+            if verdict.get(key) is not None
+        }
+        outcome["judge"]["trigger"] = "ambiguous_candidates"
+        return outcome
+
+    def _store_turn_receipt(self, turn_id, receipt):
+        """存一轮回执进缓存，只留最近 _TURN_RECEIPTS_MAX 条。
+
+        dict 按插入顺序，超了就删最旧的（去重回执要查它，无上限
+        会一直长）。
+        """
+        self._turn_receipts[turn_id] = copy.deepcopy(receipt)
+        while len(self._turn_receipts) > _TURN_RECEIPTS_MAX:
+            self._turn_receipts.pop(next(iter(self._turn_receipts)))
 
     def save_turn(self, messages, turn_id=None):
         """一轮对话的收尾：同步把用户亲口说的事实原样存下来，留回执。
@@ -656,20 +3077,41 @@ class SQLiteStore:
         没有“提取返回空就当成功”。调完这个函数，事实要么在账本里、
         要么在回执里写明为什么没存——绝不悄悄丢。
         同一个 turn_id 只存一次（web 的 ask() 和 run_question() 会各调
-        一次，第二次直接返回上次的回执，不重复存）。
+        一次，第二次直接返回上次的回执（含 correction），不重复存）。
         """
         # 没传 turn_id 时生成内部兜底 ID（2026-11-21 Gemini 第三轮）：多句轮次的
         # 每句都带同一个 turn_id，撤回才能整轮作废，否则退化成只作废最后 1 条。
         # _next_write_seq() 进程内严格递增，每次调用都不同，去重逻辑不受影响。
         turn_id = turn_id or f"auto-{_next_write_seq()}"
         if turn_id and turn_id in self._seen_turn_ids:
+            # 根因 a（2026-11-22）：第二次调用不能只回一个空去重回执——
+            # 上次的回执（含 correction）要原样还给调用方，否则纠正结果
+            # 在第二次调用里丢了，页面拿不到 correction 键。
+            cached = self._turn_receipts.get(turn_id)
+            if cached is not None:
+                receipt = copy.deepcopy(cached)
+                receipt["duplicate_turn"] = True
+                return receipt
             return {"turn_id": turn_id, "duplicate_turn": True, "results": []}
         if turn_id:
             self._seen_turn_ids.add(turn_id)
+            self._active_turn_id = turn_id
         latest_user = ""
-        for m in reversed(messages or []):
-            if (m or {}).get("role") == "user":
-                latest_user = (m or {}).get("content") or ""
+        _msgs = list(messages or [])
+        for _i in range(len(_msgs) - 1, -1, -1):
+            if (_msgs[_i] or {}).get("role") == "user":
+                latest_user = (_msgs[_i] or {}).get("content") or ""
+                # 缺点清单第 11 条（2026-11-24）：一句话分两条发——
+                # 紧挨着的上一条也是 user 消息（中间没有助手回复）、
+                # 且本条是明显续接碎片时，拼成整句再走后面的存储/
+                # 纠正处理，不让“吗”这类碎片被当成独立消息。只拼
+                # 本轮输入，会话历史里的原始两条不动。
+                if _i > 0 and (_msgs[_i - 1] or {}).get("role") == "user":
+                    _prev_user = (_msgs[_i - 1] or {}).get("content") or ""
+                    if _prev_user.strip() and _is_continuation_fragment(
+                        latest_user, _prev_user
+                    ):
+                        latest_user = _prev_user.strip() + latest_user.strip()
                 break
         receipt = {
             "turn_id": turn_id,
@@ -681,16 +3123,108 @@ class SQLiteStore:
             "results": [],
         }
         if not (latest_user or "").strip():
+            self._store_turn_receipt(turn_id, receipt)
             return receipt
         # 撤回：光秃秃的整句信号，把上一轮刚存的那条作废（软删进账本）。
         if latest_user.strip().rstrip("。！？.!?") in _BARE_RETRACTION:
             dropped = self._void_last_stored()
             receipt["retracted"] = True
             receipt["dropped_count"] = dropped
+            self._store_turn_receipt(turn_id, receipt)
             return receipt
         today = _shanghai_today()
+        # 聊天纠错（2026-11-22 correct_memory 接线）：本轮最后一条 user 消息
+        # 里有明确纠错说法时（见 correction_text._detect_correction），先调
+        # correct_memory 改旧记忆，结果放进回执的 "correction" 键（web 层
+        # 已经在读这个键，供页面展示，见 web/server.py）。
+        #   updated/unchanged/failed：纠错已处理，新说法不再当事实重存，
+        #     只处理纠错句之外的部分；
+        #   not_found/ambiguous：没找着旧记忆、或分不清改哪条时，新说法
+        #     不能丢——当新事实存下来（根因 c，2026-11-22）；ambiguous
+        #     的状态照实留在回执里，旧的没被取代。
+        # 没纠错时走正常逐句循环，原来的键不动。
+        correction = None
+        correction_fact_norm = None  # 本轮纠正的新说法（归一化），逐句循环
+        # 里认“这句就是纠正事实”用——只有它才走槽位取代（model fix #1）。
+        sentences = _split_sentences(latest_user)
+        detected = _detect_correction(latest_user)
+        if detected is not None:
+            fact = (detected.get("fact") or "").strip()
+            # 叠起来的纠错说法（“不对，你记错了，我住上海”）：_detect_correction
+            # 取最早的说法（“不对”），fact 里还带着“你记错了，”——再剥一层，
+            # 剥到只剩新说法为止（最多两层，防循环）。
+            for _ in range(2):
+                inner = _detect_correction(fact)
+                if inner is None:
+                    break
+                inner_fact = (inner.get("fact") or "").strip()
+                if not inner_fact or inner_fact == fact:
+                    break
+                # 叠剥护栏（2026-11-24 webfix 一）：内层再剥只许剥掉
+                # 纯纠正信号——被剥掉的那截里带事实内容（否定从句
+                # “不吃牛肉”之类）时不许剥。实测根因：“我其实不吃
+                # 牛肉，我吃鸡杂面”被内层“其实”剥成“我吃鸡杂面”，
+                # 否定从句丢了，纠正只打中推断行、已确认的旧说法
+                # 留活。剥掉的前缀只能是信号词+标点+人称。
+                if not fact.endswith(inner_fact):
+                    break
+                dropped_prefix = fact[:len(fact) - len(inner_fact)]
+                if not _correction_signal_only(dropped_prefix):
+                    break
+                fact = inner_fact
+            if fact:
+                # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
+                # 补不出来就原样走 correct_memory（找不到旧记忆时当新记忆存）。
+                fact = self._complete_correction_fragment(fact)
+                correction_fact_norm = _normalize_memory_text(fact)
+                # 当下的想法/问句不纠正（“我现在想喝茶了”不是在改一条记忆）：
+                # 检测到了也不走纠正分支，留给下面的正常循环按老规矩处理
+                # （当下的想法会被 _looks_like_fact 拦下、不存）。
+                if _looks_like_fact(fact)[0]:
+                    correction = self.correct_memory(
+                        fact, fact, exclude_identical_to_new=True,
+                        explicit_correction=True, turn_id=turn_id,
+                    )
+                    if (correction or {}).get("status") == "ambiguous":
+                        # 分不清改哪条时按槽位再筛一次：新说法带单值槽位、
+                        # 且候选里恰好只有一条同槽位时，就改那条，不用问。
+                        retry = self._retry_correction_by_slot(
+                            correction, fact, turn_id=turn_id
+                        )
+                        if retry is not None:
+                            correction = retry
+                    if (correction or {}).get("status") == "ambiguous":
+                        # 触发条件 (b)：纠正候选多条、相似度都过线，程序筛不出来——
+                        # 再问大模型判官挑一条；挑不出来/模型断了就保持 ambiguous，
+                        # 不猜（下面照常把新说法当新记忆存）。
+                        judged = self._judge_ambiguous_correction(
+                            correction, fact, context=messages,
+                            turn_id=turn_id,
+                        )
+                        if judged is not None:
+                            correction = judged
+                    if (correction or {}).get("status") == "updated":
+                        # 纠正换来的新记忆带上槽位标（以后按槽位找得到它）。
+                        slot, _value = _infer_fact_slot(fact)
+                        if slot:
+                            self._set_memory_slot(
+                                (correction or {}).get("memory_id"), slot
+                            )
+                    kept = _strip_correction_sentences(latest_user)
+                    if (correction or {}).get("status") in ("not_found", "ambiguous"):
+                        # 没找到旧记忆 / 分不清改哪条：新说法当新记忆存
+                        # （带上纠错句之外的部分）。根因 c：ambiguous 时
+                        # 以前这里直接丢了新说法，S4 的摩托车就是这么丢的。
+                        # 逐句循环里这句是纠正事实，同槽位旧值在时才走
+                        # correct_memory 顶掉最新那条（model fix #1）；
+                        # 不是纠正事实的句子只存新行、不顶旧的。
+                        sentences = kept + [fact]
+                    else:
+                        sentences = kept
         live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
-        for sentence in _split_sentences(latest_user):
+        new_questions = []  # 本轮拿不准重要性的问题（Phase 2 #4）
+        touched_ids = set()  # 本轮触碰到的记忆 id（第 8 条实时整理用）
+        for sentence in sentences:
             receipt["considered"].append(sentence)
             # “记住”前缀先剥（#8）：剥完再判事实、再算日期——“记住”两字
             # 本身不是记忆内容。剥完为空（光秃秃一句“记住”）直接丢掉。
@@ -723,6 +3257,14 @@ class SQLiteStore:
                 if sentence in live_texts:
                     receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
                     continue
+            # 纠正元句提炼（webfix 一）：整句是“刚才那句说错了，
+            # 我只吃鸡杂面”这种元句、又没被 _detect_correction
+            # 认成纠正时，先提炼成事实再走后面的存储/判官路——
+            # 原话整句不许当事实存进库。提炼不出就原样不动。
+            if is_correction_meta_sentence(sentence):
+                _distilled = distill_correction_fact(sentence)
+                if _distilled:
+                    sentence = _distilled
             ok, reason = _looks_like_fact(sentence)
             if not ok:
                 receipt["dropped"].append({"text": sentence, "reason": reason})
@@ -730,14 +3272,77 @@ class SQLiteStore:
             # 存原话：去掉句尾的 。！（？的已经当问句 drop 了，不会到这里）。
             sentence = sentence.rstrip("。！")
             event_date = resolve_event_date(sentence, today)
-            # 来源标 inferred（提取所得）：原样存的事实是从对话里提出来的，
-            # 出处完整（turn_id + created_at），和 DeepSeek 提取同一档，
-            # 只是没经过模型改写、保真度更高。unconfirmed 是留给“完全没来源
-            # 信息”的旧记忆的桶（2026-11-09 之前）；标错了问答提示词会把它
-            # 当没来源处理、问起来只说不知道——这就是第一轮验收回答卡住的原因。
+            # 刚被纠正取代的旧说法（同一轮里先肯定、后纠正）不再重存。
+            if (
+                correction is not None
+                and (correction or {}).get("status") == "updated"
+                and (correction or {}).get("old_text")
+                and _normalize_memory_text(sentence)
+                == _normalize_memory_text((correction or {}).get("old_text") or "")
+            ):
+                receipt["dropped"].append({"text": sentence, "reason": "已被纠正取代"})
+                continue
+            # 这句是不是本轮的纠正事实（只有它是，才走槽位取代；
+            # 普通新陈述只存新行、不顶旧的，2026-11-23 model fix #1）。
+            is_correction_sentence = bool(
+                correction_fact_norm
+                and _normalize_memory_text(sentence) == correction_fact_norm
+            )
+            # 同槽位更新（2026-11-22 通用纠正 + 2026-11-23 model fix #1）：
+            # 只有带明确纠正词的句子才取代同槽位旧值（且只顶最新那条）；
+            # 无纠正词的新事实只存新行、不顶旧的。没冲突时照常存，
+            # 顺手把槽位标上。
+            slot, slot_value = _infer_fact_slot(sentence)
+            if slot is not None and self._apply_same_slot_update(
+                sentence, slot, slot_value, receipt, turn_id, event_date,
+                is_correction=is_correction_sentence,
+            ):
+                continue
+            # 混合判断（2026-11-22，BOOS 定）：程序推不出槽位的偏好句，
+            # 主控（十二本地程序）按程序算出的触发条件决定问不问大模型
+            # （见 _needs_semantic_judge：slot 为 None + 偏好句式 + 库里
+            # 有同类偏好活记忆）；大模型只当判官，不做分流。
+            if slot is None and self._apply_semantic_judge_update(
+                sentence, receipt, turn_id, event_date, context=messages
+            ):
+                continue
+            # 来源标 user（已确认）：save_turn 只存用户本轮直接说的话，
+            # 不是模型推断——2026-11-22 BOOS 定选 A：用户亲口说的新事实
+            # 直接算已确认（可信度 1.0）。但已确认不等于自动取代旧事实：
+            # 2026-11-23 model fix #1——没纠正词的新陈述只存新行、不顶
+            # 旧的，只有带明确纠正词的才取代。unconfirmed
+            # 是留给“完全没来源信息”的旧记忆的桶（2026-11-09 之前）。
+            # 模型自己推断的事实不走这里，仍按 inferred/0.7 直存
+            # （add_memory_text(source="inferred")，见低可信度挂起的回归测试）。
+            # 重要性判断（Phase 2 #2）：程序先判（槽位/偏好/决定/语气/
+            # 时间词），难的问大模型判官；判不准时先当一次性经历存，
+            # 再问 BOOS（#4，见下面的 new_questions）。
+            importance_decision, importance_reason, _importance_judge = (
+                self._decide_importance(sentence, slot, context=messages)
+            )
             saved = self.add_memory_text(
-                sentence, source="inferred", turn_id=turn_id,
-                event_date=event_date, decay_kind="episodic",
+                sentence, source="user", turn_id=turn_id,
+                event_date=event_date,
+                decay_kind=(
+                    _decay.DECAY_KIND_STABLE
+                    if importance_decision == "important"
+                    else "episodic"
+                ),
+                importance=(
+                    "high" if importance_decision == "important" else "normal"
+                ),
+                semantic_judge=False,
+                # 只有纠正事实才允许直存路的槽位取代（model fix #1）；
+                # 普通新陈述只存新行、不顶旧的。
+                allow_slot_supersede=is_correction_sentence,
+                **({"slot": slot} if slot else {}),
+                # 重要性护栏的封顶留痕透传（webfix 二）：判官被程序
+                # 压回去时，把 clamped 落进新记忆的 meta。
+                **(
+                    {"importance_clamped": _importance_judge["clamped"]}
+                    if (_importance_judge or {}).get("clamped")
+                    else {}
+                ),
             )
             if (saved or {}).get("event") == "ADD":
                 if live_texts is not None:
@@ -746,16 +3351,1200 @@ class SQLiteStore:
                 receipt["results"].append(
                     {"id": saved.get("id"), "memory": sentence, "event": "ADD"}
                 )
+                if importance_decision == "unsure":
+                    _q = self._queue_importance_question(
+                        sentence, saved.get("id"), importance_reason, turn_id
+                    )
+                    if _q is not None:
+                        new_questions.append(_q)
             elif (saved or {}).get("event") == "UNCHANGED":
+                # 同文又出现：晋升计数刚在 add_memory_text 里记过，
+                # 这条算本轮触碰到的（实时整理复核晋升用）。
+                if (saved or {}).get("id"):
+                    touched_ids.add(saved["id"])
                 receipt["dropped"].append({"text": sentence, "reason": "已在库里"})
             elif (saved or {}).get("event") == "SENSITIVE":
                 receipt["dropped"].append({"text": sentence, "reason": "含敏感信息"})
+            elif (saved or {}).get("event") == "PENDING":
+                # 同槽位裁决：新说法可信度低于旧的，挂起来待确认，不存。
+                receipt["dropped"].append({"text": sentence, "reason": "槽位冲突待确认"})
+            elif (saved or {}).get("event") in ("STALE", "ASK"):
+                # 同槽位裁决：新说法比旧的还早（STALE），或分不出先后（ASK），不存。
+                receipt["dropped"].append({"text": sentence, "reason": "槽位冲突未裁决"})
             else:
                 receipt["dropped"].append({"text": sentence, "reason": "账本写失败"})
+        # 已确认冲突同轮清扫（webfix 一）：明确纠正这一轮里，主目标
+        # 若被推断保护挂起（pending_question）或候选分不清
+        # （ambiguous 后新事实走逐句循环存下），新事实里带否定、
+        # 和某条“已确认”旧记忆正面冲突的，不许留活到下一轮再问
+        # ——同一轮一并顶掉（指向已存的新行）。实测根因：纠正
+        # “不吃牛肉”只打中推断来的“喜欢吃鸡杂面”，已确认的
+        # “喜欢吃牛肉面”留活，回复还反问“要我一并处理吗”。
+        if detected is not None and correction_fact_norm:
+            _new_row_id = None
+            _new_row_text = None
+            if (correction or {}).get("memory_id"):
+                _new_row_id = correction["memory_id"]
+            else:
+                for _r in receipt["results"]:
+                    if (
+                        isinstance(_r, dict)
+                        and _r.get("event") == "ADD"
+                        and _r.get("id")
+                        and _normalize_memory_text(_r.get("memory") or "")
+                        == correction_fact_norm
+                    ):
+                        _new_row_id = _r["id"]
+                        break
+            if _new_row_id:
+                try:
+                    _row = self._conn.execute(
+                        "SELECT text FROM memories WHERE id=?",
+                        (_new_row_id,),
+                    ).fetchone()
+                    _new_row_text = (_row or [""])[0] or ""
+                except Exception:
+                    _new_row_text = ""
+            if _new_row_id and _new_row_text:
+                try:
+                    _swept = self._supersede_confirmed_contradictions(
+                        _new_row_text, _new_row_id, turn_id=turn_id,
+                    )
+                except Exception:
+                    logger.warning("已确认冲突清扫失败。", exc_info=True)
+                    _swept = []
+                if _swept and correction is not None:
+                    correction["also_superseded"] = _swept
+                    if correction.get("status") in (
+                        "ambiguous", "pending_question",
+                    ):
+                        correction["reason"] = (
+                            (correction.get("reason") or "")
+                            + "；另有已确认的旧说法和新说法冲突，"
+                            "已一并改掉："
+                            + "、".join(
+                                s["old_text"] for s in _swept
+                            )
+                        )
         if receipt["stored"]:
             with self._lock:
                 self._last_stored_turn_id = turn_id
+        if correction is not None and (
+            "correction" not in receipt
+            or (correction or {}).get("status") == "updated"
+            or (receipt.get("correction") or {}).get("status") != "updated"
+        ):
+            # 显式纠错优先；但它报 not_found/ambiguous、而逐句循环里的槽位
+            # 更新已经真换了旧记忆时，留循环那边的 updated，不拿
+            # not_found/ambiguous 盖掉它（2026-11-23 回归修：纠正分支先报
+            # ambiguous 时，循环兜底顶掉最新那条后回执仍要是 updated，
+            # 回复才说得出“已经改好了”）。
+            receipt["correction"] = correction
+            if (correction or {}).get("status") == "updated":
+                # 纠错存的新记忆属于本轮：撤回标记拨到本轮，
+                # 下一句“撤回”作废的是这条新记忆，不是上一轮的。
+                with self._lock:
+                    self._last_stored_turn_id = turn_id
+        # #4：本轮拿不准的问题先问，顺带把攒着的旧问题一起带出来
+        # （一轮最多 3 条，含新问题）。R-2（2026-11-24）：以前只有
+        # 本轮有新问题时才带旧问题——本轮没新问题时，攒着的旧问题
+        # 连带都不带，永远没机会在聊天里被问。现在每轮都带；重问
+        # 的间隔/上限在 drain_for_chat 里管，不会每轮轰炸同一条。
+        # 一轮最多问 3 个（QUESTIONS_PER_CHAT_MAX）：只把前 3 个
+        # 标成已问、放进回执；多出来的留在 pending 里，下一轮再带。
+        new_questions = new_questions[:_pq.QUESTIONS_PER_CHAT_MAX]
+        for _q in new_questions:
+            self.pending_questions.mark_asked(_q["id"])
+        room = max(0, _pq.QUESTIONS_PER_CHAT_MAX - len(new_questions))
+        backlog = (
+            self.pending_questions.drain_for_chat(max_n=room)
+            if room > 0
+            else []
+        )
+        if new_questions or backlog:
+            receipt["questions"] = new_questions + backlog
+        # 第 8 条实时整理（2026-11-24）：本轮触碰到的记忆（新存的、
+        # 纠正换上的、同文引用计数的）立刻在后台整理一小轮——
+        # 打标/晋升复核/去重检查/集合内冲突扫描，不等定时调度；
+        # 后台线程跑，不拖慢本轮回复，失败只记日志。
+        for _r in receipt["results"]:
+            if isinstance(_r, dict) and _r.get("id"):
+                touched_ids.add(_r["id"])
+        if correction is not None and (correction or {}).get("memory_id"):
+            touched_ids.add(correction["memory_id"])
+        self._schedule_turn_organize(sorted(touched_ids), turn_id=turn_id)
+        self._store_turn_receipt(turn_id, receipt)
         return receipt
+
+    def _find_correction_candidates(self, old_fact, new_fact=None, top_k=10,
+                                        exclude_identical_to_new=False):
+        """找纠错候选：要改的旧记忆（和 mem0_store._find_correction_candidates
+        同款两路 + 兜底）。
+
+        1. 语义 + BM25（_search_inner 两路都走了，含 0.4 资格线）；
+        2. 兜底（直接检索为空时才走，免得往池子里加噪音）：最近上下文
+           （note_context 记的本轮检索到的 id）+ 同核心槽位
+           （extract_core_slots 交集，数字/日期/二字词）——“住上海”
+           vs“住北京”余弦低、关键词不撞时，靠这条兜底找着旧条
+           （mem0 的 Bug 6 场景）。
+        返回活记忆的 id 列表（已确认在前、同类里新的在前）。
+        exclude_identical_to_new 时跳过与 new_fact 相同的条目：纠错是来
+        取代旧说法的，库里已有的新说法本身不是目标；不跳过的话，exact
+        会先命中它而直接返回 unchanged，漏掉真正该被取代的旧说法。
+        """
+        with self._lock:
+            old_fact = (old_fact or "").strip()
+            if not old_fact:
+                return []
+            found = []
+            seen = set()
+            try:
+                for hit in self._search_inner(old_fact, top_k=top_k * 4):
+                    mid = hit.get("id")
+                    if mid and mid not in seen:
+                        seen.add(mid)
+                        found.append(mid)
+            except Exception:
+                logger.warning("纠错：语义找候选失败。", exc_info=True)
+            if not found:
+                # 兜底：最近上下文 + 同核心槽位。
+                try:
+                    for mid in list(getattr(self, "_last_context_ids", []) or []):
+                        if mid and mid not in seen:
+                            row = self._conn.execute(
+                                "SELECT id FROM memories WHERE id=? AND voided=0"
+                                " AND deleted=0 AND superseded=0",
+                                (mid,),
+                            ).fetchone()
+                            if row is not None:
+                                seen.add(mid)
+                                found.append(mid)
+                except Exception:
+                    pass
+                try:
+                    slots = extract_core_slots(new_fact or old_fact)
+                    if slots:
+                        for row in self._conn.execute(
+                            "SELECT id, text FROM memories"
+                            " WHERE voided=0 AND deleted=0 AND superseded=0"
+                        ).fetchall():
+                            if row[0] in seen:
+                                continue
+                            if extract_core_slots(row[1] or "") & slots:
+                                seen.add(row[0])
+                                found.append(row[0])
+                except Exception:
+                    pass
+            if exclude_identical_to_new and new_fact:
+                # 跳过与新说法相同的条目（见 docstring）：纠错是来取代旧
+                # 说法的，库里已有的新说法本身不是目标。
+                norm_new = _normalize_memory_text(new_fact)
+                kept = []
+                for mid in found:
+                    row = self._conn.execute(
+                        "SELECT text FROM memories WHERE id=?", (mid,)
+                    ).fetchone()
+                    if row is not None and _normalize_memory_text(
+                        row[0] or ""
+                    ) == norm_new:
+                        continue
+                    kept.append(mid)
+                found = kept
+            # 排：已确认的在前，同类里新的在前。
+            # P1-1（2026-11-23）：旧 key 是 (-confirmed, -(created_at 字符串))，
+            # 字符串取负号抛 TypeError、被下面的 try/except 吞掉，排序从不执行。
+            # ISO 时间字符串字典序即时间序，(confirmed, created_at) 倒序排
+            # 就是“已确认在前，同类里新的在前”。
+            def _cand_key(mid):
+                row = self._conn.execute(
+                    "SELECT metadata_json, created_at FROM memories WHERE id=?", (mid,)
+                ).fetchone()
+                try:
+                    meta = json.loads(((row or [None, None])[0]) or "{}")
+                except Exception:
+                    meta = {}
+                confirmed = 1 if meta.get("user_confirmed") else 0
+                created_at = (row[1] if row else None) or ""
+                return (confirmed, created_at)
+            try:
+                found.sort(key=_cand_key, reverse=True)
+            except Exception:
+                pass
+            return found
+
+    def _rescue_correction_candidate(self, old_fact, new_fact, exclude_ids):
+        """R-9（2026-11-24）：相似度筛全军覆没时补跑一次同槽兜底。
+
+        _find_correction_candidates 的兜底（最近上下文 + 同核心槽位
+        扫描）只在语义召回为空时才跑；召回返回了一堆不相关命中时，
+        兜底不触发，真目标压根不在候选里，筛完只能报 not_found、
+        旧错留着。这里把兜底单独再跑一次：排除已有候选、排除与
+        新说法相同的行，兜底里恰好只有一条与新说法相似度 ≥ 0.70
+        时返回它，其余情况返回 None（调用方维持原判）。
+        只加查找，不放宽任何顶替护栏——返回的候选回主流程后还要
+        再过单候选的相似度安全网。调用方需持锁（correct_memory 里）。"""
+        seen = set(exclude_ids or [])
+        rescued = []
+        try:
+            for mid in list(getattr(self, "_last_context_ids", []) or []):
+                if mid and mid not in seen:
+                    row = self._conn.execute(
+                        "SELECT id FROM memories WHERE id=? AND voided=0"
+                        " AND deleted=0 AND superseded=0",
+                        (mid,),
+                    ).fetchone()
+                    if row is not None:
+                        seen.add(mid)
+                        rescued.append(mid)
+        except Exception:
+            pass
+        try:
+            slots = extract_core_slots(new_fact or old_fact)
+            if slots:
+                for row in self._conn.execute(
+                    "SELECT id, text FROM memories"
+                    " WHERE voided=0 AND deleted=0 AND superseded=0"
+                ).fetchall():
+                    if row[0] in seen:
+                        continue
+                    if extract_core_slots(row[1] or "") & slots:
+                        seen.add(row[0])
+                        rescued.append(row[0])
+        except Exception:
+            pass
+        if not rescued:
+            return None
+        norm_new = _normalize_memory_text(new_fact or "")
+        high = []
+        for mid in rescued:
+            text = self._candidate_text(mid)
+            if text is None:
+                continue
+            if _normalize_memory_text(text) == norm_new:
+                continue
+            sim = self._candidate_similarity(mid, new_fact)
+            if sim is not None and sim >= _CORRECTION_TOPIC_MIN_SIMILARITY:
+                high.append(mid)
+        if len(high) == 1:
+            return high[0]
+        return None
+
+    def _cross_slot_net_target(self, old_fact, new_fact):
+        """第 5 条跨槽安全网（2026-11-24，BOOS 定“让他概率最小”）。
+
+        纠正靠同槽找对手 + R-9 同槽兜底；两条冲突记忆没分进一个槽
+        时，真目标仍可能不在候选里，主路只能报 not_found、旧错留着。
+        这里在主路全落空之后，对全部活记忆再扫一遍：
+        - 与新说法或旧说法的语义相似度 ≥ 0.80（_CROSS_SLOT_NET_MIN_
+          SIMILARITY，高于主路 0.70，宁缺毋滥）才算命中；
+        - 命中按相似度取前 5 条打包给判官，判官明确 should_supersede
+          且点名其中一条，才返回那条作取代目标。
+        护栏（一条不许松）：
+        - 判官说不取代 / 模型断了 / 点名的不在命中里 → 返回 None，
+          调用方维持 not_found（旧错留着，也不误伤）；
+        - 核心/置顶（_is_core_protected_row）命中也不自动顶，
+          返回 None——动核心永远走问 BOOS 的路径；
+        - 纠正便条行不进判官候选（和判官路同一口径）；
+        - 与新说法相同的行跳过（那是新值本身，不是旧错）；
+        - 判官目标还要过主食合理性守卫（和判官路同一口径）。
+        返回 (memory_id, text, meta, verdict) 或 None。调用方需持锁。"""
+        norm_new = _normalize_memory_text(new_fact or "")
+        norm_old = _normalize_memory_text(old_fact or "")
+        hits = []
+        try:
+            rows = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall()
+        except Exception:
+            return None
+        for mid, text, meta_json in rows:
+            text = text or ""
+            if not text or _normalize_memory_text(text) == norm_new:
+                continue
+            if any(m in text for m in _JUDGE_SKIP_MARKERS):
+                continue
+            sims = []
+            sim_new = self._candidate_similarity(mid, new_fact)
+            if sim_new is not None:
+                sims.append(sim_new)
+            if norm_old and norm_old != norm_new:
+                sim_old = self._candidate_similarity(mid, old_fact)
+                if sim_old is not None:
+                    sims.append(sim_old)
+            if not sims or max(sims) < _CROSS_SLOT_NET_MIN_SIMILARITY:
+                continue
+            hits.append((max(sims), mid, text, meta_json))
+        if not hits:
+            return None
+        hits.sort(key=lambda h: h[0], reverse=True)
+        hits = hits[:5]
+        cand_list = [
+            {"id": mid, "text": text} for _s, mid, text, _m in hits
+        ]
+        verdict = self._ask_semantic_judge(new_fact, cand_list)
+        if not verdict or not verdict.get("should_supersede"):
+            return None
+        target = next(
+            (h for h in hits if h[1] == verdict.get("target_id")), None
+        )
+        if target is None:
+            logger.warning("跨槽安全网：判官点名的目标不在命中里，不取代。")
+            return None
+        _best, mid, text, meta_json = target
+        try:
+            meta = json.loads(meta_json or "{}")
+        except Exception:
+            meta = {}
+        if self._is_core_protected_row(meta, meta.get("slot")):
+            logger.info("跨槽安全网：命中核心/置顶记忆，不自动顶：%s", text)
+            return None
+        if not _judge_target_is_staple_plausible(new_fact, text):
+            logger.warning("跨槽安全网：判官目标不是主食，不取代：%s", text)
+            return None
+        return mid, text, meta, verdict
+
+    def _candidate_text(self, memory_id):
+        """按 ID 查一条记忆的原文；查不到返回 None（调用方兜底，不抛异常）。"""
+        try:
+            row = self._conn.execute(
+                "SELECT text FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+        except Exception:
+            return None
+        return (row or [None])[0] if row else None
+
+    def _candidates_with_text(self, candidates):
+        """把纠错候选统一成 [{"id", "text"}]（2026-11-22 Bug 1 治本）。
+
+        _find_correction_candidates 内部返回的是内存 ID（字符串）列表，
+        调用方（main.py 的打印、网页的候选列表）要的是带文本的字典——
+        以前直接把 ID 串交出去，打印层按字典 .get('text') 就崩成 500。
+        字典候选原样过（缺 text 时按 ID 补查）；字符串候选按 ID 查库
+        补文本，查不到就把 ID 本身当 text；绝不抛异常。
+        """
+        out = []
+        for cand in candidates or []:
+            if isinstance(cand, dict):
+                cid = cand.get("id")
+                text = cand.get("text")
+                if not text and cid:
+                    text = self._candidate_text(cid)
+                out.append({"id": cid, "text": text or (cid or "")})
+            elif isinstance(cand, str):
+                out.append({"id": cand, "text": self._candidate_text(cand) or cand})
+            else:
+                out.append({"id": cand, "text": str(cand)})
+        return out
+
+    def _candidate_similarity(self, memory_id, new_fact):
+        """一条候选旧记忆和新说法的余弦相似度（根因 b 的筛子）。
+
+        优先用库里存着的向量，没有再现算；算不出来返回 None（调用方
+        按“算不出来”处理，不当 0 分用——0 分会把候选错误地筛掉）。
+        """
+        row = self._conn.execute(
+            "SELECT text, embedding FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            old_vec = _blob_to_vector(row[1])
+            if old_vec is None:
+                old_vec = self._embed_text(row[0])
+            return _cosine(old_vec, self._embed_text(new_fact))
+        except Exception:
+            return None
+
+    def _apply_correction_result(self, new_fact, old_id, old_text, old_meta,
+                                 *, same_text, candidates, status="updated",
+                                 resolution=None, audit=None, source="user",
+                                 layer="single", turn_id=None,
+                                 slot_sweep=False):
+        """纠错收尾（2026-11-22）：按状态把结果写进账本和 SQLite，返回
+        回执。纠错是追加式——旧记忆不改原文、不删：新说法当一条新记忆
+        存（来源 user、已确认），账本记 supersede，旧行标 superseded=1。
+        same_text 时新说法和旧的一样，不用重存：只记一笔出现。
+        库里已有和新说法相同的活记忆时直接复用那条（刷新 last_used_at，
+        dormant / delete_due 改回 verbatim），不再新插，防重复行。
+        layer 哪一层定的（mem0 同款词）：exact（原样对上）/ single
+        （单候选过安全网）；调用方显式传，不从 same_text 推。
+        slot_sweep（R-1，2026-11-24）：True 时（槽位型纠正，见
+        correct_memory）取代成功后把同槽其余真冲突旧值走连带清扫
+        （_sweep_extra_conflicts），清掉的 id 记进回执 swept_ids。
+        """
+        # 提炼收口（webfix 一）：不管哪条路把纠正原话递进来
+        # （判官路曾把“我只吃鸡杂面”连着“刚才那句说错了”整句
+        # 当新事实），落盘前先提炼——元句不许成为 supersede 的
+        # 现行事实。提炼不出（剥完没事实）就保持原样走老流程，
+        # 不在这里拦（撤回类文本有自己的路）。
+        if any(marker in (new_fact or "") for marker in (
+            "说错了", "写错了", "讲错了", "记错了", "搞错了", "记岔了",
+        )):
+            _distilled = distill_correction_fact(new_fact)
+            if _distilled and _distilled != new_fact:
+                new_fact = _distilled
+        with self._lock:
+            # 回执里的 candidates 统一成带文本的字典（2026-11-22 Bug 1）：
+            # 传进来的是 _find_correction_candidates 给的 ID 串列表，
+            # 这里转完再返回，调用方不用再猜格式。
+            candidates = self._candidates_with_text(candidates)
+            if status == "unchanged":
+                self._record_occurrence(
+                    old_id, old_meta, _shanghai_today().isoformat(), turn_id,
+                    old_text,
+                )
+                return {
+                    "status": "unchanged", "memory_id": old_id,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "已是该内容，无需修改",
+                    "layer": layer, "resolution": resolution or "exact",
+                    "audit": audit or {"source": "user", "method": "unchanged"},
+                }
+            # 库里已有和新说法相同的活记忆时直接复用，不再新插一条
+            #（否则新旧说法同时在库里时会留下两条一样的活记录）。
+            # 复用时刷新 last_used_at，dormant / delete_due 顺便改回
+            # verbatim；_supersede_row 的目标就是这条已有记录。
+            existing_id = None
+            existing_meta = None
+            existing_text = None
+            for _row in self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories WHERE voided=0"
+                " AND deleted=0 AND superseded=0 AND id != ?",
+                (old_id,),
+            ).fetchall():
+                if _dedupe_key(_row[1] or "") == _dedupe_key(new_fact):
+                    existing_id = _row[0]
+                    existing_text = _row[1] or ""
+                    existing_meta = json.loads(_row[2] or "{}")
+                    break
+            if existing_id is not None:
+                revived = existing_meta.get("decay_state") in (
+                    _decay.DECAY_STATE_DORMANT, _decay.DECAY_STATE_DELETE_DUE,
+                )
+                existing_meta["last_used_at"] = _now_iso()
+                if revived:
+                    existing_meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
+                self._conn.execute(
+                    "UPDATE memories SET metadata_json=? WHERE id=?",
+                    (json.dumps(existing_meta, ensure_ascii=False), existing_id),
+                )
+                if revived:
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {"type": _ledger.LEDGER_EVENT_REVIVE,
+                             "memory_id": existing_id, "key": existing_id,
+                             "text": existing_text},
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning("复活记账失败。", exc_info=True)
+                new_key = existing_id
+            else:
+                created_at = _now_iso()
+                write_seq = _next_write_seq()
+                today = _shanghai_today().isoformat()
+                metadata = {
+                    "source": source,
+                    "confidence": 1.0,
+                    "user_confirmed": True,
+                    "created_at": created_at,
+                    "write_seq": write_seq,
+                    # 本轮号（2026-11-24 1a）：以前写死 None，撤回按
+                    # turn_id 找这条时找不到，纠正出的新记忆撤不掉。
+                    "turn_id": turn_id,
+                    "slot": (old_meta or {}).get("slot"),
+                    "is_rule": bool((old_meta or {}).get("is_rule")),
+                    "curated": bool((old_meta or {}).get("curated")),
+                    # P1-3（2026-11-23）：新记忆的 decay_kind 继承旧记忆的。
+                    # 旧写法按 source="user" 一律算 stable，纠正一条一次性事件
+                    #（“昨天我吃了牛肉面”→“鸡杂面”）也会变 stable，违背
+                    #“一次性经历是 episodic”的规矩。旧记忆没写 decay_kind
+                    # 时才回退到 classify_decay_kind。
+                    "decay_kind": (old_meta or {}).get("decay_kind")
+                    or _decay.classify_decay_kind(
+                        source, False, bool((old_meta or {}).get("is_rule"))
+                    ),
+                    "importance": (old_meta or {}).get("importance", "normal"),
+                    "event_date": resolve_event_date(new_fact),
+                    "last_used_at": created_at,
+                    "decay_state": _decay.DECAY_STATE_VERBATIM,
+                }
+                # 出现证据只记本轮（纠正轮本身是新事实的一次
+                # 出现）：旧行攒的天数/会话不在这里预支——“取代
+                # 后才继承”（2026-11-24 晋升优化），推断保护挂起
+                # 时 BOOS 还没裁，预支了裁“不换”就并错了。真顶
+                # 成功后由 _inherit_seen_evidence 统一并入+复核。
+                dates, sessions, _added = _decay.record_seen_occurrence(
+                    None, None, today, turn_id
+                )
+                metadata["seen_dates"] = _decay._dump_seen_list(dates)
+                metadata["seen_sessions"] = _decay._dump_seen_list(sessions)
+                try:
+                    new_key = self._append_new_memory(new_fact, metadata)
+                except Exception:
+                    return {
+                        "status": "failed", "memory_id": old_id,
+                        "old_text": old_text, "new_text": new_fact,
+                        "candidates": candidates or [],
+                        "reason": "新记忆写入失败", "layer": "none",
+                        "resolution": resolution or "failed",
+                        "audit": audit or {"source": source, "method": "correct_memory"},
+                    }
+                if new_key is None:
+                    return {
+                        "status": "failed", "memory_id": old_id,
+                        "old_text": old_text, "new_text": new_fact,
+                        "candidates": candidates or [],
+                        "reason": "账本写失败", "layer": "none",
+                        "resolution": resolution or "failed",
+                        "audit": audit or {"source": source, "method": "correct_memory"},
+                    }
+            if self._is_inferred_unconfirmed(old_meta):
+                # 推断记忆保护（2026-11-24，BOOS 裁决“类似的事情
+                # 别再犯”）：新说法照常存下（上面已存/已复用），
+                # 推断来的旧记忆不直接顶——攒待问问题，BOOS 点头
+                # 才换；连带清扫也不跑（主目标都没定，其余的更
+                # 不许先顶）。回答走 answer_question 的冲突分支。
+                question = self._queue_conflict_question(
+                    old_id, old_text, new_key, new_fact, turn_id=turn_id,
+                )
+                return {
+                    "status": "pending_question", "memory_id": new_key,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "旧记忆是推断来的、还没确认过：新说法已存，旧的等你确认再换",
+                    "layer": layer,
+                    "resolution": "pending_question",
+                    "audit": audit or {"source": source, "method": "correct_memory"},
+                    "question_id": (question or {}).get("id"),
+                }
+            try:
+                self._supersede_row(
+                    old_id, old_text, old_meta, new_key, new_fact,
+                    turn_id=turn_id,
+                )
+            except Exception:
+                logger.warning("纠错取代记账失败：旧行未取代。", exc_info=True)
+                return {
+                    "status": "failed", "memory_id": new_key,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": candidates or [],
+                    "reason": "新记忆已存，但旧记忆未被取代",
+                    "layer": "none",
+                    "resolution": "failed",
+                    "audit": audit or {"source": source, "method": "correct_memory"},
+                }
+            # 晋升证据继承（2026-11-24）：真顶成功了，旧行攒的
+            # 天数/会话并给新行并复核晋升——新事实不从零开始数。
+            # 失败只记日志（_inherit_seen_evidence 内部处理），
+            # 不拖垮已经落盘的纠正。
+            self._inherit_seen_evidence(old_meta, new_key, turn_id=turn_id)
+            result = {
+                "status": status, "memory_id": new_key,
+                "old_text": old_text, "new_text": new_fact,
+                "candidates": candidates or [],
+                "reason": "已更正",
+                "layer": layer,
+                "resolution": resolution or "updated",
+                "audit": audit or {"source": source, "method": "correct_memory"},
+            }
+            if slot_sweep:
+                # R-1：主目标已顶掉，同槽其余真冲突旧值连带清扫
+                #（门槛见 _sweep_extra_conflicts，防广州式误伤）。
+                _slot, _value = _infer_fact_slot(new_fact)
+                if _slot is not None:
+                    _extras = [
+                        c for c in self._find_same_slot_conflicts(
+                            _slot, _value
+                        )
+                        if c[0] != old_id
+                    ]
+                    _swept = self._sweep_extra_conflicts(
+                        _slot, _extras, new_key, new_fact,
+                        turn_id=turn_id,
+                    )
+                    if _swept:
+                        result["swept_ids"] = _swept
+            return result
+
+    def _find_correction_note_target(self, candidates, new_fact):
+        """找模型写的纠正备注行（2026-11-23 A 组修复）：
+        备注行是模型在 save_turn 之前自己调 add_memory 写下的，
+        形如“BOOS 喜欢吃面条（纠正：不是喜欢吃米饭）”——它已经顶掉了
+        旧说法，但 slot 是 null、相似度又被括号里的旧说法拉低，
+        纠正分支认不出它，就会报 not_found。
+        认法：文本含“纠正：”标记，且标记前面那半句与新说法归一化后
+        相同（主语“我/BOOS”已由 _normalize_memory_text 剥掉）。
+        只在带明确纠正词时用；找不到返回 None（调用方走老路，不硬猜）。
+        真纠正便条（如“用户表示……纠正了此前‘喜欢吃鸡杂面’的说法”）
+        没有“纠正：”冒号标记，不会误认。"""
+        norm_new = _normalize_memory_text(new_fact)
+        if not norm_new:
+            return None
+        for mid in candidates or []:
+            text = self._candidate_text(mid)
+            if not text:
+                continue
+            marker_idx = text.find("纠正：")
+            if marker_idx < 0:
+                marker_idx = text.find("纠正:")
+            if marker_idx < 0:
+                continue
+            head = text[:marker_idx].rstrip("（(").strip()
+            if not head:
+                continue
+            if _normalize_memory_text(head) == norm_new:
+                return mid
+        return None
+
+    def _supersede_note_old_fact(self, old_fact_text, new_key, new_fact,
+                                 turn_id=None):
+        """备注行里被纠正掉的旧说法若还活着，一并取代（2026-11-23 A 组修复
+        的兜底）：线上备注行写下时语义判官通常已顶掉旧行，这时旧行已不
+        是活的，什么都不做；万一旧行还活着（判官没顶），按备注行里写的
+        旧说法原样找出来顶掉——归一化后完全相同才顶，不猜。"""
+        if not old_fact_text or not new_key:
+            return
+        norm_old = _normalize_memory_text(old_fact_text)
+        if not norm_old:
+            return
+        try:
+            rows = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0 AND id != ?",
+                (new_key,),
+            ).fetchall()
+        except Exception:
+            return
+        for row in rows:
+            if _normalize_memory_text(row[1] or "") != norm_old:
+                continue
+            try:
+                old_meta = json.loads(row[2] or "{}")
+            except Exception:
+                old_meta = {}
+            try:
+                # 推断记忆保护：备注兜底要顶的旧行是推断未确认时，
+                # 改走待问（_supersede_or_ask 内部处理）。
+                self._supersede_or_ask(
+                    row[0], row[1] or "", old_meta, new_key, new_fact,
+                    turn_id=turn_id,
+                )
+            except Exception:
+                logger.warning("备注旧说法取代记账失败。", exc_info=True)
+
+    def _explicit_correction_slot_target(self, candidates, new_fact):
+        """带明确纠正词时按槽位找要改的那条（2026-11-23 model fix #2）：
+        新说法和候选的 _correction_topic_slot 相同（住处/名字/喜欢吃……）
+        时，取候选顺序里的第一条（候选已按已确认在前、同类里新的在前
+        排过）；没有同槽位候选时返回 None（调用方走老路，不硬猜）。
+        同槽多条时按相似度差距直选（2026-11-24 1c）：真记忆同槽永远
+        多条（火锅/牛肉面/鸡杂面同为“喜欢吃”），原先“恰好 1 条才
+        直选”在 live 里从未触发。改成：第一名 ≥ 0.70（沿用纠正安全
+        网的线）且第二名 < 0.50（明显不像）才直选第一名；差距不够、
+        或相似度算不出来时返回 None，走老路（相似度筛→ambiguous→
+        判官），不猜一条改掉（2026-11-23 回归修的底线还在：
+        “不对，我喜欢吃米线”对火锅/冒菜两条同槽旧行时相似度都
+        不够线，必须报 ambiguous）。"""
+        slot_key = _correction_topic_slot(new_fact)
+        if slot_key is None:
+            return None
+        norm_new = _normalize_memory_text(new_fact)
+        same_slot = []
+        for mid in candidates or []:
+            text = self._candidate_text(mid)
+            if text is None:
+                continue
+            if _normalize_memory_text(text) == norm_new:
+                continue
+            if _correction_topic_slot(text) == slot_key:
+                same_slot.append(mid)
+        if len(same_slot) == 1:
+            return same_slot[0]
+        if not same_slot:
+            return None
+        scored = [
+            (mid, self._candidate_similarity(mid, new_fact))
+            for mid in same_slot
+        ]
+        if any(sim is None for _mid, sim in scored):
+            return None
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        if (scored[0][1] >= _CORRECTION_TOPIC_MIN_SIMILARITY
+                and scored[1][1] < 0.50):
+            return scored[0][0]
+        return None
+
+
+    def _already_corrected_receipt(self, new_fact, old_fact, turn_id=None):
+        """新说法已是活记忆、且它顶掉旧说法的账本事件就是本轮（turn_id
+        相同）的，说明纠正已在本轮完成过：模型生成回复时调 update_memory 先改
+        了，save_turn 又调一次 correct_memory——两边都改就会误顶同槽位
+        的另一条旧记忆（D 组把真记忆广州顶掉；E 组则报 not_found、回复
+        丢了“改好了”）。此时不再另找目标，直接回 updated，old_text 就是
+        账本里这行顶掉的旧说法。返回 None 表示没撞上这条路。
+        只拦两种情况：(a) save_turn 的调用（old_fact == new_fact）；
+        (b) 工具的重复调用（旧说法已不在库里活着）。旧说法还活着时不拦
+        ——那是真纠正（例如新说法早就在库里、旧说法还活着），正常流程会
+        顶掉旧行、复用新行。
+        """
+        norm_new = _normalize_memory_text(new_fact)
+        live_id = None
+        for row in self._conn.execute(
+            "SELECT id, text FROM memories WHERE voided=0 AND deleted=0"
+            " AND superseded=0"
+        ).fetchall():
+            if _normalize_memory_text(row[1] or "") == norm_new:
+                live_id = row[0]
+                break
+        if live_id is None:
+            return None
+        # (b) 工具调用：旧说法还活着 → 真纠正，别拦。
+        if _normalize_memory_text(old_fact) != norm_new:
+            norm_old = _normalize_memory_text(old_fact)
+            for row in self._conn.execute(
+                "SELECT id, text FROM memories WHERE voided=0 AND deleted=0"
+                " AND superseded=0"
+            ).fetchall():
+                if _normalize_memory_text(row[1] or "") == norm_old:
+                    return None
+        # 账本里找这行顶掉的旧说法（最近的一条 supersede 事件）。
+        old_text = None
+        sup_turn_id = None
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            return None
+        for ev in reversed(events):
+            if (ev.get("type") == _ledger.LEDGER_EVENT_SUPERSEDE
+                    and ev.get("memory_id") == live_id):
+                old_text = ev.get("old_text")
+                sup_turn_id = ev.get("turn_id")
+                break
+        if not old_text:
+            return None
+        # 只有本轮（turn_id 相同）的 supersede 才算“刚改过”（2026-11-24
+        # 1b）。以前靠 5 分钟墙钟猜：上一轮刚改完、这一轮改回旧值时，
+        # 最近一条 supersede 还在 5 分钟内，护栏会误拦，真该顶的那条
+        # 顶不掉。没带 turn_id 的旧事件、和本轮对不上的，一律不拦，
+        # 交给正常流程；turn_id 没传进来（认不出本轮）时也不拦。
+        if not turn_id or sup_turn_id != turn_id:
+            return None
+        return {
+            "status": "updated", "memory_id": live_id,
+            "old_text": old_text, "new_text": new_fact,
+            "candidates": [], "reason": "已改好（本轮已纠正过）",
+            "layer": "already", "resolution": "already_corrected",
+            "audit": {"source": "user", "method": "already_corrected"},
+        }
+
+    @staticmethod
+    def _negation_conflicts(new_fact, old_text):
+        """新说法和旧说法是不是“否定式正面冲突”（webfix 一）。
+
+        程序信号，不猜语义：两边共享至少一个内容二字组；这个二字组
+        在新说法里落在否定辖域内（前面 3 字内有 不/没/别），在旧
+        说法里不在否定辖域内——新说法否定的正是旧说法肯定的东西
+        （“不吃牛肉” vs “喜欢吃牛肉面”）。旧说法自己也带否定的
+        （“不吃牛肉，吃鸡杂面”）不算冲突，那是同义/同向。
+        """
+        def _bigrams(s):
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+
+        new_fact = new_fact or ""
+        old_text = old_text or ""
+        for bigram in _bigrams(new_fact) & _bigrams(old_text):
+            i = new_fact.find(bigram)
+            if not any(c in "不没别" for c in new_fact[max(0, i - 3):i]):
+                continue
+            j = old_text.find(bigram)
+            if any(c in "不没别" for c in old_text[max(0, j - 3):j]):
+                continue
+            return True
+        return False
+
+    def _supersede_confirmed_contradictions(self, new_fact_text,
+                                            new_key, turn_id=None):
+        """同轮清扫已确认冲突（webfix 一）：把和新事实否定式冲突的
+        “已确认”活记忆一并顶掉，指向已存好的新行（不另存重复行）。
+
+        只顶 user_confirmed 的行：推断/未确认的行不在这里动——
+        它们有推断保护和待问问题管。返回顶掉的清单
+        [{"memory_id", "old_text"}]。单条失败只记日志，不拦其余。
+        """
+        out = []
+        if not new_key or not (new_fact_text or "").strip():
+            return out
+        if not re.search(r"[不没别无]", new_fact_text):
+            return out
+        with self._lock:
+            for m in self._all_live_memories():
+                mid = m["id"]
+                if mid == new_key:
+                    continue
+                meta = m["metadata"] or {}
+                if not meta.get("user_confirmed"):
+                    continue
+                old_text = m["text"] or ""
+                if _dedupe_key(old_text) == _dedupe_key(new_fact_text):
+                    continue
+                if not self._negation_conflicts(new_fact_text, old_text):
+                    continue
+                try:
+                    self._supersede_row(
+                        mid, old_text, meta, new_key, new_fact_text,
+                        turn_id=turn_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "已确认冲突清扫：取代 %s 失败。", mid, exc_info=True
+                    )
+                    continue
+                out.append({"memory_id": mid, "old_text": old_text})
+        return out
+
+    def correct_memory(self, old_fact, new_fact, exclude_identical_to_new=True,
+                       explicit_correction=False, turn_id=None):
+        """纠错：把 old_fact 指的那条记忆改成 new_fact（整合方案 §6.3）。
+
+        流程（和 mem0_store.correct_memory 一致）：
+        先找候选（语义 + 关键词/同槽位 + 近期同一轮）；
+        旧说法原样在库里 → 直接改那条；
+        带明确纠正词时（explicit_correction=True，2026-11-23 model fix
+        #2，A 组阈值）：按槽位找要改的那条，不走相似度 0.70 阈值——
+        候选里同槽位的第一条就是目标，找不到同槽位候选时走下面老路；
+        只有一条候选 → 过相似度安全网（余弦 ≥ 0.70 才改，否则 ambiguous，
+        免得改错不相干的记忆；向量算不出来时跳过安全网，交由调用方兜底）；
+        多条候选、没有原样 → 先按相似度筛（根因 b，2026-11-22）：只留
+        与新说法相似度 ≥ 0.70 的；筛后剩 1 条就按单候选走，剩 0 条报
+        not_found，仍剩多条再报 ambiguous；向量算不出来时不筛，直接
+        ambiguous（不猜，留给调用方问）；
+        一条没有 → not_found（调用方按新记忆存）；
+        新说法和旧的一样 → unchanged；新说法含敏感信息 → failed。
+        纠错是追加式（整合方案）：旧记忆不改原文、不删，记 supersede，
+        新说法另存一条。返回 mem0 同款回执：
+        {status, memory_id, old_text, new_text, candidates, reason,
+         layer, resolution, audit}。
+        candidates 是带 id 和 text 的字典列表（2026-11-22 Bug 1：以前是
+        光秃秃的 ID 串，打印层按字典取 text 就崩成 500）。
+        """
+        with self._lock:
+            new_fact = (new_fact or "").strip()
+            old_fact = (old_fact or "").strip()
+            if _contains_sensitive(new_fact):
+                return {
+                    "status": "failed", "memory_id": None,
+                    "old_text": old_fact, "new_text": new_fact,
+                    "candidates": [],
+                    "reason": "新说法含敏感信息", "layer": "none",
+                    "resolution": "blocked",
+                    "audit": {"source": "user", "method": "correct_memory"},
+                }
+            if turn_id is None:
+                # 工具路（update_memory）没有轮次上下文：用当前轮登记
+                # （search / save_turn 登记的 _active_turn_id）兜底，这样
+                # 工具先改、save_turn 再调时，护栏和账本都认得出本轮。
+                turn_id = getattr(self, "_active_turn_id", None)
+            # R-1（2026-11-24）：old 与 new 同文（save_turn 的
+            # correct_memory(fact, fact) 路）是一次“槽位型纠正”——
+            # BOOS 直接报了槽位的新值、没点名旧值，纠正的是整个
+            # 槽位：成功后同槽其余真冲突旧值走连带清扫。点名了
+            # 旧值的纠正（old != new）是外科手术式，只改被点名
+            # 的那条，不清扫（group1 槽位直选的护栏）。
+            slot_sweep = (
+                _normalize_memory_text(old_fact)
+                == _normalize_memory_text(new_fact)
+            )
+            already = self._already_corrected_receipt(
+                new_fact, old_fact, turn_id=turn_id
+            )
+            if already is not None:
+                return already
+            candidates = self._find_correction_candidates(
+                old_fact, new_fact=new_fact,
+                exclude_identical_to_new=exclude_identical_to_new,
+            )
+            if not candidates:
+                if _normalize_memory_text(old_fact) == _normalize_memory_text(new_fact):
+                    # 新旧说法相同：候选过滤已跳过与新说法相同的条目；库里
+                    # 已是这句、又没有别的冲突记忆时，无事可做，报 unchanged
+                    #（而不是 not_found——“已经是对的”不是“找不到”）。
+                    for _row in self._conn.execute(
+                        "SELECT id, text, metadata_json FROM memories WHERE voided=0"
+                        " AND deleted=0 AND superseded=0"
+                    ).fetchall():
+                        if _normalize_memory_text(_row[1] or "") == _normalize_memory_text(new_fact):
+                            return self._apply_correction_result(
+                                new_fact, _row[0], _row[1],
+                                json.loads(_row[2] or "{}"),
+                                same_text=True, candidates=[], status="unchanged",
+                                resolution="exact", layer="exact",
+                                audit={"source": "user", "method": "exact_match"},
+                                turn_id=turn_id, slot_sweep=slot_sweep,
+                            )
+                # 第 5 条跨槽安全网（2026-11-24）：主路一条候选都
+                # 没找到时，先别下 not_found——对全部活记忆再扫一遍
+                # （高门槛 + 判官确认），捞到真冲突就按那条落盘；
+                # 捞不到才维持原判。
+                net = self._cross_slot_net_target(old_fact, new_fact)
+                if net is not None:
+                    mid, old_text, old_meta, verdict = net
+                    return self._apply_correction_result(
+                        new_fact, mid, old_text, old_meta, same_text=False,
+                        candidates=[mid], status="updated",
+                        resolution="cross_slot_net", layer="net",
+                        audit={"source": "user", "method": "cross_slot_net",
+                               "provider": verdict.get("provider"),
+                               "model": verdict.get("model"),
+                               "judge_slot": verdict.get("slot")},
+                        turn_id=turn_id, slot_sweep=slot_sweep,
+                    )
+                return {
+                    "status": "not_found", "memory_id": None,
+                    "old_text": old_fact, "new_text": new_fact,
+                    "candidates": [],
+                    "reason": "未找到可纠正的记忆", "layer": "none",
+                    "resolution": "not_found",
+                    "audit": {"source": "user", "method": "correct_memory"},
+                }
+            # 原样匹配：旧说法原样在库里，直接改那条（不用过安全网）。
+            exact = None
+            for mid in candidates:
+                row = self._conn.execute(
+                    "SELECT text, metadata_json FROM memories WHERE id=?", (mid,)
+                ).fetchone()
+                if row and (row[0] or "").strip() == old_fact:
+                    exact = (mid, row[0], json.loads(row[1] or "{}"))
+                    break
+            if exact is not None:
+                mid, old_text, old_meta = exact
+                same = _normalize_memory_text(new_fact) == _normalize_memory_text(old_text)
+                if same:
+                    return self._apply_correction_result(
+                        new_fact, mid, old_text, old_meta, same_text=True,
+                        candidates=candidates, status="unchanged",
+                        resolution="exact", layer="exact",
+                        audit={"source": "user", "method": "exact_match"},
+                        turn_id=turn_id, slot_sweep=slot_sweep,
+                    )
+                return self._apply_correction_result(
+                    new_fact, mid, old_text, old_meta, same_text=False,
+                    candidates=candidates, status="updated",
+                    resolution="exact", layer="exact",
+                    audit={"source": "user", "method": "exact_match"},
+                    turn_id=turn_id, slot_sweep=slot_sweep,
+                )
+            # 2026-11-23 model fix #2（A 组阈值）：带明确纠正词的，不走
+            # 相似度 0.70 阈值，直接按槽位找要改的那条——候选里同槽位的
+            # 第一条（候选已按已确认在前、同类里新的在前排过）。找不到
+            # 同槽位候选时走下面的老路（相似度/判官），不硬猜。
+            if explicit_correction:
+                # 2026-11-23 A 组修复：先认模型已写的纠正备注行——
+                # 模型在 save_turn 之前自己调 add_memory 写下
+                # “BOOS 喜欢吃面条（纠正：不是喜欢吃米饭）”，已经顶掉
+                # 了米饭；但备注行 slot 是 null、相似度又被括号拉低，
+                # 槽位直选和相似度筛都认不出它，纠正分支会报 not_found，
+                # 新说法又被 _dedupe_key 当成备注行的重复而不存。
+                # 认出来就用 exact 新说法取代备注行，回执 updated；
+                # 备注行里被纠正掉的旧说法（米饭）若还活着，也一并取代。
+                note_target = self._find_correction_note_target(
+                    candidates, new_fact
+                )
+                if note_target is not None:
+                    mid = note_target
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                    if row is not None:
+                        old_text, old_meta = row[0], json.loads(row[1] or "{}")
+                        same = (
+                            _normalize_memory_text(new_fact)
+                            == _normalize_memory_text(old_text)
+                        )
+                        result = self._apply_correction_result(
+                            new_fact, mid, old_text, old_meta, same_text=same,
+                            candidates=candidates,
+                            status="unchanged" if same else "updated",
+                            resolution="explicit_note", layer="note",
+                            audit={
+                                "source": "user",
+                                "method": "explicit_correction_note",
+                            },
+                            turn_id=turn_id, slot_sweep=slot_sweep,
+                        )
+                        if (result or {}).get("status") == "updated":
+                            extracted_old = _extract_note_old_fact(old_text)
+                            if extracted_old:
+                                result["old_text"] = extracted_old
+                                self._supersede_note_old_fact(
+                                    extracted_old,
+                                    (result or {}).get("memory_id"),
+                                    new_fact, turn_id=turn_id,
+                                )
+                        return result
+                slot_target = self._explicit_correction_slot_target(
+                    candidates, new_fact
+                )
+                if slot_target is not None:
+                    mid = slot_target
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json FROM memories WHERE id=?",
+                        (mid,),
+                    ).fetchone()
+                    if row is not None:
+                        old_text, old_meta = row[0], json.loads(row[1] or "{}")
+                        same = (
+                            _normalize_memory_text(new_fact)
+                            == _normalize_memory_text(old_text)
+                        )
+                        return self._apply_correction_result(
+                            new_fact, mid, old_text, old_meta, same_text=same,
+                            candidates=candidates,
+                            status="unchanged" if same else "updated",
+                            resolution="explicit_slot", layer="slot",
+                            audit={
+                                "source": "user",
+                                "method": "explicit_correction_slot",
+                                "slot": _correction_topic_slot(new_fact),
+                            },
+                            turn_id=turn_id, slot_sweep=slot_sweep,
+                        )
+            # 多条候选、没有原样：先按相似度筛（根因 b，2026-11-22）——
+            # 0.4 的召回线太宽，“我喜欢…”这种短句会召回一堆无关行；
+            # 只留与新说法相似度 ≥ 0.70 的（沿用已有的安全网标准）。
+            # 向量算不出来（sim 是 None）时不筛：宁可 ambiguous 问
+            # BOOS，也不凭空猜。
+            chosen = None
+            if len(candidates) > 1:
+                scored = [
+                    (mid, self._candidate_similarity(mid, new_fact))
+                    for mid in candidates
+                ]
+                high = [
+                    mid for mid, sim in scored
+                    if sim is not None and sim >= _CORRECTION_TOPIC_MIN_SIMILARITY
+                ]
+                unknown = [mid for mid, sim in scored if sim is None]
+                if len(high) >= 2:
+                    return {
+                        "status": "ambiguous", "memory_id": None,
+                        "old_text": old_fact, "new_text": new_fact,
+                        "candidates": self._candidates_with_text(high),
+                        "reason": "多条候选与新说法相似度都 ≥ 0.70，无法确定改哪一条",
+                        "layer": "none", "resolution": "ambiguous",
+                        "audit": {"source": "user", "method": "correct_memory"},
+                    }
+                if len(high) == 1 and not unknown:
+                    chosen = high[0]
+                elif len(high) == 0 and not unknown:
+                    # R-9（2026-11-24）：下 not_found 结论前补跑一次
+                    # 同槽兜底——召回有命中但全不相关时，真目标可能
+                    # 不在候选里（兜底只在召回为空时才跑）。兜底恰好
+                    # 捞出一条过线的，按单候选继续走（还要过下面的
+                    # 安全网）；捞不出就维持原判。
+                    rescued = self._rescue_correction_candidate(
+                        old_fact, new_fact, candidates
+                    )
+                    if rescued is not None:
+                        chosen = rescued
+                    else:
+                        # 第 5 条跨槽安全网（2026-11-24）：同槽兜底也
+                        # 落空了，对全部活记忆再扫一遍（高门槛 + 判官
+                        # 确认）；捞到真冲突就直接按那条落盘（判官
+                        # 确认就是这条路的安全网，不再回下面的相似度
+                        # 安全网——它过的就是 ≥0.80 的更高门槛），
+                        # 捞不到维持原判 not_found。
+                        net = self._cross_slot_net_target(old_fact, new_fact)
+                        if net is not None:
+                            mid, old_text, old_meta, verdict = net
+                            return self._apply_correction_result(
+                                new_fact, mid, old_text, old_meta,
+                                same_text=False, candidates=[mid],
+                                status="updated",
+                                resolution="cross_slot_net", layer="net",
+                                audit={"source": "user",
+                                       "method": "cross_slot_net",
+                                       "provider": verdict.get("provider"),
+                                       "model": verdict.get("model"),
+                                       "judge_slot": verdict.get("slot")},
+                                turn_id=turn_id, slot_sweep=slot_sweep,
+                            )
+                        best = max(sim for _mid, sim in scored)
+                        return {
+                            "status": "not_found", "memory_id": None,
+                            "old_text": old_fact, "new_text": new_fact,
+                            "candidates": self._candidates_with_text(candidates),
+                            "reason": "候选与新说法相似度均低于 0.70（最高 %.2f），未找到可纠正的记忆" % best,
+                            "layer": "none", "resolution": "not_found",
+                            "audit": {"source": "user", "method": "correct_memory"},
+                        }
+                else:
+                    return {
+                        "status": "ambiguous", "memory_id": None,
+                        "old_text": old_fact, "new_text": new_fact,
+                        "candidates": self._candidates_with_text(candidates),
+                        "reason": "多条候选，无法确定改哪一条",
+                        "layer": "none", "resolution": "ambiguous",
+                        "audit": {"source": "user", "method": "correct_memory"},
+                    }
+            else:
+                chosen = candidates[0]
+            # 单条候选（或多候选筛后只剩 1 条）：过相似度安全网。
+            mid = chosen
+            row = self._conn.execute(
+                "SELECT text, metadata_json, embedding FROM memories WHERE id=?", (mid,)
+            ).fetchone()
+            if row is None:
+                return {
+                    "status": "not_found", "memory_id": None,
+                    "old_text": old_fact, "new_text": new_fact,
+                    "candidates": self._candidates_with_text(candidates),
+                    "reason": "候选记忆已不在库里", "layer": "none",
+                    "resolution": "not_found",
+                    "audit": {"source": "user", "method": "correct_memory"},
+                }
+            old_text, old_meta = row[0], json.loads(row[1] or "{}")
+            same = _normalize_memory_text(new_fact) == _normalize_memory_text(old_text)
+            if same:
+                return self._apply_correction_result(
+                    new_fact, mid, old_text, old_meta, same_text=True,
+                    candidates=candidates, status="unchanged",
+                    resolution="semantic", layer="single",
+                    audit={"source": "user", "method": "single_candidate"},
+                    turn_id=turn_id, slot_sweep=slot_sweep,
+                )
+            try:
+                # 安全网比的是候选旧记忆和新说法的话题相似度，不是两个入参
+                #（save_turn 传的是 correct_memory(fact, fact)，拿入参比
+                # 永远是 1.0）。优先用库里存着的向量，没有再现算。
+                old_vec = _blob_to_vector(row[2])
+                if old_vec is None:
+                    old_vec = self._embed_text(old_text)
+                sim = _cosine(old_vec, self._embed_text(new_fact))
+            except Exception:
+                sim = None
+            if sim is not None and sim < _CORRECTION_TOPIC_MIN_SIMILARITY:
+                return {
+                    "status": "ambiguous", "memory_id": None,
+                    "old_text": old_text, "new_text": new_fact,
+                    "candidates": self._candidates_with_text(candidates),
+                    "reason": "与候选记忆相似度过低（%.2f），不敢改" % sim,
+                    "layer": "none", "resolution": "ambiguous",
+                    "audit": {"source": "user", "method": "safety_net",
+                              "similarity": sim},
+                }
+            return self._apply_correction_result(
+                new_fact, mid, old_text, old_meta, same_text=False,
+                candidates=candidates, status="updated",
+                resolution="semantic", layer="single",
+                audit={"source": "user", "method": "single_candidate",
+                       "similarity": sim},
+                turn_id=turn_id, slot_sweep=slot_sweep,
+            )
 
     def _void_last_stored(self):
         """作废上一轮刚存的记忆：账本记 delete，SQLite 标 voided。
@@ -767,7 +4556,7 @@ class SQLiteStore:
         with self._lock:
             candidates = self._conn.execute(
                 "SELECT id, text, metadata_json FROM memories"
-                " WHERE voided=0 AND deleted=0"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
                 " ORDER BY write_seq DESC, rowid DESC"
             ).fetchall()
             if not candidates:
@@ -818,7 +4607,7 @@ class SQLiteStore:
             rows = self._conn.execute(
                 "SELECT id, text, metadata_json, created_at, write_seq, slot,"
                 " source, user_confirmed, decay_kind, importance, event_date,"
-                " embedding FROM memories WHERE voided=0 AND deleted=0"
+                " embedding FROM memories WHERE voided=0 AND deleted=0 AND superseded=0"
                 " ORDER BY created_at DESC"
             ).fetchall()
             out = []
@@ -863,13 +4652,38 @@ class SQLiteStore:
         query = (query or "").strip()
         if not query:
             return []
+        if turn_id is not None:
+            # 登记当前轮（2026-11-24 1b）：ask() 的检索在本轮最前面，
+            # 登记后本轮内工具调 correct_memory 没带 turn_id 时认得出本轮。
+            self._active_turn_id = turn_id
         try:
-            return self._search_inner(query, top_k=top_k)
+            results = self._search_inner(
+                query, top_k=top_k, include_history=include_history
+            )
         except Exception:
             logger.warning("SQLite 检索失败。", exc_info=True)
             return []
+        # 冲突通道（webfix 三）：对外检索（给回答用的）才做——
+        # 同话题冲突标注 + pending 新事实换入；内部候选检索
+        # （_search_inner 的其他调用方）不走这里，免得干扰纠错
+        # 候选逻辑。标注只改 metadata 里的冲突标记，不动返回形状。
+        results = self._annotate_search_conflicts(results)
+        if reinforce and results:
+            # 真用上了才强化（2026-11-24 3a，和 Mem0Store.search 的
+            # reinforce 同款语义）：以前 SQLite 的 search 接了
+            # reinforce/turn_id 却没往下传，强化从没发生过。SQLite
+            # 这边由 note_context 一并做（刷新 last_used_at、沉底
+            # 复活、记账本 TOUCH）；历史结果不强化——翻出来看看
+            # 不算用上。写回失败不拦检索。
+            try:
+                self.note_context(
+                    [r for r in results if not (r or {}).get("is_history")]
+                )
+            except Exception:
+                logger.warning("检索强化写回失败：记忆本身还在。", exc_info=True)
+        return results
 
-    def _search_inner(self, query, top_k=5):
+    def _search_inner(self, query, top_k=5, include_history=False):
         """宽召回 → RRF 融合 → 先筛后截（旧 mem0 search 的排名逻辑，
         commit 7a69699“宽召回 + RRF 融合”，mem0_store.py search）。
 
@@ -1062,6 +4876,7 @@ class SQLiteStore:
                         ):
                             continue
                         events.append({
+                            "type": _ledger.LEDGER_EVENT_ADD,
                             "key": rec.get("key"), "text": rec.get("text") or "",
                             "meta": rec.get("meta") or {},
                         })
@@ -1086,16 +4901,662 @@ class SQLiteStore:
                         seen.add(text)
                 except Exception:
                     logger.warning("账本兜底检索失败。", exc_info=True)
+            # 历史查询（2026-11-22，Gemini #5）：include_history=True 时，
+            # 在活记忆后面补账本里被取代/删了的旧版本（翻找 supersede/delete
+            # 事件），标 is_history=True、source="history"。活记忆不动、
+            # 顺序不动，历史只追加；默认（include_history=False）不补，
+            # 免得旧版本混进正常回答。
+            if include_history:
+                try:
+                    state = self.ledger_state()
+                    key_states = (state or {}).get("key_states") or {}
+                    history_events = []
+                    for rec in (state or {}).get("adds") or []:
+                        if key_states.get(rec.get("key")) in (
+                            _ledger.LEDGER_STATE_SUPERSEDED,
+                            _ledger.LEDGER_STATE_DELETED,
+                        ):
+                            history_events.append({
+                                "type": _ledger.LEDGER_EVENT_ADD,
+                                "key": rec.get("key"),
+                                "text": rec.get("text") or "",
+                                "meta": rec.get("meta") or {},
+                            })
+                    for hit in _ledger.find_in_ledger(
+                        history_events, query, top_k=top_k,
+                        exclude_keys={r["id"] for r in results},
+                    ):
+                        text = hit.get("text") or ""
+                        if not text or text in seen:
+                            continue
+                        if _contains_sensitive(text):
+                            continue
+                        meta = _normalize_metadata(hit.get("meta") or {})
+                        results.append({
+                            "id": hit.get("key"), "text": text,
+                            "score": hit.get("score"), "source": "history",
+                            "metadata": meta,
+                            "confirmed": bool(meta.get("user_confirmed")),
+                            "decay_weight": 1.0, "is_history": True,
+                            "ledger_key": hit.get("key"),
+                        })
+                        seen.add(text)
+                except Exception:
+                    logger.warning("历史检索失败。", exc_info=True)
             return results
+
+    @staticmethod
+    def _content_bigrams(text):
+        """内容二字组：两个字都是汉字、且不含偏好脚手架字
+        （喜欢/爱/讨厌）——“BOOS 喜欢吃 X”里真正区分内容的是
+        X 部分的二字组（鸡杂、杂面），脚手架人人相同、不算数。"""
+        s = text or ""
+        out = set()
+        for i in range(len(s) - 1):
+            a, b = s[i], s[i + 1]
+            if not ("一" <= a <= "龥" and "一" <= b <= "龥"):
+                continue
+            if a in "喜欢爱讨厌" or b in "喜欢爱讨厌":
+                continue
+            out.add(s[i:i + 2])
+        return out
+
+    @classmethod
+    def _same_conflict_topic(cls, a, b):
+        """两条记忆是不是“同一件事的两种说法”（webfix 三成组用）。
+
+        只认硬信号，不猜：单值槽（住处/名字）同槽不同值；或否定式
+        正面冲突（_negation_conflicts 任一方向）。同是“喜欢吃”
+        槽但吃的东西不一样（冒菜 vs 火锅）不是冲突——那是两个
+        偏好，可以并存，不许标冲突。
+        """
+        slot_a, val_a = _infer_fact_slot(a)
+        slot_b, val_b = _infer_fact_slot(b)
+        if slot_a is not None and slot_a == slot_b:
+            return (
+                _normalize_memory_text(val_a or "")
+                != _normalize_memory_text(val_b or "")
+            )
+        return (
+            cls._negation_conflicts(a, b)
+            or cls._negation_conflicts(b, a)
+        )
+
+    def _annotate_search_conflicts(self, results):
+        """检索收尾的冲突通道（webfix 三，只改善不根治）。
+
+        0. 槽位二次整理（2026-11-24 漏答优化）：见 _slot_recompose
+           ——某槽的现行条没进结果、同槽旧冲突行进了，把现行条
+           换进来；现行条在结果里也不许排在旧行后面。
+        1. pending 不隐身：未答冲突问题的新事实（new_id）不在
+           结果里、但旧行在结果里（或与结果任一条同话题/共享
+           内容二字组）时，把它换进来（挤掉最末一条非规则、
+           非历史的结果）——新事实已存活，就不许在回答里隐身
+           （实测漏答根因之一）。
+        2. 冲突标注，成组只认硬信号：
+           - 待问问题亲口认定的那一对（old_id/new_id）是种子组，
+             再把与新行共享内容二字组的其余结果并进来（同一件
+             事的其它说法）；
+           - 没有待问问题时，靠 _same_conflict_topic 的硬信号
+             （单值槽同槽不同值 / 否定式正面冲突）成组。
+           组内以（已确认优先、write_seq/created_at 最新）定
+           “现行”：现行标 conflict_current，其余标 conflict_stale
+           + conflict_with=<现行文本>。main._memory_block 据此
+           给模型加一句“以最新确认的为准”，不让它面对互相
+           矛盾的记录把整个话题跳过。
+        全程失败只记日志，照常返回原结果；不动返回形状。
+        """
+        try:
+            items = [
+                r for r in results
+                if not r.get("is_history") and (r.get("text") or "")
+            ]
+            try:
+                questions = self.pending_questions.list_unanswered()
+            except Exception:
+                questions = []
+            conflict_questions = [
+                q for q in questions
+                if q.get("kind") == _pq.QUESTION_KIND_CONFLICT
+            ]
+            present = {r.get("id") for r in items}
+            by_id = {r.get("id"): r for r in items}
+            # --- 0. 槽位二次整理（2026-11-24，BOOS 定“漏答再
+            # 优化”）：按话题粗槽分组——某槽的现行条（已确认优先、
+            # 同级最新）没进结果、同槽的旧冲突行却进了，就把现行
+            # 条换进来占旧行的位置；现行条在结果里但排在旧行后面
+            # 的，提到旧行前面。已取代的行本来就不在活行里，这里
+            # 管的是“还活着但已经输了”的旧行（待问挂起、没纠正
+            # 词的新旧并存）：它们不许压过现行条。失败只记日志，
+            # 不连累后面的 pending 换入和冲突标注。
+            try:
+                self._slot_recompose(
+                    results, items, by_id, present, conflict_questions
+                )
+            except Exception:
+                logger.warning("槽位二次整理失败：照常返回结果。", exc_info=True)
+            # --- 1. pending 换入 ---
+            for q in conflict_questions:
+                new_id = q.get("new_id")
+                old_id = q.get("old_id")
+                if not new_id or new_id in present:
+                    continue
+                row = self._conn.execute(
+                    "SELECT text, metadata_json FROM memories WHERE id=?"
+                    " AND voided=0 AND deleted=0 AND superseded=0",
+                    (new_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                new_text = row[0] or ""
+                try:
+                    new_meta = json.loads(row[1] or "{}")
+                except Exception:
+                    new_meta = {}
+                new_bigrams = self._content_bigrams(new_text)
+                linked = old_id in present or any(
+                    self._same_conflict_topic(new_text, r["text"])
+                    or bool(new_bigrams & self._content_bigrams(r["text"]))
+                    for r in items
+                )
+                if not linked:
+                    continue
+                new_item = {
+                    "id": new_id, "text": new_text, "score": 0.0,
+                    "source": "pending_conflict",
+                    "metadata": _normalize_metadata(new_meta),
+                    "confirmed": bool(new_meta.get("user_confirmed")),
+                    "decay_weight": 1.0, "is_history": False,
+                }
+                for idx in range(len(results) - 1, -1, -1):
+                    cand = results[idx]
+                    if cand.get("is_history"):
+                        continue
+                    if (cand.get("metadata") or {}).get("is_rule") is True:
+                        continue
+                    del results[idx]
+                    break
+                results.append(new_item)
+                items.append(new_item)
+                by_id[new_id] = new_item
+                present.add(new_id)
+            # --- 2. 成组 ---
+            groups = []
+            grouped_ids = set()
+
+            def _add_to_group(group, item):
+                if item.get("id") in grouped_ids:
+                    return
+                grouped_ids.add(item.get("id"))
+                group.append(item)
+
+            for q in conflict_questions:
+                pair = [
+                    by_id[q.get("old_id")], by_id[q.get("new_id")],
+                ] if q.get("old_id") in by_id and q.get("new_id") in by_id else []
+                if len(pair) < 2:
+                    continue
+                group = []
+                for item in pair:
+                    _add_to_group(group, item)
+                new_bigrams = self._content_bigrams(pair[1]["text"])
+                for r in items:
+                    if r.get("id") in grouped_ids:
+                        continue
+                    if new_bigrams & self._content_bigrams(r["text"]):
+                        _add_to_group(group, r)
+                if len(group) >= 2:
+                    groups.append(group)
+            for r in items:
+                if r.get("id") in grouped_ids:
+                    continue
+                placed = False
+                for group in groups:
+                    if any(
+                        self._same_conflict_topic(g["text"], r["text"])
+                        for g in group
+                    ):
+                        _add_to_group(group, r)
+                        placed = True
+                        break
+                if not placed:
+                    group = [r]
+                    grouped_ids.add(r.get("id"))
+                    groups.append(group)
+
+            def _rank(g):
+                meta = g.get("metadata") or {}
+                return (
+                    1 if (g.get("confirmed")
+                          or meta.get("user_confirmed")) else 0,
+                    meta.get("write_seq") or 0,
+                    meta.get("created_at") or "",
+                )
+
+            for group in groups:
+                if len(group) < 2:
+                    continue
+                if len({_dedupe_key(g["text"]) for g in group}) < 2:
+                    continue
+                current = max(group, key=_rank)
+                for g in group:
+                    meta = g.setdefault("metadata", {})
+                    if g is current:
+                        meta["conflict_current"] = True
+                    else:
+                        meta["conflict_stale"] = True
+                        meta["conflict_with"] = current["text"]
+            return results
+        except Exception:
+            logger.warning("检索冲突标注失败：照常返回结果。", exc_info=True)
+            return results
+
+    def _slot_recompose(self, results, items, by_id, present,
+                        conflict_questions):
+        """槽位二次整理（2026-11-24）：见 _annotate_search_conflicts
+        第 0 步。只就地改 results/items/by_id/present，不改返回形状。
+
+        成组只认硬信号（和 _same_conflict_topic 一个标准）：
+        - 单值槽（slot: 住处/名字…）：同槽不同值天然互斥，全槽一组；
+        - 偏好话题（pref: 喜欢吃…）：同话题不同食物可以并存，不算
+          冲突——只认未答冲突问题亲口认定的对子成组。否定式链接
+          不用来成组：“纠正了鸡杂面”那种备注行靠否定词和半个
+          话题的二字组就能和并存偏好攀上关系，拿它换入/重排会
+          把冒菜这种并存偏好误当现行条（全套回归实测：Q3 排序
+          被打乱、webfix 口味场景换错行）。
+        组内现行 = 已确认优先、同级按 write_seq/created_at 最新
+        （和第 2 步标注同一个 _rank 口径）。现行不在结果里时，
+        换掉组内最旧的那条占它的位置（规则行不换）；现行在结果
+        里但排在旧行后面的，挪到本组最靠前的旧行前面。
+        """
+        def _rank_of(item):
+            meta = item.get("metadata") or {}
+            return (
+                1 if (item.get("confirmed")
+                      or meta.get("user_confirmed")) else 0,
+                meta.get("write_seq") or 0,
+                meta.get("created_at") or "",
+            )
+
+        linked_pairs = set()
+        for q in conflict_questions or []:
+            _o, _n = q.get("old_id"), q.get("new_id")
+            if _o and _n and _o != _n:
+                linked_pairs.add(frozenset((_o, _n)))
+
+        topics = {}
+        for item in items:
+            topic = _correction_topic_slot(item.get("text") or "")
+            if topic:
+                topics.setdefault(topic, []).append(item)
+        if not topics:
+            return
+        live_by_topic = {}
+        for row in self._conn.execute(
+            "SELECT id, text, metadata_json FROM memories"
+            " WHERE voided=0 AND deleted=0 AND superseded=0"
+        ).fetchall():
+            topic = _correction_topic_slot(row[1] or "")
+            if not topic or topic not in topics:
+                continue
+            try:
+                _meta = json.loads(row[2] or "{}")
+            except Exception:
+                _meta = {}
+            live_by_topic.setdefault(topic, []).append({
+                "id": row[0], "text": row[1] or "", "metadata": _meta,
+                "confirmed": bool(_meta.get("user_confirmed")),
+            })
+
+        for topic, group_items in topics.items():
+            live_rows = live_by_topic.get(topic) or []
+            if len(live_rows) < 2:
+                continue
+            clusters = []
+            if topic.startswith("slot:"):
+                clusters = [live_rows]
+            else:
+                # 偏好话题只认待问问题认定的对子（见 docstring）。
+                by_id_live = {c["id"]: c for c in live_rows}
+                grouped_live = set()
+                for pair in linked_pairs:
+                    members = [
+                        by_id_live[i] for i in pair if i in by_id_live
+                    ]
+                    if len(members) < 2:
+                        continue
+                    if any(m["id"] in grouped_live for m in members):
+                        continue
+                    grouped_live.update(m["id"] for m in members)
+                    clusters.append(members)
+            for cluster in clusters:
+                member_ids = {c["id"] for c in cluster}
+                in_results = [
+                    it for it in group_items if it.get("id") in member_ids
+                ]
+                if not in_results:
+                    continue
+                current = max(cluster, key=_rank_of)
+                if current["id"] in present:
+                    # 现行在结果里：不许排在任何同组旧行后面。
+                    cur_item = by_id.get(current["id"])
+                    if cur_item is None or cur_item not in results:
+                        continue
+                    stale_idxs = [
+                        results.index(it) for it in in_results
+                        if it.get("id") != current["id"] and it in results
+                    ]
+                    if stale_idxs and results.index(cur_item) > min(stale_idxs):
+                        results.pop(results.index(cur_item))
+                        results.insert(min(stale_idxs), cur_item)
+                    continue
+                # 现行不在结果里：换掉组内最旧的一条（规则行不换；
+                # 单值槽里和现行同值的说法不算旧行，不换它）。
+                _cur_value = _infer_fact_slot(current["text"])[1]
+                victims = []
+                for it in in_results:
+                    if (it.get("metadata") or {}).get("is_rule") is True:
+                        continue
+                    if topic.startswith("slot:") and _cur_value is not None:
+                        _v_value = _infer_fact_slot(it.get("text") or "")[1]
+                        if (
+                            _v_value is not None
+                            and _normalize_memory_text(_v_value)
+                            == _normalize_memory_text(_cur_value)
+                        ):
+                            continue
+                    victims.append(it)
+                if not victims:
+                    continue
+                victim = min(victims, key=_rank_of)
+                new_item = {
+                    "id": current["id"], "text": current["text"],
+                    "score": victim.get("score") or 0.0,
+                    "source": "slot_current",
+                    "metadata": _normalize_metadata(current["metadata"]),
+                    "confirmed": bool(
+                        current["metadata"].get("user_confirmed")
+                    ),
+                    "decay_weight": 1.0, "is_history": False,
+                }
+                results[results.index(victim)] = new_item
+                items[items.index(victim)] = new_item
+                group_items[group_items.index(victim)] = new_item
+                by_id.pop(victim.get("id"), None)
+                by_id[new_item["id"]] = new_item
+                present.discard(victim.get("id"))
+                present.add(new_item["id"])
 
     def search_history(self, query, top_k=5):
         return self.search(query, top_k=top_k, include_history=True)
 
     def note_context(self, memories):
-        """记下本轮检索到的记忆 id（只记在内存里，不写回——衰减写回还没接）。"""
-        self._last_context_ids = [
-            (m or {}).get("id") for m in (memories or []) if (m or {}).get("id")
-        ]
+        """记下本轮检索到的记忆 id，并写回 last_used_at（刚被用上）：
+        沉底的（dormant）和待删的（decay_delete_due）都复活回 verbatim，
+        账本记 REVIVE（2026-11-22 decay 接线）。
+        last_used_at 同时记账本（2026-11-24 3a）：每轮一笔 TOUCH
+        事件（带本轮全部 id、同一个时间戳），对账重建时按 TOUCH
+        把 last_used_at 带回来——P1-6 时期“只写 SQLite、重建退回
+        旧值”的已知问题就此修掉；一轮一笔，不逐条记，不吵。
+        """
+        with self._lock:
+            self._last_context_ids = [
+                (m or {}).get("id") for m in (memories or []) if (m or {}).get("id")
+            ]
+            used_at = _now_iso()
+            for mid in self._last_context_ids:
+                try:
+                    row = self._conn.execute(
+                        "SELECT text, metadata_json FROM memories WHERE id=? AND voided=0"
+                        " AND deleted=0 AND superseded=0",
+                        (mid,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    meta = json.loads(row[1] or "{}")
+                    was_dormant = meta.get("decay_state") in (
+                        _decay.DECAY_STATE_DORMANT, _decay.DECAY_STATE_DELETE_DUE,
+                    )
+                    if was_dormant:
+                        # R-4（2026-11-24）：复活账本先行——REVIVE
+                        # 写不进去就整条不动（last_used_at 也不写），
+                        # 下次用上时再试。以前先改 SQLite、记账失败
+                        # 只警告，SQLite 已是原话态、账本还认为它
+                        # 沉底，两边静默分叉。
+                        try:
+                            _ledger.append_event(
+                                self.ledger_path,
+                                {"type": _ledger.LEDGER_EVENT_REVIVE,
+                                 "memory_id": mid, "key": mid,
+                                 "text": row[0] or ""},
+                                lock=self._ledger_lock,
+                            )
+                        except Exception:
+                            logger.warning("复活记账失败：本条先不复活。", exc_info=True)
+                            continue
+                        meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
+                    meta["last_used_at"] = used_at
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), mid),
+                    )
+                    self._conn.commit()
+                except Exception:
+                    logger.warning("note_context 写回失败。", exc_info=True)
+            if self._last_context_ids:
+                try:
+                    _ledger.append_event(
+                        self.ledger_path,
+                        {"type": _ledger.LEDGER_EVENT_TOUCH,
+                         "memory_id": self._last_context_ids[0],
+                         "key": self._last_context_ids[0],
+                         "memory_ids": list(self._last_context_ids),
+                         "ts": used_at},
+                        lock=self._ledger_lock,
+                    )
+                except Exception:
+                    logger.warning("使用时间记账失败。", exc_info=True)
+
+    def sweep_decay(self, now=None):
+        """衰减扫一遍（2026-11-22 decay 接线）：按 decay.py 的规矩，
+        闲置够久、权重够低的标沉底（dormant），到期的记 delete_due。
+        沉底只是状态（decay_state=dormant + 账本 DORMANT 事件），
+        记忆还在、可搜；delete_due 只是到期标记，不删——真删永远只
+        走 BOOS 点头的那条路（delete_memory / 忘记这个）。
+        不自动跑：由调用方（定时任务/自检）定期调一次。
+        标待删也记账本（2026-11-24 3d）：写一笔 DORMANT 事件带
+        delete_due=True（账本状态层早就认这个标记）——以前待删只
+        写 SQLite，账本里没有，重建就丢了待删状态。
+        返回 {"dormant": n, "delete_due": n}。
+        """
+        now = now or _now_epoch()
+        dormant = 0
+        delete_due = 0
+        with self._lock:
+            for row in self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall():
+                meta = json.loads(row[2] or "{}")
+                state = _decay.decay_state(
+                    meta.get("decay_kind") or _decay.DECAY_KIND_EPISODIC,
+                    meta.get("last_used_at") or meta.get("created_at"),
+                    now=now,
+                    is_core=bool(_provenance._is_core_memory(meta)),
+                    is_curated=bool(meta.get("curated")),
+                )
+                # R-4（2026-11-24）：三个分支统一账本先行——账本写
+                # 不进去就整条不动、不计数，下次扫再试。以前是先改
+                # SQLite、记账失败只警告，账本与 SQLite 静默分叉。
+                if state == _decay.DECAY_STATE_DELETE_DUE and meta.get(
+                    "decay_state"
+                ) != _decay.DECAY_STATE_DELETE_DUE:
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {"type": _ledger.LEDGER_EVENT_DORMANT,
+                             "memory_id": row[0], "key": row[0],
+                             "text": row[1] or "", "delete_due": True},
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning("待删记账失败：本条先不标待删。", exc_info=True)
+                        continue
+                    meta["decay_state"] = state
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), row[0]),
+                    )
+                    delete_due += 1
+                elif state == _decay.DECAY_STATE_DORMANT and meta.get(
+                    "decay_state"
+                ) != _decay.DECAY_STATE_DORMANT:
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {"type": _ledger.LEDGER_EVENT_DORMANT,
+                             "memory_id": row[0], "key": row[0],
+                             "text": row[1] or ""},
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning("沉底记账失败：本条先不沉底。", exc_info=True)
+                        continue
+                    meta["decay_state"] = state
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), row[0]),
+                    )
+                    dormant += 1
+                elif state == _decay.DECAY_STATE_VERBATIM and meta.get(
+                    "decay_state"
+                ) in (
+                    _decay.DECAY_STATE_DORMANT,
+                    _decay.DECAY_STATE_DELETE_DUE,
+                ):
+                    # 复活过的记忆：算出来已是原话态，把库里还顶着的旧
+                    # 牌子改回 verbatim，别让它一直挂着 dormant / delete_due。
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {"type": _ledger.LEDGER_EVENT_REVIVE,
+                             "memory_id": row[0], "key": row[0],
+                             "text": row[1] or ""},
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning("复活记账失败：本条先不改状态。", exc_info=True)
+                        continue
+                    meta["decay_state"] = state
+                    self._conn.execute(
+                        "UPDATE memories SET metadata_json=? WHERE id=?",
+                        (json.dumps(meta, ensure_ascii=False), row[0]),
+                    )
+            self._conn.commit()
+        return {"dormant": dormant, "delete_due": delete_due}
+
+    def organizing_router(self):
+        """整理记忆的大模型路由（懒建，和 Mem0Store.organizing_router
+        同款）：主力 deepseek-v4-pro，备选 flash，本地降级；每月
+        3 美元上限超了只提醒、不断服务（见 memory/model_router.py）。
+        状态文件在账本同目录。建不出来（比如没配 DeepSeek Key）时
+        返回 None——调用方走本地降级，不抛异常。"""
+        router = getattr(self, "_organizing_router", None)
+        if router is not None:
+            return router
+        try:
+            from memory import model_router as _model_router
+
+            router = _model_router.OrganizingModelRouter(
+                state_path=str(
+                    self.ledger_path.parent / "organizing_router_state.json"
+                ),
+                budget_tracker=self.budget_tracker,
+            )
+        except Exception:
+            logger.warning("整理记忆路由建不起来：本次走本地降级。", exc_info=True)
+            return None
+        self._organizing_router = router
+        return router
+
+    def run_self_check(self, now=None, sample_size=20,
+                       include_model_judge=True):
+        """跑一次定期自检（SQLite 版，2026-11-24 3b；第 9 项抽查
+        20 条、自检节奏改每周见缺点清单第 4 条）：先扫一遍衰减
+        （sweep_decay：该沉底的沉底、该标待删的标待删，都记账本），
+        再跑十项自检（memory/self_check.py，只查、只报告，不改库）。
+        返回自检报告 dict，多带一个 "decay_sweep" 键记这次衰减扫的
+        结果。不在服务启动时自动跑（启动会变慢）：由维护调度按周
+        调，和 Mem0Store.run_self_check 同名同节奏，调用方不用分
+        后端。模型抽查（第 9/10 项）走整理路由的判官（R-6，
+        2026-11-24，和 mem0 同款接法）；路由建不起来时 model_judge
+        为 None、判官判不出来时 verdict 为 None，两项都如实
+        skipped——判不出来就不猜。"""
+        sweep_now = None
+        if isinstance(now, bool):
+            sweep_now = None
+        elif isinstance(now, (int, float)):
+            sweep_now = float(now)
+        elif isinstance(now, datetime):
+            sweep_now = now.timestamp()
+        sweep = self.sweep_decay(now=sweep_now)
+        from memory import self_check as _self_check_module
+        from memory import store_self_check as _store_self_check
+
+        class _SQLiteAdapter(_store_self_check._StoreSelfCheckAdapter):
+            """SQLite 版适配器：只有索引口径和 mem0 不同——mem0 对的
+            是 history.db vs Chroma，SQLite 索引就是本库，对的是账本
+            当前态（current + dormant 的 key）vs SQLite 活行 id；
+            两边对不上就是索引丢了/坏了。其余方法照用基类的。"""
+
+            def index_counts(self):
+                live_ids = {
+                    row[0]
+                    for row in self._store._conn.execute(
+                        "SELECT id FROM memories WHERE voided=0"
+                        " AND deleted=0 AND superseded=0"
+                    ).fetchall()
+                }
+                key_states = (
+                    (self._store.ledger_state() or {}).get("key_states")
+                    or {}
+                )
+                ledger_ids = {
+                    k
+                    for k, v in key_states.items()
+                    if v in (
+                        _ledger.LEDGER_STATE_CURRENT,
+                        _ledger.LEDGER_STATE_DORMANT,
+                    )
+                }
+                return {
+                    "sqlite": len(live_ids),
+                    "chroma": len(ledger_ids),
+                    "mismatched_ids": sorted(live_ids ^ ledger_ids),
+                }
+
+        # R-6（2026-11-24）：把整理路由的判官接进来（make_model_judge
+        # 和 mem0 同款），第 9/10 项在 SQLite 后端也真跑；路由不可用
+        # 时 model_judge=None，两项 skipped，和 mem0 路由不可用时一样。
+        # 错过补跑（2026-11-24）：include_model_judge=False 是离线
+        # 模式——判官项（第 9/10 项）不接路由、直接 skipped，报告
+        # 里标 model_judge_deferred，维护调度据此把判官部分挂成
+        # 待跑、等网络恢复补跑；本地项（衰减扫 + 其余八项）照常跑。
+        router = self.organizing_router() if include_model_judge else None
+        model_judge = None
+        if router is not None:
+            model_judge = _store_self_check.make_model_judge(router)
+        report = _self_check_module.run_self_check(
+            _SQLiteAdapter(self),
+            now=now,
+            model_judge=model_judge,
+            sample_size=sample_size,
+            router_status=router.status() if router is not None else {},
+        )
+        report["decay_sweep"] = sweep
+        if not include_model_judge:
+            report["model_judge_deferred"] = True
+        return report
 
     # ---------- 改 / 删（今天只实现删除；纠错后面再做） ----------
 
@@ -1162,14 +5623,54 @@ class SQLiteStore:
             self._conn.commit()
             return {"deleted": True, "memory_id": row[0]}
 
-    def correct_memory(self, old_text, new_text, exclude_identical_to_new=False):
-        """纠错：SQLite 版还没接（候选检索 + 模型判唯一），现在不猜。
+    def revive_memory(self, memory_id):
+        """恢复一条被取代的记忆（2026-11-22，广州行被杭州错取代后恢复用）。
 
-        明确返回 not_yet，不悄悄改、不悄悄存——调用方看到就知道
-        这条路还没通，而不是以为改好了。
+        只恢复 superseded=1 的行：SQLite 取消取代标记，账本记一笔 REVIVE
+        事件（账本是真相源；只改 SQLite 会被对账逻辑弄乱——对账按账本
+        的 key_states 认，REVIVE 事件把该 key 拨回 current）。
+        已经是活记忆时报 unchanged；行不存在、或已删除/已作废时报
+        not_found（删了的恢复走别的路，不在这里顺手复活）。
+        账本写失败时把 SQLite 的标记撤回来再报 failed，两边保持一致。
         """
-        return {"status": "failed", "reason": "sqlite_correct_not_yet",
-                "old_text": old_text, "new_text": new_text}
+        if not memory_id:
+            return {"status": "not_found", "memory_id": memory_id}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, text, superseded, voided, deleted FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"status": "not_found", "memory_id": memory_id}
+            if row[3] or row[4]:
+                return {"status": "not_found", "memory_id": memory_id,
+                        "reason": "已作废或已删除的记忆不能这样恢复"}
+            if not row[2]:
+                return {"status": "unchanged", "memory_id": row[0],
+                        "text": row[1] or ""}
+            self._conn.execute(
+                "UPDATE memories SET superseded=0 WHERE id=?", (row[0],)
+            )
+            self._conn.commit()
+            try:
+                event = _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_REVIVE,
+                     "memory_id": row[0], "key": row[0],
+                     "text": row[1] or ""},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                self._conn.execute(
+                    "UPDATE memories SET superseded=1 WHERE id=?", (row[0],)
+                )
+                self._conn.commit()
+                logger.warning("恢复记账失败：取代标记已撤回。", exc_info=True)
+                return {"status": "failed", "memory_id": row[0],
+                        "reason": "账本写失败"}
+            return {"status": "revived", "memory_id": row[0],
+                    "text": row[1] or "",
+                    "seq": (event or {}).get("seq")}
 
     def confirm_memory(self, memory_id):
         with self._lock:
@@ -1278,7 +5779,13 @@ class SQLiteStore:
                 }
             history = []
             try:
-                for event in _ledger.read_events(self.ledger_path):
+                # read_events 返回 (events, info) 二元组，不是事件列表本身：
+                # 直接 for 遍历会拿到 events 列表再拿 info 字典，dict
+                # 的 .get 不会报错但事件列表被当成事件、.get 在 list 上
+                # 抛 AttributeError，try 包着所以历史永远是空的
+                # （2026-11-22 修：先解包再遍历事件）。
+                events, _info = _ledger.read_events(self.ledger_path)
+                for event in events:
                     if (event or {}).get("key") == key or (event or {}).get("memory_id") == key:
                         history.append(event)
             except Exception:
@@ -1312,17 +5819,59 @@ def _default_memory_dir():
     return Path(__file__).resolve().parent
 
 
+# _CORRECTION_TOPIC_MIN_SIMILARITY（纠错安全网：旧-新话题相似度下限，2026-11-22 接线）：
+# 单候选时，旧说法和新说法的余弦相似度低于这个值就不换，改报 ambiguous
+# （问 BOOS），免得改错不相干的记忆。0.70 是 mem0 那边 2026-11-12
+# 实测校准出来的分界（同话题 0.757–0.907、跨话题 0.411–0.763，
+# 干净空隙 0.656–0.757，取中点约 0.70；见 mem0_store.py 同名常量）。
+# 向量算不出来（模型没起来）时跳过这道网，交由调用方兜底。
+_CORRECTION_TOPIC_MIN_SIMILARITY = 0.70
+
+# 跨槽安全网的命中门槛（缺点清单第 5 条，2026-11-24）：纠正主路和
+# 同槽兜底全落空后，对全部活记忆再扫一遍时用——比主路安全网的
+# 0.70 更高（宁缺毋滥），且命中后还必须过判官确认才允许取代。
+_CROSS_SLOT_NET_MIN_SIMILARITY = 0.80
+
+
+def _cosine(a, b):
+    """两条向量的余弦相似度；任一向量没有（None）或模为 0 时返回 None
+    （调用方按“算不出来”处理，不当 0 分用）。"""
+    if a is None or b is None:
+        return None
+    try:
+        import numpy as np
+
+        va = np.asarray(a, dtype="float64")
+        vb = np.asarray(b, dtype="float64")
+        na = float(np.linalg.norm(va))
+        nb = float(np.linalg.norm(vb))
+        if na == 0.0 or nb == 0.0:
+            return None
+        return float(np.dot(va, vb) / (na * nb))
+    except Exception:
+        return None
+
+
 def _decay_weight(metadata):
     """这条记忆现在的衰减权重（0.10–1.0，核心记忆恒为 1.0）。
 
-    现在恒为 1.0：SQLite 行里还没有 decay.py 要的输入（last_used_at、
-    decay_state 都没有，2026-11-21 核实：33 条活记忆里 0 条带这两个键），
-    衰减规则还没接进来。接口留在这里：以后按 memory/decay.py 的
-    decay_weight(kind, last_used_at, now, is_core) 算，算出来直接乘在
-    RRF 融合分上（_search_inner 的排序键）；资格仍只看原始余弦分 ≥ 0.4——
-    和旧 mem0 的规矩一样，权重只管排位、不管能不能搜到。
+    按 memory/decay.py 算（2026-11-22 接线）：指数衰减，
+    weight = 0.5 ** (闲置天数 / 半衰期)，下限 0.10；稳定事实半衰期
+    180 天、一次性经历 14 天；核心记忆恒为 1.0。
+    输入从 metadata 来：decay_kind、last_used_at（没有时按 created_at
+    算，再没有按 1.0）；is_core 按 provenance 的口径（已确认或有槽位）。
+    权重只管排位、不管能不能搜到（资格仍只看原始余弦分 ≥ 0.4）。
+    注意：这里不用 effective_weight 的未确认封顶（0.80）——封顶会改动
+    已确认/未确认混排的 RRF 钉死顺序（Q4 等回归），等 BOOS 定了再接。
     """
-    return 1.0
+    meta = metadata or {}
+    kind = meta.get("decay_kind") or _decay.DECAY_KIND_EPISODIC
+    last_used = meta.get("last_used_at") or meta.get("created_at")
+    try:
+        is_core = bool(_provenance._is_core_memory(meta))
+    except Exception:
+        is_core = bool(meta.get("is_rule") or meta.get("curated"))
+    return _decay.decay_weight(kind, last_used, now=None, is_core=is_core)
 
 
 def _type_weight(text):
