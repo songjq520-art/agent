@@ -513,7 +513,7 @@
         '\n本月成本：工具 ¥' + (s.tool_cost_cny !== undefined ? s.tool_cost_cny.toFixed(2) : '?') +
         ' / ¥' + (s.tool_budget_cap_cny !== undefined ? s.tool_budget_cap_cny.toFixed(2) : '33.35') +
         '，聊天 ¥' + (s.chat_cost_cny !== undefined ? s.chat_cost_cny.toFixed(2) : '?') +
-        '\n记忆：' + (s.mem0_enabled ? '已启用' : '未启用');
+        '\n记忆：' + (s.memory_enabled ? '已启用' : '未启用');
       if (s.budget_corrupted) text += '\n⚠️ 预算记录异常，已暂停付费调用';
       else if (s.unknown_cost) text += '\n⚠️ 有未核对的未知成本，已暂停付费调用';
       statusEl.textContent = text;
@@ -560,7 +560,7 @@
   // send(presetText)：发一条消息。平时从输入框取值；
   // 纠错候选按钮点“选第 N 条”时，直接传 "第 N 条" 发出去，
   // 走同一条 /api/chat，后端按待确认的纠错把它认成“挑候选”
-  // （见 memory/mem0_store.py 的 _parse_pending_selection）。
+  // （见 服务端待答问题解析）。
   async function send(presetText) {
     // 只认字符串 presetText：点发送按钮时浏览器会传一个鼠标事件对象，
     // 不是字符串就当没传、读输入框——44 号就是这个事件对象把按钮弄坏的。
@@ -989,7 +989,7 @@
   });
   // ---------- 长期记忆面板 ----------
   // 列表、忘记、纠正都走 /api/memories 这组接口；
-  // 真正的删和改在服务端 Mem0Store 里，页面只负责展示和传确认。
+  // 真正的删和改在服务端记忆库里，页面只负责展示和传确认。
   const memoriesPanel = document.getElementById('memoriesPanel');
   const memoriesListEl = document.getElementById('memoriesList');
   const memoriesMsgEl = document.getElementById('memoriesMsg');
@@ -1059,7 +1059,7 @@
         setMemoriesMsg('加载失败：' + (data.error || ('HTTP ' + res.status)), true);
         return;
       }
-      if (!data.mem0_enabled) {
+      if (!data.memory_enabled) {
         setMemoriesMsg('记忆未启用：服务启动时没接上记忆库，所以这里是空的。先在 .env 里配好 DEEPSEEK_API_KEY 再重启服务。');
         return;
       }
@@ -1070,7 +1070,7 @@
       }
       setMemoriesMsg('共 ' + memories.length + ' 条记忆。');
       // 36 号：按形成时间倒序，新的在最上面；没时间的排最后。
-      // 后端返回的顺序不保证（mem0 的 list 按 created_at 升序），这里按
+      // 后端返回的顺序不保证（list 按 created_at 升序），这里按
       // created_at 自己排一遍，新的在前才对。
       const sorted = memories.slice().sort((a, b) => {
         const ta = Date.parse(((a.metadata || {}).created_at) || '') || 0;
@@ -1094,7 +1094,7 @@
     try {
       const res = await fetch('/api/protection-events');
       const data = await res.json();
-      if (!res.ok || !data.mem0_enabled) return;
+      if (!res.ok || !data.memory_enabled) return;
       (data.events || []).forEach((ev) => listEl.appendChild(renderProtectionEvent(ev)));
     } catch (e) {
       // 保护记录读不出来不拦记忆列表，只是不显示。

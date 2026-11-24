@@ -36,14 +36,7 @@ memory/*.json*
 # 对话全文记录（38 号：每场对话一份全文，只保存在本地，不上传）
 memory/conversation_transcripts/
 
-# mem0 长期记忆数据（只保存在本地，不上传）
-# mem0_chroma/ 是本地向量库（记忆内容），history.db 是修改历史记录，
-# mem0_versions.json 是版本文件（记着用的哪个 embedding 模型、多少维，
 # 各人本地自己生成，不同步），memories-backup-*.json 是重嵌脚本的备份。
-memory/mem0_chroma/
-memory/history.db
-memory/delete-journal.json
-memory/mem0_versions.json
 memory/memories-backup-*.json
 
 # 工具循环的任务状态（进行中的任务、等确认的卡，只保存在本地，不上传）

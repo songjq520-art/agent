@@ -24,7 +24,6 @@ from config import (
     get_api_key,
     get_model_status,
 )
-from memory import mem0_store
 from memory import inference as _inference
 from memory.conversation_summary import (
     ConversationSummaryStore,
@@ -59,18 +58,19 @@ logging.basicConfig(
 logger = logging.getLogger("agent")
 
 
-# ---------- 长期记忆接入（mem0） ----------
-# 记忆走 memory/mem0_store.py（mem0 适配层）：提问前语义检索相关记忆、
-# 回答后自动提取并存进长期记忆。main.py 不直接碰 mem0，只调适配层。
+# ---------- 长期记忆接入 ----------
+# 记忆走 memory/store_factory.py → memory/sqlite_store.py（账本 +
+# SQLite 投影）：提问前语义检索相关记忆、回答后自动提取并存进
+# 长期记忆。main.py 不直接碰存储细节，只调记忆库接口。
 #   - 问问题前，先用问题去记忆库里搜相关的记忆，拼成一段提示塞进
 #     发给模型的消息里，让模型回答时能用上；
 #   - 历史里记的还是用户原话，不会被拼进去的记忆污染；
 #   - 记忆库坏了、搜不到、或没传记忆库时，都照常提问，不拦聊天。
-# 命令行默认不加载 mem0（启动要加载 embedding 模型，约 25 秒，
+# 命令行默认不加载记忆库（启动要加载 embedding 模型，约 25 秒，
 # 单次问答不付这个代价）：只有用户说“记住……”时才懒加载一次；
 # 常驻的网页服务在启动时建好记忆库传进来（见 web/server.py）。
 # 注意：这里只做“用起来”，不做 v1 那套关键词检索、手动拟记忆、
-#       先问再存——那些都已作废，记忆的提取和存储全交给 mem0。
+#       先问再存——那些都已作废，记忆的提取和存储全交给记忆库。
 
 # MEMORY_CONTEXT_TOKEN_MAX（一次注入记忆的 Token 上限）：
 # 只限条数不够——5 条长记忆也可能塞太多 Token。
@@ -163,7 +163,7 @@ def _memory_block(memories, token_max=MEMORY_CONTEXT_TOKEN_MAX):
     相关性要求（BOOS 的硬规矩）：只用真正回答了问题的记忆；
     如果没有一条记忆能回答这个问题，就说不知道，不要用看着像的
     记忆猜答案。
-    来源分层（2026-11-09 起，见 memory/mem0_store.py 的“来源”一节）：
+    来源分层（2026-11-09 起，见 memory/provenance.py）：
     每条记忆都带来源标签，模型按标签决定可信度——
       【用户确认】BOOS 亲口说/让记住/亲口纠正的：可以直接当作事实回答；
       【提取所得】DeepSeek 从对话里提取的、未经逐条确认：只能当背景参考，
@@ -425,13 +425,12 @@ def remember_content(text):
 
 
 def handle_remember(budget_tracker, text):
-    """处理“记住……”命令：懒加载 mem0 记忆库，原文存一条记忆，不用确认。
+    """处理“记住……”命令：懒加载记忆库，原文存一条记忆，不用确认。
 
     记忆内容是“记住”后面的文字。命令行默认不加载记忆库（启动要约 25 秒），
     只有用户明确说“记住”时才懒加载一次（store_factory.get_store，
-    默认 mem0 单例、建好后一直复用；后端按 SHIER_MEMORY_BACKEND
-    选，和网页服务同一个入口，2026-11-24 3c）。
-    拿不到记忆库（没配 DEEPSEEK_API_KEY 或没装 mem0）时直接提示，不保存。
+    和网页服务同一个入口）。
+    拿不到记忆库（没配 DEEPSEEK_API_KEY）时直接提示，不保存。
     保存失败时也只打印提示，不抛异常、不影响对话。
     """
     content = remember_content(text)
@@ -442,7 +441,7 @@ def handle_remember(budget_tracker, text):
 
     store = _store_factory.get_store(budget_tracker)
     if store is None:
-        print("记忆未启用：请先配置 DEEPSEEK_API_KEY 并安装 mem0。")
+        print("记忆未启用：请先配置 DEEPSEEK_API_KEY。")
         return
     result = store.add_memory_text(content)
     if result:
@@ -681,7 +680,7 @@ def _run_deepseek_with_tools(prompt, original_prompt, model_prompt, provider,
     }
 
 
-def run_question(prompt, task_type="question", budget_tracker=None, messages=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, resume_task=None, pending_tool_result=None, user_declined=False, original_prompt=None, confirm_callback=None, turn_id=None):
+def run_question(prompt, task_type="question", budget_tracker=None, messages=None, memory_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, resume_task=None, pending_tool_result=None, user_declined=False, original_prompt=None, confirm_callback=None, turn_id=None):
     """跑一次普通问答任务（最简单的运行示例）.
 
     参数 prompt：用户的问题；task_type：任务类型，默认 "question"。
@@ -692,7 +691,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     传入时，本轮会把历史 + 本轮问题一起发给模型（Muse 走 chat_messages，
     DeepSeek 走工具循环，29 号起两条路都带历史），
     预算预估也覆盖完整历史。
-    参数 mem0_store：mem0 长期记忆库（Mem0Store），不传时不带记忆；
+    参数 memory_store：长期记忆库（SQLiteStore），不传时不带记忆；
     传了时，提问前先用问题搜相关记忆（search，top_k=5），有结果就拼
     成提示块塞进发给模型的问题里（历史里仍记原话），没搜到记忆就
     什么都不拼、原样提问（不知道一定要说不知道，不注入近似记忆）；
@@ -797,15 +796,15 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 先找相关记忆，拼进发给模型的问题里（历史里仍记原话，
     # 这里只改发给模型的那一份）；找不到记忆时原样提问，不注入近似记忆。
     model_prompt = prompt
-    if mem0_store is not None and resume_task is None:
+    if memory_store is not None and resume_task is None:
         try:
             with timer.measure("memory_search_ms"):
                 # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
                 # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
-                memories = mem0_store.search(prompt, top_k=5, reinforce=True, turn_id=turn_id)
+                memories = memory_store.search(prompt, top_k=5, reinforce=True, turn_id=turn_id)
             # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
-            # “当前在聊什么”的提示（见 Mem0Store.note_context）。
-            mem0_store.note_context(memories)
+            # “当前在聊什么”的提示（见记忆库的 note_context）。
+            memory_store.note_context(memories)
         except Exception:
             # 记忆检索失败也不拦聊天，只记一条日志，原样提问。
             logger.warning("记忆检索失败，本次不带记忆继续。", exc_info=True)
@@ -872,7 +871,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
                 # 不走这里，它在 ask() 里自己绑。
                 from tools.memory_tool import bound_memory_store
 
-                with bound_memory_store(mem0_store):
+                with bound_memory_store(memory_store):
                     tools_outcome = _run_deepseek_with_tools(
                         prompt=prompt,
                         original_prompt=original_prompt or prompt,
@@ -946,7 +945,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # BOOS（见 _print_correction_result），并放进返回里供调用方看。
     correction = None
     inference = None
-    if mem0_store is not None:
+    if memory_store is not None:
         # 收尾只存 BOOS 的原话 + 最后的回答：记忆提示块、摘要、
         # 工具中间结果都不进长期记忆。
         recent = (
@@ -957,7 +956,7 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             ]
         )[-6:]
         with timer.measure("memory_save_ms"):
-            saved = mem0_store.save_turn(recent, turn_id=turn_id)
+            saved = memory_store.save_turn(recent, turn_id=turn_id)
         try:
             correction = _print_correction_result(saved)
         except Exception:
@@ -1017,7 +1016,7 @@ def is_exit_command(text):
     return str(text or "").strip().lower() in EXIT_COMMANDS
 
 
-def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
+def chat_loop(budget_tracker=None, memory_store=None, summary_store=None):
     """连续对话循环：持续与模型对话，直到输入退出命令。
 
     整个会话共用一个 BudgetTracker 和一个 messages 历史（user 和 assistant
@@ -1027,7 +1026,7 @@ def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
     时历史不动。
     退出命令（exit / quit / 退出）不调用 API，直接正常结束；历史里的
     每一轮，成功时 run_question 已经存过长期记忆了，退出时不用再存。
-    参数 mem0_store：mem0 长期记忆库（Mem0Store），不传时不带记忆；
+    参数 memory_store：长期记忆库（SQLiteStore），不传时不带记忆；
     传了时，每轮提问前先搜相关记忆带给模型，回答成功后把本轮对话存进
     长期记忆；输入“记住：内容”可直接存一条记忆原文（懒加载记忆库，
     不用确认）。不传记忆库时启动会打印一行提示：本次对话不会被记住。
@@ -1043,8 +1042,8 @@ def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
     print(f"模型状态：{get_model_status()}")
     print("每月预算：工具调用 ¥33.35（$5），到 5 美元提醒一次，永不自动停；平时聊天只记账、不设限")
     print("输入问题开始对话，输入 exit、quit 或 退出 结束。")
-    if mem0_store is None:
-        print("提示：记忆未启用（未配置 DEEPSEEK_API_KEY 或未安装 mem0），本次对话不会被记住。")
+    if memory_store is None:
+        print("提示：记忆未启用（未配置 DEEPSEEK_API_KEY），本次对话不会被记住。")
     print("想让 Agent 记住一件事时，输入“记住：内容”，它会直接存进长期记忆，不用确认。")
     while True:
         try:
@@ -1066,7 +1065,7 @@ def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
             handle_remember(tracker, prompt)
             continue
         try:
-            outcome = run_question(prompt, budget_tracker=tracker, messages=messages, mem0_store=mem0_store, summary_store=summary_store, confirm_callback=_cli_confirm_approval)
+            outcome = run_question(prompt, budget_tracker=tracker, messages=messages, memory_store=memory_store, summary_store=summary_store, confirm_callback=_cli_confirm_approval)
         except RuntimeError as exc:
             # 调用失败：历史不动，继续等下一句，不伪造回答。
             print(f"调用失败：{exc}")
@@ -1101,9 +1100,9 @@ def chat_loop(budget_tracker=None, mem0_store=None, summary_store=None):
     # Plan C：退出时把待定区里最后一轮提交——会话结束了，不会再有
     # 下一轮、也不会再有撤回；不提交，最后一轮就永远丢了。
     # “不不不”撤回过的那轮在撤回时已经丢掉，这里不会把它捞回来。
-    if mem0_store is not None:
+    if memory_store is not None:
         try:
-            mem0_store.flush_pending()
+            memory_store.flush_pending()
         except Exception:
             logger.warning("退出时提交待定记忆失败。", exc_info=True)
     # 对话摘要：退出时把剩下的历史总结保存（不只到上限才总结），
@@ -1132,14 +1131,14 @@ def _default_summary_store(budget_tracker=None):
         return None
 
 
-def main(argv=None, mem0_store=None):
+def main(argv=None, memory_store=None):
     """命令行入口。
 
     用法：
       python3 main.py "你好"        # 问一个问题（单次问答）
       python3 main.py              # 不带参数时，进入连续对话循环，
                                    # 可持续对话，直到输入 exit、quit 或 退出
-    参数 mem0_store：mem0 长期记忆库（Mem0Store），不传时不带记忆——
+    参数 memory_store：长期记忆库（SQLiteStore），不传时不带记忆——
     命令行默认不自动加载 mem0（启动要加载 embedding 模型，约 25 秒，
     单次问答不付这个代价），记忆只在网页服务里启用，或用户说
     “记住……”时才懒加载一次。调用方（比如测试）可以显式传一个
@@ -1154,7 +1153,7 @@ def main(argv=None, mem0_store=None):
         tracker = BudgetTracker()
         return chat_loop(
             budget_tracker=tracker,
-            mem0_store=mem0_store,
+            memory_store=memory_store,
             summary_store=_default_summary_store(budget_tracker=tracker),
         )
 
@@ -1173,7 +1172,7 @@ def main(argv=None, mem0_store=None):
     try:
         outcome = run_question(
             prompt,
-            mem0_store=mem0_store,
+            memory_store=memory_store,
             summary_store=_default_summary_store(),
             confirm_callback=_cli_confirm_approval,
         )
@@ -1196,9 +1195,9 @@ def main(argv=None, mem0_store=None):
         print(f"本次成本：{result.get('cost_usd')} 美元（None 表示模型未返回 usage，成本未知）")
     # Plan C：单次问答没有下一轮，进程退出前把待定区提交，
     # 否则本轮对话永远丢了（和 chat_loop 退出时一样）。
-    if mem0_store is not None:
+    if memory_store is not None:
         try:
-            mem0_store.flush_pending()
+            memory_store.flush_pending()
         except Exception:
             logger.warning("退出时提交待定记忆失败。", exc_info=True)
     return 0

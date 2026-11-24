@@ -574,25 +574,6 @@ def _run_add_memory(args):
                                        semantic_judge=True)
     except Exception as exc:  # noqa: BLE001 - 存失败也算执行失败
         return {"ok": False, "data": None, "error": f"存记忆失败：{exc}"}
-    # mem0 那条路的旧形状（{"results": [...]}）还留着兼容。
-    if isinstance((result or {}).get("results"), list):
-        results = result.get("results") or []
-        if not results:
-            return {
-                "ok": False,
-                "data": None,
-                "error": "没存进去（可能内容脱敏后什么都不剩，或存的时候出了问题）。",
-            }
-        first = results[0] or {}
-        return {
-            "ok": True,
-            "data": {
-                "memory_id": first.get("id"),
-                "text": text,
-                "duplicate": bool((result or {}).get("duplicate")),
-            },
-            "error": None,
-        }
     event = (result or {}).get("event")
     if event == "ADD":
         return {

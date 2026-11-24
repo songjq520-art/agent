@@ -1,4 +1,4 @@
-# memory/store_self_check.py（自检适配器：把 Mem0Store 接到自检的九项表上）
+# memory/store_self_check.py（自检适配器：把记忆库接到自检的九项表上）
 # self_check.run_self_check 只认一个 adapter 对象（见 memory/self_check.py
 # 的适配器约定），这里把 store 的现成能力包成那七个方法。
 # 只查不改：这个文件里不写库、不删东西；verify_backup 的演练写临时目录，
@@ -22,7 +22,7 @@ from memory.timeutil import _now_dt, _parse_created_at
 
 
 class _StoreSelfCheckAdapter:
-    """把一个 Mem0Store 包成自检要的 adapter。"""
+    """把一个记忆库包成自检要的 adapter。"""
 
     def __init__(self, store):
         self._store = store
@@ -192,7 +192,7 @@ class _StoreSelfCheckAdapter:
 
 
 def build_self_check_adapter(store):
-    """给一个 Mem0Store 建自检适配器。"""
+    """给一个记忆库建自检适配器。"""
     return _StoreSelfCheckAdapter(store)
 
 

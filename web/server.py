@@ -15,7 +15,7 @@
 #
 # 接口（给页面用的，前后端只通过这几个接口打交道，页面里不写后端逻辑）：
 #   GET  /            → 聊天页面（web/index.html）
-#   GET  /api/status  → 模型状态 + 预算 + 记忆是否启用（JSON，含 mem0_enabled）
+#   GET  /api/status  → 模型状态 + 预算 + 记忆是否启用（JSON，含 memory_enabled）
 #   POST /api/chat    → 发消息，请求 JSON {"message": "..."}，
 #                        返回 JSON {"reply": 回答, "model": 模型名,
 #                        "mode": "real" 或 "demo", "cost_usd": 成本,
@@ -60,7 +60,7 @@
 #                        waiting_approval 字典；任务不对时回 409。
 #   POST /api/tasks/<id>/discard → 作废一条没交代的任务（12 号），
 #                        返回 {"ok": true}；任务不对时回 409。
-#   GET  /api/memories → 已存记忆列表（JSON {"memories": [...], "mem0_enabled": bool}，
+#   GET  /api/memories → 已存记忆列表（JSON {"memories": [...], "memory_enabled": bool}，
 #                        每条含 id、text、metadata：source/created_at/confidence/
 #                        user_confirmed/confirmed；记忆未启用时列表为空）。
 #   GET  /api/memories/<id>/scope → 删除范围预览（deletion_scope 的原样返回：
@@ -83,7 +83,7 @@
 #     点一条就能接着聊；新对话开始时读回最新摘要当上下文。
 #   - 服务用 ThreadingHTTPServer，每个请求一个线程；ChatState 里有一把锁，
 #     问、清空、读状态都走这把锁，一次只处理一个请求，历史和预算不会乱。
-#   - 长期记忆走 mem0（见 memory/mem0_store.py）：服务启动时建一个
+#   - 长期记忆走 mem0（见 memory/memory_store.py）：服务启动时建一个
 #     Mem0Store（常驻只建一次），每轮提问前语义检索、回答后自动存；
 #     记忆库建不好时不带记忆运行，服务照常启动。
 #   - 监听地址和端口集中在下面的 ServerConfig 里改（命令行参数、环境变量
@@ -127,7 +127,6 @@ from memory.conversation_transcript import (  # noqa: E402
     TranscriptStore,
     message_fingerprint,
 )
-from memory.mem0_store import create_mem0_store  # noqa: E402
 from memory.redaction import _redact_sensitive  # noqa: E402
 from memory.correction_text import _infer_fact_slot  # noqa: E402
 from memory.sqlite_store import resolve_event_date  # noqa: E402
@@ -324,7 +323,7 @@ class ChatState:
     对话历史只保存在内存里，重启服务后清空；但每段对话结束（开新对话、
     回到旧对话、停服务）时都会总结保存——摘要 + 最近几轮存在硬盘上
     （memory/conversation_summary.json），重启后左边“最近”列表里能找回。
-    长期记忆：mem0_store 不传时不带记忆；传了时，每轮提问前先语义检索
+    长期记忆：memory_store 不传时不带记忆；传了时，每轮提问前先语义检索
     相关记忆拼进发给模型的问题里（历史里仍记原话），回答成功后把本轮
     及最近的消息存进长期记忆（mem0 自动提取，不用确认）。
     对话摘要：summary_store 不传时不记摘要；传了时，每轮后历史超
@@ -333,12 +332,12 @@ class ChatState:
     记忆数据只保存在本地（memory/mem0_chroma/ + memory/history.db），不上传。
     """
 
-    def __init__(self, budget_tracker=None, mem0_store=None, summary_store=None,
+    def __init__(self, budget_tracker=None, memory_store=None, summary_store=None,
                  tool_gateway=None, task_store=None, search_service=None,
                  transcript_store=None):
         self.tracker = budget_tracker or BudgetTracker()
         self.messages = []
-        self.mem0_store = mem0_store
+        self.memory_store = memory_store
         self.summary_store = summary_store
         # 工具循环用的网关、任务存储、搜索服务：不传时第一次用才建
         # （懒加载——服务启动时不建任务文件、不碰搜索服务的 Key）；
@@ -694,7 +693,7 @@ class ChatState:
                 "usd_cny_rate": summary["usd_cny_rate"],
                 "budget_corrupted": bool(getattr(self.tracker, "corrupted", False)),
                 "unknown_cost": bool(self.tracker.unknown_cost),
-                "mem0_enabled": self.mem0_store is not None,
+                "memory_enabled": self.memory_store is not None,
             }
 
     def ask(self, prompt):
@@ -738,11 +737,11 @@ class ChatState:
             # （上一轮待定区的提交会因此晚一轮，和命令行“记住”跳过整轮
             # run_question 的做法一致，不丢数据。）
             remember_stored = False
-            if self.mem0_store is not None and is_remember_command(prompt):
+            if self.memory_store is not None and is_remember_command(prompt):
                 content = remember_content(prompt)
                 if content:
                     try:
-                        result = self.mem0_store.add_memory_text(
+                        result = self.memory_store.add_memory_text(
                             content, source="user", turn_id=turn_id,
                             semantic_judge=True,
                         )
@@ -753,17 +752,17 @@ class ChatState:
                         )
             # 提问前检索记忆：有结果就拼提示块，没结果就什么都不拼。
             model_prompt = prompt
-            if self.mem0_store is not None:
+            if self.memory_store is not None:
                 try:
                     with timer.measure("memory_search_ms"):
                         # 第二步衰减：这里是真把记忆用上了（拼进发给模型的问题里），
                         # 返回的这几条才强化一次；内部检索（纠错找候选等）不传。
-                        memories = self.mem0_store.search(
+                        memories = self.memory_store.search(
                             prompt, top_k=5, reinforce=True, turn_id=turn_id
                         )
                     # 记下本轮检索到的记忆 id（最近对话上下文）：纠错时拿它当
                     # “当前在聊什么”的提示（见 Mem0Store.note_context）。
-                    self.mem0_store.note_context(memories)
+                    self.memory_store.note_context(memories)
                 except Exception:
                     # 检索失败也不拦聊天，只记一条日志，原样提问。
                     logger.warning("记忆检索失败，本次不带记忆继续。", exc_info=True)
@@ -801,12 +800,12 @@ class ChatState:
             # “记忆库没启用”。出块就恢复，不串到别的请求。）
             from tools.memory_tool import bound_memory_store
 
-            with bound_memory_store(self.mem0_store):
+            with bound_memory_store(self.memory_store):
                 outcome = run_question(
                     model_prompt,
                     budget_tracker=self.tracker,
                     messages=self.messages,
-                    mem0_store=self.mem0_store,
+                    memory_store=self.memory_store,
                     summary_store=self.summary_store,
                     tool_gateway=self.tool_gateway,
                     task_store=self.task_store,
@@ -951,7 +950,7 @@ class ChatState:
         correction = None
         questions = None
         saved = None
-        if self.mem0_store is not None and not skip_memory_save:
+        if self.memory_store is not None and not skip_memory_save:
             recent = self.messages[-_MEMORY_SAVE_HISTORY_MAX:]
             if insert_at is not None and not any(
                 msg is user_msg for msg in recent
@@ -965,7 +964,7 @@ class ChatState:
             with timer.measure("memory_save_ms"):
                 # 26 号：后台存记忆——先回答、后台再存；纠错/撤回的轮次
                 # 在 save_turn 里自动走同步（结果要立刻回给页面展示）。
-                saved = self.mem0_store.save_turn(recent, turn_id=turn_id)
+                saved = self.memory_store.save_turn(recent, turn_id=turn_id)
             if isinstance(saved, dict):
                 correction = saved.get("correction")
                 questions = saved.get("questions")
@@ -979,7 +978,7 @@ class ChatState:
             # 无纠正词的新陈述存成了新行、同槽旧行还在时（E 组 T1 那种），
             # 也只认记下了，不反问“要不要改”。
             reply_override = _slot_conflict_reply_text(
-                self.mem0_store, saved.get("stored")
+                self.memory_store, saved.get("stored")
             )
         if reply_override is not None:
             reply_text = reply_override
@@ -1137,7 +1136,7 @@ class ChatState:
             # 下面恢复循环时模型可能再调记忆工具，也得绑着。
             from tools.memory_tool import bound_memory_store
 
-            with bound_memory_store(self.mem0_store):
+            with bound_memory_store(self.memory_store):
                 resolved = self.tool_gateway.resolve_approval(
                     self.task_store, task_id, approval_id, decision
                 )
@@ -1145,12 +1144,12 @@ class ChatState:
                 return {"ok": False, "reason": resolved["reason"]}
             goal = (resolved.get("task") or {}).get("goal") or task.get("goal") or ""
             if resolved["decision"] == "cancelled":
-                with bound_memory_store(self.mem0_store):
+                with bound_memory_store(self.memory_store):
                     outcome = run_question(
                         goal,
                         budget_tracker=self.tracker,
                         messages=self.messages,
-                        mem0_store=self.mem0_store,
+                        memory_store=self.memory_store,
                         summary_store=self.summary_store,
                         tool_gateway=self.tool_gateway,
                         task_store=self.task_store,
@@ -1161,12 +1160,12 @@ class ChatState:
                         turn_id=turn_id,
                     )
             else:  # 确认执行了
-                with bound_memory_store(self.mem0_store):
+                with bound_memory_store(self.memory_store):
                     outcome = run_question(
                         goal,
                         budget_tracker=self.tracker,
                         messages=self.messages,
-                        mem0_store=self.mem0_store,
+                        memory_store=self.memory_store,
                         summary_store=self.summary_store,
                         tool_gateway=self.tool_gateway,
                         task_store=self.task_store,
@@ -1342,7 +1341,7 @@ class ChatState:
                     goal,
                     budget_tracker=self.tracker,
                     messages=self.messages,
-                    mem0_store=self.mem0_store,
+                    memory_store=self.memory_store,
                     summary_store=self.summary_store,
                     tool_gateway=self.tool_gateway,
                     task_store=self.task_store,
@@ -1508,10 +1507,10 @@ class ChatState:
         不拦聊天）。
         """
         with self._lock:
-            if self.mem0_store is None:
+            if self.memory_store is None:
                 return []
             try:
-                return self.mem0_store.get_all()
+                return self.memory_store.get_all()
             except Exception:
                 logger.warning("读记忆列表失败。", exc_info=True)
                 return []
@@ -1524,10 +1523,10 @@ class ChatState:
         （memory/protection-events.jsonl），这里只做传话。
         """
         with self._lock:
-            if self.mem0_store is None:
+            if self.memory_store is None:
                 return []
             try:
-                return self.mem0_store.list_protection_events()
+                return self.memory_store.list_protection_events()
             except Exception:
                 logger.warning("读保护事件失败。", exc_info=True)
                 return []
@@ -1540,10 +1539,10 @@ class ChatState:
         再调 forget_memory() 决定。
         """
         with self._lock:
-            if self.mem0_store is None:
+            if self.memory_store is None:
                 return None
             try:
-                return self.mem0_store.deletion_scope(memory_id)
+                return self.memory_store.deletion_scope(memory_id)
             except Exception:
                 logger.warning("取删除范围失败：id=%s。", memory_id, exc_info=True)
                 return None
@@ -1563,9 +1562,9 @@ class ChatState:
         with self._lock:
             if not confirmed:
                 raise PermissionError("删除记忆需要先确认删除范围。")
-            if self.mem0_store is None:
+            if self.memory_store is None:
                 raise RuntimeError("记忆未启用。")
-            deleted = self.mem0_store.delete_memory(memory_id, approve=True)
+            deleted = self.memory_store.delete_memory(memory_id, approve=True)
             # 归一化（2026-11-21 网页测第二轮 #6）：SQLite 版
             # delete_memory 返回 {"deleted": bool, ...} 字典，mem0 版
             # 返回布尔——调用方（/api/memories/<id>/forget）只认布尔，
@@ -1584,14 +1583,14 @@ class ChatState:
         记忆未启用时抛 RuntimeError。
         """
         with self._lock:
-            if self.mem0_store is None:
+            if self.memory_store is None:
                 raise RuntimeError("记忆未启用。")
             if memory_id:
                 # 按 id 取准旧文本：get_all 里找得到才纠，找不到说明
                 # 这条已经被删了，直接报 not_found，不凭空改。
                 owned = {
                     item["id"]: item
-                    for item in self.mem0_store.get_all(include_sensitive=True)
+                    for item in self.memory_store.get_all(include_sensitive=True)
                 }
                 item = owned.get(memory_id)
                 if item is None:
@@ -1604,17 +1603,17 @@ class ChatState:
                         "reason": "库里没有这条记忆，可能已经被删了。",
                     }
                 old_text = item["text"]
-            return self.mem0_store.correct_memory(old_text, new_text)
+            return self.memory_store.correct_memory(old_text, new_text)
 
     def list_pending_questions(self):
         """还没回答的待问问题（Phase 2 #4），按创建时间从旧到新。
 
         记忆未启用时返回空列表；读失败时也返回空列表，不拦页面。
         """
-        if self.mem0_store is None:
+        if self.memory_store is None:
             return []
         try:
-            return self.mem0_store.list_pending_questions()
+            return self.memory_store.list_pending_questions()
         except Exception:
             logger.warning("读待问问题失败。", exc_info=True)
             return []
@@ -1625,9 +1624,9 @@ class ChatState:
         choice 只能是“进核心 / 当一次性经历 / 不存”（见
         SQLiteStore.answer_question）。记忆未启用时 ok=False。
         """
-        if self.mem0_store is None:
+        if self.memory_store is None:
             return {"ok": False, "reason": "记忆未启用。"}
-        return self.mem0_store.answer_question(question_id, choice)
+        return self.memory_store.answer_question(question_id, choice)
 
 
 def make_handler(state, authenticator=None):
@@ -1787,11 +1786,11 @@ def make_handler(state, authenticator=None):
                 # 没交代的任务（12 号）：页面上“恢复卡住的任务”入口用。
                 self._send_json({"tasks": state.list_unresolved_tasks()})
             elif path == "/api/memories":
-                # 记忆列表：记忆未启用时 mem0_enabled 为 False、列表为空，
+                # 记忆列表：记忆未启用时 memory_enabled 为 False、列表为空，
                 # 页面据此显示“记忆未启用”，不报错。
                 self._send_json(
                     {
-                        "mem0_enabled": state.mem0_store is not None,
+                        "memory_enabled": state.memory_store is not None,
                         "memories": state.list_memories(),
                     }
                 )
@@ -1804,7 +1803,7 @@ def make_handler(state, authenticator=None):
                 # 记忆未启用时列表为空，页面显示“暂无保护记录”。
                 self._send_json(
                     {
-                        "mem0_enabled": state.mem0_store is not None,
+                        "memory_enabled": state.memory_store is not None,
                         "events": state.list_protection_events(),
                     }
                 )
@@ -1812,7 +1811,7 @@ def make_handler(state, authenticator=None):
                 # 删除范围预览：GET /api/memories/<id>/scope。
                 # id 在路径中间那段（可能含 URL 编码，先解码再查）。
                 memory_id = unquote(path[len("/api/memories/") : -len("/scope")].strip("/"))
-                if state.mem0_store is None:
+                if state.memory_store is None:
                     self._send_json({"error": "记忆未启用。"}, status=503)
                     return
                 scope = state.memory_scope(memory_id)
@@ -1971,7 +1970,7 @@ def make_handler(state, authenticator=None):
                         status=400,
                     )
                     return
-                if state.mem0_store is None:
+                if state.memory_store is None:
                     self._send_json({"error": "记忆未启用。"}, status=503)
                     return
                 try:
@@ -2018,7 +2017,7 @@ def make_handler(state, authenticator=None):
                         {"error": "请先选一条要纠正的记忆，或写明旧内容。"}, status=400
                     )
                     return
-                if state.mem0_store is None:
+                if state.memory_store is None:
                     self._send_json({"error": "记忆未启用。"}, status=503)
                     return
                 result = state.correct_memory(old_text, new_text, memory_id=memory_id)
@@ -2098,12 +2097,12 @@ def _is_loopback_host(host):
         return False
 
 
-def create_server(config=None, budget_tracker=None, authenticator=None, mem0_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, transcript_store=None):
+def create_server(config=None, budget_tracker=None, authenticator=None, memory_store=None, summary_store=None, tool_gateway=None, task_store=None, search_service=None, transcript_store=None):
     """建一个网页服务（不启动），方便测试用临时端口和临时预算文件。
 
     config 是 ServerConfig；不传时用环境变量/默认值（ServerConfig.from_env()）。
     authenticator 是身份验证钩子（见 make_handler），默认不校验。
-    mem0_store 是 mem0 长期记忆库（Mem0Store），不传时不带记忆；传了时，
+    memory_store 是 mem0 长期记忆库（Mem0Store），不传时不带记忆；传了时，
     每轮提问前先语义检索相关记忆带给模型，回答成功后自动存本轮对话。
     summary_store 是对话摘要库（ConversationSummaryStore），不传时不记摘要；
     传了时，每轮后历史超上限就总结压缩、记一笔最近对话，开新对话时
@@ -2129,7 +2128,7 @@ def create_server(config=None, budget_tracker=None, authenticator=None, mem0_sto
         )
     state = ChatState(
         budget_tracker=budget_tracker,
-        mem0_store=mem0_store,
+        memory_store=memory_store,
         summary_store=summary_store,
         tool_gateway=tool_gateway,
         task_store=task_store,
@@ -2455,27 +2454,25 @@ def main(argv=None):
             file=sys.stderr, flush=True,
         )
         return 1
-    # 长期记忆：常驻服务启动时建一个 Mem0Store（只建一次），每轮提问前
-    # 语义检索、回答后自动存。建不好（没 Key、mem0 没装、记忆库坏了）
-    # 时返回 None：只警告一句，服务照常启动、不带记忆运行——记忆库出问题
-    # 不能把服务搞崩。建失败的具体原因，create_mem0_store 已记进日志。
+    # 长期记忆：常驻服务启动时建一个记忆库（只建一次），每轮提问前
+    # 语义检索、回答后自动存。建不好（没 Key、记忆库坏了）时返回 None：
+    # 只警告一句，服务照常启动、不带记忆运行——记忆库出问题不能把
+    # 服务搞崩。建失败的具体原因，create_store 已记进日志。
     tracker = BudgetTracker()
-    # 第二步（2026-11-21）：记忆后端可切换，默认 mem0；
-    # SHIER_MEMORY_BACKEND=sqlite 时走 memory/sqlite_store.py
-    # （JSONL 账本仍是真相源，SQLite WAL 只做索引）。
-    # 切换只看环境变量，不改默认行为；测试服务在启动脚本里设。
-    # 2026-11-24 3c：选后端的逻辑收进 memory/store_factory，
-    # 命令行（main.py 的“记住……”）和网页共用一个入口，不再各选各的。
+    # 记忆库只走 memory/store_factory → memory/sqlite_store.py
+    # （JSONL 账本是真相源，SQLite WAL 只做投影；mem0 后端已于
+    # 2026-11-24 Step 2 彻底删除）。命令行（main.py 的“记住……”）
+    # 和网页共用这一个入口。
     from memory.store_factory import create_store
 
-    mem0_store = create_store(tracker)
-    if mem0_store is None:
+    memory_store = create_store(tracker)
+    if memory_store is None:
         print("⚠️ 记忆未启用，本次不带记忆运行。（原因见日志）", file=sys.stderr, flush=True)
     else:
         # Plan C + 17 号：把十二的名字、SOUL.md 和 BOOS 的电脑配置
         # 以“已确认”种进长期记忆（只加没有的，不覆盖已有的；失败只记日志、不拦启动）。
         try:
-            seeded = mem0_store.ensure_identity_memories()
+            seeded = memory_store.ensure_identity_memories()
             added = [
                 key
                 for key, outcome in (seeded or {}).items()
@@ -2489,7 +2486,7 @@ def main(argv=None):
         # （只补缺的，标记为后补，来源/可信度原样不动；失败只记日志、
         # 不拦启动；补过的下次不再补）。
         try:
-            backfilled = mem0_store.backfill_timestamps()
+            backfilled = memory_store.backfill_timestamps()
             if backfilled and backfilled > 0:
                 print(f"长期记忆：给 {backfilled} 条老记忆补了时间戳。", flush=True)
         except Exception:
@@ -2498,7 +2495,7 @@ def main(argv=None):
         # 启动 outbox，捞回盘上没存完的轮次——别等第一次聊天才懒建，否则
         # 重启后没人接话，落盘的轮次就没人消费、待定区也没人提交。
         try:
-            mem0_store.ensure_outbox_started()
+            memory_store.ensure_outbox_started()
         except Exception:
             logger.warning("启动后台 outbox 失败：重启后待存的轮次要等第一次聊天才恢复。", exc_info=True)
     # 对话摘要：常驻服务启动时建一个 ConversationSummaryStore（只建一次），
@@ -2515,7 +2512,7 @@ def main(argv=None):
         server, _state = create_server(
             config=config,
             budget_tracker=tracker,
-            mem0_store=mem0_store,
+            memory_store=memory_store,
             summary_store=summary_store,
         )
     except ValueError as exc:
@@ -2552,9 +2549,9 @@ def main(argv=None):
     # 每月一次（到期才跑，上次运行时间落盘，启动时到期就补跑）。
     # 以前这两个函数没有任何调用方，记忆永远不会沉底、自检永远
     # 不出报告。调度挂不上只记日志，绝不拦服务启动。
-    if mem0_store is not None:
+    if memory_store is not None:
         try:
-            start_memory_maintenance(mem0_store)
+            start_memory_maintenance(memory_store)
             print("记忆维护调度已启动：衰减每天一次、自检每月一次（到期才跑）。", flush=True)
         except Exception:
             logger.warning("记忆维护调度启动失败：衰减/自检暂不自动跑。", exc_info=True)
@@ -2577,9 +2574,9 @@ def main(argv=None):
         logger.warning("关机时暂停任务失败。", exc_info=True)
     # Plan C：服务停之前把待定区里最后一轮提交——否则最后一轮
     # 永远待在内存里。撤回过的那轮在撤回时已经丢掉，不会捞回来。
-    if mem0_store is not None:
+    if memory_store is not None:
         try:
-            mem0_store.flush_pending()
+            memory_store.flush_pending()
         except Exception:
             logger.warning("停服务时提交待定记忆失败。", exc_info=True)
     # 对话摘要：服务停之前把当前对话总结保存，不然这段对话的尾巴就丢了。

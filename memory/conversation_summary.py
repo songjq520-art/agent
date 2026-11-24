@@ -46,7 +46,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from memory.mem0_store import _redact_sensitive
+from memory.redaction import _redact_sensitive
 from memory.redaction import _contains_sensitive
 
 logger = logging.getLogger("agent")
