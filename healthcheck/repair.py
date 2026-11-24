@@ -4,6 +4,11 @@
 - proposer 执行器：有 fork 的平台仍走子进程；Windows 无 fork，
   改走同进程守护线程 + 硬超时（提案代码是受信代码，边界见
   _call_proposer_thread 的 docstring），实测见集成测试。
+- 路线①（2026-11-24 BOOS 拍板，十一实现）：proposer 若是
+  NamedProposer（具名句柄），一律走 proposer_subprocess 的子进程
+  隔离执行器——父进程只点名、不 import 提案代码，超时杀整个进程
+  树。裸 callable 的 fork/线程路径保留兼容（既有测试与 POSIX 用），
+  但 Windows 工厂装配只发具名句柄，不再用线程执行器跑提案。
 - git() 子进程显式 encoding="utf-8", errors="replace"：原版
   text=True 用系统区域编码，中文 Windows（GBK）下解 git 的
   UTF-8 输出会让读取线程抛 UnicodeDecodeError、stdout 变
@@ -21,6 +26,8 @@ import time
 import uuid
 from .core import DEFAULT_MODE, Trace, Unconnected, confined, emit, redact
 from .gates import Gates, GateConfigError, capability_diff, copy_repo, run, command_check
+from .proposer_subprocess import (
+    NamedProposer, ProposerTimeoutError, SubprocessProposerExecutor)
 
 
 @dataclasses.dataclass
@@ -69,6 +76,9 @@ class Repair:
             raise BudgetExit("time_budget")
 
     def call_proposer(self, proposer, evidence):
+        # 具名句柄（路线①）：子进程隔离执行，父进程从不 import 提案代码。
+        if isinstance(proposer, NamedProposer):
+            return self._call_proposer_subprocess(proposer, evidence)
         # 独立子进程硬超时；POSIX 用 fork，不在父进程执行不可取消回调。
         # 移植注记（2026-11-24）：十二真服务跑在 Windows 上，没有 fork——
         # 无 fork 的平台走 _call_proposer_thread（守护线程 + 硬超时，
@@ -103,6 +113,32 @@ class Repair:
             if process.is_alive():
                 process.kill()
                 process.join()
+
+    def _call_proposer_subprocess(self, named, evidence):
+        """路线①执行器接线：子进程隔离跑具名提案函数。
+
+        硬超时 = min(句柄自带 timeout（若有）, 本轮剩余预算)；超时在
+        执行器内杀净进程树后转 BudgetExit("time_budget")，与 fork /
+        线程路径的超时语义一致；未登记名字 / 参数不可序列化在启动
+        子进程前被执行器拒绝（ProposerRejected，属 ValueError，
+        execute 归 executor_error）；子进程内异常/崩溃为 RuntimeError。
+        候选以 dict 回来，在这里转 Candidate，后续三道闸原样不变。"""
+        cap = max(0.0, self.remaining())
+        timeout = cap if named.timeout is None else min(cap, named.timeout)
+        if timeout <= 0:
+            raise BudgetExit("time_budget")
+        executor = SubprocessProposerExecutor()
+        try:
+            candidate = executor.run(named, evidence, timeout=timeout,
+                                     cwd=self.config.repo)
+        except ProposerTimeoutError as exc:
+            raise BudgetExit("time_budget") from exc
+        if candidate is None:
+            return None
+        return Candidate(files=candidate["files"],
+                         explanation=candidate.get("explanation", ""),
+                         cost=float(candidate.get("cost", 0.0)),
+                         calls=int(candidate.get("calls", 1)))
 
     def _call_proposer_thread(self, proposer, evidence):
         """无 fork 平台的回调执行器：守护线程里跑 proposer，join 硬超时。

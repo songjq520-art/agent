@@ -10,7 +10,10 @@ from .adapter import (
     ShierHealthcheckAdapter,
     SubprocessComponent,
 )
-from .factory import build_adapter, build_config, build_healthcheck
+from .factory import (
+    build_adapter, build_config, build_healthcheck, build_proposer,
+    build_proposer_registry,
+)
 
 __all__ = [
     "APPROVAL_KIND",
@@ -20,4 +23,6 @@ __all__ = [
     "build_adapter",
     "build_config",
     "build_healthcheck",
+    "build_proposer",
+    "build_proposer_registry",
 ]
