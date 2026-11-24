@@ -516,6 +516,20 @@ def _has_emphasis(text):
     return any(marker in (text or "") for marker in _EMPHASIS_MARKERS)
 
 
+# 重复性/习惯标记（重要性护栏的另一类例外）：句子本身在陈述一个
+# 反复发生的习惯/规律（“我每天下班去游泳”），不是“单次提及”——
+# 判官判 important 时程序不封顶（Phase 2 #2 既有行为：习惯类
+# 判重要就进核心）。“睡前/晚上”这类时段词不算重复性标记。
+_RECURRENCE_MARKERS = (
+    "每天", "每日", "天天", "每周", "每月", "每年",
+    "总是", "老是", "经常", "习惯", "定期", "日常",
+)
+
+
+def _has_recurrence(text):
+    return any(marker in (text or "") for marker in _RECURRENCE_MARKERS)
+
+
 # 纠正信号词（save_turn 叠剥护栏用）：一截文本剥掉这些和标点后
 # 应该什么都不剩，才算“纯纠正信号”——剩了实词（如“不吃牛肉”）
 # 就是事实内容，不许当信号剥掉。
@@ -2164,7 +2178,10 @@ class SQLiteStore:
         - 判官提议的 important，对“单次提及的非核心内容”封顶成
           episodic：非核心 = 没槽位（槽位在 _decide_importance_inner
           里先行返回、judge_info 为 None，走不到这里）、非规则、
-          文本里没有用户明确强调的说法（_EMPHASIS_MARKERS）。
+          文本里没有用户明确强调的说法（_EMPHASIS_MARKERS）、
+          也不带重复性/习惯标记（_RECURRENCE_MARKERS——“我每天
+          去游泳”是习惯陈述，不是单次提及，判重要就进核心，
+          是 Phase 2 #2 的既有行为）。
           程序侧类别（槽位/偏好/决定句式）判的 important 不封顶
           （那是既定的核心类别设计，judge_info 同样为 None）。
         封顶留痕：judge_info["clamped"] 写明 from/to/reason，
@@ -2180,6 +2197,7 @@ class SQLiteStore:
             and judge_info is not None
             and slot is None
             and not _has_emphasis(text)
+            and not _has_recurrence(text)
         ):
             judge_info = dict(judge_info)
             judge_info["clamped"] = {

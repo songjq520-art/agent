@@ -229,6 +229,15 @@ def test_single_mention_judge_important_clamped(store, monkeypatch):
     assert meta2["importance"] == "high", meta2
     assert "importance_clamped" not in meta2, meta2
 
+    # 习惯陈述不算单次提及：带“每天”的重复性说法，判官判重要
+    # 就进核心（Phase 2 #2 既有行为，护栏不许误伤）。
+    receipt3 = _turn(store, "我每天下班都去游泳", "c3")
+    assert receipt3["stored"], receipt3
+    meta3 = _meta_of(store, receipt3["results"][0]["id"])
+    assert meta3["decay_kind"] == "stable", meta3
+    assert meta3["importance"] == "high", meta3
+    assert "importance_clamped" not in meta3, meta3
+
 
 class _FakeToneRouter:
     """整理路由打桩：语气一律判 joke（模拟模型听出反话）。"""
