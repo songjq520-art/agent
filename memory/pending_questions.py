@@ -14,6 +14,7 @@
 import json
 import logging
 import os
+import shutil
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -106,6 +107,10 @@ class PendingQuestions:
             self._path = Path("memory") / "pending_questions.json"
         self._lock = threading.RLock()
         self.load_error = None
+        # 损坏原件没能保全（改名、复制都失败）时置 True：_save
+        # 据此拒绝覆盖——宁可问题先只攒在内存里，也不许把唯一
+        # 的坏文件原件无副本覆盖掉（见 _preserve_corrupt）。
+        self._corrupt_unpreserved = False
         self._questions = self._load()
 
     def _preserve_corrupt(self, reason):
@@ -113,8 +118,10 @@ class PendingQuestions:
 
         原件改名为 pending_questions.json.corrupt-<时间戳> 留在同
         目录——坏成什么样就是什么样，死无对证的事不许干。改名
-        失败（权限之类）也照样把 load_error 记下来：报警不能丢，
-        store 的 pending_notices 会把它带到结论可见处。"""
+        失败再试复制留副本；两样都失败也照样把 load_error 记
+        下来（报警不能丢，store 的 pending_notices 会把它带到
+        结论可见处），并置 _corrupt_unpreserved——这种情况下
+        _save 拒绝覆盖原文件，免得坏内容无副本消失。"""
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         backup = self._path.with_name(
             "%s.corrupt-%s" % (self._path.name, stamp)
@@ -130,10 +137,22 @@ class PendingQuestions:
             os.replace(self._path, backup)
             moved = True
         except OSError:
+            # 改名失败退一步试复制（2026-11-25 互查 (a)）：原件
+            # 动不了，至少留一份副本，后续 _save 覆盖原文件时
+            # 内容不至于无副本消失。复制也失败才算没保全住。
             logger.error(
-                "pending_questions 文件损坏且保全改名失败：%s",
+                "pending_questions 文件损坏且保全改名失败，改试复制保全：%s",
                 self._path, exc_info=True,
             )
+            try:
+                shutil.copyfile(self._path, backup)
+                moved = True
+            except OSError:
+                logger.error(
+                    "pending_questions 文件损坏且复制保全也失败：%s",
+                    self._path, exc_info=True,
+                )
+        self._corrupt_unpreserved = not moved
         self.load_error = {
             "path": str(self._path),
             "backup_path": str(backup) if moved else None,
@@ -143,7 +162,8 @@ class PendingQuestions:
         logger.error(
             "pending_questions 文件损坏（%s）：原件保全到 %s，"
             "本次按空加载，待启动恢复按存活记录重建。",
-            reason, str(backup) if moved else "（改名失败，原地保留）",
+            reason,
+            str(backup) if moved else "（保全失败，原地保留，后续保存将被拒绝）",
         )
 
     def recovery_report(self):
@@ -174,7 +194,15 @@ class PendingQuestions:
         if not isinstance(data, dict):
             self._preserve_corrupt("bad_shape: top level is not an object")
             return []
-        items = data.get("questions") or []
+        # questions 键缺失、或值不是 list（{} / "" / 0 / False /
+        # None 等）都是坏形状：旧写法 data.get(...) or [] 把这些
+        # 静默吞成空队列，绕过保全与报警，之后任意一次 _save
+        # 还会把原坏文件覆盖掉、连副本都不留（2026-11-25 互查
+        # 修复二，探针实证）。
+        if "questions" not in data:
+            self._preserve_corrupt("bad_shape: questions key missing")
+            return []
+        items = data["questions"]
         if not isinstance(items, list):
             self._preserve_corrupt("bad_shape: questions is not a list")
             return []
@@ -189,7 +217,16 @@ class PendingQuestions:
 
     def _save(self):
         """原子写盘：先写临时文件再 os.replace。写失败只记不抛——
-        问题存不下来不拦聊天，下次还能再攒。"""
+        问题存不下来不拦聊天，下次还能再攒。例外：损坏原件没能
+        保全时拒绝保存（见 _preserve_corrupt），宁可这批问题先
+        只攒在内存里，也不许覆盖掉唯一的坏文件原件。"""
+        if getattr(self, "_corrupt_unpreserved", False):
+            logger.error(
+                "pending_questions 损坏原件未能保全，拒绝覆盖保存"
+                "（问题暂存内存，先保住原件）：%s",
+                self._path,
+            )
+            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_name(".%s.tmp" % self._path.name)

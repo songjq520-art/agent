@@ -774,6 +774,15 @@ class SQLiteStore:
                     "decay_state": metadata.get("decay_state"),
                     "seen_dates": metadata.get("seen_dates"),
                     "seen_sessions": metadata.get("seen_sessions"),
+                    # 授权标记（实测问题一）：auth_claim 不进账本
+                    # 的话，行丢了按账本重建时标记就没了——待问
+                    # 文件损坏后按行 meta 标记重建 auth_claim 问题
+                    # 时，捞回来的行永远缺这个标记、问题永远漏
+                    # 掉（2026-11-25 互查 (b)，同核心字段进账本
+                    # 的先例口径）。
+                    "auth_claim": metadata.get("auth_claim"),
+                    "auth_reason": metadata.get("auth_reason"),
+                    "claimed_source": metadata.get("claimed_source"),
                 },
             },
             lock=self._ledger_lock,
@@ -1116,22 +1125,24 @@ class SQLiteStore:
                 if expected is None:
                     expected = (by_id.get(rid) or {}).get("state")
                 new_sup, new_del = sup, dele
-                if not voided:
-                    if expected == _ledger.LEDGER_STATE_SUPERSEDED and not sup:
-                        new_sup = 1
+                if not voided and expected is not None:
+                    # 按折叠终态精确对齐（2026-11-25 互查修复三）：
+                    # 终态是哪个，标记就是哪个，另一个必须清掉。
+                    # 旧写法不对称——expected=superseded 会清
+                    # deleted，反过来 expected=deleted 不清
+                    # superseded，能留下 deleted=1 且 superseded=1
+                    # 的双标行。voided 行照旧不碰：作废是投影侧
+                    # 终局标记，账本折叠态里没有对应状态（见方法
+                    # docstring），只认它自己的事件兜底。
+                    if expected == _ledger.LEDGER_STATE_SUPERSEDED:
+                        new_sup, new_del = 1, 0
+                    elif expected == _ledger.LEDGER_STATE_DELETED:
+                        new_sup, new_del = 0, 1
                     elif expected in (
                         _ledger.LEDGER_STATE_CURRENT,
                         _ledger.LEDGER_STATE_DORMANT,
-                    ) and sup:
-                        new_sup = 0
-                    if expected == _ledger.LEDGER_STATE_DELETED and not dele:
-                        new_del = 1
-                    elif expected in (
-                        _ledger.LEDGER_STATE_CURRENT,
-                        _ledger.LEDGER_STATE_DORMANT,
-                        _ledger.LEDGER_STATE_SUPERSEDED,
-                    ) and dele:
-                        new_del = 0
+                    ):
+                        new_sup, new_del = 0, 0
                 try:
                     meta = json.loads(meta_json or "{}")
                 except (ValueError, TypeError):
@@ -1158,7 +1169,12 @@ class SQLiteStore:
                         for _field in ("protection_tier", "core_drawer"):
                             if _field in _promoted:
                                 new_meta[_field] = _promoted[_field]
-                    if _slot and not new_meta.get("slot"):
+                    if _slot:
+                        # 槽位与同函数其他字段同口径：有最新 SLOT
+                        # 事件就无条件按最新一笔覆盖（账本为准）。
+                        # 旧写法只填空——meta 里先有别的槽位时，
+                        # 账本的新标永远盖不上，投影与账本长期
+                        # 对不齐（2026-11-25 互查修复一）。
                         new_meta["slot"] = _slot
                     if _touched and _touched > str(
                         new_meta.get("last_used_at") or ""
@@ -7559,4 +7575,15 @@ def create_sqlite_store(budget_tracker=None, **kwargs):
         store.reconcile_ledger_index()
     except Exception:
         logger.warning("启动对账失败：本次不对索引补缺。", exc_info=True)
+    try:
+        # 待问重建补跑（2026-11-25 互查 (b)）：startup_recovery
+        # 里的重建跑在 reconcile 补缺之前——账本里有、SQLite 里
+        # 缺的行当时还不存在，靠行 meta 标记重建的 auth_claim
+        # 问题会漏掉。补缺完成后再扫一遍：攒问题自带去重
+        # （add 按 kind+memory_id 去重、挂起问题按原文去重），
+        # 不会重复攒。
+        if store.pending_questions.recovery_report():
+            store.rebuild_pending_questions()
+    except Exception:
+        logger.warning("启动对账后待问重建补跑失败。", exc_info=True)
     return store
