@@ -639,6 +639,10 @@ class SQLiteStore:
         self._controlled_intents = {}
         self._controlled_intents_load_error = None
         self._controlled_fingerprints = {}
+        # 撤销接口（立项 H3，2026-11-25）：撤销回执与撤销指纹
+        # 登记，与提案回执同文件落盘（见 _controlled_save_receipts）。
+        self._controlled_revocations = {}
+        self._controlled_revocation_fingerprints = {}
         self._controlled_frozen_reason = None
         self._controlled_health_issues = []
         self._controlled_reconcile_report = None
@@ -7463,6 +7467,24 @@ class SQLiteStore:
                 self._controlled_fingerprints = {
                     str(k): str(v) for k, v in fingerprints.items()
                 }
+            revocations = (
+                data.get("revocations") if isinstance(data, dict) else None
+            )
+            if isinstance(revocations, dict):
+                self._controlled_revocations = {
+                    str(k): v
+                    for k, v in revocations.items()
+                    if isinstance(v, dict)
+                }
+            rev_fingerprints = (
+                data.get("revocation_fingerprints")
+                if isinstance(data, dict) else None
+            )
+            if isinstance(rev_fingerprints, dict):
+                self._controlled_revocation_fingerprints = {
+                    str(k): str(v)
+                    for k, v in rev_fingerprints.items()
+                }
         except FileNotFoundError:
             self._controlled_receipts = {}
         except Exception as exc:
@@ -7527,9 +7549,12 @@ class SQLiteStore:
 
     def _controlled_save_receipts(self):
         payload = {
-            "version": 2,
+            "version": 3,
             "receipts": self._controlled_receipts,
             "fingerprints": self._controlled_fingerprints,
+            "revocations": self._controlled_revocations,
+            "revocation_fingerprints":
+                self._controlled_revocation_fingerprints,
         }
         tmp = self._controlled_receipts_path.with_suffix(".tmp")
         tmp.write_text(
@@ -7883,6 +7908,7 @@ class SQLiteStore:
             "set_protection_tier": "改保护档",
             "set_core_drawer": "改核心抽屉",
             "mark_dormant": "标记休眠",
+            "revoke": "撤销受控变更",
         }.get(action, action)
         return self.pending_questions.add(
             _pq.QUESTION_KIND_AUTH_CLAIM,
@@ -8254,6 +8280,21 @@ class SQLiteStore:
                 return _finish("refused", "missing_version")
             # —— 操作意图落盘（提交/恢复协议的提交点） ——
             op_id = "op-" + uuid.uuid4().hex
+            # 执行前/后字段快照（立项 H3）：撤销接口靠它定恢复
+            # 目标与漂移检查；本轮之前的老意图没这两键，撤销时
+            # 按账本折叠重建（见 _controlled_derive_fields）。
+            if action == "demote":
+                _after_fields = {"user_confirmed": False}
+            elif action == "set_protection_tier":
+                _after_fields = {
+                    _core_cap.PROTECTION_TIER_FIELD: tier_value,
+                }
+            elif action == "set_core_drawer":
+                _after_fields = {_core_cap.DRAWER_FIELD: drawer_value}
+            else:  # mark_dormant
+                _after_fields = {
+                    "decay_state": _decay.DECAY_STATE_DORMANT,
+                }
             intent = {
                 "op_id": op_id,
                 "idempotency_key": idem_key,
@@ -8265,6 +8306,9 @@ class SQLiteStore:
                 "ts": _now_iso(),
                 "ledger_seq": None,
                 "version_after": None,
+                "before_fields": self._controlled_before_fields(meta),
+                "after_fields": _after_fields,
+                "before_version": receipt["version_before"],
             }
             self._controlled_intents[op_id] = intent
             try:
@@ -8474,6 +8518,729 @@ class SQLiteStore:
             return _finish("executed", "", detail=detail)
 
 
+
+    # ---------- 撤销接口（立项 H3，2026-11-25） ----------
+    #
+    # 「后悔药」：经受控入口（submit_controlled_proposal）已经
+    # 执行落账的变更，发现错了能按 op 反向补偿，恢复到执行
+    # 前的字段状态。撤销对象范围（本轮核定）：只限受控入口
+    # 四动作（demote / set_protection_tier / set_core_drawer /
+    # mark_dormant）已提交（committed / committed_unverified）
+    # 的执行。宿主自用路（confirm_memory 晋升、delete/revive
+    # 批准路等）做出的变更不在本接口范围——那些仍归 BOOS
+    # 自己的路处置；凭据撤销是 H2 的 revoke_session（凭据
+    # 作废），与这里的变更回滚是两回事，命名不混。
+    #
+    # 口径：
+    #   - 补偿走账本先行的既有路径、带自己的 op_id；撤销意图
+    #     记 revokes_op_id 指回原 op，审计行同带两边 op_id；
+    #     原 op 的意图、回执、账本事件一律不删不改（追加式）。
+    #   - 补偿本身也是一笔受控变更：先落撤销意图（pending），
+    #     补偿落账后标 committed、原意图标 revoked_by；启动
+    #     对账（_controlled_reconcile_intents）同样管撤销意图。
+    #   - 门禁比照原执行从严：只认 BOOS 本人来源；执行开关
+    #     打开时必验会话凭据（按原动作验范围，敏感动作——
+    #     保护变更——只认主人直达，与 H2 同口径）；当前行已
+    #     成核心保护行（_is_core_protected_row）的一律拒，不
+    #     许借撤销绕护栏；入口冻结时拒；开关关时只出影子
+    #     回执、不落状态（与提案同口径）。
+    #   - 栈纪律（防踩踏）：目标字段的当前值必须还等于原 op
+    #     落下的值（after），说明没人动过它；被后来的变更改
+    #     过就拒 state_drifted——要撤先撤最近的那一笔。
+    #   - 幂等：撤销带自己的幂等键；同键同指纹重提回原回执
+    #     副本（duplicate）；原 op 已被别的键撤销 → 明确拒
+    #     already_revoked，不产生二次补偿。
+    #   - 撤销只回滚字段状态：不删记忆、不改原文（四动作本
+    #     就不动原文，补偿后逐字核对）、不碰无关字段；不许
+    #     借撤销之名走删除或改原文。
+    #   - 执行前字段快照：本轮起新执行的意图一律记
+    #     before_fields / after_fields（见 submit 处）；更早的
+    #     老意图没记时按账本折叠重建（_controlled_derive_fields），
+    #     mark_dormant 的旧 decay_state 账本折不出，老意图缺
+    #     快照时如实拒 before_state_unavailable，不猜。
+    #   - 注意：撤销意图的幂等键与提案键共用一套登记文件，
+    #     _controlled_prior 按意图 idem_key 找先行处理时可能
+    #     碰到撤销意图——指纹形状不同，只会往 idempotency_
+    #     conflict 的拒绝方向走，不会误放行。
+
+    @staticmethod
+    def _controlled_before_fields(meta):
+        """一份 meta 里受控四动作能动的字段的当前值（规范化
+        口径，与 core_cap 的 normalize 一致）：撤销的恢复目标
+        与漂移检查都按这份形状比。decay_state 取原值（缺失
+        记 None，恢复时按「键不存在」处理）。"""
+        meta = meta or {}
+        return {
+            "user_confirmed": bool(meta.get("user_confirmed")),
+            _core_cap.PROTECTION_TIER_FIELD:
+                _core_cap.normalize_protection_tier(meta),
+            _core_cap.DRAWER_FIELD:
+                _core_cap.normalize_core_drawer(meta),
+            "decay_state": meta.get("decay_state"),
+        }
+
+    @staticmethod
+    def _controlled_action_field(action):
+        """每个受控动作动的那一个字段（四动作都只动一个）。"""
+        return {
+            "demote": "user_confirmed",
+            "set_protection_tier": _core_cap.PROTECTION_TIER_FIELD,
+            "set_core_drawer": _core_cap.DRAWER_FIELD,
+            "mark_dormant": "decay_state",
+        }.get(action)
+
+    @staticmethod
+    def _controlled_revocation_fingerprint(target_op_id,
+                                           target_idem_key, source):
+        """规范撤销指纹：定位目标＋来源的哈希。同键重提时比
+        指纹——同指纹才是同一撤销，异指纹是同键冲突。会话
+        凭据不进指纹（同 submit 口径）。"""
+        payload = json.dumps(
+            {
+                "target_op_id": target_op_id,
+                "target_idempotency_key": target_idem_key,
+                "instruction_source": source,
+            },
+            sort_keys=True, ensure_ascii=False, default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _controlled_find_intent(self, op_id=None, idempotency_key=None):
+        """按 op_id 或原提案幂等键定位一笔受控入口执行意图；
+        找不到返回 None。撤销意图（kind=revocation）不算原
+        执行——不许拿这道接口去撤销一笔撤销。"""
+        if op_id:
+            intent = self._controlled_intents.get(op_id)
+            if intent is not None and \
+                    intent.get("kind") != "revocation":
+                return intent
+            return None
+        if idempotency_key:
+            for intent in self._controlled_intents.values():
+                if intent.get("kind") == "revocation":
+                    continue
+                if intent.get("idempotency_key") == idempotency_key:
+                    return intent
+        return None
+
+    def _controlled_derive_fields(self, intent):
+        """老意图（本轮之前落的）没记 before/after 字段时，按
+        账本重建：after 取原 op 那笔账本事件的完整 meta 快照
+        折出的字段值，before 取 seq 小于原 op 的事件折出的
+        同一记忆的字段值。重建不出（账本序号缺失、对不上、
+        mark_dormant 的旧 decay_state 无账本载体）返回 None，
+        调用方如实拒，不猜。"""
+        action = intent.get("action")
+        field = self._controlled_action_field(action)
+        if field is None:
+            return None
+        ledger_seq = intent.get("ledger_seq")
+        if ledger_seq is None:
+            return None
+        if action == "mark_dormant":
+            # 旧 decay_state 在账本里没有载体（DORMANT 事件不
+            # 带 meta、折叠不折 decay_state），折不出——不猜。
+            return None
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            logger.warning("撤销重建字段读账本失败", exc_info=True)
+            return None
+        op_event = None
+        for event in events:
+            if event.get("seq") == ledger_seq and \
+                    event.get("op_id") == intent.get("op_id"):
+                op_event = event
+                break
+        if op_event is None or not op_event.get("meta"):
+            return None
+        after_fields = self._controlled_before_fields(
+            op_event.get("meta")
+        )
+        prior = [
+            e for e in events
+            if (e.get("seq") or 0) < ledger_seq
+        ]
+        folded = _core_cap.fold_ledger_metas(prior)
+        before_meta = folded.get(intent.get("memory_id"))
+        if before_meta is None:
+            return None
+        before_fields = self._controlled_before_fields(before_meta)
+        return {
+            "before_fields": before_fields,
+            "after_fields": after_fields,
+        }
+
+    def _controlled_verify_revocation(self, memory_id, field,
+                                      before_value, before_text,
+                                      pre_meta, action):
+        """补偿后核对（调用方持锁）：目标字段已恢复到 before
+        值、原文逐字未变、补偿只动了那一个字段、账本口径与
+        库内一致、座位账自洽。返回 {"ok", "checks"}。"""
+        checks = {}
+        row = self._conn.execute(
+            "SELECT text, metadata_json FROM memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "checks": {"row_present": False}}
+        checks["row_present"] = True
+        checks["text_unchanged"] = (row[0] or "") == (before_text or "")
+        try:
+            meta_after = json.loads(row[1] or "{}")
+        except Exception:
+            meta_after = {}
+        current = self._controlled_before_fields(meta_after)
+        checks["field_restored"] = current.get(field) == before_value
+        pre_meta = pre_meta or {}
+        changed = {
+            f
+            for f in set(pre_meta) | set(meta_after)
+            if pre_meta.get(f) != meta_after.get(f)
+        }
+        checks["fields_confined"] = changed <= {field}
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+            if action == "mark_dormant":
+                state = _ledger.resolve_state(events)
+                key_states = (state or {}).get("key_states") or {}
+                checks["ledger_matches"] = (
+                    key_states.get(memory_id)
+                    != _ledger.LEDGER_STATE_DORMANT
+                )
+            else:
+                ledger_metas = _core_cap.fold_ledger_metas(events)
+                ledger_meta = ledger_metas.get(memory_id)
+                checks["ledger_matches"] = (
+                    ledger_meta is not None
+                    and self._controlled_before_fields(
+                        ledger_meta
+                    ).get(field) == before_value
+                )
+        except Exception:
+            checks["ledger_matches"] = False
+        snap = self.core_seat_snapshot()
+        checks["seats_reconciled"] = bool(snap.get("reconciled"))
+        return {"ok": all(checks.values()), "checks": checks}
+
+    def controlled_revocation_receipt(self, idempotency_key):
+        """按撤销幂等键查已登记的撤销回执；没有返回 None。"""
+        receipt = self._controlled_revocations.get(idempotency_key)
+        return dict(receipt) if receipt is not None else None
+
+    def revoke_controlled_change(self, request):
+        """撤销接口：回滚一笔经受控入口已执行的变更，返回统一回执。
+
+        请求形状（dict）：
+          target_op_id / target_idempotency_key
+                             定位原执行（二选一，op_id 优先）；
+          reason             一句理由（只留痕，不参与判定）；
+          instruction_source 指令来源（口径同 auth_guard：
+                             只认 BOOS 本人）；
+          idempotency_key    撤销自己的幂等键（必填非空 str）；
+          session            会话凭据（issue_session 签发）；
+                             执行开关打开时必验——按原动作验
+                             范围，敏感动作（保护变更）只认
+                             主人直达（口径同 H2）。
+
+        回执形状（键恒定）：
+          {ok, status, reason, revokes_op_id, revocation_op_id,
+           action, memory_id, idempotency_key, duplicate,
+           question_id, trace_index, version_before,
+           version_after, detail, ts}
+          status ∈ revoked / refused / shadow / duplicate。
+          ok 只在真补偿且核对全过时为 True；补偿落了账但核对
+          没过时 status=revoked、reason=invariant_failed、
+          ok=False（已回滚是事实，但不许报干净成功）。
+          version_before 是补偿前的行戳，version_after 是补
+          偿后的行戳；校验类早拒两者都 None，载行后拒绝
+          version_after 为 None。
+        """
+        if not isinstance(request, dict):
+            request = {}
+        target_op_id = request.get("target_op_id")
+        target_key = request.get("target_idempotency_key")
+        rev_key = request.get("idempotency_key")
+        source = request.get("instruction_source")
+        fingerprint = self._controlled_revocation_fingerprint(
+            target_op_id if isinstance(target_op_id, str) else None,
+            target_key if isinstance(target_key, str) else None,
+            source if isinstance(source, str) else None,
+        )
+        receipt = {
+            "ok": False,
+            "status": "refused",
+            "reason": "",
+            "revokes_op_id": target_op_id,
+            "revocation_op_id": None,
+            "action": None,
+            "memory_id": None,
+            "idempotency_key": rev_key,
+            "duplicate": False,
+            "question_id": None,
+            "trace_index": None,
+            "version_before": None,
+            "version_after": None,
+            "detail": {},
+            "ts": _now_iso(),
+        }
+
+        def _trace(status, reason):
+            entry = {
+                "event": status,
+                "revocation": True,
+                "action": receipt["action"],
+                "memory_id": receipt["memory_id"],
+                "idempotency_key": rev_key,
+                "instruction_source": source,
+                "reason": reason,
+                "proposal_reason": request.get("reason") or "",
+                "revokes_op_id": receipt["revokes_op_id"],
+                "fingerprint": fingerprint,
+                "version_before": receipt["version_before"],
+                "version_after": receipt["version_after"],
+            }
+            if receipt["revocation_op_id"]:
+                entry["op_id"] = receipt["revocation_op_id"]
+            if receipt["detail"].get("ledger_seq") is not None:
+                entry["ledger_seq"] = receipt["detail"]["ledger_seq"]
+            return self._controlled_trace(entry)
+
+        def _finish(status, reason, detail=None, question_id=None,
+                    register=True, ok_override=None):
+            receipt["status"] = status
+            receipt["reason"] = reason
+            receipt["ok"] = (
+                status == "revoked" if ok_override is None
+                else bool(ok_override)
+            )
+            if detail:
+                receipt["detail"] = detail
+            if question_id:
+                receipt["question_id"] = question_id
+            try:
+                receipt["trace_index"] = _trace(status, reason)
+            except Exception:
+                logger.warning("撤销接口留痕写失败", exc_info=True)
+                receipt["trace_index"] = None
+                receipt["detail"]["audit_write_failed"] = True
+                self._controlled_note_health(
+                    "audit_write_failed",
+                    {"idempotency_key": rev_key, "status": status},
+                )
+            if register and rev_key:
+                self._controlled_revocations[rev_key] = dict(receipt)
+                self._controlled_revocation_fingerprints[rev_key] = \
+                    fingerprint
+                try:
+                    self._controlled_save_receipts()
+                except Exception:
+                    logger.warning(
+                        "撤销回执登记落盘失败", exc_info=True
+                    )
+                    receipt["detail"]["receipt_persist_failed"] = True
+                    self._controlled_revocations[rev_key] = \
+                        dict(receipt)
+                    self._controlled_note_health(
+                        "receipts_save_failed",
+                        {"idempotency_key": rev_key},
+                    )
+            return dict(receipt)
+
+        with self._lock:
+            # —— 纯形状校验（不占键，同 submit 口径）——
+            if rev_key is None or (
+                isinstance(rev_key, str) and not rev_key
+            ):
+                return _finish(
+                    "refused", "missing_idempotency_key",
+                    register=False,
+                )
+            if not isinstance(rev_key, str):
+                return _finish(
+                    "refused", "bad_idempotency_key", register=False
+                )
+            if target_op_id is not None and (
+                not isinstance(target_op_id, str) or not target_op_id
+            ):
+                return _finish(
+                    "refused", "bad_target", register=False
+                )
+            if target_key is not None and (
+                not isinstance(target_key, str) or not target_key
+            ):
+                return _finish(
+                    "refused", "bad_target", register=False
+                )
+            if target_op_id is None and target_key is None:
+                return _finish(
+                    "refused", "missing_target", register=False
+                )
+            if source is not None and not isinstance(source, str):
+                return _finish("refused", "bad_source", register=False)
+            # —— 撤销幂等查重 ——
+            prev = self._controlled_revocations.get(rev_key)
+            if prev is not None:
+                stored_fp = \
+                    self._controlled_revocation_fingerprints.get(
+                        rev_key
+                    )
+                if stored_fp is not None and stored_fp != fingerprint:
+                    return _finish(
+                        "refused", "idempotency_conflict",
+                        detail={
+                            "fingerprint": fingerprint,
+                            "prior_fingerprint": stored_fp,
+                        },
+                        register=False,
+                    )
+                dup = dict(prev)
+                dup["duplicate"] = True
+                dup["status"] = "duplicate"
+                receipt["action"] = dup.get("action")
+                receipt["memory_id"] = dup.get("memory_id")
+                receipt["revokes_op_id"] = dup.get("revokes_op_id")
+                receipt["detail"] = dup.get("detail") or {}
+                try:
+                    dup["trace_index"] = _trace(
+                        "duplicate", dup.get("reason") or ""
+                    )
+                except Exception:
+                    logger.warning(
+                        "撤销接口留痕写失败（duplicate）",
+                        exc_info=True,
+                    )
+                    dup["trace_index"] = None
+                    self._controlled_note_health(
+                        "audit_write_failed",
+                        {"idempotency_key": rev_key,
+                         "status": "duplicate"},
+                    )
+                return dup
+            # —— 定位原执行 ——
+            intent = self._controlled_find_intent(
+                op_id=target_op_id, idempotency_key=target_key,
+            )
+            if intent is None:
+                return _finish("refused", "op_not_found")
+            if intent.get("status") == "pending":
+                # 先对账再定性：可能只是提交标记没落盘。
+                self._controlled_reconcile_intents()
+                intent = self._controlled_intents.get(
+                    intent.get("op_id"), intent
+                )
+            receipt["revokes_op_id"] = intent.get("op_id")
+            receipt["action"] = intent.get("action")
+            receipt["memory_id"] = intent.get("memory_id")
+            action = intent.get("action")
+            memory_id = intent.get("memory_id")
+            field = self._controlled_action_field(action)
+            if field is None:
+                return _finish("refused", "op_not_found")
+            if intent.get("status") not in (
+                "committed", "committed_unverified",
+            ):
+                return _finish(
+                    "refused", "op_not_committed",
+                    detail={"intent_status": intent.get("status")},
+                )
+            if intent.get("revoked_by"):
+                return _finish(
+                    "refused", "already_revoked",
+                    detail={
+                        "revocation_op_id": intent.get("revoked_by"),
+                    },
+                )
+            # —— 载行 ——
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted,"
+                " voided FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return _finish("refused", "not_found")
+            if row[2] or row[3] or row[4]:
+                return _finish("refused", "not_live")
+            text = row[0] or ""
+            meta = json.loads(row[1] or "{}")
+            receipt["version_before"] = \
+                self._controlled_version_stamp(text, meta)
+            # —— 验来源：撤销只认 BOOS 本人 ——
+            if not _auth_guard.is_owner_instruction(source):
+                question = self._queue_controlled_entry_question(
+                    "revoke", memory_id, source,
+                    "not_owner_instruction",
+                )
+                return _finish(
+                    "refused", "not_owner_instruction",
+                    question_id=(question or {}).get("id"),
+                )
+            # —— 验保护：当前行已成核心保护行的，撤销路不许
+            # 绕护栏碰它（要动走 BOOS 自己的路）——
+            if self._is_core_protected_row(meta):
+                question = self._queue_controlled_entry_question(
+                    "revoke", memory_id, source, "core_protected",
+                )
+                return _finish(
+                    "refused", "core_protected",
+                    question_id=(question or {}).get("id"),
+                )
+            # —— 恢复目标：意图里记了 before/after 就用它，
+            # 没记（老意图）按账本重建，重建不出如实拒 ——
+            before_fields = intent.get("before_fields")
+            after_fields = intent.get("after_fields")
+            if not isinstance(before_fields, dict) or \
+                    not isinstance(after_fields, dict):
+                derived = self._controlled_derive_fields(intent)
+                if derived is None:
+                    return _finish(
+                        "refused", "before_state_unavailable",
+                        detail={"action": action},
+                    )
+                before_fields = derived["before_fields"]
+                after_fields = derived["after_fields"]
+            before_value = before_fields.get(field)
+            after_value = after_fields.get(field)
+            # —— 栈纪律：字段当前值必须还是原 op 落下的值 ——
+            current_fields = self._controlled_before_fields(meta)
+            if current_fields.get(field) != after_value:
+                return _finish(
+                    "refused", "state_drifted",
+                    detail={
+                        "field": field,
+                        "expected_current": after_value,
+                        "actual_current": current_fields.get(field),
+                    },
+                )
+            # —— 执行开关：关时只出影子回执（同提案口径）——
+            if not self.controlled_entry_execution_enabled:
+                return _finish("shadow", "execution_disabled")
+            # —— 健康冻结闸口 ——
+            if self._controlled_frozen_reason:
+                return _finish(
+                    "refused", "entry_frozen",
+                    detail={
+                        "frozen_reason": self._controlled_frozen_reason,
+                    },
+                )
+            # —— 会话认证（H2 口径）：按原动作验范围；敏感
+            # 动作（保护变更）只认主人直达 ——
+            verdict = self._session_authority.validate(
+                request.get("session"), action
+            )
+            if not verdict["ok"]:
+                return _finish(
+                    "refused", verdict["reason"],
+                    detail={"session_reason": verdict["reason"]},
+                )
+            # —— 撤销意图落盘（补偿的提交点）——
+            rev_op_id = "op-" + uuid.uuid4().hex
+            receipt["revocation_op_id"] = rev_op_id
+            rev_intent = {
+                "op_id": rev_op_id,
+                "kind": "revocation",
+                "revokes_op_id": intent.get("op_id"),
+                "idempotency_key": rev_key,
+                "fingerprint": fingerprint,
+                "action": action,
+                "memory_id": memory_id,
+                "expected_version": receipt["version_before"],
+                "status": "pending",
+                "ts": _now_iso(),
+                "ledger_seq": None,
+                "version_after": None,
+            }
+            self._controlled_intents[rev_op_id] = rev_intent
+            try:
+                self._controlled_save_intents()
+            except Exception:
+                logger.warning(
+                    "撤销意图落盘失败", exc_info=True
+                )
+                self._controlled_intents.pop(rev_op_id, None)
+                self._controlled_note_health(
+                    "intents_save_failed", {"op_id": rev_op_id},
+                )
+                return _finish(
+                    "refused", "intent_persist_failed",
+                    register=False,
+                )
+            # —— 执行补偿：只走既有路径，账本先行 ——
+            detail = {
+                "revokes_op_id": intent.get("op_id"),
+                "field": field,
+                "restored_value": before_value,
+                "session_id": verdict["session_id"],
+            }
+            exec_failure = None
+            try:
+                if action == "demote":
+                    result = self._update_core_fields(
+                        memory_id, {"user_confirmed": before_value},
+                        _op_id=rev_op_id, _idem_key=rev_key,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                    else:
+                        self._conn.execute(
+                            "UPDATE memories SET user_confirmed=?"
+                            " WHERE id=?",
+                            (1 if before_value else 0, memory_id),
+                        )
+                        self._conn.commit()
+                elif action == "set_protection_tier":
+                    result = self.set_protection_tier(
+                        memory_id, before_value,
+                        _op_id=rev_op_id, _idem_key=rev_key,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                elif action == "set_core_drawer":
+                    result = self.set_core_drawer(
+                        memory_id, before_value,
+                        _op_id=rev_op_id, _idem_key=rev_key,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                elif action == "mark_dormant":
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {
+                                "type": _ledger.LEDGER_EVENT_REVIVE,
+                                "memory_id": memory_id,
+                                "key": memory_id,
+                                "text": text,
+                                "op_id": rev_op_id,
+                                "idem_key": rev_key,
+                                "revokes_op_id": intent.get("op_id"),
+                            },
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "撤销休眠写账本失败", exc_info=True
+                        )
+                        exec_failure = ("ledger_failed", {})
+                    else:
+                        new_meta = dict(meta)
+                        if before_value is None:
+                            new_meta.pop("decay_state", None)
+                        else:
+                            new_meta["decay_state"] = before_value
+                        self._conn.execute(
+                            "UPDATE memories SET metadata_json=?"
+                            " WHERE id=?",
+                            (
+                                json.dumps(
+                                    new_meta, ensure_ascii=False
+                                ),
+                                memory_id,
+                            ),
+                        )
+                        self._conn.commit()
+            except Exception as exc:
+                event = self._controlled_ledger_op(rev_op_id)
+                if event is None:
+                    rev_intent["status"] = "aborted"
+                    rev_intent["abort_reason"] = "execute_failed"
+                    self._controlled_save_intents_quiet()
+                    return _finish(
+                        "refused", "execute_failed",
+                        detail={
+                            "error": "%s: %s" % (
+                                type(exc).__name__, exc,
+                            ),
+                        },
+                    )
+                rev_intent["status"] = "committed"
+                rev_intent["ledger_seq"] = event.get("seq")
+                detail["commit_state"] = "committed_after_error"
+                detail["error"] = "%s: %s" % (
+                    type(exc).__name__, exc,
+                )
+            if exec_failure is not None:
+                rev_intent["status"] = "aborted"
+                rev_intent["abort_reason"] = exec_failure[0]
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "refused", exec_failure[0],
+                    detail=exec_failure[1],
+                )
+            if rev_intent["status"] != "committed":
+                # 事件关联核验：补偿必须在账本里找得到。
+                event = self._controlled_ledger_op(rev_op_id)
+                if event is None:
+                    rev_intent["status"] = "committed_unverified"
+                    detail["commit_state"] = "committed_unverified"
+                    self._controlled_note_health(
+                        "commit_unverified",
+                        {
+                            "op_id": rev_op_id,
+                            "revokes_op_id": intent.get("op_id"),
+                        },
+                    )
+                else:
+                    rev_intent["status"] = "committed"
+                    rev_intent["ledger_seq"] = event.get("seq")
+                    detail["commit_state"] = "committed"
+                    detail["ledger_seq"] = event.get("seq")
+            detail["op_id"] = rev_op_id
+            # 原意图标已撤销（追加式标记，原记录不删不改）。
+            intent["revoked_by"] = rev_op_id
+            intent["revoked_at"] = _now_iso()
+            row_after = self._conn.execute(
+                "SELECT text, metadata_json FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row_after is not None:
+                receipt["version_after"] = \
+                    self._controlled_version_stamp(
+                        row_after[0] or "",
+                        json.loads(row_after[1] or "{}"),
+                    )
+                rev_intent["version_after"] = \
+                    receipt["version_after"]
+            try:
+                self._controlled_save_intents()
+            except Exception:
+                logger.warning(
+                    "撤销提交标记落盘失败", exc_info=True
+                )
+                detail["intent_persist_failed"] = True
+                self._controlled_note_health(
+                    "intents_save_failed", {"op_id": rev_op_id},
+                )
+            # —— 补偿后核对：字段恢复/原文未变/只动一字段/
+            # 账本一致/座位自洽，任一不过不许报干净成功 ——
+            verify = self._controlled_verify_revocation(
+                memory_id, field, before_value, text, meta, action
+            )
+            detail["verify"] = verify["checks"]
+            detail["verify_ok"] = verify["ok"]
+            if not verify["ok"]:
+                self._controlled_note_health(
+                    "invariant_failed",
+                    {
+                        "op_id": rev_op_id,
+                        "revokes_op_id": intent.get("op_id"),
+                        "checks": verify["checks"],
+                    },
+                )
+                return _finish(
+                    "revoked", "invariant_failed", detail=detail,
+                    ok_override=False,
+                )
+            return _finish("revoked", "", detail=detail)
 
     def void_joke_memory(self, memory_id):
         """作废一条玩笑记忆：先记账本 delete（标记 voided），再标 SQLite voided=1。
