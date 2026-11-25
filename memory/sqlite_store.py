@@ -1197,10 +1197,11 @@ class SQLiteStore:
                     {}, {}, {}, set()
                 )
             rows = self._conn.execute(
-                "SELECT id, metadata_json, superseded, deleted, voided"
+                "SELECT id, metadata_json, superseded, deleted, voided,"
+                " user_confirmed"
                 " FROM memories"
             ).fetchall()
-            for rid, meta_json, sup, dele, voided in rows:
+            for rid, meta_json, sup, dele, voided, uc in rows:
                 report["rows_checked"] += 1
                 if rid not in known_keys:
                     report["extra_rows"] += 1
@@ -1278,13 +1279,29 @@ class SQLiteStore:
                     ):
                         new_meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
                 meta_changed = new_meta != meta
+                # user_confirmed 独立列无条件核对（贵妃第十八
+                # 份复查 F）：demote 两段写之间硬崩会留下 meta
+                # 已与账本一致、列还停在旧值的分叉；旧写法只
+                # 在旗或 meta 变化时才连列一起 UPDATE，这种
+                # 分叉永远修不到。列与修复后 meta 对不上就强
+                # 制进 UPDATE（UPDATE 本来就写这一列），计数
+                # 并入 meta_fixed，报告键集不变。voided 行照
+                # 旧不碰。
+                column_diverged = (
+                    not voided
+                    and (1 if uc else 0)
+                    != (1 if new_meta.get("user_confirmed") else 0)
+                )
                 if new_sup != sup:
                     report["superseded_fixed"] += 1
                 if new_del != dele:
                     report["deleted_fixed"] += 1
-                if meta_changed:
+                if meta_changed or column_diverged:
                     report["meta_fixed"] += 1
-                if new_sup != sup or new_del != dele or meta_changed:
+                if (
+                    new_sup != sup or new_del != dele
+                    or meta_changed or column_diverged
+                ):
                     self._conn.execute(
                         "UPDATE memories SET superseded=?, deleted=?,"
                         " metadata_json=?, decay_kind=?, source=?,"
@@ -1497,16 +1514,20 @@ class SQLiteStore:
     # 冻结级：verify 缺失（步骤抛错）或 ok 非 True（账本序
     # 号缺口/残行/坏行——账本本身不可信）；ledger_repair /
     # projection 步骤抛错（报告字段为 None）；投影修复后
-    # 复检仍有分叉（行状态旗对、保护档/抽屉、槽位与账本折
-    # 叠不符，复检口径与 repair_projection_from_ledger 对
+    # 复检仍有分叉（行状态旗对、保护档/抽屉、槽位、
+    # user_confirmed 列与 meta 分叉，与账本折叠不符，复检
+    # 口径与 repair_projection_from_ledger 对
     # 应段一致，只查受控入口安全所系字段）；账本里没有的
     # 行 extra_rows > 0（repair 明定不删不改、等 BOOS
     # 裁——投影与账本对不上且恢复自己解不开，冻到人工处
     # 置后靠干净恢复/复检解冻）；待问文件损坏且重建没跑
     # 成（pending 非空但 pending_rebuilt 为 None）。
     # 注意级（记录、不冻结）：待问损坏但已重建；H5 待补证
-    # 计数 > 0；受控入口健康痕迹非空（不变量失败等——H1
-    # 既有口径只记不冻，照旧；冻结痕迹本身不算这一项）。
+    # 计数 > 0；受控入口非冻结类健康痕迹非空。冻结类痕迹
+    # （不变量失败/提交待核实/持久化故障/对账未定案——补
+    # 修二轮起同在 _CONTROLLED_FREEZE_KINDS）不算注意级：
+    # 它们经 _controlled_frozen_reason 直接定 frozen，并在
+    # 残余清单里以 controlled_entry_frozen 冻结级列明。
     # status：无残余 = clean；只有注意级 = attention；有
     # 冻结级残余或入口已冻结 = frozen。
 
@@ -1535,10 +1556,11 @@ class SQLiteStore:
             mismatched = []
             extra_rows = 0
             rows = self._conn.execute(
-                "SELECT id, metadata_json, superseded, deleted, voided"
+                "SELECT id, metadata_json, superseded, deleted, voided,"
+                " user_confirmed"
                 " FROM memories"
             ).fetchall()
-            for rid, meta_json, sup, dele, voided in rows:
+            for rid, meta_json, sup, dele, voided, uc in rows:
                 if rid not in known_keys:
                     extra_rows += 1
                     continue
@@ -1562,11 +1584,18 @@ class SQLiteStore:
                         want = None
                     if want is not None and (sup, dele) != want:
                         bad = True
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
+                if not bad and (1 if uc else 0) != (
+                    1 if meta.get("user_confirmed") else 0
+                ):
+                    # user_confirmed 独立列与 meta 分叉（复查
+                    # F）：demote 两段写中间窗口的残留，复检必
+                    # 须看得见——旧复检根本不查这一列。
+                    bad = True
                 if not bad:
-                    try:
-                        meta = json.loads(meta_json or "{}")
-                    except (ValueError, TypeError):
-                        meta = {}
                     promoted = promote_meta.get(rid) or {}
                     for _field in ("protection_tier", "core_drawer"):
                         if _field in promoted and (
@@ -1686,12 +1715,34 @@ class SQLiteStore:
             i for i in getattr(self, "_controlled_health_issues", [])
             if i.get("kind") != self._RECOVERY_FREEZE_REASON
         ]
-        if other_issues:
+        # 补修二轮（复查 A）：冻结类痕迹（不变量失败/提交待
+        # 核实/持久化故障/对账未定案）在残余清单里定冻结级，
+        # 不再混进注意级的 controlled_entry_health——冻结事
+        # 实以 _controlled_frozen_reason 为准，这里只是把同
+        # 一事实如实列进恢复结论页。
+        freeze_issues = [
+            i for i in other_issues
+            if i.get("kind") in self._CONTROLLED_FREEZE_KINDS
+        ]
+        plain_issues = [
+            i for i in other_issues
+            if i.get("kind") not in self._CONTROLLED_FREEZE_KINDS
+        ]
+        if freeze_issues:
+            residuals.append({
+                "kind": "controlled_entry_frozen",
+                "detail": {
+                    "count": len(freeze_issues),
+                    "kinds": [i.get("kind") for i in freeze_issues],
+                },
+                "freezing": True,
+            })
+        if plain_issues:
             residuals.append({
                 "kind": "controlled_entry_health",
                 "detail": {
-                    "count": len(other_issues),
-                    "kinds": [i.get("kind") for i in other_issues],
+                    "count": len(plain_issues),
+                    "kinds": [i.get("kind") for i in plain_issues],
                 },
                 "freezing": False,
             })
@@ -1715,11 +1766,19 @@ class SQLiteStore:
         )
         unfrozen = None
         if freezing:
+            # recovery_unclean 只记恢复自身判出的冻结级残余；
+            # 受控入口自身的冻结类痕迹（controlled_entry_
+            # frozen）不是恢复的账，别替它背、也别在恢复重
+            # 启时替它解冻（它有自己的解冻条件）。
+            recovery_caused = any(
+                r["freezing"] and r["kind"] != "controlled_entry_frozen"
+                for r in residuals
+            )
             already = any(
                 i.get("kind") == self._RECOVERY_FREEZE_REASON
                 for i in self._controlled_health_issues
             )
-            if not already:
+            if recovery_caused and not already:
                 self._controlled_note_health(
                     self._RECOVERY_FREEZE_REASON,
                     {
@@ -7778,7 +7837,10 @@ class SQLiteStore:
         """改一条活记忆的分类抽屉：drawer 是五类键之一 / None
         （摘回未入格）。只影响分块记账、不改变占座总数，不过
         容量门；落库走 _update_core_fields（账本先行）。"""
-        if drawer is not None and drawer not in _core_cap.CORE_DRAWERS:
+        if drawer is not None and (
+            not isinstance(drawer, str)
+            or drawer not in _core_cap.CORE_DRAWERS
+        ):
             return {"ok": False, "reason": "bad_drawer", "memory_id": memory_id}
         return self._update_core_fields(
             memory_id, {_core_cap.DRAWER_FIELD: drawer},
@@ -7793,8 +7855,8 @@ class SQLiteStore:
         不改 SQLite，两边不许分叉。"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT text, metadata_json, superseded, deleted, voided"
-                " FROM memories WHERE id=?",
+                "SELECT text, metadata_json, superseded, deleted,"
+                " voided, user_confirmed FROM memories WHERE id=?",
                 (memory_id,),
             ).fetchone()
             if row is None:
@@ -7813,7 +7875,7 @@ class SQLiteStore:
             tier_before = meta.get(_tier_field)
             tier_after = new_meta.get(_tier_field)
             version_before = self._controlled_version_stamp(
-                row[0] or "", meta
+                row[0] or "", meta, row[5]
             )
             if after["occupies_seat"] and not before["occupies_seat"]:
                 snap = self.core_seat_snapshot()
@@ -7885,7 +7947,7 @@ class SQLiteStore:
                     "idem_key": _idem_key,
                     "version_before": version_before,
                     "version_after": self._controlled_version_stamp(
-                        row[0] or "", new_meta
+                        row[0] or "", new_meta, row[5]
                     ),
                     "text_hash": hashlib.sha256(
                         (row[0] or "").encode("utf-8")
@@ -8022,6 +8084,12 @@ class SQLiteStore:
         "receipts_save_failed",
         "intents_save_failed",
         "audit_write_failed",
+        # 补修二轮（贵妃第十八份复查 A/D/E）：不变量失败与
+        # 提交待核实是危险方向，对账定不了生死（读账本失败/
+        # 坏行存疑）同样——全部与持久化故障共用同一面冻结旗。
+        "invariant_failed",
+        "commit_unverified",
+        "reconcile_undetermined",
         # 立项 H6：启动恢复结论不干净（判据见 H6 节）同样冻结
         # 危险写，与持久化故障共用同一面冻结旗、同一道闸口。
         "recovery_unclean",
@@ -8147,6 +8215,31 @@ class SQLiteStore:
         except Exception:
             logger.warning("受控入口启动对账失败", exc_info=True)
 
+    @staticmethod
+    def _controlled_write_json(path, payload):
+        """受控入口持久化落盘（补修二轮，复查第三节第 2 项）：
+        写临时文件 → flush + fsync 文件 → os.replace 原子换名
+        → 尽力 fsync 目录。旧写法 write_text + replace 只保证
+        进程崩溃不丢，断电时新文件可能只剩半截或根本没落盘
+        （回执/意图丢了，对账与重建都无从谈起）。目录 fsync
+        在 Windows 上可能打不开目录句柄，失败静默跳过——文
+        件级 fsync 是断电持久性的主要部分。"""
+        tmp = path.with_suffix(".tmp")
+        data = json.dumps(payload, ensure_ascii=False, indent=1)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+
     def _controlled_save_receipts(self):
         payload = {
             "version": 3,
@@ -8156,19 +8249,15 @@ class SQLiteStore:
             "revocation_fingerprints":
                 self._controlled_revocation_fingerprints,
         }
-        tmp = self._controlled_receipts_path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        self._controlled_write_json(
+            self._controlled_receipts_path, payload
         )
-        os.replace(tmp, self._controlled_receipts_path)
 
     def _controlled_save_intents(self):
         payload = {"version": 1, "intents": self._controlled_intents}
-        tmp = self._controlled_intents_path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        self._controlled_write_json(
+            self._controlled_intents_path, payload
         )
-        os.replace(tmp, self._controlled_intents_path)
 
     def _controlled_save_intents_quiet(self):
         """落盘操作意图，失败只记健康痕迹＋冻结、不抛（调用方
@@ -8200,15 +8289,26 @@ class SQLiteStore:
             return index
 
     @staticmethod
-    def _controlled_version_stamp(text, meta):
+    def _controlled_version_stamp(text, meta, user_confirmed=None):
         """目标行版本戳：正文＋完整 metadata 的哈希（提案绑版本用）。
 
         注意（互查口径）：这是内容版本候选，不是单调修订号——
         同一内容改回去会得到同一个戳；G1 再议独立列/授权保护
         的版本覆盖，本轮先把「执行必绑版本」立住。
+
+        补修二轮（复查第三节第 1 项）：戳面补上 user_confirmed
+        独立列——demote 在 meta 之外单独写这一列，戳不覆盖它，
+        列被单独改动时版本比对看不见。user_confirmed 传 None
+        时退回 meta 里的同名字段（历史调用点兼容）。
         """
-        payload = (text or "") + "\x00" + json.dumps(
-            meta or {}, sort_keys=True, ensure_ascii=False
+        if user_confirmed is None:
+            user_confirmed = (meta or {}).get("user_confirmed")
+        payload = (
+            (text or "")
+            + "\x00"
+            + json.dumps(meta or {}, sort_keys=True, ensure_ascii=False)
+            + "\x00uc="
+            + ("1" if user_confirmed else "0")
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -8233,13 +8333,17 @@ class SQLiteStore:
 
     def _controlled_ledger_op(self, op_id):
         """在账本里按 op_id 找这笔受控入口执行落的事件；没有
-        返回 None（读账本失败也返回 None，调用方按没落账处置
-        并留健康痕迹，不许假装查过）。"""
+        返回 None。读账本失败同样返回 None，但在
+        _controlled_op_read_failed 上标 True 与「确定没落账」
+        区分开——调用方必须按未定案处置，不许当成没落账
+        （贵妃第十八份复查 D）。"""
         try:
             events, _info = _ledger.read_events(self.ledger_path)
         except Exception:
             logger.warning("受控入口按 op_id 查账本失败", exc_info=True)
+            self._controlled_op_read_failed = True
             return None
+        self._controlled_op_read_failed = False
         for event in events:
             if event.get("op_id") == op_id:
                 return event
@@ -8263,14 +8367,27 @@ class SQLiteStore:
         except Exception:
             logger.warning("受控入口对账读账本失败", exc_info=True)
             report["still_pending"] = len(pending)
+            # 读账本失败 = fail-closed（复查 D）：冻结危险写，
+            # 待决意图全部按未定案，不许按新提案放行。
+            self._controlled_note_health(
+                "reconcile_undetermined",
+                {"error": "ledger_read_failed", "pending": len(pending)},
+            )
             self._controlled_reconcile_report = report
             return report
+        # 账本有坏行/被截断时（复查 E）：解析出的事件集合不
+        # 完整，「没找到 op_id」不能当成确定没落账——待决意
+        # 图留 pending 按未定案处理，并留冻结痕迹。
+        ledger_doubtful = bool(
+            (_info or {}).get("bad_lines") or (_info or {}).get("truncated")
+        )
         by_op = {}
         for event in events:
             op = event.get("op_id")
             if op:
                 by_op[op] = event
         changed = False
+        undetermined = 0
         for intent in pending:
             report["checked"] += 1
             event = by_op.get(intent.get("op_id"))
@@ -8278,11 +8395,25 @@ class SQLiteStore:
                 intent["status"] = "committed"
                 intent["ledger_seq"] = event.get("seq")
                 report["committed"] += 1
+                intent["reconciled_at"] = _now_iso()
+                changed = True
+            elif ledger_doubtful:
+                undetermined += 1
+                report["still_pending"] += 1
             else:
                 intent["status"] = "aborted"
                 report["aborted"] += 1
-            intent["reconciled_at"] = _now_iso()
-            changed = True
+                intent["reconciled_at"] = _now_iso()
+                changed = True
+        if undetermined:
+            self._controlled_note_health(
+                "reconcile_undetermined",
+                {
+                    "bad_lines": (_info or {}).get("bad_lines"),
+                    "truncated": (_info or {}).get("truncated"),
+                    "pending": undetermined,
+                },
+            )
         if changed:
             self._controlled_save_intents_quiet()
         self._controlled_reconcile_report = report
@@ -8297,11 +8428,39 @@ class SQLiteStore:
     def _controlled_receipt_from_intent(self, intent):
         """回执登记丢了时，按已提交的操作意图重建一份
         duplicate 回执（提交点在意图里，账本可复核）——不
-        重新执行，只把当时的结论还给调用方。"""
+        重新执行，只把当时的结论还给调用方。
+
+        最终结论以意图里存的 final_ok/final_reason 为准
+        （补修二轮，复查 B）：执行时不变量失败的笔，登记丢
+        了重建出来也必须是失败，不许对 committed 一律
+        ok=True 洗白。补修前的老意图没有 final_* 字段，属
+        于结论未经核实——按未核实交回（ok=False、
+        reason=committed_unverified、detail 标
+        unverified_reconstruction），不许冒充干净成功。"""
+        status = intent.get("status")
+        detail = {
+            "op_id": intent.get("op_id"),
+            "ledger_seq": intent.get("ledger_seq"),
+            "commit_state": status,
+            "reconstructed_from_intent": True,
+        }
+        if status == "committed" and "final_ok" in intent:
+            ok = bool(intent.get("final_ok"))
+            reason = intent.get("final_reason") or ""
+        elif status == "committed":
+            ok = False
+            reason = "committed_unverified"
+            detail["unverified_reconstruction"] = True
+        elif status == "committed_unverified":
+            ok = False
+            reason = intent.get("final_reason") or "committed_unverified"
+        else:
+            ok = False
+            reason = intent.get("final_reason") or ""
         return {
-            "ok": intent.get("status") == "committed",
+            "ok": ok,
             "status": "duplicate",
-            "reason": "",
+            "reason": reason,
             "action": intent.get("action"),
             "memory_id": intent.get("memory_id"),
             "idempotency_key": intent.get("idempotency_key"),
@@ -8310,12 +8469,7 @@ class SQLiteStore:
             "trace_index": None,
             "version_before": intent.get("expected_version"),
             "version_after": intent.get("version_after"),
-            "detail": {
-                "op_id": intent.get("op_id"),
-                "ledger_seq": intent.get("ledger_seq"),
-                "commit_state": intent.get("status"),
-                "reconstructed_from_intent": True,
-            },
+            "detail": detail,
             "ts": _now_iso(),
         }
 
@@ -8333,7 +8487,16 @@ class SQLiteStore:
             stored_fp = self._controlled_fingerprints.get(idem_key)
             if stored_fp is not None and stored_fp != fingerprint:
                 return ("conflict", stored_fp)
-            return ("duplicate", dict(prev))
+            dup = dict(prev)
+            if stored_fp is None:
+                # 无指纹的老回执（v1 时代，复查第三节第 6
+                # 项）：指纹绑定核对做不了，明示标
+                # legacy/unverified，不许冒充已核对的重复。
+                dup_detail = dict(dup.get("detail") or {})
+                dup_detail["legacy_receipt"] = True
+                dup_detail["unverified"] = True
+                dup["detail"] = dup_detail
+            return ("duplicate", dup)
         matches = [
             intent for intent in self._controlled_intents.values()
             if intent.get("idempotency_key") == idem_key
@@ -8347,6 +8510,11 @@ class SQLiteStore:
                 intent = self._controlled_intents.get(
                     intent.get("op_id"), intent
                 )
+            if intent.get("status") == "pending":
+                # 对账后仍定不了生死（读账本失败/坏行存疑已
+                # 在对账里冻结）：这笔到底执行没执行不知道，
+                # 绝不许按新提案放行（复查 D）。
+                return ("unresolved", intent)
             if intent.get("status") in ("committed", "committed_unverified"):
                 return (
                     "duplicate",
@@ -8368,12 +8536,56 @@ class SQLiteStore:
         snap = self.core_seat_snapshot()
         checks["seats_reconciled"] = bool(snap.get("reconciled"))
         try:
-            recount = self.recount_core_seats_from_ledger()
-            checks["members_match_ledger"] = all(
-                snap.get(field) == recount.get(field)
-                for field in (
-                    "seats_used", "members", "pinned", "temp_pinned",
-                )
+            # 成员按 ID 集合比对（贵妃第十八份复查附带项）：
+            # 只比四个计数时，同计数换一批成员也报一致，与
+            # 本项注释口径（成员集合一致）不符。两侧都走
+            # core_cap.classify 同一口径：投影侧读 SQLite 活
+            # 行，账本侧读折叠后未死状态的 meta；档位集合对
+            # 全部活行先算（与 count_seats 的计数顺序一致），
+            # 成员/占座再按成员资格筛。
+            events, _info = _ledger.read_events(self.ledger_path)
+            folded = _core_cap.fold_ledger_metas(events)
+            states = _ledger.resolve_state(events).get(
+                "key_states", {}
+            )
+
+            def _id_sets(pairs):
+                members, seats, pinned, temp = set(), set(), set(), set()
+                for mid, m in pairs:
+                    c = _core_cap.classify(m, live=True)
+                    if c["protection_tier"] == _core_cap.TIER_PINNED:
+                        pinned.add(mid)
+                    elif (
+                        c["protection_tier"]
+                        == _core_cap.TIER_TEMP_PINNED
+                    ):
+                        temp.add(mid)
+                    if c["member"]:
+                        members.add(mid)
+                        if c["occupies_seat"]:
+                            seats.add(mid)
+                return members, seats, pinned, temp
+
+            ledger_pairs = [
+                (key, meta)
+                for key, meta in folded.items()
+                if states.get(key)
+                not in _core_cap._LEDGER_DEAD_STATES
+            ]
+            proj_rows = self._conn.execute(
+                "SELECT id, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall()
+            proj_pairs = []
+            for rid, mjson in proj_rows:
+                try:
+                    proj_pairs.append(
+                        (rid, json.loads(mjson or "{}"))
+                    )
+                except (ValueError, TypeError):
+                    proj_pairs.append((rid, {}))
+            checks["members_match_ledger"] = (
+                _id_sets(proj_pairs) == _id_sets(ledger_pairs)
             )
         except Exception:
             checks["members_match_ledger"] = False
@@ -8450,13 +8662,14 @@ class SQLiteStore:
         """目标行当前版本戳（提案绑版本用）；行不存在返回 None。"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT text, metadata_json FROM memories WHERE id=?",
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories WHERE id=?",
                 (memory_id,),
             ).fetchone()
             if row is None:
                 return None
             return self._controlled_version_stamp(
-                row[0] or "", json.loads(row[1] or "{}")
+                row[0] or "", json.loads(row[1] or "{}"), row[2]
             )
 
     def controlled_entry_receipt(self, idempotency_key):
@@ -8464,7 +8677,13 @@ class SQLiteStore:
         意图重建一份（提交/恢复协议）；都没有返回 None。"""
         receipt = self._controlled_receipts.get(idempotency_key)
         if receipt is not None:
-            return dict(receipt)
+            out = dict(receipt)
+            if idempotency_key not in self._controlled_fingerprints:
+                detail = dict(out.get("detail") or {})
+                detail["legacy_receipt"] = True
+                detail["unverified"] = True
+                out["detail"] = detail
+            return out
         for intent in self._controlled_intents.values():
             if intent.get("idempotency_key") != idempotency_key:
                 continue
@@ -8714,6 +8933,10 @@ class SQLiteStore:
                 return _finish("refused", "bad_params", register=False)
             if not params_present:
                 params = {}
+            # 参数值先验类型再查枚举（补修二轮，复查 C）：
+            # drawer 枚举是 dict，非字符串值（list/dict）做
+            # 成员测试会抛 TypeError——任何 JSON 值都只许走
+            # 结构化 bad_params，不许抛异常逃出入口。
             tier_value = None
             drawer_value = None
             explicit_clear = False
@@ -8725,9 +8948,9 @@ class SQLiteStore:
                         register=False,
                     )
                 tier_value = params["tier"]
-                if (
-                    tier_value is not None
-                    and tier_value not in _core_cap.PROTECTION_TIERS
+                if tier_value is not None and (
+                    not isinstance(tier_value, str)
+                    or tier_value not in _core_cap.PROTECTION_TIERS
                 ):
                     return _finish(
                         "refused", "bad_params",
@@ -8743,9 +8966,9 @@ class SQLiteStore:
                         register=False,
                     )
                 drawer_value = params["drawer"]
-                if (
-                    drawer_value is not None
-                    and drawer_value not in _core_cap.CORE_DRAWERS
+                if drawer_value is not None and (
+                    not isinstance(drawer_value, str)
+                    or drawer_value not in _core_cap.CORE_DRAWERS
                 ):
                     return _finish(
                         "refused", "bad_params",
@@ -8766,6 +8989,16 @@ class SQLiteStore:
                     detail={
                         "fingerprint": fingerprint,
                         "prior_fingerprint": prior_payload,
+                    },
+                    register=False,
+                )
+            if prior_kind == "unresolved":
+                return _finish(
+                    "refused", "prior_unresolved",
+                    detail={
+                        "op_id": (prior_payload or {}).get("op_id"),
+                        "commit_state": "pending",
+                        "frozen_reason": self._controlled_frozen_reason,
                     },
                     register=False,
                 )
@@ -8791,8 +9024,8 @@ class SQLiteStore:
                 return dup
             # —— 载行 ——
             row = self._conn.execute(
-                "SELECT text, metadata_json, superseded, deleted, voided"
-                " FROM memories WHERE id=?",
+                "SELECT text, metadata_json, superseded, deleted,"
+                " voided, user_confirmed FROM memories WHERE id=?",
                 (memory_id,),
             ).fetchone()
             if row is None:
@@ -8802,7 +9035,7 @@ class SQLiteStore:
             text = row[0] or ""
             meta = json.loads(row[1] or "{}")
             receipt["version_before"] = self._controlled_version_stamp(
-                text, meta
+                text, meta, row[5]
             )
             # 验来源（授权硬判，实测问题一）：改记忆类动作只认
             # BOOS 本人指令；非本人来源拒绝＋攒知情待问
@@ -9032,7 +9265,28 @@ class SQLiteStore:
                 # 已落账就算已提交：不许假报 refused，更不许
                 # 只回滚 SQLite 造成账本分叉。
                 event = self._controlled_ledger_op(op_id)
-                if event is None:
+                if event is None and getattr(
+                    self, "_controlled_op_read_failed", False
+                ):
+                    # 账本读失败：到底落没落账定不了，不许按
+                    # 没落账判 aborted（复查 D）——按待核实
+                    # 落账走完后续核验，冻结由
+                    # commit_unverified 负责。
+                    intent["status"] = "committed_unverified"
+                    detail["commit_state"] = "committed_unverified"
+                    detail["ledger_read_failed"] = True
+                    detail["error"] = "%s: %s" % (
+                        type(exec_error).__name__, exec_error,
+                    )
+                    self._controlled_note_health(
+                        "commit_unverified",
+                        {
+                            "op_id": op_id,
+                            "memory_id": memory_id,
+                            "ledger_read_failed": True,
+                        },
+                    )
+                elif event is None:
                     intent["status"] = "aborted"
                     intent["abort_reason"] = "execute_failed"
                     self._controlled_save_intents_quiet()
@@ -9044,12 +9298,13 @@ class SQLiteStore:
                             ),
                         },
                     )
-                intent["status"] = "committed"
-                intent["ledger_seq"] = event.get("seq")
-                detail["commit_state"] = "committed_after_error"
-                detail["error"] = "%s: %s" % (
-                    type(exec_error).__name__, exec_error,
-                )
+                else:
+                    intent["status"] = "committed"
+                    intent["ledger_seq"] = event.get("seq")
+                    detail["commit_state"] = "committed_after_error"
+                    detail["error"] = "%s: %s" % (
+                        type(exec_error).__name__, exec_error,
+                    )
             else:
                 # 事件关联核验：这笔 op 必须在账本里找得到，
                 # 找不到如实标「已提交/待核实」，不假报成功
@@ -9074,13 +9329,15 @@ class SQLiteStore:
             if explicit_clear:
                 detail["explicit_clear"] = True
             row_after = self._conn.execute(
-                "SELECT text, metadata_json FROM memories WHERE id=?",
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories WHERE id=?",
                 (memory_id,),
             ).fetchone()
             if row_after is not None:
                 receipt["version_after"] = self._controlled_version_stamp(
                     row_after[0] or "",
                     json.loads(row_after[1] or "{}"),
+                    row_after[2],
                 )
                 intent["version_after"] = receipt["version_after"]
             try:
@@ -9103,6 +9360,15 @@ class SQLiteStore:
             detail["invariants"] = invariants["checks"]
             detail["invariants_ok"] = invariants["ok"]
             detail["session_id"] = verdict["session_id"]
+            # 最终结论落进意图再返回（补修二轮，复查 B）：
+            # 回执登记丢了时重建回执以此为准，失败不许被洗
+            # 成成功。落盘失败由 quiet 版自己记冻结痕迹。
+            intent["final_ok"] = bool(invariants["ok"])
+            intent["final_reason"] = (
+                "" if invariants["ok"] else "invariant_failed"
+            )
+            intent["invariant_checks"] = invariants["checks"]
+            self._controlled_save_intents_quiet()
             if not invariants["ok"]:
                 self._controlled_note_health(
                     "invariant_failed",
@@ -9555,7 +9821,7 @@ class SQLiteStore:
             # —— 载行 ——
             row = self._conn.execute(
                 "SELECT text, metadata_json, superseded, deleted,"
-                " voided FROM memories WHERE id=?",
+                " voided, user_confirmed FROM memories WHERE id=?",
                 (memory_id,),
             ).fetchone()
             if row is None:
@@ -9565,7 +9831,7 @@ class SQLiteStore:
             text = row[0] or ""
             meta = json.loads(row[1] or "{}")
             receipt["version_before"] = \
-                self._controlled_version_stamp(text, meta)
+                self._controlled_version_stamp(text, meta, row[5])
             # —— 验来源：撤销只认 BOOS 本人 ——
             if not _auth_guard.is_owner_instruction(source):
                 question = self._queue_controlled_entry_question(
@@ -9801,7 +10067,8 @@ class SQLiteStore:
             intent["revoked_by"] = rev_op_id
             intent["revoked_at"] = _now_iso()
             row_after = self._conn.execute(
-                "SELECT text, metadata_json FROM memories WHERE id=?",
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories WHERE id=?",
                 (memory_id,),
             ).fetchone()
             if row_after is not None:
@@ -9809,6 +10076,7 @@ class SQLiteStore:
                     self._controlled_version_stamp(
                         row_after[0] or "",
                         json.loads(row_after[1] or "{}"),
+                        row_after[2],
                     )
                 rev_intent["version_after"] = \
                     receipt["version_after"]
@@ -9829,6 +10097,14 @@ class SQLiteStore:
             )
             detail["verify"] = verify["checks"]
             detail["verify_ok"] = verify["ok"]
+            # 撤销的最终结论同样落进撤销意图（补修二轮，
+            # 复查 B 的一致性要求）。
+            rev_intent["final_ok"] = bool(verify["ok"])
+            rev_intent["final_reason"] = (
+                "" if verify["ok"] else "invariant_failed"
+            )
+            rev_intent["invariant_checks"] = verify["checks"]
+            self._controlled_save_intents_quiet()
             if not verify["ok"]:
                 self._controlled_note_health(
                     "invariant_failed",
@@ -10122,7 +10398,8 @@ class SQLiteStore:
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT text, metadata_json FROM memories"
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories"
                 " WHERE id=?",
                 (memory_id,),
             ).fetchone()
@@ -10198,7 +10475,7 @@ class SQLiteStore:
                 target["ledger_seq"] or 0
             ):
                 stamp_now = self._controlled_version_stamp(
-                    row[0] or "", row_meta
+                    row[0] or "", row_meta, row[2]
                 )
                 stamp_ok = (
                     stamp_now == evidence["version_after"]
@@ -10388,8 +10665,9 @@ class SQLiteStore:
             wanted = {str(m) for m in memory_ids}
         frozen = {}
         live_metas = []
-        for mid, text, mjson, voided, deleted, superseded in self._conn.execute(
-            "SELECT id, text, metadata_json, voided, deleted, superseded"
+        for mid, text, mjson, voided, deleted, superseded, uc in self._conn.execute(
+            "SELECT id, text, metadata_json, voided, deleted, superseded,"
+            " user_confirmed"
             " FROM memories"
         ).fetchall():
             try:
@@ -10401,7 +10679,9 @@ class SQLiteStore:
             if wanted is not None and mid not in wanted:
                 continue
             frozen[mid] = {
-                "version": self._controlled_version_stamp(text or "", meta),
+                "version": self._controlled_version_stamp(
+                    text or "", meta, uc
+                ),
                 "text": text or "",
                 "meta": copy.deepcopy(meta),
                 "state": self._snapshot_row_state(
