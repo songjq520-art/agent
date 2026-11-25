@@ -643,6 +643,11 @@ class SQLiteStore:
         # 登记，与提案回执同文件落盘（见 _controlled_save_receipts）。
         self._controlled_revocations = {}
         self._controlled_revocation_fingerprints = {}
+        # 持锁稳定版本快照（立项 H4，2026-11-25）：整理员提案绑
+        # 版本用的冻结视图，只活在进程内登记里——不落盘、不进账
+        # 本，进程重启即全失效（get/diff 如实 KeyError，不给假数
+        # 据）；口径见下方快照节。
+        self._stable_snapshots = {}
         self._controlled_frozen_reason = None
         self._controlled_health_issues = []
         self._controlled_reconcile_report = None
@@ -9396,6 +9401,162 @@ class SQLiteStore:
                 }
             )
         return notices
+
+    # ---------- 持锁稳定版本快照（立项 H4，2026-11-25） ----------
+
+    @staticmethod
+    def _snapshot_row_state(voided, deleted, superseded, meta):
+        """快照里一行的状态名：终态旗优先（deleted > voided >
+        superseded），活行再按衰减状态分 current / dormant。
+        与账本折叠的 key_states 口径对齐（同一条记忆两边同名）。"""
+        if deleted:
+            return "deleted"
+        if voided:
+            return "voided"
+        if superseded:
+            return "superseded"
+        if (meta or {}).get("decay_state") == _decay.DECAY_STATE_DORMANT:
+            return "dormant"
+        return "current"
+
+    def _frozen_rows_locked(self, memory_ids=None):
+        """持锁内一次读全库行，冻成 {id: 行视图}（调用方须已持
+        self._lock）。行视图 = 内容版本戳（与受控入口
+        controlled_entry_version 同一戳法，提案绑版本/H1 漂移
+        检出共用）＋原文＋meta 深拷贝＋状态＋保护档/抽屉。
+        同时返回全库活行 meta 列表（座位账从同一批读数算，
+        保证快照内部同源、不半新半旧）。"""
+        wanted = None
+        if memory_ids is not None:
+            wanted = {str(m) for m in memory_ids}
+        frozen = {}
+        live_metas = []
+        for mid, text, mjson, voided, deleted, superseded in self._conn.execute(
+            "SELECT id, text, metadata_json, voided, deleted, superseded"
+            " FROM memories"
+        ).fetchall():
+            try:
+                meta = json.loads(mjson or "{}")
+            except Exception:
+                meta = {}
+            if not (voided or deleted or superseded):
+                live_metas.append(meta)
+            if wanted is not None and mid not in wanted:
+                continue
+            frozen[mid] = {
+                "version": self._controlled_version_stamp(text or "", meta),
+                "text": text or "",
+                "meta": copy.deepcopy(meta),
+                "state": self._snapshot_row_state(
+                    voided, deleted, superseded, meta
+                ),
+                "live": not (voided or deleted or superseded),
+                "protection_tier": _core_cap.normalize_protection_tier(meta),
+                "core_drawer": _core_cap.normalize_core_drawer(meta),
+            }
+        return frozen, live_metas
+
+    def take_stable_snapshot(self, memory_ids=None):
+        """取一份持锁稳定版本快照（立项 H4）：在 store 锁内一
+        次性冻结——行版本戳＋保护版本＋账本序号（ledger_state
+        的 seq_max）同一临界区内取齐，生成过程不写账本、不写
+        库。整理员拿这份快照出提案、绑版本；之后库里再变，
+        快照视图纹丝不动，差异走 diff_stable_snapshot 对账。
+
+        形状：{snapshot_id, generated_at, ledger_seq,
+        ledger_snapshot_seq, seats, rows, row_count, scoped}。
+        seats 是全库座位账（count_seats 口径，与
+        core_seat_snapshot 同源同读）；rows 可按 memory_ids
+        缩小行范围（scoped=True），座位账永远全库口径。
+        快照只活在进程内登记里，不落盘：进程重启即失效。
+        返回的是深拷贝，调用方改它污染不了登记里的原件。"""
+        with self._lock:
+            frozen, live_metas = self._frozen_rows_locked(memory_ids)
+            seats = _core_cap.count_seats(
+                live_metas, limit=self.core_seat_limit
+            )
+            state = self.ledger_state() or {}
+            snapshot = {
+                "snapshot_id": uuid.uuid4().hex,
+                "generated_at": _now_iso(),
+                "ledger_seq": state.get("seq_max") or 0,
+                "ledger_snapshot_seq": state.get("snapshot_seq"),
+                "seats": seats,
+                "rows": frozen,
+                "row_count": len(frozen),
+                "scoped": memory_ids is not None,
+            }
+            self._stable_snapshots[snapshot["snapshot_id"]] = (
+                copy.deepcopy(snapshot)
+            )
+            return copy.deepcopy(snapshot)
+
+    def get_stable_snapshot(self, snapshot_id):
+        """按 id 取回快照（深拷贝）。没取过、已释放或进程重启
+        后登记已空——如实抛 KeyError，不给假数据。"""
+        with self._lock:
+            snap = self._stable_snapshots.get(snapshot_id)
+            if snap is None:
+                raise KeyError(snapshot_id)
+            return copy.deepcopy(snap)
+
+    def release_stable_snapshot(self, snapshot_id):
+        """释放一份快照：登记里摘掉，之后 get/diff 一律
+        KeyError。摘到了返回 True，本来就没有返回 False。"""
+        with self._lock:
+            return self._stable_snapshots.pop(snapshot_id, None) is not None
+
+    def diff_stable_snapshot(self, snapshot_id):
+        """快照 vs 当前：按 memory_id 给出变化清单。变化判定
+        只认版本戳与行状态（不用时间猜）：戳变了就是 changed，
+        并带 state_before/state_after——顶替（→superseded）、
+        进档案（→dormant）、删除（→deleted）都从状态迁移里
+        看得出。added 只对全库快照有意义（scoped 快照的行集
+        固定，只报 changed/removed）。快照不存在如实
+        KeyError。"""
+        with self._lock:
+            snap = self._stable_snapshots.get(snapshot_id)
+            if snap is None:
+                raise KeyError(snapshot_id)
+            then_rows = snap["rows"]
+            now_rows, _live = self._frozen_rows_locked(
+                list(then_rows) if snap.get("scoped") else None
+            )
+            state = self.ledger_state() or {}
+            added = []
+            if not snap.get("scoped"):
+                added = sorted(set(now_rows) - set(then_rows))
+            removed = sorted(set(then_rows) - set(now_rows))
+            changed = []
+            unchanged = 0
+            for mid in sorted(set(then_rows) & set(now_rows)):
+                before = then_rows[mid]
+                after = now_rows[mid]
+                if (
+                    before["version"] == after["version"]
+                    and before["state"] == after["state"]
+                ):
+                    unchanged += 1
+                    continue
+                changed.append(
+                    {
+                        "memory_id": mid,
+                        "version_before": before["version"],
+                        "version_after": after["version"],
+                        "state_before": before["state"],
+                        "state_after": after["state"],
+                    }
+                )
+            return {
+                "snapshot_id": snapshot_id,
+                "generated_at": snap["generated_at"],
+                "ledger_seq_then": snap["ledger_seq"],
+                "ledger_seq_now": state.get("seq_max") or 0,
+                "added": added,
+                "removed": removed,
+                "changed": changed,
+                "unchanged_count": unchanged,
+            }
 
     # ---------- 启动时要调的（接口兼容，SQLite 版里是空操作） ----------
 
