@@ -657,10 +657,26 @@ class SQLiteStore:
         )
         self._protection_evidence_lock = threading.Lock()
         self._protection_evidence_pending = []
+        # 恢复健康度（立项 H6，2026-11-25）：最近一次启动恢复的
+        # 健康结论落盘于 memory 目录下 recovery_health.json，
+        # 跨重启可查（补决定十五的缺口：待问 load_error 只活在
+        # 进程里、重启即消失、报警无留存）。构造时先读回上一
+        # 份（_load_recovery_health）；上一轮恢复不干净且冻的
+        # 是危险写时，本进程先承接冻结、等本轮
+        # startup_recovery 重新裁决。口径见 startup_recovery
+        # 之后的 H6 节。
+        self._recovery_health_path = (
+            self.memory_dir / "recovery_health.json"
+        )
+        self._recovery_health_latest = None
+        self._recovery_health_own = False
+        self._recovery_health_load_error = None
+        self._recovery_health_lock = threading.Lock()
         self._controlled_frozen_reason = None
         self._controlled_health_issues = []
         self._controlled_reconcile_report = None
         self._load_controlled_entry_state()
+        self._load_recovery_health()
         # 同轮裁决缓存 {(turn_id, 归一化原文): (verdict, info)}：
         # save_turn 逐句循环里带当场判标记合并裁决过的句子，下游
         # 内部直存（槽位路、收尾直存）复用同一裁决——不许二次屏
@@ -1395,8 +1411,496 @@ class SQLiteStore:
                 )
         except Exception:
             logger.warning("启动恢复：待问文件恢复失败。", exc_info=True)
+        # 恢复健康度收尾（立项 H6）：结论落盘，不干净时冻结
+        # 危险写（见 startup_recovery 之后的 H6 节）。收尾永
+        # 不抛——健康度落盘失败不能反过来堵住启动。
+        try:
+            self._finalize_recovery_health(report)
+        except Exception:
+            logger.warning("启动恢复：健康度收尾失败。", exc_info=True)
         return report
 
+
+    # ---------- 恢复健康度（立项 H6，2026-11-25） ----------
+    #
+    # 三件：健康度落盘、结论页映射、危险写冻结。
+    #
+    # 【落盘】每次 startup_recovery 收尾把健康结论写进
+    # memory 目录下 recovery_health.json（{version,
+    # updated_at, latest, history}，history 留最近 10 份、
+    # 最新在前，原子换名不留半截 JSON）。进程重启后读得出
+    # 上一份——补决定十五的缺口（待问 load_error 只活在进
+    # 程里，重启即消失、报警无留存）。
+    #
+    # 【结论页映射】沿既有消费通道接，不新造页面：
+    #   - recovery_health() 返回最近一份记录（本进程产出的
+    #     优先，没有读落盘的上一份），结论页/健康检查从同
+    #     一份记录取数；
+    #   - pending_notices() 新增 kind=recovery_health：状态
+    #     为 frozen 时必出（带 residuals 种类列表与
+    #     frozen_reason）；本进程还没产出自己的记录时，上
+    #     一进程落盘的未净记录（attention/frozen）也出——
+    #     跨重启可见。字段对应：record.status → 总状态；
+    #     record.residuals[].kind → 异常项；
+    #     record.controlled_entry.frozen/frozen_reason → 冻
+    #     结状态与原因；record.recovery.* → 恢复各步明细；
+    #     record.controlled_entry.
+    #     protection_evidence_pending_count → H5 待补证计数；
+    #   - 冻结本身另沿既有 kind=controlled_entry_frozen 露
+    #     头（reason=recovery_unclean）。attention 级残余各
+    #     有既有 kind 露头（pending_questions_corrupt /
+    #     protection_evidence_pending /
+    #     controlled_entry_health），不在 recovery_health
+    #     条里重复汇总。
+    #
+    # 【危险写冻结】不另造第二套：仍是
+    # _controlled_frozen_reason 这一面旗、submit/revoke 同
+    # 一道闸口（执行路径拒 entry_frozen，影子与拒绝照常）。
+    # 恢复不干净时经 _controlled_note_health(
+    # "recovery_unclean", ...) 置旗（已并入
+    # _CONTROLLED_FREEZE_KINDS；置过不覆盖、保留最早原因的
+    # 既有口径不变）。解冻只许两种：① 下一次
+    # startup_recovery 结论无冻结级残余；②
+    # recovery_health_recheck() 显式只读复检通过。两种都
+    # 只解 recovery_unclean 这一来源；持久化故障类冻结
+    # （receipts_load_error 等）照旧不自动解、复检也不碰。
+    # 跨重启承接：构造时读回上一份记录，status=frozen 且
+    # frozen_reason=recovery_unclean 的，先承接冻结等本轮
+    # 恢复重新裁决（_load_recovery_health）。
+    #
+    # 【不干净判据（本轮核定）】
+    # 冻结级：verify 缺失（步骤抛错）或 ok 非 True（账本序
+    # 号缺口/残行/坏行——账本本身不可信）；ledger_repair /
+    # projection 步骤抛错（报告字段为 None）；投影修复后
+    # 复检仍有分叉（行状态旗对、保护档/抽屉、槽位与账本折
+    # 叠不符，复检口径与 repair_projection_from_ledger 对
+    # 应段一致，只查受控入口安全所系字段）；账本里没有的
+    # 行 extra_rows > 0（repair 明定不删不改、等 BOOS
+    # 裁——投影与账本对不上且恢复自己解不开，冻到人工处
+    # 置后靠干净恢复/复检解冻）；待问文件损坏且重建没跑
+    # 成（pending 非空但 pending_rebuilt 为 None）。
+    # 注意级（记录、不冻结）：待问损坏但已重建；H5 待补证
+    # 计数 > 0；受控入口健康痕迹非空（不变量失败等——H1
+    # 既有口径只记不冻，照旧；冻结痕迹本身不算这一项）。
+    # status：无残余 = clean；只有注意级 = attention；有
+    # 冻结级残余或入口已冻结 = frozen。
+
+    _RECOVERY_HEALTH_HISTORY_KEEP = 10
+    _RECOVERY_FREEZE_REASON = "recovery_unclean"
+
+    def _projection_residual_mismatches(self):
+        """投影修复后的只读复检（H6）：拿账本折叠比对行状
+        态旗对（superseded/deleted）、保护档/抽屉、槽位——
+        口径与 repair_projection_from_ledger 的对应段一致，
+        只查不修。返回 {"mismatch_count", "sample_ids",
+        "extra_rows"}。voided 行照 repair 口径不碰、不算分
+        叉；账本里没有的行单记 extra_rows，不混进分叉数。
+        内部异常向上抛，调用方拦。"""
+        with self._lock:
+            state = self.ledger_state() or {}
+            key_states = state.get("key_states") or {}
+            by_id = state.get("by_id") or {}
+            known_keys = set(key_states) | set(by_id)
+            for _record in state.get("adds") or []:
+                if _record.get("key"):
+                    known_keys.add(_record["key"])
+            promote_meta, _decay_marks, slot_map, _revived = (
+                self._ledger_overlays()
+            )
+            mismatched = []
+            extra_rows = 0
+            rows = self._conn.execute(
+                "SELECT id, metadata_json, superseded, deleted, voided"
+                " FROM memories"
+            ).fetchall()
+            for rid, meta_json, sup, dele, voided in rows:
+                if rid not in known_keys:
+                    extra_rows += 1
+                    continue
+                if voided:
+                    continue
+                expected = key_states.get(rid)
+                if expected is None:
+                    expected = (by_id.get(rid) or {}).get("state")
+                bad = False
+                if expected is not None:
+                    if expected == _ledger.LEDGER_STATE_SUPERSEDED:
+                        want = (1, 0)
+                    elif expected == _ledger.LEDGER_STATE_DELETED:
+                        want = (0, 1)
+                    elif expected in (
+                        _ledger.LEDGER_STATE_CURRENT,
+                        _ledger.LEDGER_STATE_DORMANT,
+                    ):
+                        want = (0, 0)
+                    else:
+                        want = None
+                    if want is not None and (sup, dele) != want:
+                        bad = True
+                if not bad:
+                    try:
+                        meta = json.loads(meta_json or "{}")
+                    except (ValueError, TypeError):
+                        meta = {}
+                    promoted = promote_meta.get(rid) or {}
+                    for _field in ("protection_tier", "core_drawer"):
+                        if _field in promoted and (
+                            meta.get(_field) != promoted[_field]
+                        ):
+                            bad = True
+                            break
+                    if not bad:
+                        _slot = slot_map.get(rid)
+                        if _slot and meta.get("slot") != _slot:
+                            bad = True
+                if bad:
+                    mismatched.append(rid)
+            return {
+                "mismatch_count": len(mismatched),
+                "sample_ids": mismatched[:10],
+                "extra_rows": extra_rows,
+            }
+
+    def _recovery_residuals(self, report, residual, recheck=False):
+        """按 H6 节头判据组装残余异常清单。residual 是
+        _projection_residual_mismatches 的返回（None = 复检
+        没跑成，本身按冻结级记）。recheck=True 时
+        ledger_repair/projection 两步不在复检范围，报告里
+        的占位不作数、跳过对应判据。返回 (residuals,
+        freezing)：residuals 每条 {kind, detail, freezing}，
+        freezing = 有没有冻结级残余。"""
+        residuals = []
+        verify = (report or {}).get("verify")
+        if verify is None:
+            residuals.append({
+                "kind": "ledger_verify_failed",
+                "detail": "账本校验步骤没跑成（报告缺失）",
+                "freezing": True,
+            })
+        elif not verify.get("ok"):
+            residuals.append({
+                "kind": "ledger_verify_failed",
+                "detail": {
+                    "gaps": verify.get("gaps"),
+                    "truncated": verify.get("truncated"),
+                    "bad_lines": verify.get("bad_lines"),
+                },
+                "freezing": True,
+            })
+        if not recheck:
+            if (report or {}).get("ledger_repair") is None:
+                residuals.append({
+                    "kind": "ledger_repair_failed",
+                    "detail": "账本残行修复步骤没跑成（报告缺失）",
+                    "freezing": True,
+                })
+            if (report or {}).get("projection") is None:
+                residuals.append({
+                    "kind": "projection_repair_failed",
+                    "detail": "投影修复步骤没跑成（报告缺失）",
+                    "freezing": True,
+                })
+        if residual is None:
+            residuals.append({
+                "kind": "projection_residual_mismatch",
+                "detail": "投影修复后复检没跑成",
+                "freezing": True,
+            })
+        elif residual.get("mismatch_count"):
+            residuals.append({
+                "kind": "projection_residual_mismatch",
+                "detail": {
+                    "count": residual["mismatch_count"],
+                    "sample_ids": residual["sample_ids"],
+                },
+                "freezing": True,
+            })
+        extra = None
+        projection = (report or {}).get("projection")
+        if isinstance(projection, dict) and projection.get(
+            "extra_rows"
+        ) is not None:
+            extra = projection.get("extra_rows") or 0
+        elif residual is not None:
+            extra = residual.get("extra_rows") or 0
+        if extra:
+            residuals.append({
+                "kind": "projection_extra_rows",
+                "detail": {"count": extra},
+                "freezing": True,
+            })
+        pending = (report or {}).get("pending")
+        if pending:
+            if (report or {}).get("pending_rebuilt") is None:
+                residuals.append({
+                    "kind": "pending_questions_unrecovered",
+                    "detail": {
+                        "backup_path": pending.get("backup_path"),
+                        "reason": pending.get("reason"),
+                    },
+                    "freezing": True,
+                })
+            else:
+                residuals.append({
+                    "kind": "pending_questions_corrupt",
+                    "detail": {
+                        "backup_path": pending.get("backup_path"),
+                        "reason": pending.get("reason"),
+                    },
+                    "freezing": False,
+                })
+        if getattr(self, "_protection_evidence_pending", []):
+            residuals.append({
+                "kind": "protection_evidence_pending",
+                "detail": {
+                    "count": len(self._protection_evidence_pending),
+                },
+                "freezing": False,
+            })
+        other_issues = [
+            i for i in getattr(self, "_controlled_health_issues", [])
+            if i.get("kind") != self._RECOVERY_FREEZE_REASON
+        ]
+        if other_issues:
+            residuals.append({
+                "kind": "controlled_entry_health",
+                "detail": {
+                    "count": len(other_issues),
+                    "kinds": [i.get("kind") for i in other_issues],
+                },
+                "freezing": False,
+            })
+        freezing = any(r["freezing"] for r in residuals)
+        return residuals, freezing
+
+    def _finalize_recovery_health(self, report, source="startup_recovery"):
+        """恢复健康度收尾（H6）：复检投影残余 → 组装残余
+        → 冻结/解冻裁决 → 组装记录并落盘。返回健康记录
+        dict。本函数自己拦异常（落盘失败只记痕、不抛），
+        调用方（startup_recovery）外层再兜一层。"""
+        try:
+            residual = self._projection_residual_mismatches()
+        except Exception:
+            logger.warning(
+                "恢复健康度：投影残余复检失败。", exc_info=True
+            )
+            residual = None
+        residuals, freezing = self._recovery_residuals(
+            report, residual, recheck=(source == "recheck")
+        )
+        unfrozen = None
+        if freezing:
+            already = any(
+                i.get("kind") == self._RECOVERY_FREEZE_REASON
+                for i in self._controlled_health_issues
+            )
+            if not already:
+                self._controlled_note_health(
+                    self._RECOVERY_FREEZE_REASON,
+                    {
+                        "residual_kinds": [
+                            r["kind"] for r in residuals if r["freezing"]
+                        ],
+                        "source": source,
+                    },
+                )
+        elif (
+            self._controlled_frozen_reason
+            == self._RECOVERY_FREEZE_REASON
+        ):
+            # 解冻只解 recovery_unclean 这一来源（判据：本轮
+            # 无冻结级残余）；持久化故障类冻结不在这里动。
+            self._controlled_frozen_reason = None
+            unfrozen = {"previous_reason": self._RECOVERY_FREEZE_REASON}
+        frozen_now = bool(self._controlled_frozen_reason)
+        if frozen_now:
+            status = "frozen"
+        elif residuals:
+            status = "attention"
+        else:
+            status = "clean"
+        record = {
+            "version": 1,
+            "recorded_at": _now_iso(),
+            "source": source,
+            "status": status,
+            "clean": status == "clean",
+            "recovery": {
+                "verify": (report or {}).get("verify"),
+                "ledger_repair": (report or {}).get("ledger_repair"),
+                "projection": (report or {}).get("projection"),
+                "projection_residual_mismatches": (
+                    residual.get("mismatch_count")
+                    if residual else None
+                ),
+                "pending_corrupt": (report or {}).get("pending"),
+                "pending_rebuilt": (report or {}).get("pending_rebuilt"),
+            },
+            "residuals": residuals,
+            "controlled_entry": {
+                "frozen": frozen_now,
+                "frozen_reason": self._controlled_frozen_reason,
+                "health_issue_count": len(
+                    getattr(self, "_controlled_health_issues", [])
+                ),
+                "protection_evidence_pending_count": len(
+                    getattr(self, "_protection_evidence_pending", [])
+                ),
+            },
+        }
+        if unfrozen:
+            record["unfrozen"] = unfrozen
+        self._recovery_health_latest = record
+        self._recovery_health_own = True
+        self._persist_recovery_health(record)
+        return record
+
+    def _persist_recovery_health(self, record):
+        """健康记录落盘（H6）：recovery_health.json =
+        {version, updated_at, latest, history}，history 留
+        最近 10 份（最新在前）。临时文件＋replace 原子换
+        名，不留半截 JSON。落盘失败只记日志与 load_error
+        痕迹、不抛（不堵启动的既有口径）。"""
+        with self._recovery_health_lock:
+            try:
+                history = []
+                try:
+                    raw = self._recovery_health_path.read_text(
+                        encoding="utf-8"
+                    )
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and isinstance(
+                        data.get("history"), list
+                    ):
+                        history = [
+                            h for h in data["history"]
+                            if isinstance(h, dict)
+                        ]
+                except Exception:
+                    history = []
+                history = [record] + history
+                history = history[: self._RECOVERY_HEALTH_HISTORY_KEEP]
+                payload = {
+                    "version": 1,
+                    "updated_at": _now_iso(),
+                    "latest": record,
+                    "history": history,
+                }
+                tmp = self._recovery_health_path.parent / (
+                    self._recovery_health_path.name + ".tmp"
+                )
+                tmp.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, self._recovery_health_path)
+            except Exception as exc:
+                self._recovery_health_load_error = "%s: %s" % (
+                    type(exc).__name__, exc,
+                )
+                logger.warning(
+                    "恢复健康度落盘失败：%s", exc, exc_info=True
+                )
+
+    def _load_recovery_health(self):
+        """构造时读回上一份健康记录（H6，永不抛）：进程重
+        启后上一轮的恢复结论还在（recovery_health() 与
+        pending_notices 跨重启取数）。上一份若 status=
+        frozen 且冻结来源是 recovery_unclean，先承接冻结
+        ——等本进程的 startup_recovery 重新裁决（干净才
+        解，见 _finalize_recovery_health）；持久化故障类冻
+        结不靠这里承接，它们在 _load_controlled_entry_state
+        里按文件现状重新派生。"""
+        try:
+            raw = self._recovery_health_path.read_text(
+                encoding="utf-8"
+            )
+            data = json.loads(raw)
+            latest = (
+                data.get("latest") if isinstance(data, dict) else None
+            )
+            if isinstance(latest, dict):
+                self._recovery_health_latest = latest
+                entry = latest.get("controlled_entry") or {}
+                if (
+                    latest.get("status") == "frozen"
+                    and entry.get("frozen_reason")
+                    == self._RECOVERY_FREEZE_REASON
+                ):
+                    self._controlled_note_health(
+                        self._RECOVERY_FREEZE_REASON,
+                        {
+                            "carried_from": latest.get("recorded_at"),
+                            "residual_kinds": [
+                                r.get("kind")
+                                for r in latest.get("residuals") or []
+                                if r.get("freezing")
+                            ],
+                        },
+                    )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self._recovery_health_load_error = "%s: %s" % (
+                type(exc).__name__, exc,
+            )
+            logger.warning("读回恢复健康记录失败。", exc_info=True)
+
+    def recovery_health(self):
+        """最近一份恢复健康记录（H6）：本进程产出的优先，
+        没有就读落盘的上一份；从来没有过返回 None。深拷
+        贝，调用方改它污染不了登记原件。结论页/健康检查
+        从这一份取数（映射见 H6 节头）。"""
+        latest = getattr(self, "_recovery_health_latest", None)
+        if latest is None:
+            try:
+                raw = self._recovery_health_path.read_text(
+                    encoding="utf-8"
+                )
+                data = json.loads(raw)
+                if isinstance(data, dict) and isinstance(
+                    data.get("latest"), dict
+                ):
+                    latest = data["latest"]
+                    self._recovery_health_latest = latest
+            except Exception:
+                latest = None
+        return copy.deepcopy(latest) if latest is not None else None
+
+    def recovery_health_recheck(self):
+        """显式只读复检（H6）：不跑修复，只重验账本、复检
+        投影残余、看待问损坏痕迹。干净且当前冻的是
+        recovery_unclean 时解冻，并落一条 source=recheck
+        的健康记录；不干净、或冻的是持久化故障类来源时，
+        只落记录、不解冻（那种冻结照旧等对账/人工处置）。
+        待问一项复检不重判重建：痕迹在时按最近一份记录的
+        重建结果记账（没有记录可依就按未恢复记，宁严勿
+        松）。返回健康记录 dict。"""
+        report = {
+            "verify": None,
+            "ledger_repair": {"recheck": True, "repaired": False,
+                              "dropped": 0},
+            "projection": None,
+            "pending": None,
+            "pending_rebuilt": None,
+        }
+        try:
+            report["verify"] = _ledger.verify_ledger(self.ledger_path)
+        except Exception:
+            logger.warning("健康复检：账本校验失败。", exc_info=True)
+        try:
+            report["pending"] = self.pending_questions.recovery_report()
+        except Exception:
+            report["pending"] = None
+        if report["pending"]:
+            latest = getattr(self, "_recovery_health_latest", None)
+            if latest:
+                report["pending_rebuilt"] = (
+                    (latest.get("recovery") or {}).get("pending_rebuilt")
+                )
+        return self._finalize_recovery_health(
+            report, source="recheck"
+        )
 
     def import_from_mem0(self, mem0_store):
         """一次性迁移：把只活在 Chroma 里的旧记忆搬进来（2026-11-21 核实）。
@@ -7489,6 +7993,9 @@ class SQLiteStore:
         "receipts_save_failed",
         "intents_save_failed",
         "audit_write_failed",
+        # 立项 H6：启动恢复结论不干净（判据见 H6 节）同样冻结
+        # 危险写，与持久化故障共用同一面冻结旗、同一道闸口。
+        "recovery_unclean",
     })
 
     def _controlled_note_health(self, kind, detail):
@@ -9792,6 +10299,33 @@ class SQLiteStore:
                     "kind": "controlled_entry_frozen",
                     "reason": frozen,
                     "at": _now_iso(),
+                }
+            )
+        # 恢复健康度映射（立项 H6）：状态 frozen 必出（带
+        # 残余种类与冻结原因）；本进程还没产出自己的记录
+        # 时，上一进程落盘的未净记录也出——跨重启可见。
+        # attention 级残余各有上面的既有 kind 露头，这里不
+        # 重复汇总（映射全表见 H6 节头）。
+        health = getattr(self, "_recovery_health_latest", None)
+        if health and (
+            health.get("status") == "frozen"
+            or (
+                health.get("status") != "clean"
+                and not getattr(self, "_recovery_health_own", False)
+            )
+        ):
+            notices.append(
+                {
+                    "kind": "recovery_health",
+                    "status": health.get("status"),
+                    "residuals": [
+                        r.get("kind")
+                        for r in health.get("residuals") or []
+                    ],
+                    "frozen_reason": (
+                        health.get("controlled_entry") or {}
+                    ).get("frozen_reason"),
+                    "at": health.get("recorded_at"),
                 }
             )
         return notices
