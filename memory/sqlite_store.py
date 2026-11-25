@@ -608,6 +608,22 @@ class SQLiteStore:
         self.intake_marker = None
         self._intake_log_path = self.memory_dir / "intake_log.jsonl"
         self._intake_log_lock = threading.Lock()
+        # 统一受控入口（立项 H1，2026-11-25）：整理员侧状态变更的正门。
+        # 回执登记落盘（幂等键 → 回执），重启重放不重复执行；留痕走
+        # 独立 append-only 日志（先例：intake_log.jsonl），不进账本折叠。
+        self._controlled_log_path = self.memory_dir / "controlled_entry_log.jsonl"
+        self._controlled_log_lock = threading.Lock()
+        self._controlled_receipts_path = (
+            self.memory_dir / "controlled_entry_receipts.json"
+        )
+        # 生产执行开关：默认关。入口只接受影子/测试调用（走完全部门禁、
+        # 出回执、不落状态）；打开的前置是 H2 会话认证先界定可信来源
+        # 范围——在此之前任何生产接线把开关设 True 都属越界。
+        self.controlled_entry_execution_enabled = False
+        self._controlled_receipts = {}
+        self._controlled_receipts_load_error = None
+        self._controlled_trace_index = 0
+        self._load_controlled_entry_state()
         # 同轮裁决缓存 {(turn_id, 归一化原文): (verdict, info)}：
         # save_turn 逐句循环里带当场判标记合并裁决过的句子，下游
         # 内部直存（槽位路、收尾直存）复用同一裁决——不许二次屏
@@ -3489,7 +3505,7 @@ class SQLiteStore:
         别的选项一律不认，什么都不改。
         """
         question_id = question.get("id")
-        if question.get("auth_action") == "change_attempt":
+        if question.get("auth_action") in ("change_attempt", "controlled_entry_blocked"):
             if choice not in (question.get("options") or []):
                 return {"ok": False, "reason": "选项不对。"}
             self.pending_questions.answer(question_id, choice)
@@ -7308,6 +7324,391 @@ class SQLiteStore:
             "memory_id": memory_id,
             "deleted": True,
         }
+    # ---------- 统一受控入口（立项 H1，2026-11-25） ----------
+    #
+    # 整理员（及任何程序化调用方）的状态变更只许走这道正门：
+    # submit_controlled_proposal 接结构化提案，门内顺序固定——
+    # 形状校验 → 幂等查重 → 载行 → 验来源 → 验保护 → 验版本 →
+    # 执行开关 → 走既有 store 路径执行（_update_core_fields /
+    # set_protection_tier / set_core_drawer / sweep_decay 同款
+    # DORMANT 事件），不新开一套写库逻辑，全程留痕出回执。
+    # 删除永远不在动作集里：删除只走 delete_memory(approve=True)
+    # 的 BOOS 批准路，整理员永无删除权限（契约三）。
+    # 本轮只建门与门禁：生产执行开关默认关（见 __init__ 注释，
+    # H2 会话认证是打开开关的前置）；开关关时入口只出影子回执
+    # （门禁全走完、不落任何状态），不接贵妃侧、不启用自动执行。
+
+    CONTROLLED_ACTIONS = (
+        "demote",
+        "set_protection_tier",
+        "set_core_drawer",
+        "mark_dormant",
+    )
+
+    def _load_controlled_entry_state(self):
+        """载入受控入口的回执登记与留痕序号（构造时调，永不抛）。
+
+        回执登记文件损坏时按待问文件先例：原文件改名保全、
+        load_error 记在实例上、从空登记开始——不许静默吞掉。
+        """
+        try:
+            raw = self._controlled_receipts_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            receipts = data.get("receipts") if isinstance(data, dict) else None
+            if not isinstance(receipts, dict):
+                raise ValueError("receipts is not a dict")
+            self._controlled_receipts = {
+                str(k): v for k, v in receipts.items() if isinstance(v, dict)
+            }
+        except FileNotFoundError:
+            self._controlled_receipts = {}
+        except Exception as exc:
+            self._controlled_receipts = {}
+            self._controlled_receipts_load_error = "%s: %s" % (
+                type(exc).__name__, exc,
+            )
+            try:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                os.replace(
+                    self._controlled_receipts_path,
+                    str(self._controlled_receipts_path) + ".corrupt-" + stamp,
+                )
+            except Exception:
+                logger.warning("受控入口回执登记保全失败", exc_info=True)
+        try:
+            with open(self._controlled_log_path, "r", encoding="utf-8") as fh:
+                self._controlled_trace_index = sum(1 for _ in fh)
+        except FileNotFoundError:
+            self._controlled_trace_index = 0
+        except Exception:
+            logger.warning("受控入口留痕计数失败", exc_info=True)
+            self._controlled_trace_index = 0
+
+    def _controlled_save_receipts(self):
+        payload = {"version": 1, "receipts": self._controlled_receipts}
+        tmp = self._controlled_receipts_path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        os.replace(tmp, self._controlled_receipts_path)
+
+    def _controlled_trace(self, entry):
+        """往受控入口留痕日志追加一行，返回该行序号。
+
+        留痕通道独立于账本：提案被拒/影子这类没有状态变更的
+        事件不许污染账本折叠；真正执行的状态变更由既有路径
+        自己写账本事件，两边凭幂等键与 memory_id 对照可查。
+        """
+        with self._controlled_log_lock:
+            index = self._controlled_trace_index
+            record = {"index": index, "ts": _now_iso()}
+            record.update(entry)
+            with open(self._controlled_log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            self._controlled_trace_index = index + 1
+            return index
+
+    @staticmethod
+    def _controlled_version_stamp(text, meta):
+        """目标行版本戳：正文＋完整 metadata 的哈希（提案绑版本用）。"""
+        payload = (text or "") + "\x00" + json.dumps(
+            meta or {}, sort_keys=True, ensure_ascii=False
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def controlled_entry_version(self, memory_id):
+        """目标行当前版本戳（提案绑版本用）；行不存在返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._controlled_version_stamp(
+                row[0] or "", json.loads(row[1] or "{}")
+            )
+
+    def controlled_entry_receipt(self, idempotency_key):
+        """按幂等键查已登记回执；没有返回 None。"""
+        receipt = self._controlled_receipts.get(idempotency_key)
+        return dict(receipt) if receipt is not None else None
+
+    def _queue_controlled_entry_question(self, action, memory_id,
+                                         instruction_source, block_reason):
+        """受控入口拦下的提案攒一条知情待问（先例：change_attempt）。
+
+        只知情、不执行：BOOS 答「知道了」只是确认知晓，永远不
+        因此放行被拦的提案。问题本体 memory_id=None（先例同），
+        目标 id、动作与拦截原因记在 extra 里备查。
+        """
+        action_cn = {
+            "demote": "降级",
+            "set_protection_tier": "改保护档",
+            "set_core_drawer": "改核心抽屉",
+            "mark_dormant": "标记休眠",
+        }.get(action, action)
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "受控入口拦下一条%s提案（来源：%s，目标记忆 id：%s，"
+            "拦截原因：%s），已拒绝、未执行。"
+            % (action_cn, instruction_source, memory_id, block_reason),
+            _pq.CHANGE_ATTEMPT_QUESTION_OPTIONS,
+            "受控入口门禁：改记忆类动作只认 BOOS 本人指令，"
+            "核心保护行与钉死区不许自动变更（立项 H1）",
+            memory_id=None,
+            extra={
+                "auth_action": "controlled_entry_blocked",
+                "target_memory_id": memory_id,
+                "attempted_action": action,
+                "block_reason": block_reason,
+            },
+        )
+
+    def submit_controlled_proposal(self, proposal):
+        """统一受控入口：提交一条结构化状态变更提案，返回统一回执。
+
+        提案形状（dict）：
+          action             demote / set_protection_tier /
+                             set_core_drawer / mark_dormant
+          memory_id          目标记忆 id
+          reason             一句理由（只留痕，不参与判定）
+          instruction_source 指令来源（口径同 auth_guard：
+                             None / "owner" 才算 BOOS 本人指令）
+          idempotency_key    幂等键（必填；同键重复提交不重复
+                             执行，回执副本标 duplicate）
+          params             动作参数：set_protection_tier 用
+                             {"tier": "pinned"/"temp_pinned"/None}，
+                             set_core_drawer 用 {"drawer": 五类键/None}
+          expected_version   可选，提案时目标行的版本戳（见
+                             controlled_entry_version）；执行前
+                             复检，对不上提案即作废（version_stale）
+
+        回执形状（键恒定）：
+          {ok, status, reason, action, memory_id, idempotency_key,
+           duplicate, question_id, trace_index, version_before,
+           version_after, detail, ts}
+          status ∈ executed / refused / shadow / duplicate。
+        降级只改核心成员状态（user_confirmed 落 False）：不删原文、
+        不清保护标记；删除不在动作集里，永远走 BOOS 批准路。
+        """
+        if not isinstance(proposal, dict):
+            proposal = {}
+        action = proposal.get("action")
+        memory_id = proposal.get("memory_id")
+        idem_key = proposal.get("idempotency_key")
+        source = proposal.get("instruction_source")
+        params = proposal.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        expected_version = proposal.get("expected_version")
+        receipt = {
+            "ok": False,
+            "status": "refused",
+            "reason": "",
+            "action": action,
+            "memory_id": memory_id,
+            "idempotency_key": idem_key,
+            "duplicate": False,
+            "question_id": None,
+            "trace_index": None,
+            "version_before": None,
+            "version_after": None,
+            "detail": {},
+            "ts": _now_iso(),
+        }
+
+        def _trace(event, reason):
+            return self._controlled_trace({
+                "event": event,
+                "action": action,
+                "memory_id": memory_id,
+                "idempotency_key": idem_key,
+                "instruction_source": source,
+                "reason": reason,
+                "proposal_reason": proposal.get("reason") or "",
+            })
+
+        def _finish(status, reason, detail=None, question_id=None,
+                    register=True):
+            receipt["status"] = status
+            receipt["reason"] = reason
+            receipt["ok"] = status == "executed"
+            if detail:
+                receipt["detail"] = detail
+            if question_id:
+                receipt["question_id"] = question_id
+            receipt["trace_index"] = _trace(status, reason)
+            if register and idem_key:
+                self._controlled_receipts[idem_key] = dict(receipt)
+                try:
+                    self._controlled_save_receipts()
+                except Exception:
+                    logger.warning("受控入口回执登记落盘失败", exc_info=True)
+            return dict(receipt)
+
+        with self._lock:
+            # 形状校验：未知动作（含 delete）一律拒——删除不走这道门。
+            if action not in self.CONTROLLED_ACTIONS:
+                return _finish("refused", "unknown_action", register=False)
+            if not idem_key:
+                return _finish(
+                    "refused", "missing_idempotency_key", register=False
+                )
+            if not memory_id:
+                return _finish("refused", "missing_target")
+            # 幂等查重：同键已处理过，回原回执副本，不重复执行。
+            prev = self._controlled_receipts.get(idem_key)
+            if prev is not None:
+                dup = dict(prev)
+                dup["duplicate"] = True
+                dup["status"] = "duplicate"
+                dup["trace_index"] = _trace(
+                    "duplicate", prev.get("reason") or ""
+                )
+                return dup
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return _finish("refused", "not_found")
+            if row[2] or row[3] or row[4]:
+                return _finish("refused", "not_live")
+            text = row[0] or ""
+            meta = json.loads(row[1] or "{}")
+            receipt["version_before"] = self._controlled_version_stamp(
+                text, meta
+            )
+            # 验来源（授权硬判，实测问题一）：改记忆类动作只认
+            # BOOS 本人指令；非本人来源拒绝＋攒知情待问
+            # （先例：delete_memory 的 not_owner_instruction）。
+            if not _auth_guard.is_owner_instruction(source):
+                question = self._queue_controlled_entry_question(
+                    action, memory_id, source, "not_owner_instruction"
+                )
+                return _finish(
+                    "refused", "not_owner_instruction",
+                    question_id=(question or {}).get("id"),
+                )
+            # 验保护：核心保护行全动作拒绝；钉死/临时钉死行不许
+            # 被降级或标记休眠（降级不清保护标记，契约三）。
+            tier = _core_cap.normalize_protection_tier(meta)
+            if self._is_core_protected_row(meta) or (
+                action in ("demote", "mark_dormant") and tier is not None
+            ):
+                question = self._queue_controlled_entry_question(
+                    action, memory_id, source, "core_protected"
+                )
+                return _finish(
+                    "refused", "core_protected",
+                    detail={"protection_tier": tier},
+                    question_id=(question or {}).get("id"),
+                )
+            # 验版本：提案绑的版本与当前行对不上，提案作废重判，
+            # 不许拿旧批准改新内容（契约三）。
+            if (
+                expected_version is not None
+                and expected_version != receipt["version_before"]
+            ):
+                return _finish("refused", "version_stale")
+            # 执行开关：H1 默认关——门禁全走完，只出影子回执，
+            # 不落任何状态。打开前置是 H2 会话认证（见 __init__）。
+            if not self.controlled_entry_execution_enabled:
+                return _finish("shadow", "execution_disabled")
+            # 执行：只走既有 store 路径，不新开一套写库逻辑。
+            detail = {}
+            if action == "demote":
+                if not _core_cap.is_core_member(meta):
+                    return _finish("refused", "not_core_member")
+                result = self._update_core_fields(
+                    memory_id, {"user_confirmed": False}
+                )
+                if not result.get("ok"):
+                    return _finish(
+                        "refused",
+                        result.get("reason") or "execute_failed",
+                        detail=result,
+                    )
+                self._conn.execute(
+                    "UPDATE memories SET user_confirmed=0 WHERE id=?",
+                    (memory_id,),
+                )
+                self._conn.commit()
+                detail = result
+            elif action == "set_protection_tier":
+                new_tier = params.get("tier")
+                if new_tier not in ("pinned", "temp_pinned", None):
+                    return _finish("refused", "bad_params")
+                result = self.set_protection_tier(memory_id, new_tier)
+                if not result.get("ok"):
+                    return _finish(
+                        "refused",
+                        result.get("reason") or "execute_failed",
+                        detail=result,
+                    )
+                detail = result
+            elif action == "set_core_drawer":
+                new_drawer = params.get("drawer")
+                if (
+                    new_drawer is not None
+                    and new_drawer not in _core_cap.CORE_DRAWERS
+                ):
+                    return _finish("refused", "bad_params")
+                result = self.set_core_drawer(memory_id, new_drawer)
+                if not result.get("ok"):
+                    return _finish(
+                        "refused",
+                        result.get("reason") or "execute_failed",
+                        detail=result,
+                    )
+                detail = result
+            elif action == "mark_dormant":
+                if meta.get("decay_state") == _decay.DECAY_STATE_DORMANT:
+                    return _finish("refused", "already_dormant")
+                try:
+                    _ledger.append_event(
+                        self.ledger_path,
+                        {
+                            "type": _ledger.LEDGER_EVENT_DORMANT,
+                            "memory_id": memory_id,
+                            "key": memory_id,
+                            "text": text,
+                        },
+                        lock=self._ledger_lock,
+                    )
+                except Exception:
+                    logger.warning(
+                        "受控入口标记休眠写账本失败", exc_info=True
+                    )
+                    return _finish("refused", "ledger_failed")
+                new_meta = dict(meta)
+                new_meta["decay_state"] = _decay.DECAY_STATE_DORMANT
+                self._conn.execute(
+                    "UPDATE memories SET metadata_json=? WHERE id=?",
+                    (json.dumps(new_meta, ensure_ascii=False), memory_id),
+                )
+                self._conn.commit()
+                detail = {"decay_state": _decay.DECAY_STATE_DORMANT}
+            # 执行后结构不变量自检（契约三）：座位账须自洽，
+            # 结果记进回执 detail，失败不回滚已执行变更（留痕在）。
+            snap = self.core_seat_snapshot()
+            detail["invariants_ok"] = bool(snap.get("reconciled"))
+            row_after = self._conn.execute(
+                "SELECT text, metadata_json FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row_after is not None:
+                receipt["version_after"] = self._controlled_version_stamp(
+                    row_after[0] or "",
+                    json.loads(row_after[1] or "{}"),
+                )
+            return _finish("executed", "", detail=detail)
+
+
     def void_joke_memory(self, memory_id):
         """作废一条玩笑记忆：先记账本 delete（标记 voided），再标 SQLite voided=1。
 
