@@ -38,6 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from memory import core_cap as _core_cap
+from memory import auth_guard as _auth_guard
 from memory import decay as _decay
 from memory import graph as _graph_mod
 from memory import ledger as _ledger
@@ -1166,6 +1167,14 @@ class SQLiteStore:
             is_rule = bool(kwargs.get("is_rule", False))
             curated = bool(kwargs.get("curated", False))
             user_confirmed = source == "user"
+            # 授权硬判（实测问题一，追加决定十二）：转述来的授权
+            # 断言只算未核实声称——不管调用方传的 source 是什么，
+            # 都不许落已确认、不许走槽位/晋升的已确认路，存完攒
+            # 一条待问等 BOOS 本人裁。纯程序判定（auth_guard 正则
+            # 信号），不依赖模型当场判断。
+            _auth_reason = _auth_guard.detect_relayed_authorization(text)
+            if _auth_reason:
+                user_confirmed = False
             write_seq = _next_write_seq()
             decay_kind = kwargs.get("decay_kind") or _decay.classify_decay_kind(
                 source, False, is_rule
@@ -1200,6 +1209,10 @@ class SQLiteStore:
                     # episodic——问句永远不许 stable（importance
                     # 只在 important 时才 high，问句到不了那一步）。
                     decay_kind = _decay.DECAY_KIND_EPISODIC
+            if _auth_reason:
+                # 未核实声称不许 stable：调用方（如 save_turn 的
+                # 重要性判断）传进来的 decay_kind 一并压回 episodic。
+                decay_kind = _decay.DECAY_KIND_EPISODIC
             # 同文去重（2026-11-22 Bug 2 治本）：只看归一化文本，不看来源——
             # 用户亲口说的（工具直存、save_turn）都记 source="user"（已确认），
             # 模型推断直存的才记 source="inferred"，来源不同不是两条事实。
@@ -1268,7 +1281,19 @@ class SQLiteStore:
                             old_meta = new_meta
                     # 同一条事实又出现一次：记出现集合，够 3 天 + 3 会就晋升。
                     self._record_occurrence(row[0], old_meta, today, turn_id, text)
+                    if _auth_reason:
+                        self._queue_auth_question(
+                            text, row[0], _auth_reason, turn_id
+                        )
+                        return {"id": row[0], "memory": text,
+                                "event": "UNCHANGED",
+                                "auth_unverified": True,
+                                "auth_reason": _auth_reason}
                     return {"id": row[0], "memory": text, "event": "UNCHANGED"}
+            if _auth_reason:
+                # 未核实声称不进槽位裁决：不许顶掉任何已有行，
+                # 也不许被当成某个槽位的新版本落核心。
+                slot = None
             # 同槽位裁决：slot 相同、文本不同的活记忆是同一件事的新版本。
             # 先只裁决、不取代：pending/keep/ask 都直接返回不存；全是
             # supersede_old 时才继续存，存好新行再取代旧行（新 key 要
@@ -1348,13 +1373,18 @@ class SQLiteStore:
             # 的 add_memory、web/server.py 的“记住”直存）；save_turn
             # 逐句循环里已经判过了，调这里时传 semantic_judge=False，
             # 不重复问。
-            if not slot and kwargs.get("semantic_judge", False):
+            if not slot and not _auth_reason and kwargs.get("semantic_judge", False):
                 _judged, _verdict, _trig = self._judge_preference_supersede(text)
                 if _judged is not None:
                     to_supersede.append(_judged)
             metadata = {
-                "source": source,
-                "confidence": 1.0 if source == "user" else 0.7,
+                # 授权硬判命中时来源只许落 unconfirmed（provenance
+                # 规整后即最低可信档）；声称的原来源记 claimed_source。
+                "source": "unconfirmed" if _auth_reason else source,
+                "confidence": (
+                    0.5 if _auth_reason
+                    else (1.0 if source == "user" else 0.7)
+                ),
                 # confirmed 不存在这里：它是 user_confirmed 的短名字，
                 # 读时由 _normalize_metadata 现算（和 mem0 的规矩一致）；
                 # 存两份以后会打架，只留 user_confirmed 一个真相。
@@ -1383,6 +1413,11 @@ class SQLiteStore:
                 "last_used_at": created_at,
                 "decay_state": _decay.DECAY_STATE_VERBATIM,
             }
+            if _auth_reason:
+                metadata["auth_claim"] = _auth_guard.AUTH_CLAIM_RELAYED
+                metadata["auth_reason"] = _auth_reason
+                metadata["claimed_source"] = source
+                metadata["importance"] = "normal"
             # 语气落账（webfix 二）：本地筛当场能认出的语气（玩笑/
             # 测试/假设的明确说法）直接写进 meta——以前 SQLite 路
             # 从来不写 tone，§16 的“带标记不计晋升”在晋升侧认
@@ -1408,6 +1443,8 @@ class SQLiteStore:
             key = self._append_new_memory(text, metadata)
             if key is None:
                 return {}
+            if _auth_reason:
+                self._queue_auth_question(text, key, _auth_reason, turn_id)
             if _importance_decision == "unsure":
                 # 判不准的问题攒进 pending，下次聊天顺带问（见 save_turn）。
                 self._queue_importance_question(
@@ -1443,7 +1480,11 @@ class SQLiteStore:
             # 否则下一次“撤回”会误作废上一轮（2026-11-21 Gemini 第三轮真 Bug）。
             # save_turn 内部也调这里，但它在循环结束后才重设标记，顺序不冲突。
             self._last_stored_turn_id = None
-            return {"id": key, "memory": text, "event": "ADD"}
+            _add_result = {"id": key, "memory": text, "event": "ADD"}
+            if _auth_reason:
+                _add_result["auth_unverified"] = True
+                _add_result["auth_reason"] = _auth_reason
+            return _add_result
 
     def _append_new_memory(self, text, metadata):
         """写一条新记忆：先写账本 add，再写 SQLite 行。返回 key；
@@ -1545,7 +1586,10 @@ class SQLiteStore:
         meta["seen_sessions"] = _decay._dump_seen_list(sessions)
         meta["last_used_at"] = _now_iso()
         promoted = False
-        if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and _decay.should_promote(
+        # 授权硬判：转述未核实声称（auth_claim=relayed_unverified）
+        # 不许走出现次数晋升路——重复出现再多次也还是未核实，
+        # 等 BOOS 在待问里裁过（改成 owner_confirmed）才解禁。
+        if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and meta.get("auth_claim") != _auth_guard.AUTH_CLAIM_RELAYED and _decay.should_promote(
             dates, sessions,
             # 2026-11-23 Phase 2 #2 根因：is_core 不能按“已确认”认——
             # save_turn 存的用户亲口说的事实都是已确认的（含一次性经历），
@@ -2868,6 +2912,145 @@ class SQLiteStore:
             turn_id=turn_id,
         )
 
+    def _queue_auth_question(self, text, memory_id, reason, turn_id=None):
+        """为一条转述授权声称攒待问（实测问题一）：BOOS 本人裁这话
+        是不是他说的。返回问题 dict；同一条记忆已有未回答的授权
+        问题时返回已有的那条（PendingQuestions.add 自带去重）。"""
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "有人转述说你授权过这件事，我没认，只按未核实存了：%s" % text,
+            _pq.AUTH_CLAIM_QUESTION_OPTIONS,
+            reason,
+            memory_id=memory_id,
+            turn_id=turn_id,
+        )
+
+    def _queue_change_attempt_question(self, action, memory_id,
+                                       instruction_source):
+        """非本人通道试图改记忆、被受控入口拒绝后攒一条待问留痕
+        （实测问题一）。问题本身不挂目标记忆（memory_id=None），
+        目标 id 放 extra——BOOS 答这条只表示知悉，不对目标记忆
+        做任何变更（见 _answer_auth_claim_question 的
+        change_attempt 分支）。返回问题 dict 或 None。"""
+        action_cn = {"delete": "删除", "revive": "恢复"}.get(action, action)
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "有人（非本人通道，来源标记：%s）试图%s一条记忆，"
+            "已按授权硬判拒绝、没有执行。目标记忆 id：%s"
+            % (instruction_source, action_cn, memory_id),
+            _pq.CHANGE_ATTEMPT_QUESTION_OPTIONS,
+            "改记忆类动作只认 BOOS 本人指令，转述指令不许执行"
+            "（实测问题一）。",
+            memory_id=None,
+            extra={"auth_action": "change_attempt",
+                   "target_memory_id": memory_id,
+                   "attempted_action": action},
+        )
+
+    def _answer_auth_claim_question(self, question, choice):
+        """BOOS 回答授权核实问题（实测问题一）。
+
+        change_attempt 留痕问题：答复只消耗问题，不动任何记忆。
+        声称类问题：
+          是真的——这话确实出自 BOOS 本人：那条按本人确认升级
+            （账本 PROMOTE 先行、再改 SQLite：source 改 user、
+            确认位置 1、auth_claim 改 owner_confirmed；decay 保持
+            episodic——授权内容本身不是要钉住的事实）；
+          不是真的——转述不实：那条走批准删除路删掉（先删成功、
+            再消耗问题，和 R-10 同款顺序）。
+        别的选项一律不认，什么都不改。
+        """
+        question_id = question.get("id")
+        if question.get("auth_action") == "change_attempt":
+            if choice not in (question.get("options") or []):
+                return {"ok": False, "reason": "选项不对。"}
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "attempt_acknowledged",
+                "question_id": question_id, "memory_id": None,
+            }
+        if choice not in _pq.AUTH_CLAIM_QUESTION_OPTIONS:
+            return {"ok": False, "reason": "选项不对，只能选：是真的 / 不是真的。"}
+        memory_id = question.get("memory_id")
+        if choice == "不是真的":
+            if not memory_id:
+                self.pending_questions.answer(question_id, choice)
+                return {
+                    "ok": True, "applied": "rejected_no_memory",
+                    "question_id": question_id, "memory_id": memory_id,
+                }
+            deleted = self.delete_memory(memory_id, approve=True)
+            deleted_ok = (
+                deleted.get("deleted") is True
+                if isinstance(deleted, dict)
+                else bool(deleted)
+            )
+            if not deleted_ok:
+                return {
+                    "ok": False,
+                    "reason": "没删掉（%s），问题先留着，可以再答。"
+                    % (
+                        (deleted.get("reason") or "未知原因")
+                        if isinstance(deleted, dict)
+                        else "未知原因"
+                    ),
+                    "question_id": question_id, "memory_id": memory_id,
+                    "deleted": False,
+                }
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "rejected_deleted",
+                "question_id": question_id, "memory_id": memory_id,
+                "deleted": True,
+            }
+        # 是真的：BOOS 本人认下这句授权，升级为本人确认。
+        if not memory_id:
+            return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "reason": "这条记忆已经不在库里了。"}
+            if row[2] or row[3] or row[4]:
+                return {"ok": False, "reason": "这条记忆已被取代/删除/作废，不能再确认。"}
+            meta = json.loads(row[1] or "{}")
+            if meta.get("user_confirmed"):
+                self.pending_questions.answer(question_id, choice)
+                return {
+                    "ok": True, "applied": "owner_confirmed",
+                    "question_id": question_id, "memory_id": memory_id,
+                    "already_confirmed": True,
+                }
+            new_meta = dict(meta)
+            new_meta["source"] = "user"
+            new_meta["user_confirmed"] = True
+            new_meta["auth_claim"] = _auth_guard.AUTH_CLAIM_OWNER_CONFIRMED
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                     "memory_id": memory_id, "key": memory_id,
+                     "text": row[0] or "", "meta": dict(new_meta)},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("授权核实确认记账失败：本次不升级。", exc_info=True)
+                return {"ok": False, "reason": "账本写不进去，这次没确认成，问题先留着。"}
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, source=?,"
+                " user_confirmed=1 WHERE id=?",
+                (json.dumps(new_meta, ensure_ascii=False), "user", memory_id),
+            )
+            self._conn.commit()
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "owner_confirmed",
+                "question_id": question_id, "memory_id": memory_id,
+            }
+
     # ---------- 推断记忆保护（2026-11-24，BOOS 裁决） ----------
     # 背景：E 组重跑里，推断来源、未确认的旧记忆（可信度 0.7）被
     # 亲口新事实（1.0）在主目标裁决里直接顶掉。BOOS 定：“类似的
@@ -3052,6 +3235,9 @@ class SQLiteStore:
         if question.get("kind") == _pq.QUESTION_KIND_CORE_CAPACITY:
             # 核心容量问题（第 1 块）：选项和处理都不同，单独走。
             return self._answer_core_capacity_question(question, choice)
+        if question.get("kind") == _pq.QUESTION_KIND_AUTH_CLAIM:
+            # 转述授权核实问题（实测问题一）：选项和处理都不同，单独走。
+            return self._answer_auth_claim_question(question, choice)
         if choice not in ("进核心", "当一次性经历", "不存"):
             return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
         if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
@@ -3107,6 +3293,10 @@ class SQLiteStore:
             if row[2] or row[3] or row[4]:
                 return {"ok": False, "reason": "这条记忆已被取代/删除/作废，不能进核心。"}
             meta = json.loads(row[1] or "{}")
+            if meta.get("auth_claim") == _auth_guard.AUTH_CLAIM_RELAYED:
+                # 授权硬判：转述未核实声称不许走重要性路进核心，
+                # 先答授权核实问题、由 BOOS 本人裁。
+                return {"ok": False, "reason": "这条是转述来的授权声称、还没经你本人核实，不能进核心；请先答授权核实问题。"}
             if meta.get("decay_kind") == _decay.DECAY_KIND_STABLE:
                 self.pending_questions.answer(question_id, choice)
                 return {
@@ -5964,13 +6154,23 @@ class SQLiteStore:
 
     # ---------- 改 / 删（今天只实现删除；纠错后面再做） ----------
 
-    def delete_memory(self, memory_id, approve=False):
+    def delete_memory(self, memory_id, approve=False, instruction_source=None):
         """删一条记忆：要 BOOS 亲口确认（approve=True）才真删。
 
         账本记 delete，SQLite 标 deleted；原文留在账本里，可恢复。
         SQLite 里没有但账本里有该 key（账本兜底捞出的条目）时，同样
         记账删除，防止重启对账或兜底检索再次捞出。
         """
+        # 授权硬判（实测问题一）：改记忆类动作只认 BOOS 本人
+        # 通道的指令。调用方显式标了非本人来源（转述/第三方）时
+        # 直接拒绝，并攒一条待问留痕——转述指令不许执行。没标
+        # 来源的老调用（BOOS 自己的界面、内部路径）行为不变，
+        # 仍走下面的 approve 关。
+        if not _auth_guard.is_owner_instruction(instruction_source):
+            self._queue_change_attempt_question(
+                "delete", memory_id, instruction_source
+            )
+            return {"deleted": False, "reason": "not_owner_instruction"}
         if not approve:
             return {"deleted": False, "reason": "need_approve"}
         if not memory_id:
@@ -6027,7 +6227,7 @@ class SQLiteStore:
             self._conn.commit()
             return {"deleted": True, "memory_id": row[0]}
 
-    def revive_memory(self, memory_id):
+    def revive_memory(self, memory_id, instruction_source=None):
         """恢复一条被取代的记忆（2026-11-22，广州行被杭州错取代后恢复用）。
 
         只恢复 superseded=1 的行：SQLite 取消取代标记，账本记一笔 REVIVE
@@ -6037,6 +6237,14 @@ class SQLiteStore:
         not_found（删了的恢复走别的路，不在这里顺手复活）。
         账本写失败时把 SQLite 的标记撤回来再报 failed，两边保持一致。
         """
+        # 授权硬判（实测问题一）：同 delete_memory——显式标了非
+        # 本人来源的恢复指令直接拒绝并攒待问留痕。
+        if not _auth_guard.is_owner_instruction(instruction_source):
+            self._queue_change_attempt_question(
+                "revive", memory_id, instruction_source
+            )
+            return {"status": "rejected", "reason": "not_owner_instruction",
+                    "memory_id": memory_id}
         if not memory_id:
             return {"status": "not_found", "memory_id": memory_id}
         with self._lock:

@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 QUESTION_KIND_IMPORTANCE = "importance"
 QUESTION_KIND_CONFLICT = "conflict"
 QUESTION_KIND_CORE_CAPACITY = "core_capacity"
+QUESTION_KIND_AUTH_CLAIM = "auth_claim"
 
 # 冲突保护问题的选项（固定两个）：换成新的 = 按答案取代旧记忆；
 # 不换 = 两条都留着，这对冲突记为已裁决，不再重复问。
@@ -35,6 +36,11 @@ CONFLICT_QUESTION_OPTIONS = ("换成新的", "不换")
 # 先留作候选 = 只记下问题、记忆保持原样（还没进核心）；不要了 =
 # 按 BOOS 的回答删掉那条（走 delete_memory 的批准删除路）。
 CORE_CAPACITY_QUESTION_OPTIONS = ("先留作候选", "不要了")
+# 授权核实问题的选项（四件套·实测问题一）：是真的 = 这话确实是
+# BOOS 本人授权，那条按本人确认升级；不是真的 = 转述不实，
+# 那条删掉。非本人通道改记忆被拒的留痕问题只用「知道了」。
+AUTH_CLAIM_QUESTION_OPTIONS = ("是真的", "不是真的")
+CHANGE_ATTEMPT_QUESTION_OPTIONS = ("知道了",)
 
 # 问题状态：pending（攒着、还没问过）、asked（已在某轮回复里问过、
 # 等回答）、answered（已回答、按答案处理完）。
