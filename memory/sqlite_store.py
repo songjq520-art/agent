@@ -8214,6 +8214,52 @@ class SQLiteStore:
             self._controlled_reconcile_intents()
         except Exception:
             logger.warning("受控入口启动对账失败", exc_info=True)
+        # 跨重启承接冻结（补修三轮，贵妃第二十二份复查 A）：
+        # 已决意图里带着冻结级最终原因的，冻结事实不许随进
+        # 程重启蒸发——在新进程里按 final_reason 重建同一面
+        # 冻结旗。解冻沿用现有口径：干净恢复/复检只解
+        # recovery_unclean 来源，本来源不被顺手解掉（与同进
+        # 程语义一致：不变量失败类冻结在进程内本来也不自动
+        # 解，重启更不许成为意外的解冻键）。
+        try:
+            self._controlled_carry_intent_freezes()
+        except Exception:
+            logger.warning("受控入口冻结承接失败", exc_info=True)
+
+    # 哪些已决意图的最终原因要在重启后重建冻结（与
+    # _CONTROLLED_FREEZE_KINDS 里执行结论类的三种对齐）。
+    _CONTROLLED_CARRY_FREEZE_REASONS = frozenset({
+        "invariant_failed",
+        "commit_unverified",
+        "reconcile_undetermined",
+    })
+
+    def _controlled_carry_intent_freezes(self):
+        """按已落盘意图的 final_reason 重建受控入口冻结旗
+        （补修三轮，复查 A）：进程 1 里执行结论为不变量失
+        败/提交待核实的笔，意图已落盘；进程 2 构造时在这里
+        把同一原因的冻结重新置上，健康痕迹如实记
+        carried_from_intent——失败回执保留之外，冻结本身
+        也必须保留。pending 意图不归这里（对账管），没有
+        final_reason 的老意图不推定、不承接。"""
+        for intent in self._controlled_intents.values():
+            if intent.get("status") not in (
+                "committed", "committed_unverified",
+            ):
+                # 只承接已决执行（提交点已落账/待核实）；
+                # pending 归对账、aborted 是没执行成，都不
+                # 许凭一个 final_reason 字段冻结。
+                continue
+            reason = intent.get("final_reason")
+            if reason in self._CONTROLLED_CARRY_FREEZE_REASONS:
+                self._controlled_note_health(
+                    reason,
+                    {
+                        "carried_from_intent": intent.get("op_id"),
+                        "action": intent.get("action"),
+                        "memory_id": intent.get("memory_id"),
+                    },
+                )
 
     @staticmethod
     def _controlled_write_json(path, payload):
@@ -8331,23 +8377,50 @@ class SQLiteStore:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _controlled_ledger_op(self, op_id):
-        """在账本里按 op_id 找这笔受控入口执行落的事件；没有
-        返回 None。读账本失败同样返回 None，但在
-        _controlled_op_read_failed 上标 True 与「确定没落账」
-        区分开——调用方必须按未定案处置，不许当成没落账
-        （贵妃第十八份复查 D）。"""
+    # 按 op 查账的三态结论（补修三轮，贵妃第二十二份复查
+    # D/E 收口）：找到 / 确定没落账 / 无法确定。读账本抛异
+    # 常、或账本有坏行/被截断（解析出的事件集合不完整）时，
+    # 「没找到」不许当成「确定没落账」——submit/revoke/
+    # reconcile 三条兄弟路径共用同一套三态，不许再各自加一
+    # 个只在部分调用者消费的旗。
+    _LEDGER_OP_FOUND = "found"
+    _LEDGER_OP_ABSENT = "absent"
+    _LEDGER_OP_UNDETERMINED = "undetermined"
+
+    def _controlled_ledger_op_state(self, op_id):
+        """按 op_id 查账本，三态返回 (state, event)：
+        found → (found, 事件)；absent → (absent, None)（账本
+        完整且确无此 op）；undetermined → (undetermined,
+        None)（读失败或账本存疑，生死定不了）。同步维护
+        _controlled_op_read_failed：undetermined 时为 True
+        （含坏行/截断存疑，不只是抛异常）。"""
         try:
             events, _info = _ledger.read_events(self.ledger_path)
         except Exception:
             logger.warning("受控入口按 op_id 查账本失败", exc_info=True)
             self._controlled_op_read_failed = True
-            return None
-        self._controlled_op_read_failed = False
+            return (self._LEDGER_OP_UNDETERMINED, None)
+        doubtful = bool(
+            (_info or {}).get("bad_lines")
+            or (_info or {}).get("truncated")
+        )
         for event in events:
             if event.get("op_id") == op_id:
-                return event
-        return None
+                self._controlled_op_read_failed = False
+                return (self._LEDGER_OP_FOUND, event)
+        if doubtful:
+            self._controlled_op_read_failed = True
+            return (self._LEDGER_OP_UNDETERMINED, None)
+        self._controlled_op_read_failed = False
+        return (self._LEDGER_OP_ABSENT, None)
+
+    def _controlled_ledger_op(self, op_id):
+        """兼容旧签名：返回事件或 None。None 可能是 absent
+        也可能是 undetermined——必须区分生死时用
+        _controlled_ledger_op_state；本方法同步维护
+        _controlled_op_read_failed（undetermined 时 True）。"""
+        _state, event = self._controlled_ledger_op_state(op_id)
+        return event
 
     def _controlled_reconcile_intents(self):
         """对账 pending 操作意图：账本有这笔 op_id → committed
@@ -8444,6 +8517,11 @@ class SQLiteStore:
             "commit_state": status,
             "reconstructed_from_intent": True,
         }
+        if intent.get("version_after") is None:
+            # 执行后版本戳当时没记下（补修三轮，复查小
+            # 项①）：如实明示缺失，不许静默留空、让调用方
+            # 以为有戳可比；不强填现值、不伪造历史戳。
+            detail["version_after_missing"] = True
         if status == "committed" and "final_ok" in intent:
             ok = bool(intent.get("final_ok"))
             reason = intent.get("final_reason") or ""
@@ -9264,17 +9342,17 @@ class SQLiteStore:
             if exec_error is not None:
                 # 已落账就算已提交：不许假报 refused，更不许
                 # 只回滚 SQLite 造成账本分叉。
-                event = self._controlled_ledger_op(op_id)
-                if event is None and getattr(
-                    self, "_controlled_op_read_failed", False
-                ):
+                op_state, event = self._controlled_ledger_op_state(
+                    op_id
+                )
+                if op_state == self._LEDGER_OP_UNDETERMINED:
                     # 账本读失败：到底落没落账定不了，不许按
                     # 没落账判 aborted（复查 D）——按待核实
                     # 落账走完后续核验，冻结由
                     # commit_unverified 负责。
                     intent["status"] = "committed_unverified"
                     detail["commit_state"] = "committed_unverified"
-                    detail["ledger_read_failed"] = True
+                    detail["ledger_undetermined"] = True
                     detail["error"] = "%s: %s" % (
                         type(exec_error).__name__, exec_error,
                     )
@@ -9283,10 +9361,10 @@ class SQLiteStore:
                         {
                             "op_id": op_id,
                             "memory_id": memory_id,
-                            "ledger_read_failed": True,
+                            "ledger_undetermined": True,
                         },
                     )
-                elif event is None:
+                elif op_state == self._LEDGER_OP_ABSENT:
                     intent["status"] = "aborted"
                     intent["abort_reason"] = "execute_failed"
                     self._controlled_save_intents_quiet()
@@ -9309,10 +9387,14 @@ class SQLiteStore:
                 # 事件关联核验：这笔 op 必须在账本里找得到，
                 # 找不到如实标「已提交/待核实」，不假报成功
                 # 细节、不假报 refused。
-                event = self._controlled_ledger_op(op_id)
-                if event is None:
+                op_state, event = self._controlled_ledger_op_state(
+                    op_id
+                )
+                if op_state != self._LEDGER_OP_FOUND:
                     intent["status"] = "committed_unverified"
                     detail["commit_state"] = "committed_unverified"
+                    if op_state == self._LEDGER_OP_UNDETERMINED:
+                        detail["ledger_undetermined"] = True
                     self._controlled_note_health(
                         "commit_unverified",
                         {
@@ -10017,8 +10099,10 @@ class SQLiteStore:
                         )
                         self._conn.commit()
             except Exception as exc:
-                event = self._controlled_ledger_op(rev_op_id)
-                if event is None:
+                op_state, event = self._controlled_ledger_op_state(
+                    rev_op_id
+                )
+                if op_state == self._LEDGER_OP_ABSENT:
                     rev_intent["status"] = "aborted"
                     rev_intent["abort_reason"] = "execute_failed"
                     self._controlled_save_intents_quiet()
@@ -10030,12 +10114,32 @@ class SQLiteStore:
                             ),
                         },
                     )
-                rev_intent["status"] = "committed"
-                rev_intent["ledger_seq"] = event.get("seq")
-                detail["commit_state"] = "committed_after_error"
-                detail["error"] = "%s: %s" % (
-                    type(exc).__name__, exc,
-                )
+                if op_state == self._LEDGER_OP_UNDETERMINED:
+                    # 读账失败/账本存疑（补修三轮，复查 D）：补
+                    # 偿到底落没落账定不了，不许记 aborted/
+                    # execute_failed 假报没执行——按已提交待核
+                    # 实落账，冻结由 commit_unverified 负责。
+                    rev_intent["status"] = "committed_unverified"
+                    detail["commit_state"] = "committed_unverified"
+                    detail["ledger_undetermined"] = True
+                    detail["error"] = "%s: %s" % (
+                        type(exc).__name__, exc,
+                    )
+                    self._controlled_note_health(
+                        "commit_unverified",
+                        {
+                            "op_id": rev_op_id,
+                            "revokes_op_id": intent.get("op_id"),
+                            "ledger_undetermined": True,
+                        },
+                    )
+                else:
+                    rev_intent["status"] = "committed"
+                    rev_intent["ledger_seq"] = event.get("seq")
+                    detail["commit_state"] = "committed_after_error"
+                    detail["error"] = "%s: %s" % (
+                        type(exc).__name__, exc,
+                    )
             if exec_failure is not None:
                 rev_intent["status"] = "aborted"
                 rev_intent["abort_reason"] = exec_failure[0]
@@ -10044,12 +10148,18 @@ class SQLiteStore:
                     "refused", exec_failure[0],
                     detail=exec_failure[1],
                 )
-            if rev_intent["status"] != "committed":
+            if rev_intent["status"] not in (
+                "committed", "committed_unverified",
+            ):
                 # 事件关联核验：补偿必须在账本里找得到。
-                event = self._controlled_ledger_op(rev_op_id)
-                if event is None:
+                op_state, event = self._controlled_ledger_op_state(
+                    rev_op_id
+                )
+                if op_state != self._LEDGER_OP_FOUND:
                     rev_intent["status"] = "committed_unverified"
                     detail["commit_state"] = "committed_unverified"
+                    if op_state == self._LEDGER_OP_UNDETERMINED:
+                        detail["ledger_undetermined"] = True
                     self._controlled_note_health(
                         "commit_unverified",
                         {
