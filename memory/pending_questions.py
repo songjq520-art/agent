@@ -26,10 +26,15 @@ logger = logging.getLogger(__name__)
 # 记忆和新事实冲突时，要不要换成新的——不许悄悄顶掉，先问 BOOS。
 QUESTION_KIND_IMPORTANCE = "importance"
 QUESTION_KIND_CONFLICT = "conflict"
+QUESTION_KIND_CORE_CAPACITY = "core_capacity"
 
 # 冲突保护问题的选项（固定两个）：换成新的 = 按答案取代旧记忆；
 # 不换 = 两条都留着，这对冲突记为已裁决，不再重复问。
 CONFLICT_QUESTION_OPTIONS = ("换成新的", "不换")
+# 核心容量问题的选项（四件套第 1 块）：满座被容量门拦下的候选，
+# 先留作候选 = 只记下问题、记忆保持原样（还没进核心）；不要了 =
+# 按 BOOS 的回答删掉那条（走 delete_memory 的批准删除路）。
+CORE_CAPACITY_QUESTION_OPTIONS = ("先留作候选", "不要了")
 
 # 问题状态：pending（攒着、还没问过）、asked（已在某轮回复里问过、
 # 等回答）、answered（已回答、按答案处理完）。

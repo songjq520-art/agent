@@ -37,6 +37,7 @@ import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from memory import core_cap as _core_cap
 from memory import decay as _decay
 from memory import ledger as _ledger
 from memory import pending_questions as _pq
@@ -587,6 +588,9 @@ class SQLiteStore:
         self._judge_provider = judge_provider
         # 待问 BOOS 的问题（Phase 2 #4）：攒批 + 回答，落盘不丢。
         self.pending_questions = _pq.PendingQuestions(memory_dir=self.memory_dir)
+        # 核心座位上限（四件套第 1 块）：默认契约定的 150，
+        # 测试可调小验证容量门。
+        self.core_seat_limit = _core_cap.CORE_SEAT_LIMIT
         self.user_id = kwargs.get("user_id", "boos")
         self._lock = threading.RLock()
         self._ledger_lock = threading.Lock()
@@ -731,6 +735,10 @@ class SQLiteStore:
                     "slot": metadata.get("slot"),
                     "is_rule": metadata.get("is_rule", False),
                     "curated": metadata.get("curated", False),
+                    # 核心上限字段（第 1 块）：保护档与分类抽屉必须
+                    # 进账本，不然按账本重算座位时这两样会丢。
+                    "protection_tier": metadata.get("protection_tier"),
+                    "core_drawer": metadata.get("core_drawer"),
                     "decay_kind": metadata.get("decay_kind"),
                     "importance": metadata.get("importance"),
                     "event_date": metadata.get("event_date"),
@@ -831,6 +839,11 @@ class SQLiteStore:
                                    # 不然重启对账会把标丢了。
                                    "tone", "tone_evidence", "tone_source"):
                         if _promoted.get(_field) is not None:
+                            meta[_field] = _promoted[_field]
+                    # 核心上限字段（第 1 块）：以「键在不在」为准——
+                    # 显式写 None 是摘档/摘格，重建时照样摘掉。
+                    for _field in ("protection_tier", "core_drawer"):
+                        if _field in _promoted:
                             meta[_field] = _promoted[_field]
                 if _slot and not meta.get("slot"):
                     # R-7：add 那笔还没有槽位标，按 SLOT 事件补上
@@ -1196,6 +1209,15 @@ class SQLiteStore:
                 "slot": slot,
                 "is_rule": is_rule,
                 "curated": curated,
+                # 核心上限字段（第 1 块）：只认合法值，传错当没标
+                # （普通档 / 未入格），不猜——和 _normalize_metadata
+                # 一个规矩；没传记 None，老调用方行为不变。
+                "protection_tier": _core_cap.normalize_protection_tier(
+                    {"protection_tier": kwargs.get("protection_tier")}
+                ),
+                "core_drawer": _core_cap.normalize_core_drawer(
+                    {"core_drawer": kwargs.get("core_drawer")}
+                ),
                 "decay_kind": decay_kind,
                 "importance": kwargs.get(
                     "importance",
@@ -2871,6 +2893,9 @@ class SQLiteStore:
             # 推断记忆保护的冲突问题（2026-11-24）：选项和处理都
             # 不一样，单独走 _answer_conflict_question。
             return self._answer_conflict_question(question, choice)
+        if question.get("kind") == _pq.QUESTION_KIND_CORE_CAPACITY:
+            # 核心容量问题（第 1 块）：选项和处理都不同，单独走。
+            return self._answer_core_capacity_question(question, choice)
         if choice not in ("进核心", "当一次性经历", "不存"):
             return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
         if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
@@ -5859,21 +5884,233 @@ class SQLiteStore:
                     "seq": (event or {}).get("seq")}
 
     def confirm_memory(self, memory_id):
+        """BOOS 逐条确认一条记忆（确认后按 provenance 口径成为核心成员）。
+
+        容量门（四件套第 1 块）：确认会让一条记忆新占一个核心
+        座位、而座位已满时，不许确认——记忆保持未确认，攒一条
+        「核心已满」待问（kind=core_capacity），等 BOOS 拍板或
+        腾位后再说。已经是成员的再确认不新增占座，不受拦。
+        """
         with self._lock:
             row = self._conn.execute(
-                "SELECT metadata_json FROM memories WHERE id=?", (memory_id,)
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
             ).fetchone()
             if row is None:
                 return {"confirmed": False, "reason": "not_found"}
-            meta = json.loads(row[0] or "{}")
-            meta["user_confirmed"] = True
+            meta = json.loads(row[1] or "{}")
+            new_meta = dict(meta)
+            new_meta["user_confirmed"] = True
+            if not (row[2] or row[3] or row[4]):
+                before = _core_cap.classify(meta)
+                after = _core_cap.classify(new_meta)
+                if after["occupies_seat"] and not before["occupies_seat"]:
+                    snap = self.core_seat_snapshot()
+                    if snap["seats_used"] >= snap["limit"]:
+                        question = self._queue_core_capacity_question(
+                            memory_id, row[0] or "", snap
+                        )
+                        return {
+                            "confirmed": False,
+                            "reason": "core_full",
+                            "memory_id": memory_id,
+                            "question_id": (question or {}).get("id"),
+                            "seats_used": snap["seats_used"],
+                            "limit": snap["limit"],
+                        }
             self._conn.execute(
                 "UPDATE memories SET user_confirmed=1, metadata_json=? WHERE id=?",
-                (json.dumps(meta, ensure_ascii=False), memory_id),
+                (json.dumps(new_meta, ensure_ascii=False), memory_id),
             )
             self._conn.commit()
             return {"confirmed": True, "memory_id": memory_id}
 
+    # ---------- 核心上限（四件套第 1 块，2026-11-24） ----------
+
+    def _queue_core_capacity_question(self, memory_id, text, snap):
+        """满座拦下时攒一条待问：同条记忆已有未答的容量问题时
+        PendingQuestions.add 自带去重、返回已有的那条。"""
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_CORE_CAPACITY,
+            "核心记忆座位已满（%d/%d），这条先没进核心：%s"
+            % (snap["seats_used"], snap["limit"], text),
+            _pq.CORE_CAPACITY_QUESTION_OPTIONS,
+            "核心上限已满，按规矩不许顶掉旧记忆腾座；这条先留作"
+            "候选，等整理员腾位或你拍板。",
+            memory_id=memory_id,
+            extra={
+                "seats_used": snap["seats_used"],
+                "limit": snap["limit"],
+            },
+        )
+
+    def core_seat_snapshot(self):
+        """核心座位水位快照（只读，结论页/体检用）：持锁一次读全
+        活行，同一快照出数——总数、分抽屉、钉死/临时钉死、未入
+        格、水位都在里面，分块与总量对账见 count_seats 的
+        reconciled 自证。"""
+        with self._lock:
+            metas = []
+            for (mjson,) in self._conn.execute(
+                "SELECT metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall():
+                try:
+                    metas.append(json.loads(mjson or "{}"))
+                except Exception:
+                    metas.append({})
+            snap = _core_cap.count_seats(metas, limit=self.core_seat_limit)
+            snap["generated_at"] = _now_iso()
+            return snap
+
+    def recount_core_seats_from_ledger(self):
+        """按账本事件全量重算座位（对账用）：应与同时刻的
+        core_seat_snapshot 逐项相等，不等即缺陷。"""
+        events, _info = _ledger.read_events(self.ledger_path)
+        state = self.ledger_state()
+        snap = _core_cap.count_seats_from_ledger(
+            events,
+            (state or {}).get("key_states") or {},
+            limit=self.core_seat_limit,
+        )
+        snap["generated_at"] = _now_iso()
+        return snap
+
+    def set_protection_tier(self, memory_id, tier):
+        """改一条活记忆的保护档位：tier 是 "pinned"（钉死）/
+        "temp_pinned"（临时钉死）/ None（摘档回普通）。
+
+        摘档会让成员行新占座：满座时拒绝并攒待问，不许硬摘。
+        落库走 _update_core_fields（账本先行）。"""
+        if tier is not None and tier not in _core_cap.PROTECTION_TIERS:
+            return {"ok": False, "reason": "bad_tier", "memory_id": memory_id}
+        return self._update_core_fields(
+            memory_id, {_core_cap.PROTECTION_TIER_FIELD: tier}
+        )
+
+    def set_core_drawer(self, memory_id, drawer):
+        """改一条活记忆的分类抽屉：drawer 是五类键之一 / None
+        （摘回未入格）。只影响分块记账、不改变占座总数，不过
+        容量门；落库走 _update_core_fields（账本先行）。"""
+        if drawer is not None and drawer not in _core_cap.CORE_DRAWERS:
+            return {"ok": False, "reason": "bad_drawer", "memory_id": memory_id}
+        return self._update_core_fields(
+            memory_id, {_core_cap.DRAWER_FIELD: drawer}
+        )
+
+    def _update_core_fields(self, memory_id, changes):
+        """核心上限字段（保护档/抽屉）的统一改法：持锁内复核
+        占座变化、过容量门、账本先行（PROMOTE 带改后的完整
+        meta，和语气打标同款）、再改 SQLite；账本写失败就
+        不改 SQLite，两边不许分叉。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "reason": "not_found", "memory_id": memory_id}
+            if row[2] or row[3] or row[4]:
+                return {"ok": False, "reason": "not_live", "memory_id": memory_id}
+            meta = json.loads(row[1] or "{}")
+            before = _core_cap.classify(meta)
+            new_meta = dict(meta)
+            for field, value in changes.items():
+                new_meta[field] = value
+            after = _core_cap.classify(new_meta)
+            if after["occupies_seat"] and not before["occupies_seat"]:
+                snap = self.core_seat_snapshot()
+                if snap["seats_used"] >= snap["limit"]:
+                    question = self._queue_core_capacity_question(
+                        memory_id, row[0] or "", snap
+                    )
+                    return {
+                        "ok": False,
+                        "reason": "core_full",
+                        "memory_id": memory_id,
+                        "question_id": (question or {}).get("id"),
+                        "seats_used": snap["seats_used"],
+                        "limit": snap["limit"],
+                    }
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {
+                        "type": _ledger.LEDGER_EVENT_PROMOTE,
+                        "memory_id": memory_id,
+                        "key": memory_id,
+                        "text": row[0] or "",
+                        "meta": dict(new_meta),
+                    },
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("核心字段变更记账失败：本次不改。", exc_info=True)
+                return {
+                    "ok": False,
+                    "reason": "ledger_failed",
+                    "memory_id": memory_id,
+                }
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=? WHERE id=?",
+                (json.dumps(new_meta, ensure_ascii=False), memory_id),
+            )
+            self._conn.commit()
+            result = {"ok": True, "memory_id": memory_id}
+            result.update(changes)
+            return result
+
+    def _answer_core_capacity_question(self, question, choice):
+        """BOOS 回答核心容量问题（满座候选）：
+          先留作候选：只消耗问题，记忆保持原样（还没进核心）；
+          不要了：先删成功、再消耗问题（和重要性问题「不存」
+          同款顺序——删不掉问题留着、如实报，不许先消耗后删）。"""
+        if choice not in _pq.CORE_CAPACITY_QUESTION_OPTIONS:
+            return {
+                "ok": False,
+                "reason": "选项不对，只能选：先留作候选 / 不要了。",
+            }
+        question_id = question.get("id")
+        memory_id = question.get("memory_id")
+        if choice == "先留作候选":
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True,
+                "applied": "held",
+                "question_id": question_id,
+                "memory_id": memory_id,
+            }
+        if not memory_id:
+            return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+        deleted = self.delete_memory(memory_id, approve=True)
+        deleted_ok = (
+            deleted.get("deleted") is True
+            if isinstance(deleted, dict)
+            else bool(deleted)
+        )
+        if not deleted_ok:
+            return {
+                "ok": False,
+                "reason": "没删掉（%s），问题先留着，可以再答。"
+                % (
+                    (deleted.get("reason") or "未知原因")
+                    if isinstance(deleted, dict)
+                    else "未知原因"
+                ),
+                "question_id": question_id,
+                "memory_id": memory_id,
+                "deleted": False,
+            }
+        self.pending_questions.answer(question_id, choice)
+        return {
+            "ok": True,
+            "applied": "dropped",
+            "question_id": question_id,
+            "memory_id": memory_id,
+            "deleted": True,
+        }
     def void_joke_memory(self, memory_id):
         """作废一条玩笑记忆：先记账本 delete（标记 voided），再标 SQLite voided=1。
 
