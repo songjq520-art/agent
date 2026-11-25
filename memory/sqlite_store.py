@@ -2454,6 +2454,48 @@ class SQLiteStore:
             return fact
         return old_text.replace(old_value, value, 1)
 
+    def _complete_plan_change(self, new_value, old_value):
+        """计划斜改的整句补全（2026-11-25 实测问题二）：按用户亲口
+        否定的旧值在活行里定位要改的那条，把旧值换成新值、拼回
+        旧行原文——和碎片补句同一种换值法，只是定位键是旧值本身，
+        且只认行程类行（带去/出差/行程/旅标记），不拿食物偏好这
+        类同名行开刀。核心/置顶行不在这里排除：定位到之后照样走
+        correct_memory，那里的 G7 护栏会挂起问 BOOS，不放宽。
+        返回 (fact, old_text, candidates)：
+        - 恰好一条候选 → (换好的整句, 旧行原文, [])；
+        - 多条候选 → (新值原样, None, [{"id","text"}, ...])，
+          调用方记 ambiguous、不猜；
+        - 零条 → (新值原样, None, [])，调用方按普通陈述存整句
+          （没有可顶的旧行，不存在并存问题）。"""
+        new_value = (new_value or "").strip()
+        old_value = (old_value or "").strip()
+        if not new_value or not old_value or new_value == old_value:
+            return new_value, None, []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall()
+        cands = []
+        for mid, text in rows:
+            text = text or ""
+            if old_value not in text:
+                continue
+            if not any(m in text for m in ("去", "出差", "行程", "旅")):
+                continue
+            if _normalize_memory_text(text) == \
+                    _normalize_memory_text(new_value):
+                continue
+            cands.append((mid, text))
+        if len(cands) > 1:
+            return new_value, None, [
+                {"id": mid, "text": text} for mid, text in cands
+            ]
+        if not cands:
+            return new_value, None, []
+        _mid, old_text = cands[0]
+        return old_text.replace(old_value, new_value, 1), old_text, []
+
     def _retry_correction_by_slot(self, correction, fact, turn_id=None):
         """纠错分不清改哪条（ambiguous）时，按单值槽位再筛一次：新说法
         带槽位、且候选里恰好只有一条同槽位（值不同）时，就改那条。
@@ -3676,16 +3718,31 @@ class SQLiteStore:
                     break
                 fact = inner_fact
             if fact:
-                # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
-                # 补不出来就原样走 correct_memory（找不到旧记忆时当新记忆存）。
-                fact = self._complete_correction_fragment(fact)
+                plan_old_text = None
+                plan_candidates = []
+                if detected.get("plan_change"):
+                    # 计划斜改（实测问题二）：不走槽位碎片补句——按
+                    # 用户亲口否定的旧值定位旧行、把新值换进旧行
+                    # 原文（_complete_plan_change）；定位不到唯一
+                    # 旧行时 fact 还是新值碎片，下面的事实门会拦住
+                    # 它，多候选时走后面的 ambiguous 留痕路。
+                    fact, plan_old_text, plan_candidates = (
+                        self._complete_plan_change(
+                            fact, detected.get("old_value") or ""
+                        )
+                    )
+                else:
+                    # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
+                    # 补不出来就原样走 correct_memory（找不到旧记忆时当新记忆存）。
+                    fact = self._complete_correction_fragment(fact)
                 correction_fact_norm = _normalize_memory_text(fact)
                 # 当下的想法/问句不纠正（“我现在想喝茶了”不是在改一条记忆）：
                 # 检测到了也不走纠正分支，留给下面的正常循环按老规矩处理
                 # （当下的想法会被 _looks_like_fact 拦下、不存）。
                 if _looks_like_fact(fact)[0]:
                     correction = self.correct_memory(
-                        fact, fact, exclude_identical_to_new=True,
+                        plan_old_text or fact, fact,
+                        exclude_identical_to_new=True,
                         explicit_correction=True, turn_id=turn_id,
                     )
                     if (correction or {}).get("status") == "ambiguous":
@@ -3724,6 +3781,25 @@ class SQLiteStore:
                         sentences = kept + [fact]
                     else:
                         sentences = kept
+                elif plan_candidates:
+                    # 斜改对得上不止一条旧行、分不清改哪条：不猜、
+                    # 不顶任何一条，新值碎片也不单独存；回执记
+                    # ambiguous，收尾复核会标未落账并留痕
+                    # （纠正当轮落账，实测问题二）。
+                    correction = {
+                        "status": "ambiguous",
+                        "memory_id": None,
+                        "old_text": detected.get("old_value") or "",
+                        "new_text": fact,
+                        "candidates": plan_candidates,
+                        "reason": "这次改动对得上不止一条旧记忆，"
+                                  "分不清要改哪条，先没动",
+                        "layer": "plan_change",
+                        "resolution": "ambiguous",
+                        "audit": {"source": "user",
+                                  "method": "plan_change"},
+                    }
+                    sentences = _strip_correction_sentences(latest_user)
         live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
         new_questions = []  # 本轮拿不准重要性的问题（Phase 2 #4）
         touched_ids = set()  # 本轮触碰到的记忆 id（第 8 条实时整理用）
@@ -3948,6 +4024,14 @@ class SQLiteStore:
                 # 下一句“撤回”作废的是这条新记忆，不是上一轮的。
                 with self._lock:
                     self._last_stored_turn_id = turn_id
+        # 纠正当轮落账·收尾复核（契约三、状态变更入口；实测
+        # 问题二）：回执里的纠正状态只是各路的自报，落没落账要
+        # 回查新旧两行在库里的真实状态才算数；没落账的如实标
+        # 出来并留痕，不许拿“当场答对了”结案。
+        if receipt.get("correction") is not None:
+            self._verify_correction_landed(
+                receipt["correction"], receipt, turn_id=turn_id
+            )
         # #4：本轮拿不准的问题先问，顺带把攒着的旧问题一起带出来
         # （一轮最多 3 条，含新问题）。R-2（2026-11-24）：以前只有
         # 本轮有新问题时才带旧问题——本轮没新问题时，攒着的旧问题
@@ -3978,6 +4062,139 @@ class SQLiteStore:
         self._schedule_turn_organize(sorted(touched_ids), turn_id=turn_id)
         self._store_turn_receipt(turn_id, receipt)
         return receipt
+
+    def _verify_correction_landed(self, correction, receipt,
+                                  turn_id=None):
+        """纠正当轮落账·收尾复核（契约三、状态变更入口「纠正当轮
+        落账」；2026-11-25 实测问题二）：回执里的纠正状态只是各路
+        的自报，落没落账要回查新旧两行在库里的真实状态才算数——
+          updated：旧行确已 superseded（至少没有同原文的活行
+            残留）、新行确是活行；
+          unchanged：新说法确有活行在库（本来就是对的，没啥可改）；
+          pending_question：护栏挂起未执行，如实标未落账（待问
+            本身就是留痕，不重复挂）；
+          ambiguous：候选还活着、新旧并存，未落账；只标不另挂
+            待问——conflict 待问按旧行去重，抢先挂一条会把后面
+            流程针对同一旧行的精确待问顶掉（webfix 回归实测）；
+          not_found：没有可顶的旧行时，新说法已存成活行就算
+            到位；同槽位还有别的活行冲突着，就是没落账；
+          failed 等其余状态：未落账，只标不挂问。
+        复核结论就地写回 correction：landed（True/False）、
+        verified=True；未落账时补 verify_note 说明卡在哪。
+        返回 landed。"""
+        if not isinstance(correction, dict):
+            return False
+        status = correction.get("status")
+        correction["verified"] = True
+        new_id = correction.get("memory_id")
+        new_text = correction.get("new_text") or ""
+        old_text = correction.get("old_text") or ""
+
+        def _is_live(mid):
+            if not mid:
+                return None
+            row = self._conn.execute(
+                "SELECT superseded, deleted, voided FROM memories"
+                " WHERE id=?", (mid,),
+            ).fetchone()
+            if row is None:
+                return None
+            return not (row[0] or row[1] or row[2])
+
+        def _live_id_by_text(text):
+            norm = _normalize_memory_text(text or "")
+            if not norm:
+                return None
+            for mid, t, sup, dele, voi in self._conn.execute(
+                "SELECT id, text, superseded, deleted, voided"
+                " FROM memories"
+            ).fetchall():
+                if sup or dele or voi:
+                    continue
+                if _normalize_memory_text(t or "") == norm:
+                    return mid
+            return None
+
+        def _any_row_by_text(text):
+            """按原文找一行（不论死活）：(id, is_live) 或 None。"""
+            norm = _normalize_memory_text(text or "")
+            if not norm:
+                return None
+            for mid, t, sup, dele, voi in self._conn.execute(
+                "SELECT id, text, superseded, deleted, voided"
+                " FROM memories"
+            ).fetchall():
+                if _normalize_memory_text(t or "") == norm:
+                    return mid, not (sup or dele or voi)
+            return None
+
+        landed = False
+        note = ""
+        with self._lock:
+            if status == "updated":
+                new_live = _is_live(new_id)
+                if new_live is None:
+                    new_live = _live_id_by_text(new_text) is not None
+                # 旧行：优先认 candidates 里原文对得上的那条（按
+                # id 查状态）；认不出就按原文全库找——找到活行
+                # 就是没顶掉，找不到或找到的是已顶替行都算过。
+                old_live = None
+                for cand in correction.get("candidates") or []:
+                    if not isinstance(cand, dict):
+                        continue
+                    if _normalize_memory_text(cand.get("text") or "") \
+                            == _normalize_memory_text(old_text):
+                        old_live = _is_live(cand.get("id"))
+                        break
+                if old_live is None:
+                    found = _any_row_by_text(old_text)
+                    if found is not None and found[0] != new_id:
+                        old_live = found[1]
+                if new_live and old_live is not True:
+                    landed = True
+                else:
+                    parts = []
+                    if not new_live:
+                        parts.append("新行不是活行")
+                    if old_live is True:
+                        parts.append("旧行还活着")
+                    note = "回查对不上：" + "、".join(parts) + "，纠正未落账"
+            elif status == "unchanged":
+                landed = (
+                    _is_live(new_id) is True
+                    or _live_id_by_text(new_text) is not None
+                )
+                if not landed:
+                    note = "回查对不上：新说法在库里没有活行，纠正未落账"
+            elif status == "pending_question":
+                landed = False
+                note = "纠正被护栏挂起、等 BOOS 裁决，未落账（待问已留痕）"
+            elif status == "ambiguous":
+                landed = False
+                note = "分不清要改哪条、新旧并存，未落账"
+            elif status == "not_found":
+                new_live_id = _live_id_by_text(new_text)
+                slot, value = _infer_fact_slot(new_text)
+                conflicts = (
+                    self._find_same_slot_conflicts(slot, value)
+                    if slot is not None and value is not None
+                    else []
+                )
+                if conflicts:
+                    landed = False
+                    note = "同槽位还有旧说法活着、新旧并存，未落账"
+                elif new_live_id:
+                    landed = True
+                else:
+                    landed = False
+                    note = "新说法没有存进库，纠正未落账"
+            else:  # failed 等其余状态
+                landed = False
+                note = "纠正未执行（%s），未落账" % (status or "未知状态")
+        correction["landed"] = landed
+        if not landed:
+            correction["verify_note"] = note
+        return landed
 
     def _find_correction_candidates(self, old_fact, new_fact=None, top_k=10,
                                         exclude_identical_to_new=False):
