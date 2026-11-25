@@ -1046,8 +1046,10 @@ class SQLiteStore:
                     for _field in ("protection_tier", "core_drawer"):
                         if _field in _promoted:
                             meta[_field] = _promoted[_field]
-                if _slot and not meta.get("slot"):
-                    # R-7：add 那笔还没有槽位标，按 SLOT 事件补上
+                if _slot:
+                    # R-7＋口径对齐（2026-11-25）：账本最新 SLOT 事件赢——
+                    # ADD 自带旧槽位也要被后来的 SLOT 事件盖掉，与
+                    # repair_projection_from_ledger 同口径
                     # （_insert_memory_row 会把 meta 里的 slot 写进列）。
                     meta["slot"] = _slot
                 if _touched and _touched > str(meta.get("last_used_at") or ""):

@@ -302,3 +302,28 @@ def test_create_store_rebuilds_auth_claim_after_reconcile(
         if q["kind"] == "auth_claim"
     ]
     assert len(auth_qs) == 1 and auth_qs[0]["memory_id"] == mid
+# ---------- 修复一补：reconcile 重建缺行时 slot 同口径 ----------
+
+def test_reconcile_rebuild_slot_follows_latest_slot_event(store):
+    # 账本 ADD 自带旧 slot A、后面有 SLOT 事件给 B：重建出的行
+    # slot 列与 meta 都要是 B（旧守卫只填空，A 会留到下一次启动
+    # 的 repair 才自愈）。
+    mid = _plant(store, "我习惯把钥匙挂在玄关的钩子上", slot="slot_alpha")
+    _slot_event(store, mid, "slot_beta")
+    # 无 SLOT 事件的一行：重建时保留 ADD 自带的 slot，不许乱动。
+    mid2 = _plant(store, "我把雨伞放在门后", slot="slot_alpha")
+    for m in (mid, mid2):
+        store._conn.execute("DELETE FROM memories WHERE id=?", (m,))
+    store._conn.commit()
+    added = store.reconcile_ledger_index()
+    assert added == 2
+    assert _flags(store, mid)["meta"].get("slot") == "slot_beta"
+    col = store._conn.execute(
+        "SELECT slot FROM memories WHERE id=?", (mid,)
+    ).fetchone()[0]
+    assert col == "slot_beta"
+    assert _flags(store, mid2)["meta"].get("slot") == "slot_alpha"
+    col2 = store._conn.execute(
+        "SELECT slot FROM memories WHERE id=?", (mid2,)
+    ).fetchone()[0]
+    assert col2 == "slot_alpha"
