@@ -39,6 +39,7 @@ from pathlib import Path
 
 from memory import core_cap as _core_cap
 from memory import auth_guard as _auth_guard
+from memory import session_auth as _session_auth
 from memory import intake_gate as _intake
 from memory import reanchor as _reanchor
 from memory import decay as _decay
@@ -617,9 +618,15 @@ class SQLiteStore:
             self.memory_dir / "controlled_entry_receipts.json"
         )
         # 生产执行开关：默认关。入口只接受影子/测试调用（走完全部门禁、
-        # 出回执、不落状态）；打开的前置是 H2 会话认证先界定可信来源
-        # 范围——在此之前任何生产接线把开关设 True 都属越界。
+        # 出回执、不落状态）；打开的前置（H2 会话认证）已就位——开关
+        # 打开后入口强制验会话凭据（见 session_auth）。生产接线仍未
+        # 授权（放行四关未过），本开关保持关。
         self.controlled_entry_execution_enabled = False
+        # 会话认证（立项 H2，2026-11-25）：开关打开后、执行前验凭据
+        # 的签发权威——登记与签名密钥只活在内存里（进程级），不落盘、
+        # 不进账本；签发只供宿主内部流程与测试，不存在默认后门凭据；
+        # web 层无会话概念（现状保留），接缝以本层的凭据校验为准。
+        self._session_authority = _session_auth.SessionAuthority()
         self._controlled_receipts = {}
         self._controlled_receipts_load_error = None
         self._controlled_trace_index = 0
@@ -7334,9 +7341,10 @@ class SQLiteStore:
     # DORMANT 事件），不新开一套写库逻辑，全程留痕出回执。
     # 删除永远不在动作集里：删除只走 delete_memory(approve=True)
     # 的 BOOS 批准路，整理员永无删除权限（契约三）。
-    # 本轮只建门与门禁：生产执行开关默认关（见 __init__ 注释，
-    # H2 会话认证是打开开关的前置）；开关关时入口只出影子回执
-    # （门禁全走完、不落任何状态），不接贵妃侧、不启用自动执行。
+    # 本轮只建门与门禁：生产执行开关默认关；开关关时入口只出
+    # 影子回执（门禁全走完、不落任何状态），不接贵妃侧、不启用
+    # 自动执行。打开开关的前置——H2 会话认证——已落地：开关
+    # 打开后，执行前强制验提案携带的会话凭据（session_auth）。
 
     CONTROLLED_ACTIONS = (
         "demote",
@@ -7436,6 +7444,29 @@ class SQLiteStore:
         receipt = self._controlled_receipts.get(idempotency_key)
         return dict(receipt) if receipt is not None else None
 
+    def issue_session(self, *, speaker="owner", scope=None,
+                      ttl_seconds=3600, owner_direct=False,
+                      issuance_source=None):
+        """签发受控入口会话凭据（立项 H2）；口径不合返回 None。
+
+        只供宿主内部流程与测试：scope 不传时默认受控动作全集，
+        调用方应按最小够用传窄范围。主人直达凭据必须显式
+        issuance_source="owner" 才签得出（见 session_auth 口径）；
+        web 层不许自签，只许透传宿主签发的凭据。
+        """
+        return self._session_authority.issue(
+            speaker=speaker,
+            scope=self.CONTROLLED_ACTIONS if scope is None else scope,
+            ttl_seconds=ttl_seconds,
+            owner_direct=owner_direct,
+            issuance_source=issuance_source,
+            allowed_actions=self.CONTROLLED_ACTIONS,
+        )
+
+    def revoke_session(self, session_id):
+        """撤销一张会话凭据（立项 H2；H3 撤销接口的凭据侧接缝）。"""
+        return self._session_authority.revoke(session_id)
+
     def _queue_controlled_entry_question(self, action, memory_id,
                                          instruction_source, block_reason):
         """受控入口拦下的提案攒一条知情待问（先例：change_attempt）。
@@ -7485,6 +7516,11 @@ class SQLiteStore:
           expected_version   可选，提案时目标行的版本戳（见
                              controlled_entry_version）；执行前
                              复检，对不上提案即作废（version_stale）
+          session            会话凭据对象（立项 H2，issue_session
+                             签发）；影子模式不验，执行开关打开后
+                             必验——无凭据/过期/越界/被篡改/被撤销
+                             一律拒，敏感动作（保护变更）只认
+                             主人直达会话（原因码见 session_auth）
 
         回执形状（键恒定）：
           {ok, status, reason, action, memory_id, idempotency_key,
@@ -7615,10 +7651,24 @@ class SQLiteStore:
                 and expected_version != receipt["version_before"]
             ):
                 return _finish("refused", "version_stale")
-            # 执行开关：H1 默认关——门禁全走完，只出影子回执，
-            # 不落任何状态。打开前置是 H2 会话认证（见 __init__）。
+            # 执行开关：默认关——门禁全走完，只出影子回执，
+            # 不落任何状态（立项 H1）。
             if not self.controlled_entry_execution_enabled:
                 return _finish("shadow", "execution_disabled")
+            # 会话认证（立项 H2）：开关打开后，执行前必须验提案
+            # 携带的会话凭据——有效、在范围内、未过期；敏感动作
+            # （保护变更）只认主人直达会话。验不过一律拒，原因码
+            # 由 session_auth 给（no_session / session_expired /
+            # out_of_scope / not_owner_direct / session_tampered /
+            # session_revoked），不落任何状态。
+            verdict = self._session_authority.validate(
+                proposal.get("session"), action
+            )
+            if not verdict["ok"]:
+                return _finish(
+                    "refused", verdict["reason"],
+                    detail={"session_reason": verdict["reason"]},
+                )
             # 执行：只走既有 store 路径，不新开一套写库逻辑。
             detail = {}
             if action == "demote":
@@ -7706,6 +7756,7 @@ class SQLiteStore:
                     row_after[0] or "",
                     json.loads(row_after[1] or "{}"),
                 )
+            detail["session_id"] = verdict["session_id"]
             return _finish("executed", "", detail=detail)
 
 

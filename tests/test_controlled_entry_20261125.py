@@ -18,6 +18,11 @@
 #   - 回执形状在 executed/refused/shadow/unknown 各路下键集合恒定。
 #
 # 全程离线：嵌入/判官打桩为 None，同 test_tx_recovery_fixes 口径。
+#
+# H2 口径更新（2026-11-25）：执行开关打开后入口强制验会话凭据，
+# 本文件的执行类用例改带 issue_session 签发的主人直达会话
+# （_session 助手）；原断言不变，凭据本身的验收在
+# test_session_auth_20261125.py。
 
 import json
 import uuid
@@ -99,13 +104,23 @@ def _enable(store):
     return store
 
 
+def _session(store):
+    sess = store.issue_session(
+        speaker="owner", issuance_source="owner", owner_direct=True
+    )
+    assert sess is not None
+    return sess
+
+
 # ---------- 正常提案走通 ----------
 
 def test_demote_executes_and_frees_seat(store):
     mid = _add_user(store, "用户每天定投五块钱买基金")
     assert store.core_seat_snapshot()["seats_used"] == 1
     _enable(store)
-    receipt = store.submit_controlled_proposal(_prop(memory_id=mid))
+    receipt = store.submit_controlled_proposal(
+        _prop(memory_id=mid, session=_session(store))
+    )
     assert receipt["ok"] is True and receipt["status"] == "executed"
     assert receipt["duplicate"] is False
     assert receipt["reason"] == ""
@@ -127,7 +142,7 @@ def test_set_protection_tier_via_entry(store):
     receipt = store.submit_controlled_proposal(
         _prop(
             action="set_protection_tier", memory_id=mid,
-            params={"tier": "pinned"},
+            params={"tier": "pinned"}, session=_session(store),
         )
     )
     assert receipt["status"] == "executed"
@@ -147,7 +162,7 @@ def test_set_core_drawer_via_entry(store):
     receipt = store.submit_controlled_proposal(
         _prop(
             action="set_core_drawer", memory_id=mid,
-            params={"drawer": "money_decisions"},
+            params={"drawer": "money_decisions"}, session=_session(store),
         )
     )
     assert receipt["status"] == "executed"
@@ -160,7 +175,8 @@ def test_mark_dormant_via_entry(store):
     mid = _add_user(store, "用户上周去了一趟超市")
     _enable(store)
     receipt = store.submit_controlled_proposal(
-        _prop(action="mark_dormant", memory_id=mid)
+        _prop(action="mark_dormant", memory_id=mid,
+              session=_session(store))
     )
     assert receipt["status"] == "executed"
     assert _row(store, mid)["meta"]["decay_state"] == "dormant"
@@ -236,7 +252,9 @@ def test_duplicate_key_no_reexecution(store, tmp_path):
     mid = _add_user(store, "用户养了一只猫")
     _enable(store)
     key = uuid.uuid4().hex
-    first = store.submit_controlled_proposal(_prop(memory_id=mid, key=key))
+    first = store.submit_controlled_proposal(
+        _prop(memory_id=mid, key=key, session=_session(store))
+    )
     assert first["status"] == "executed"
     second = store.submit_controlled_proposal(_prop(memory_id=mid, key=key))
     assert second["duplicate"] is True and second["status"] == "duplicate"
@@ -311,7 +329,8 @@ def test_version_stale_refused_and_match_executes(store):
     stamp = store.controlled_entry_version(mid)
     assert stamp and stamp != "0" * 64
     ok = store.submit_controlled_proposal(
-        _prop(memory_id=mid, expected_version=stamp)
+        _prop(memory_id=mid, expected_version=stamp,
+              session=_session(store))
     )
     assert ok["status"] == "executed"
     assert ok["version_before"] == stamp
@@ -324,7 +343,9 @@ def test_demote_non_member_refused(store):
     assert saved.get("event") == "ADD", saved
     mid = saved["id"]
     _enable(store)
-    receipt = store.submit_controlled_proposal(_prop(memory_id=mid))
+    receipt = store.submit_controlled_proposal(
+        _prop(memory_id=mid, session=_session(store))
+    )
     assert receipt["status"] == "refused"
     assert receipt["reason"] == "not_core_member"
 
@@ -341,7 +362,9 @@ def test_receipt_shape_stable(store):
         )
     )
     receipts.append(
-        store.submit_controlled_proposal(_prop(memory_id=mid))  # executed
+        store.submit_controlled_proposal(
+            _prop(memory_id=mid, session=_session(store))
+        )  # executed
     )
     receipts.append(
         store.submit_controlled_proposal(
