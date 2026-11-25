@@ -40,6 +40,7 @@ from pathlib import Path
 from memory import core_cap as _core_cap
 from memory import auth_guard as _auth_guard
 from memory import intake_gate as _intake
+from memory import reanchor as _reanchor
 from memory import decay as _decay
 from memory import graph as _graph_mod
 from memory import ledger as _ledger
@@ -5659,6 +5660,21 @@ class SQLiteStore:
         return [
             it for it in items
             if not _contains_sensitive(it["text"] or "")
+        ]
+
+    def confirmed_facts(self):
+        """当前全部「已确认事实」活行（回锚注入用，见 memory/reanchor.py）。
+
+        认定沿现行口径（reanchor.is_anchor_fact）：confirmed
+        （user_confirmed，含问题一 owner_confirmed 升级后写回的
+        user_confirmed=True）或核心受保护（身份槽位 / is_rule /
+        curated）。只返回活行（未作废、未删、未被取代），形状同
+        _all_live_memories。这里不截断——挑哪几条、怎么封顶由
+        reanchor.select_anchor_facts 按它写明的取舍规矩定。
+        """
+        return [
+            m for m in self._all_live_memories()
+            if _reanchor.is_anchor_fact(m)
         ]
 
     def search(self, query, top_k=5, reinforce=False, include_history=False,

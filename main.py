@@ -855,6 +855,29 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 揣摩提示词只在可能有没说出口的想法时才递（#4：_should_offer_mind_read
     # 把简单表态、交代做事、随口一提的喜好/安排直接拦在程序层）；数字规则
     # 常驻（#11）：给了本地计算结果就直接用，没给、不会算就说算不出来。
+    # 已确认事实回锚（四件套·实测问题四，2026-11-24）：已确认事实每轮
+    # 强制注入、独立成区标「已确认」并写明是定案；长对话每 8 轮用加强版
+    # 回锚块替换常规块（见 memory/reanchor.py）。只在有记忆库且非恢复
+    # 任务时拼（和检索、摘要同一口径——恢复任务的消息里已有当时拼好的
+    # 提示块）；拿事实或拼装失败不拦聊天，没带锚照常答。网页 ask() 另行
+    # 拼的检索块不经过这里，但最终发给模型的提示词在 run_question 里
+    # 组装，这一处两条路都覆盖。
+    if memory_store is not None and resume_task is None:
+        try:
+            from memory.reanchor import (
+                anchor_block_for_turn,
+                turn_number_from_messages,
+            )
+
+            _anchor_block = anchor_block_for_turn(
+                memory_store.confirmed_facts(),
+                turn_number_from_messages(messages),
+            )
+        except Exception:
+            logger.warning("已确认事实回锚拼装失败，本次不带锚继续。", exc_info=True)
+            _anchor_block = ""
+        if _anchor_block:
+            model_prompt = _anchor_block + "\n\n" + model_prompt
     _mind_read_hint = _MIND_READ_HINT if _should_offer_mind_read(prompt) else ""
     model_prompt = (
         "【给十二的提示】" + _mind_read_hint
