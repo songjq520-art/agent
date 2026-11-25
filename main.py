@@ -878,6 +878,16 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
             _anchor_block = ""
         if _anchor_block:
             model_prompt = _anchor_block + "\n\n" + model_prompt
+        # 性情区注入（追加决定八）：从壳 SOUL.md 原件现读生成，
+        # 不读记忆复印件——壳改版，下一轮注入就是新版。拼装
+        # 失败不拦聊天（同回锚口径）。
+        try:
+            _persona_block = memory_store.persona_injection_block()
+        except Exception:
+            logger.warning("性情区注入拼装失败，本次不带性情区继续。", exc_info=True)
+            _persona_block = ""
+        if _persona_block:
+            model_prompt = _persona_block + "\n\n" + model_prompt
     _mind_read_hint = _MIND_READ_HINT if _should_offer_mind_read(prompt) else ""
     model_prompt = (
         "【给十二的提示】" + _mind_read_hint

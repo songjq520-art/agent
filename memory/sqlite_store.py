@@ -43,6 +43,7 @@ from memory import auth_guard as _auth_guard
 from memory import session_auth as _session_auth
 from memory import intake_gate as _intake
 from memory import reanchor as _reanchor
+from memory import persona_shell as _persona_shell
 from memory import decay as _decay
 from memory import graph as _graph_mod
 from memory import ledger as _ledger
@@ -604,6 +605,13 @@ class SQLiteStore:
         self._judge_provider = judge_provider
         # 待问 BOOS 的问题（Phase 2 #4）：攒批 + 回答，落盘不丢。
         self.pending_questions = _pq.PendingQuestions(memory_dir=self.memory_dir)
+        # 性情区原件在壳（追加决定八）：壳 SOUL.md 路径——默认
+        # 仓库根（persona_shell.default_shell_path），测试可经
+        # shell_soul_path 注入临时壳。本店只读它、永不写它。
+        self._shell_soul_path = Path(
+            kwargs.get("shell_soul_path")
+            or _persona_shell.default_shell_path()
+        )
         # 入口当场拦/当场判（实测问题三）：intake_marker 是对话
         # 当场模型实现的标记器（可调用对象，入参 (候选, messages)，
         # 返回标记列表）；None = 不可用，save_turn 自动回退老管道。
@@ -852,6 +860,15 @@ class SQLiteStore:
                     "auth_claim": metadata.get("auth_claim"),
                     "auth_reason": metadata.get("auth_reason"),
                     "claimed_source": metadata.get("claimed_source"),
+                    # 性情投影标记（追加决定八）：不进账本的话，
+                    # 按账本重建时标记与重印戳会丢、复印件就没
+                    # 人认得出是投影（同核心字段进账本的口径）。
+                    "persona_projection": metadata.get(
+                        "persona_projection"
+                    ),
+                    "persona_shell_sha256": metadata.get(
+                        "persona_shell_sha256"
+                    ),
                 },
             },
             lock=self._ledger_lock,
@@ -1418,6 +1435,14 @@ class SQLiteStore:
             self._finalize_recovery_health(report)
         except Exception:
             logger.warning("启动恢复：健康度收尾失败。", exc_info=True)
+        # 性情区一致性校验（追加决定八第 ⑤ 环）：启动时对一遍
+        # 壳↔复印件，冲突只挂待问、不覆盖任何一边（校验函数
+        # 内处理）；没行/只有种子行不吵。永不抛——校验失败
+        # 不能反过来堵住启动。
+        try:
+            report["persona"] = self._persona_startup_check()
+        except Exception:
+            logger.warning("启动恢复：性情区校验失败。", exc_info=True)
         return report
 
 
@@ -3198,6 +3223,10 @@ class SQLiteStore:
         if slot in _provenance.KNOWN_SLOTS:
             return True
         if meta.get("slot") in _provenance.KNOWN_SLOTS:
+            return True
+        if meta.get("persona_projection"):
+            # 性情投影行（追加决定八）：哪怕槽位标丢了，投影
+            # 标记本身也单独算核心保护——只读投影不许自动动。
             return True
         return bool(meta.get("is_rule") or meta.get("curated"))
 
@@ -10488,9 +10517,273 @@ class SQLiteStore:
 
     # ---------- 启动时要调的（接口兼容，SQLite 版里是空操作） ----------
 
+    # ---------- 性情区原件在壳（追加决定八，2026-11-25 补建） ----------
+    #
+    # 决定八五环的宿主落点（纯文本活在 memory/persona_shell.py）：
+    #   ① 壳原件：仓库根 SOUL.md 标记之间的 17 条（路径可注入
+    #      shell_soul_path，测试用临时壳；默认按 persona_shell
+    #      的仓库根口径）；
+    #   ② 逐字复印件行：slot="soul"、meta 带 persona_projection
+    #      只读投影标记、protection_tier="pinned"（钉死区口径，
+    #      不占座——core_cap.classify 按「活行+成员+保护档为空」
+    #      才占座）；_is_core_protected_row 对投影标记单独认，
+    #      受控入口/自动取代/清扫/衰减一律不碰（H1 的
+    #      core_protected 拒绝就是这条链）；
+    #   ③ 单向同步/重印：sync_persona_projection 只读壳、写记忆，
+    #      永远不写壳文件。三方哈希对照分清三种不一致：
+    #      复印件哈希≠上次重印戳 → 记忆侧被动过 = 冲突（挂问、
+    #      不覆盖）；复印件没变、壳哈希≠重印戳 → 壳侧正常改版，
+    #      照印（重印 = 新行落账 + 旧行 supersede，账本留痕）；
+    #      两边都对得上 = ok 什么都不做；
+    #   ④ 注入从壳原件生成：persona_injection_block 每次现读壳，
+    #      不读复印件——壳改了下一轮注入就是新版（main.py 接点）；
+    #   ⑤ 一致性校验：verify_persona_consistency（启动恢复收尾
+    #      自动跑一遍 _persona_startup_check）；冲突只挂待问
+    #      （auth_claim 类知情问，先例同受控入口拦截问），BOOS
+    #      裁定后以壳为准时调 sync_persona_projection(force=True)
+    #      重印——force 只许人工裁定后用，程序内部不自调。
+    #   Plan C 种子行调和：旧 soul 槽行（AGENT_SOUL_TEXT 一句话
+    #   概括版，mem0 时代种下、无投影标记）在第一次同步时被
+    #   「调和重印」——新投影行落账、种子行走 supersede 退役
+    #   （账本留痕、不删），库里从此只有一行活的 soul 行，不
+    #   留两行互相竞争的「人格」行。依据：决定八＋BOOS
+    #   2026-11-25「替换」拍板——种子本就是指向 SOUL.md 的一句
+    #   概括，原件回来后它没有独立存在的理由。
+
+    def _persona_soul_rows(self):
+        """活着的 soul 相关行：slot='soul' 或带投影标记的。
+
+        返回 [{"id", "text", "meta"}]，按 write_seq 从新到旧。
+        """
+        rows = []
+        cur = self._conn.execute(
+            "SELECT id, text, metadata_json FROM memories"
+            " WHERE superseded=0 AND deleted=0 AND voided=0"
+        )
+        for rid, text, meta_json in cur.fetchall():
+            try:
+                meta = json.loads(meta_json or "{}")
+            except Exception:
+                meta = {}
+            if meta.get("slot") == "soul" or meta.get("persona_projection"):
+                rows.append({"id": rid, "text": text or "", "meta": meta})
+        rows.sort(
+            key=lambda r: r["meta"].get("write_seq") or 0, reverse=True
+        )
+        return rows
+
+    def _persona_projection(self):
+        """当前活着的投影行（最新的一行）；没有返回 None。"""
+        for row in self._persona_soul_rows():
+            if row["meta"].get("persona_projection"):
+                return row
+        return None
+
+    def _queue_persona_conflict_question(self, projection, shell_hash,
+                                         copy_hash):
+        """壳↔复印件冲突攒一条知情待问（先例：受控入口拦截问）。
+
+        只知情、不裁决：BOOS 答「知道了」只是确认知晓，冲突本身
+        等他裁定（以壳为准重印 / 保留记忆这份另议），程序不自决。
+        """
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "性情区壳原件与核心记忆复印件对不上（记忆 id：%s），"
+            "已挂起、两边都没动，等 BOOS 裁定。"
+            % (projection["id"],),
+            _pq.CHANGE_ATTEMPT_QUESTION_OPTIONS,
+            "性情区一致性校验（追加决定八）：壳与复印件冲突不许"
+            "程序自决或默默覆盖，挂起问 BOOS",
+            memory_id=projection["id"],
+            extra={
+                "auth_action": "persona_conflict",
+                "shell_sha256": shell_hash,
+                "copy_sha256": copy_hash,
+            },
+        )
+
+    def _print_persona_projection(self, shell_text, shell_hash):
+        """把壳条文逐字印成一行新的投影行（账本先行，走既有落行路）。
+
+        返回新行 key；账本写不进去返回 None（调用方如实报）。
+        调用方需持锁（_append_new_memory 的既有口径）。
+        """
+        created_at = _now_iso()
+        meta = {
+            "source": "shell",
+            "confidence": 1.0,
+            "user_confirmed": True,
+            "created_at": created_at,
+            "write_seq": _next_write_seq(),
+            "turn_id": None,
+            "slot": "soul",
+            "is_rule": False,
+            "curated": False,
+            "protection_tier": _core_cap.TIER_PINNED,
+            "core_drawer": None,
+            "decay_kind": _decay.DECAY_KIND_STABLE,
+            "importance": "high",
+            "event_date": None,
+            "last_used_at": created_at,
+            "decay_state": _decay.DECAY_STATE_VERBATIM,
+            "persona_projection": True,
+            "persona_shell_sha256": shell_hash,
+        }
+        dates, sessions, _added = _decay.record_seen_occurrence(
+            None, None, _shanghai_today().isoformat(), None
+        )
+        meta["seen_dates"] = _decay._dump_seen_list(dates)
+        meta["seen_sessions"] = _decay._dump_seen_list(sessions)
+        return self._append_new_memory(shell_text, meta)
+
+    def sync_persona_projection(self, force=False):
+        """壳→记忆单向同步/重印。返回 {"status", "memory_id", ...}。
+
+        status:
+          created    没有任何 soul 行 → 新印投影行；
+          reconciled 只有 Plan C 种子行 → 调和重印（种子退役）；
+          reprinted  壳改版（复印件未动）→ 照印新版，旧行退役；
+          ok         壳、复印件、重印戳三方一致，什么都不做；
+          conflict   复印件被记忆侧动过 → 挂待问、不覆盖（force
+                     =True 才照印，只许 BOOS 裁定后人工调用）；
+          no_shell   壳原件读不到/摘不出条文段 → 不动记忆；
+          ledger_failed  账本写不进去 → 没印成，如实报。
+        本函数永远不写壳文件（单向是死规矩，测试钉住）。
+        """
+        shell_text = _persona_shell.read_shell_clauses(
+            self._shell_soul_path
+        )
+        if not shell_text:
+            return {"status": "no_shell", "memory_id": None}
+        shell_hash = _persona_shell.clauses_sha256(shell_text)
+        with self._lock:
+            proj = None
+            others = []
+            for row in self._persona_soul_rows():
+                if row["meta"].get("persona_projection") and proj is None:
+                    proj = row
+                else:
+                    others.append(row)
+            if proj is not None and not force:
+                stored = proj["meta"].get("persona_shell_sha256")
+                copy_hash = _persona_shell.clauses_sha256(proj["text"])
+                if copy_hash != stored:
+                    question = self._queue_persona_conflict_question(
+                        proj, shell_hash, copy_hash
+                    )
+                    return {
+                        "status": "conflict",
+                        "memory_id": proj["id"],
+                        "question_id": (question or {}).get("id"),
+                    }
+                if shell_hash == stored:
+                    return {"status": "ok", "memory_id": proj["id"]}
+            if proj is not None:
+                status = "reprinted"
+            elif others:
+                status = "reconciled"
+            else:
+                status = "created"
+            new_id = self._print_persona_projection(shell_text, shell_hash)
+            if new_id is None:
+                return {"status": "ledger_failed", "memory_id": None}
+            retire = ([proj] if proj is not None else []) + others
+            for row in retire:
+                if row["id"] == new_id:
+                    continue
+                try:
+                    self._supersede_row(
+                        row["id"], row["text"], row["meta"],
+                        new_id, shell_text,
+                    )
+                except Exception:
+                    logger.warning(
+                        "性情投影重印：旧行取代失败（新行已落账）。",
+                        exc_info=True,
+                    )
+            return {"status": status, "memory_id": new_id}
+
+    def verify_persona_consistency(self):
+        """壳↔复印件一致性校验（决定八第 ⑤ 环）。
+
+        返回 {"ok", "status", ...}：ok=逐字一致；shell_changed=
+        壳改版待重印（正常流程，不挂问）；conflict=复印件被动过
+        （挂待问、两边不覆盖）；missing=还没有投影行；
+        legacy=只有种子行待调和；no_shell=壳读不到。
+        """
+        shell_text = _persona_shell.read_shell_clauses(
+            self._shell_soul_path
+        )
+        if not shell_text:
+            return {"ok": False, "status": "no_shell"}
+        shell_hash = _persona_shell.clauses_sha256(shell_text)
+        with self._lock:
+            proj = self._persona_projection()
+            if proj is None:
+                return {
+                    "ok": False,
+                    "status": "legacy" if self._persona_soul_rows()
+                    else "missing",
+                }
+            if proj["text"] == shell_text:
+                return {
+                    "ok": True, "status": "ok",
+                    "memory_id": proj["id"],
+                }
+            copy_hash = _persona_shell.clauses_sha256(proj["text"])
+            stored = proj["meta"].get("persona_shell_sha256")
+            if copy_hash == stored:
+                return {
+                    "ok": False, "status": "shell_changed",
+                    "memory_id": proj["id"],
+                }
+            question = self._queue_persona_conflict_question(
+                proj, shell_hash, copy_hash
+            )
+            return {
+                "ok": False, "status": "conflict",
+                "memory_id": proj["id"],
+                "question_id": (question or {}).get("id"),
+            }
+
+    def _persona_startup_check(self):
+        """启动恢复收尾的性情校验：没行不吵、种子行待同步不吵，
+        只有真投影在场才三方校验（冲突挂问在 verify 里）。"""
+        rows = self._persona_soul_rows()
+        if not rows:
+            return {"status": "absent"}
+        if self._persona_projection() is None:
+            return {"status": "legacy_pending_sync"}
+        return self.verify_persona_consistency()
+
+    def persona_injection_block(self):
+        """每轮注入的性情块：现读壳原件生成，不读记忆复印件。
+
+        壳读不到返回空串（宁可不带，也不拿复印件冒充原件——
+        决定八：注入从壳原件生成）。
+        """
+        shell_text = _persona_shell.read_shell_clauses(
+            self._shell_soul_path
+        )
+        if not shell_text:
+            return ""
+        return _persona_shell.build_persona_block(shell_text)
+
     def ensure_identity_memories(self):
-        """身份记忆已经在账本里了，SQLite 版启动时不用再种。"""
-        return {}
+        """身份种子接点（web 启动时调）：决定八起承担性情投影同步。
+
+        返回 {"soul": {...}}：新建/调和时 status="added"（沿调用方
+        既有口径），精确结果在 persona_status 里（created /
+        reconciled / reprinted / ok / conflict / no_shell /
+        ledger_failed）。名字/电脑配置种子是 mem0 时代的事、账本
+        里已有，本函数不再重复种（旧桩注释的口径不变）。
+        """
+        result = self.sync_persona_projection()
+        outcome = dict(result)
+        outcome["persona_status"] = result.get("status")
+        if result.get("status") in ("created", "reconciled"):
+            outcome["status"] = "added"
+        return {"soul": outcome}
 
     def backfill_timestamps(self):
         """补时间戳是 mem0 索引的事，SQLite 行里本来就有 created_at。"""
