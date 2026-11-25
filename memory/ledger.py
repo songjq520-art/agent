@@ -57,6 +57,15 @@ LEDGER_EVENT_TOUCH = "touch"
 # slot），重建时按它把标带回来。只是索引提示，不改变记忆状态，
 # resolve_state 不处理它（状态层不认这个类型，无副作用）。
 LEDGER_EVENT_SLOT = "slot"
+# 图谱二期（2026-11-24）：图边事件——同义词边的新增/作废、关系边的
+# 显式作废都记这一笔（边进账本：谁提的、凭什么、什么时候连的、
+# 什么时候废的，全可追溯）。事件形状：action=add/invalidate、
+# kind（synonym 或四种关系之一）、entity_a/entity_b（同义词边的两个
+# 实体名）或 from_key/to_key（关系边的两个记忆 key）、scope（同义词
+# 边的作用域）、provenance（来源）、evidence（放行证据）、
+# valid_at/invalid_at、reason（作废理由）。resolve_state 只把它们
+# 折成 graph_edges 列表供建图重放，不改变任何记忆状态。
+LEDGER_EVENT_GRAPH_EDGE = "graph_edge"
 LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_ADD,
     LEDGER_EVENT_SUPERSEDE,
@@ -69,6 +78,7 @@ LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_SNAPSHOT,
     LEDGER_EVENT_TOUCH,
     LEDGER_EVENT_SLOT,
+    LEDGER_EVENT_GRAPH_EDGE,
 )
 
 # 账本里的状态名（resolve_state 的 by_id 值里 "state" 字段的取值）。
@@ -280,6 +290,7 @@ def resolve_state(events, snapshot=None):
     by_id = {}
     adds = []
     relations = []
+    graph_edges = []
     key_states = {}
     id_to_key = {}
     inferences = {}
@@ -294,6 +305,8 @@ def resolve_state(events, snapshot=None):
             adds.append(dict(entry))
         for entry in snapshot.get("relations") or []:
             relations.append(dict(entry))
+        for entry in snapshot.get("graph_edges") or []:
+            graph_edges.append(dict(entry))
         for key, state in (snapshot.get("key_states") or {}).items():
             key_states[key] = state
         for mem_id, key in (snapshot.get("id_to_key") or {}).items():
@@ -426,6 +439,24 @@ def resolve_state(events, snapshot=None):
                     "seq": seq,
                 }
             )
+        elif etype == LEDGER_EVENT_GRAPH_EDGE:
+            graph_edges.append(
+                {
+                    "action": event.get("action") or "add",
+                    "kind": event.get("kind") or "",
+                    "entity_a": event.get("entity_a"),
+                    "entity_b": event.get("entity_b"),
+                    "from_key": event.get("from_key"),
+                    "to_key": event.get("to_key"),
+                    "scope": event.get("scope"),
+                    "provenance": event.get("provenance") or "",
+                    "evidence": event.get("evidence") or "",
+                    "valid_at": event.get("valid_at"),
+                    "invalid_at": event.get("invalid_at"),
+                    "reason": event.get("reason") or "",
+                    "seq": seq,
+                }
+            )
         elif etype == LEDGER_EVENT_TOUCH:
             _touch_ts = event.get("ts")
             if _touch_ts:
@@ -440,6 +471,7 @@ def resolve_state(events, snapshot=None):
         "by_id": by_id,
         "adds": adds,
         "relations": relations,
+        "graph_edges": graph_edges,
         "key_states": key_states,
         "id_to_key": id_to_key,
         "inferences": inferences,
@@ -581,6 +613,7 @@ def write_snapshot(path, state, seq_max):
         "by_id": (state or {}).get("by_id") or {},
         "adds": (state or {}).get("adds") or [],
         "relations": (state or {}).get("relations") or [],
+        "graph_edges": (state or {}).get("graph_edges") or [],
         "key_states": (state or {}).get("key_states") or {},
         "id_to_key": (state or {}).get("id_to_key") or {},
         "inferences": (state or {}).get("inferences") or {},

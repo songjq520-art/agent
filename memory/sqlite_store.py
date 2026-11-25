@@ -39,7 +39,12 @@ from pathlib import Path
 
 from memory import core_cap as _core_cap
 from memory import decay as _decay
+from memory import graph as _graph_mod
 from memory import ledger as _ledger
+from memory.graph_entities import (
+    extract_entities_free as _extract_entities_free,
+    normalize_entity_name as _normalize_entity_name,
+)
 from memory import pending_questions as _pq
 from memory import provenance as _provenance
 from memory.correction_text import (
@@ -582,6 +587,12 @@ class SQLiteStore:
         self.ledger_path = self.memory_dir / "memory_events.jsonl"
         self.snapshot_path = self.memory_dir / "graph_snapshot.json"
         self.db_path = self.memory_dir / "memories.sqlite3"
+        # 图谱二期（2026-11-24）：图是账本的投影（索引），按账本文件
+        # 指纹（mtime+大小）缓存，账本一变就从事件重建。注意别和
+        # snapshot_path 混了——那个名叫 graph_snapshot.json 的文件
+        # 是账本状态快照（load_ledger_state 用），不是图。
+        self._graph_cache = None
+        self._graph_stamp = None
         self.budget_tracker = budget_tracker
         # 语义判官对象（2026-11-22 混合法）：测试注入 mock 用；
         # None 时每次判断按 config.py 的 SEMANTIC_JUDGE 解析（默认 DeepSeek flash）。
@@ -762,6 +773,151 @@ class SQLiteStore:
             return {"by_id": {}, "adds": [], "relations": [],
                     "key_states": {}, "id_to_key": {}, "inferences": {},
                     "seq_max": 0, "snapshot_seq": None}
+
+    # ---------- 图谱二期：图投影与边维护 ----------
+
+    def _ledger_stamp(self):
+        """账本文件指纹：(mtime_ns, 大小)；文件不在返回 None。"""
+        try:
+            st = os.stat(self.ledger_path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _get_graph(self):
+        """拿当前图（账本投影）：账本没变用缓存，变了从事件重建。
+
+        重建走 MemoryGraph.rebuild_from_events：关系边由事件重放时
+        自动判，同义词边的新增/作废按 graph_edge 事件重放，边的
+        有效期按账本状态同步。图建不出来返回空图——检索少一路，
+        不拦路（和 BM25 坏掉只丢一路同口径）。
+        """
+        stamp = self._ledger_stamp()
+        if self._graph_cache is not None and stamp == self._graph_stamp:
+            return self._graph_cache
+        graph = _graph_mod.MemoryGraph()
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+            graph.rebuild_from_events(events)
+        except Exception:
+            logger.warning("图谱重建失败：本次不用图。", exc_info=True)
+            graph = _graph_mod.MemoryGraph()
+        self._graph_cache = graph
+        self._graph_stamp = self._ledger_stamp()
+        return graph
+
+    def add_synonym_edge(self, name_a, name_b, scope, provenance="",
+                         evidence=""):
+        """落一条同义词边：先写账本 graph_edge 事件，再按账本重建图。
+
+        scope 必填（契约：无作用域不许建；默认只在提出它的上下文
+        内生效，全局要明写 global）。审批分级（普通词判官放行、
+        人名/称呼双模型核，拍板 5）是调用方的事——这里只负责
+        「边带 scope 与出处、账本留痕、检索按 scope 过滤」这套
+        机制。实体名先归一化再写账，免得同一实体两种写法对不上。
+        返回 {"ok": bool, ...}；ok 只表示账写上了，applied 表示
+        重建后的图里这条边确实有效（同对同 scope 已有有效边时
+        applied 为 True 且不重复连）。
+        """
+        a = _normalize_entity_name(name_a)
+        b = _normalize_entity_name(name_b)
+        if not a or not b or a == b:
+            return {"ok": False, "reason": "bad_entities"}
+        if not isinstance(scope, str) or not scope.strip():
+            return {"ok": False, "reason": "scope_required"}
+        scope = scope.strip()
+        try:
+            record = _ledger.append_event(
+                self.ledger_path,
+                {
+                    "type": _ledger.LEDGER_EVENT_GRAPH_EDGE,
+                    "action": "add",
+                    "kind": _graph_mod.EDGE_SYNONYM,
+                    "entity_a": a,
+                    "entity_b": b,
+                    "scope": scope,
+                    "provenance": provenance or "",
+                    "evidence": evidence or "",
+                    "valid_at": _now_iso(),
+                },
+                lock=self._ledger_lock,
+            )
+        except Exception:
+            logger.warning("同义词边写账本失败。", exc_info=True)
+            return {"ok": False, "reason": "ledger_failed"}
+        self._graph_cache = None
+        graph = self._get_graph()
+        pair = {_graph_mod.entity_node_id(a), _graph_mod.entity_node_id(b)}
+        applied = any(
+            edge.get("kind") == _graph_mod.EDGE_SYNONYM
+            and not edge.get("invalid_at")
+            and edge.get("scope") == scope
+            and {edge.get("from"), edge.get("to")} == pair
+            for edge in graph.edges
+        )
+        return {"ok": True, "applied": applied, "seq": record.get("seq")}
+
+    def void_graph_edge(self, kind, name_a=None, name_b=None,
+                        from_key=None, to_key=None, reason=""):
+        """作废一条边：写账本 graph_edge(invalidate) 事件，边不删。
+
+        同义词边按实体名认（kind="synonym" + name_a/name_b），
+        关系边按记忆 key 认（kind 为四种关系之一 + from_key/
+        to_key，取代边方向按 from=旧、to=新）。作废后检索不再
+        走这条边；边本身留在账本与图里，edge_history 查得到
+        （含作废时间与理由）。返回 {"ok": bool, ...}。
+        """
+        event = {
+            "type": _ledger.LEDGER_EVENT_GRAPH_EDGE,
+            "action": "invalidate",
+            "kind": kind,
+            "invalid_at": _now_iso(),
+            "reason": reason or "",
+        }
+        if kind == _graph_mod.EDGE_SYNONYM:
+            a = _normalize_entity_name(name_a)
+            b = _normalize_entity_name(name_b)
+            if not a or not b:
+                return {"ok": False, "reason": "entities_required"}
+            event["entity_a"] = a
+            event["entity_b"] = b
+        else:
+            if not from_key or not to_key:
+                return {"ok": False, "reason": "keys_required"}
+            event["from_key"] = from_key
+            event["to_key"] = to_key
+        try:
+            record = _ledger.append_event(
+                self.ledger_path, event, lock=self._ledger_lock
+            )
+        except Exception:
+            logger.warning("图边作废写账本失败。", exc_info=True)
+            return {"ok": False, "reason": "ledger_failed"}
+        self._graph_cache = None
+        return {"ok": True, "seq": record.get("seq")}
+
+    def graph_edge_history(self, name_a=None, name_b=None,
+                           from_key=None, to_key=None, kind=None):
+        """查两个节点之间的边全史（有效 + 作废，带出处与作废理由）。
+
+        同义词边按实体名查，关系边按记忆 key 查；都不给返回 []。
+        """
+        graph = self._get_graph()
+        a = _normalize_entity_name(name_a)
+        b = _normalize_entity_name(name_b)
+        if a and b:
+            return graph.edge_history(
+                _graph_mod.entity_node_id(a),
+                _graph_mod.entity_node_id(b),
+                kind=kind,
+            )
+        if from_key and to_key:
+            return graph.edge_history(
+                _graph_mod.memory_node_id(from_key),
+                _graph_mod.memory_node_id(to_key),
+                kind=kind,
+            )
+        return []
 
     def reconcile_ledger_index(self):
         """启动对账：账本里有、SQLite 里没有的，按账本重建索引。
@@ -4851,7 +5007,7 @@ class SQLiteStore:
         ]
 
     def search(self, query, top_k=5, reinforce=False, include_history=False,
-               turn_id=None):
+               turn_id=None, scope=None):
         """搜记忆：宽召回（语义 top_k*4 + BM25 全库 top_k*4）→ RRF k=60
         融合 → 原样匹配在前 → 截断 top_k，不够再账本兜底（见 _search_inner，
         旧 mem0 search 的排名逻辑）。
@@ -4869,7 +5025,8 @@ class SQLiteStore:
             self._active_turn_id = turn_id
         try:
             results = self._search_inner(
-                query, top_k=top_k, include_history=include_history
+                query, top_k=top_k, include_history=include_history,
+                scope=scope,
             )
         except Exception:
             logger.warning("SQLite 检索失败。", exc_info=True)
@@ -4894,12 +5051,13 @@ class SQLiteStore:
                 logger.warning("检索强化写回失败：记忆本身还在。", exc_info=True)
         return results
 
-    def _search_inner(self, query, top_k=5, include_history=False):
+    def _search_inner(self, query, top_k=5, include_history=False,
+                      scope=None):
         """宽召回 → RRF 融合 → 先筛后截（旧 mem0 search 的排名逻辑，
         commit 7a69699“宽召回 + RRF 融合”，mem0_store.py search）。
 
         三路排名：语义（原始余弦分 ≥ 0.4，取 top_k*4）、BM25（全库打分，
-        取 top_k*4）、图谱（还没建，空路）。标准 RRF k=60 融合，再乘
+        取 top_k*4）、图谱（一跳联想扩展，二期接通）。标准 RRF k=60 融合，再乘
         衰减权重 × 类型权重（稳定偏好 1.25，见 _type_weight，2026-11-21
         Q3 修法）；原样匹配（基金代码/数字/整句，见
         memory/bm25.extract_exact_matches）的排在前面。
@@ -4921,8 +5079,12 @@ class SQLiteStore:
             也没有沉底态（decay_state）可拦；衰减接进来时闸门加在这里、
             截断之前。精选先查（旧逻辑第 0 步）也没接：库里 curated 行
             是 0 条，等精选清单那步再接。
-          - 图谱路是空列表：融合时等于没这一路（旧逻辑图坏了只丢图这路
-            的同款处理）；图上才找得到的记忆（source="graph"）现在没有。
+          - 图谱路（二期）：种子 = 查询抽到的实体 + 语义/BM25 已捞到
+            的记忆，顺有效边一跳扩展（同义词边按 scope 过滤、取代边
+            定向、冲突边不走、作废边不走）；图上才找得到的记忆以
+            source="graph" 进候选，score 只做展示（关键词重合度，
+            与 BM25 路同口径），排位交给 RRF。扩展纯读，不改图、
+            不改库；图坏了只丢这一路（和旧口径一致）。
         """
         with self._lock:
             import numpy as np
@@ -5040,8 +5202,39 @@ class SQLiteStore:
             for cid, item in candidates.items():
                 item.setdefault("exact_match", cid in exact_ids)
 
-            # 图谱路：还没建（已知缺口），空路进融合等于没这一路。
+            # 图谱路（二期）：一跳联想扩展，见上面 docstring 的口径。
             graph_ranked = []
+            try:
+                graph = self._get_graph()
+                seed_entities = [
+                    name for name, _kind in _extract_entities_free(query)
+                ]
+                seed_keys = [
+                    mid
+                    for mid in list(semantic_ranked) + list(bm25_ranked)
+                    if mid in by_id
+                ]
+                expanded = graph.expand_one_hop(
+                    seed_keys=seed_keys,
+                    seed_entities=seed_entities,
+                    scope=scope,
+                )
+                for gkey, _gscore in expanded.items():
+                    m = by_id.get(gkey)
+                    if m is None:
+                        continue
+                    graph_ranked.append(gkey)
+                    if gkey in candidates:
+                        continue
+                    if m["text"] in seen_texts:
+                        continue
+                    seen_texts.add(m["text"])
+                    candidates[gkey] = _result_item(
+                        m, _keyword_overlap(query, m["text"] or ""), "graph"
+                    )
+            except Exception:
+                logger.warning("图谱检索失败：本次只用语义/BM25 结果。", exc_info=True)
+                graph_ranked = []
             if _bm25 is not None:
                 fused = _bm25.reciprocal_rank_fusion(
                     [semantic_ranked, bm25_ranked, graph_ranked], k=60
