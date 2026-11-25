@@ -648,6 +648,15 @@ class SQLiteStore:
         # 本，进程重启即全失效（get/diff 如实 KeyError，不给假数
         # 据）；口径见下方快照节。
         self._stable_snapshots = {}
+        # 保护迁移完成证据（立项 H5，2026-11-25）：保护档迁移的
+        # 追加式证据日志（先例：controlled_entry_log.jsonl）——只
+        # 追加、本类不提供改/删接口；进程内另记「已迁移待补证」
+        # 清单，供 pending_notices 露头与核对函数对照。
+        self._protection_evidence_path = (
+            self.memory_dir / "protection_migration_evidence.jsonl"
+        )
+        self._protection_evidence_lock = threading.Lock()
+        self._protection_evidence_pending = []
         self._controlled_frozen_reason = None
         self._controlled_health_issues = []
         self._controlled_reconcile_report = None
@@ -7218,7 +7227,8 @@ class SQLiteStore:
         snap["generated_at"] = _now_iso()
         return snap
 
-    def set_protection_tier(self, memory_id, tier, _op_id=None, _idem_key=None):
+    def set_protection_tier(self, memory_id, tier, _op_id=None,
+                            _idem_key=None, _source=None):
         """改一条活记忆的保护档位：tier 是 "pinned"（钉死）/
         "temp_pinned"（临时钉死）/ None（摘档回普通）。
 
@@ -7228,7 +7238,7 @@ class SQLiteStore:
             return {"ok": False, "reason": "bad_tier", "memory_id": memory_id}
         return self._update_core_fields(
             memory_id, {_core_cap.PROTECTION_TIER_FIELD: tier},
-            _op_id=_op_id, _idem_key=_idem_key,
+            _op_id=_op_id, _idem_key=_idem_key, _source=_source,
         )
 
     def set_core_drawer(self, memory_id, drawer, _op_id=None, _idem_key=None):
@@ -7242,7 +7252,8 @@ class SQLiteStore:
             _op_id=_op_id, _idem_key=_idem_key,
         )
 
-    def _update_core_fields(self, memory_id, changes, _op_id=None, _idem_key=None):
+    def _update_core_fields(self, memory_id, changes, _op_id=None,
+                            _idem_key=None, _source=None):
         """核心上限字段（保护档/抽屉）的统一改法：持锁内复核
         占座变化、过容量门、账本先行（PROMOTE 带改后的完整
         meta，和语气打标同款）、再改 SQLite；账本写失败就
@@ -7263,6 +7274,14 @@ class SQLiteStore:
             for field, value in changes.items():
                 new_meta[field] = value
             after = _core_cap.classify(new_meta)
+            # 保护迁移证据（立项 H5）：档位变化前后值与变更前
+            # 版本戳先算好，账本落笔后在函数尾组装证据。
+            _tier_field = _core_cap.PROTECTION_TIER_FIELD
+            tier_before = meta.get(_tier_field)
+            tier_after = new_meta.get(_tier_field)
+            version_before = self._controlled_version_stamp(
+                row[0] or "", meta
+            )
             if after["occupies_seat"] and not before["occupies_seat"]:
                 snap = self.core_seat_snapshot()
                 if snap["seats_used"] >= snap["limit"]:
@@ -7291,8 +7310,9 @@ class SQLiteStore:
                 # 变更，idem_key 与回执/审计三方对照。
                 event["op_id"] = _op_id
                 event["idem_key"] = _idem_key
+            ledger_record = None
             try:
-                _ledger.append_event(
+                ledger_record = _ledger.append_event(
                     self.ledger_path, event, lock=self._ledger_lock,
                 )
             except Exception:
@@ -7309,6 +7329,45 @@ class SQLiteStore:
             self._conn.commit()
             result = {"ok": True, "memory_id": memory_id}
             result.update(changes)
+            if tier_after != tier_before:
+                # 保护档真变了：产一份迁移完成证据（立项 H5）。
+                # 证据追加失败不回滚——账本与投影已经一致落地，
+                # 回滚投影只会与账本分叉；如实标 pending 待补
+                # 证，核对函数（verify_protection_migration）
+                # 与 pending_notices 都会把缺证列出来。
+                evidence = {
+                    "evidence_id": "pme-%s" % (
+                        (ledger_record or {}).get("seq"),
+                    ),
+                    "memory_id": memory_id,
+                    "tier_before": tier_before,
+                    "tier_after": tier_after,
+                    "drawer_before": meta.get(_core_cap.DRAWER_FIELD),
+                    "drawer_after": new_meta.get(_core_cap.DRAWER_FIELD),
+                    "source": _source or "host_direct",
+                    "ts": _now_iso(),
+                    "ledger_seq": (ledger_record or {}).get("seq"),
+                    "ledger_ts": (ledger_record or {}).get("ts"),
+                    "op_id": _op_id,
+                    "idem_key": _idem_key,
+                    "version_before": version_before,
+                    "version_after": self._controlled_version_stamp(
+                        row[0] or "", new_meta
+                    ),
+                    "text_hash": hashlib.sha256(
+                        (row[0] or "").encode("utf-8")
+                    ).hexdigest(),
+                }
+                recorded = self._append_protection_evidence(evidence)
+                result["protection_evidence"] = {
+                    "evidence_id": evidence["evidence_id"],
+                    "recorded": recorded,
+                    "pending": not recorded,
+                }
+                if not recorded:
+                    self._protection_evidence_pending.append(
+                        dict(evidence)
+                    )
             return result
 
     def _answer_core_capacity_question(self, question, choice):
@@ -8365,6 +8424,7 @@ class SQLiteStore:
                     result = self.set_protection_tier(
                         memory_id, tier_value,
                         _op_id=op_id, _idem_key=idem_key,
+                        _source=source,
                     )
                     if not result.get("ok"):
                         exec_failure = (
@@ -9100,6 +9160,7 @@ class SQLiteStore:
                     result = self.set_protection_tier(
                         memory_id, before_value,
                         _op_id=rev_op_id, _idem_key=rev_key,
+                        _source="revocation",
                     )
                     if not result.get("ok"):
                         exec_failure = (
@@ -9295,8 +9356,326 @@ class SQLiteStore:
             self._conn.commit()
             return {"ok": True, "voided": True, "memory_id": row[0]}
 
-    def list_protection_events(self, limit=50):
-        return []
+    # ---------- 保护迁移完成证据（立项 H5，2026-11-25） ----------
+    # 证据形态（十一核定）：双层——
+    # ① 当场证据：_update_core_fields 在保护档真变化时（账本
+    #    落笔＋投影落库之后、仍在店锁内）往
+    #    protection_migration_evidence.jsonl 追加一条完整证据，
+    #    evidence_id 与账本 seq 绑死（pme-<seq>）；只追加，
+    #    本类不提供任何改/删证据的接口。
+    # ② 账本派生：list_protection_events 从账本 ADD/PROMOTE
+    #    事件按 presence 口径折档位轨迹，H5 之前发生的迁移也
+    #    列得出，标 evidence_recorded=False（待补证）——缺证
+    #    只说明没有当场证据，不许据此推断「可降级」。
+    # 完成判定以账本为准（verify_protection_migration）：账本
+    # 确有这笔且档位对得上、投影现状与账本档位链终点一致、
+    # 当场证据在档，三者齐才算完成；对不上逐项列 mismatches，
+    # 不许汇总数字掩盖。
+
+    def _append_protection_evidence(self, evidence):
+        """把一份迁移证据追加进证据日志（fsync 落盘）；成功
+        True、失败 False——失败只记日志不抛：迁移本体已落
+        账本，处置口径见 _update_core_fields 尾部注释。"""
+        try:
+            with self._protection_evidence_lock:
+                with open(
+                    self._protection_evidence_path, "a",
+                    encoding="utf-8",
+                ) as fh:
+                    fh.write(
+                        json.dumps(evidence, ensure_ascii=False) + "\n"
+                    )
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            return True
+        except Exception:
+            logger.warning(
+                "保护迁移证据落盘失败（已迁移待补证）：%s",
+                (evidence or {}).get("evidence_id"),
+                exc_info=True,
+            )
+            return False
+
+    def _read_protection_evidence(self):
+        """读证据日志全量：返回 (records, bad_lines)；文件不
+        存在视作空。坏行跳过并计数，不许整份丢弃。"""
+        records = []
+        bad = 0
+        try:
+            with open(
+                self._protection_evidence_path, "r", encoding="utf-8"
+            ) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (ValueError, TypeError):
+                        bad += 1
+                        continue
+                    if isinstance(rec, dict):
+                        records.append(rec)
+                    else:
+                        bad += 1
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning("保护迁移证据日志读取失败", exc_info=True)
+        return records, bad
+
+    def _protection_tier_history_from_ledger(self):
+        """从账本派生全库保护档轨迹：返回 (history, final_tiers)。
+
+        history：迁移条目列表（seq 升序）——ADD 只定初始档、
+        不产条目；PROMOTE 起档位真变化产一条（带 evidence_id
+        pme-<seq> 与 evidence_recorded 对照当场证据日志）。
+        final_tiers：每条记忆账本口径的当前档位。
+        档位按 presence 口径读：事件 meta 里有 protection_tier
+        键才更新轨迹（键在值为 None = 摘档），与 core_cap 的
+        _PROMOTE_PRESENCE_FIELDS 对账口径一致；其他 PROMOTE
+        写入点带的完整 meta 里档位没变，自然不产条目。"""
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            logger.warning("保护迁移历史读账本失败", exc_info=True)
+            return [], {}
+        recorded_ids = {
+            rec.get("evidence_id")
+            for rec in self._read_protection_evidence()[0]
+        }
+        tiers = {}
+        history = []
+        for event in sorted(
+            (e for e in events if isinstance(e, dict)),
+            key=lambda e: e.get("seq") or 0,
+        ):
+            etype = event.get("type")
+            if etype not in (
+                _ledger.LEDGER_EVENT_ADD, _ledger.LEDGER_EVENT_PROMOTE,
+            ):
+                continue
+            mid = event.get("memory_id") or event.get("key")
+            meta = event.get("meta") or {}
+            if not mid or _core_cap.PROTECTION_TIER_FIELD not in meta:
+                continue
+            tier = meta.get(_core_cap.PROTECTION_TIER_FIELD)
+            if etype == _ledger.LEDGER_EVENT_ADD:
+                tiers[mid] = tier
+                continue
+            before = tiers.get(mid)
+            if tier != before:
+                seq = event.get("seq")
+                history.append(
+                    {
+                        "evidence_id": "pme-%s" % seq,
+                        "memory_id": mid,
+                        "tier_before": before,
+                        "tier_after": tier,
+                        "ledger_seq": seq,
+                        "ts": event.get("ts"),
+                        "op_id": event.get("op_id"),
+                        "idem_key": event.get("idem_key"),
+                        "source": (
+                            "controlled_entry"
+                            if event.get("op_id")
+                            else "host_direct"
+                        ),
+                        "evidence_recorded": (
+                            ("pme-%s" % seq) in recorded_ids
+                        ),
+                    }
+                )
+            tiers[mid] = tier
+        return history, tiers
+
+    def list_protection_events(self, memory_id=None, limit=50):
+        """保护档迁移事件（立项 H5 做真，原兼容桩返回 []）。
+
+        数据源为账本保护类事件派生轨迹（见
+        _protection_tier_history_from_ledger）：带 memory_id
+        返回该条的迁移历史（seq 升序）；不带返回全库最近
+        limit 条（seq 升序）。每条带 evidence_recorded：
+        False = 这笔迁移没有当场证据（H5 之前发生、或证据
+        落盘失败），属「待补证」。web/server.py 无参调用，
+        签名向后兼容（新增可选 memory_id），返回仍是 list、
+        键只增不减。"""
+        history, _tiers = self._protection_tier_history_from_ledger()
+        if memory_id is not None:
+            history = [
+                h for h in history if h["memory_id"] == memory_id
+            ]
+        if limit is not None and len(history) > limit:
+            history = history[-limit:]
+        return history
+
+    def get_protection_migration_evidence(self, evidence_id):
+        """取单份完整迁移证据：先查当场证据日志（完整版，带
+        前后版本戳与原文哈希）；没有时按 pme-<seq> 从账本
+        派生重建（reconstructed=True，前后版本戳等当场字段
+        如实置 None）；两处都对不上返回 None。"""
+        if not evidence_id:
+            return None
+        for rec in self._read_protection_evidence()[0]:
+            if rec.get("evidence_id") == evidence_id:
+                out = dict(rec)
+                out["reconstructed"] = False
+                return out
+        history, _tiers = self._protection_tier_history_from_ledger()
+        for entry in history:
+            if entry["evidence_id"] == evidence_id:
+                rebuilt = dict(entry)
+                rebuilt["reconstructed"] = True
+                rebuilt["version_before"] = None
+                rebuilt["version_after"] = None
+                rebuilt["text_hash"] = None
+                return rebuilt
+        return None
+
+    def verify_protection_migration(self, memory_id=None,
+                                    evidence_id=None):
+        """核对一笔保护迁移是否真完成（贵妃 G2 接线用）。
+
+        给 evidence_id：核对指定那一笔——证据与账本原事件逐
+        项对照（迁移前后档位），再看投影现状是否与账本档位
+        链终点一致；该笔之后又有更新的迁移时在
+        detail.superseded_by 注明，不算不一致。
+        只给 memory_id：核对它最新一笔迁移；从未迁移过的，
+        核对出生档（账本 ADD 口径）与投影一致，
+        evidence_id=None、detail.no_migration=True。
+        返回 {ok, memory_id, evidence_id, checks, mismatches,
+        detail}；ok 只在 mismatches 为空时为 True。"""
+        result = {
+            "ok": False,
+            "memory_id": memory_id,
+            "evidence_id": evidence_id,
+            "checks": {},
+            "mismatches": [],
+            "detail": {},
+        }
+        history, final_tiers = (
+            self._protection_tier_history_from_ledger()
+        )
+        target = None
+        if evidence_id is not None:
+            target = next(
+                (
+                    h for h in history
+                    if h["evidence_id"] == evidence_id
+                ),
+                None,
+            )
+            if target is None:
+                result["mismatches"].append(
+                    "evidence_not_found_in_ledger"
+                )
+                return result
+            memory_id = target["memory_id"]
+            result["memory_id"] = memory_id
+        elif memory_id is not None:
+            mine = [
+                h for h in history if h["memory_id"] == memory_id
+            ]
+            target = mine[-1] if mine else None
+            if target is not None:
+                evidence_id = target["evidence_id"]
+                result["evidence_id"] = evidence_id
+        else:
+            result["mismatches"].append("missing_target")
+            return result
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json FROM memories"
+                " WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+        if row is None:
+            result["mismatches"].append("row_missing")
+            return result
+        row_meta = json.loads(row[1] or "{}")
+        row_tier = row_meta.get(_core_cap.PROTECTION_TIER_FIELD)
+        ledger_tier = final_tiers.get(memory_id)
+        result["checks"]["projection_tier"] = row_tier
+        result["checks"]["ledger_tier"] = ledger_tier
+        result["checks"]["projection_matches_ledger"] = (
+            row_tier == ledger_tier
+        )
+        if row_tier != ledger_tier:
+            result["mismatches"].append("projection_tier_mismatch")
+
+        if target is None:
+            # 从未迁移：出生档与投影一致即无迁移可核、算完成。
+            result["detail"]["no_migration"] = True
+            result["ok"] = not result["mismatches"]
+            return result
+
+        evidence = self.get_protection_migration_evidence(
+            evidence_id
+        )
+        recorded = bool(
+            evidence and not evidence.get("reconstructed")
+        )
+        result["checks"]["evidence_recorded"] = recorded
+        if not recorded:
+            result["mismatches"].append("evidence_record_missing")
+        if evidence is not None:
+            matches = (
+                evidence.get("tier_after") == target["tier_after"]
+                and evidence.get("tier_before")
+                == target["tier_before"]
+            )
+            result["checks"]["evidence_matches_ledger"] = matches
+            if evidence.get("tier_after") != target["tier_after"]:
+                result["mismatches"].append(
+                    "evidence_tier_after_mismatch"
+                )
+            if evidence.get("tier_before") != target["tier_before"]:
+                result["mismatches"].append(
+                    "evidence_tier_before_mismatch"
+                )
+
+        later = [
+            h for h in history
+            if h["memory_id"] == memory_id
+            and (h["ledger_seq"] or 0) > (target["ledger_seq"] or 0)
+        ]
+        if later:
+            result["detail"]["superseded_by"] = (
+                later[-1]["evidence_id"]
+            )
+
+        # 版本戳只在该笔是这行账本链最后一笔时可比：此后行被
+        # 任何事件动过，戳必然不同，硬比只会假报不一致。
+        if evidence is not None and evidence.get("version_after"):
+            try:
+                events, _info = _ledger.read_events(self.ledger_path)
+            except Exception:
+                events = []
+            my_seqs = [
+                (e.get("seq") or 0)
+                for e in events
+                if isinstance(e, dict)
+                and (e.get("memory_id") or e.get("key")) == memory_id
+            ]
+            if my_seqs and max(my_seqs) == (
+                target["ledger_seq"] or 0
+            ):
+                stamp_now = self._controlled_version_stamp(
+                    row[0] or "", row_meta
+                )
+                stamp_ok = (
+                    stamp_now == evidence["version_after"]
+                )
+                result["checks"]["version_stamp_matches"] = stamp_ok
+                if not stamp_ok:
+                    result["mismatches"].append(
+                        "version_stamp_mismatch"
+                    )
+            else:
+                result["checks"]["version_stamp_matches"] = None
+        result["ok"] = not result["mismatches"]
+        return result
 
     def deletion_scope(self, memory_id):
         """删除范围预览（2026-11-21 网页测第二轮 #6）：真查库，不是桩。
@@ -9389,6 +9768,21 @@ class SQLiteStore:
                     "issue": issue.get("kind"),
                     "detail": issue.get("detail"),
                     "at": issue.get("at"),
+                }
+            )
+        # 保护迁移待补证（立项 H5）：迁移已落账本、但当场证据
+        # 没落盘的逐条列示——不许静默；账本派生历史里这些条目
+        # 同样标 evidence_recorded=False，两边对得上。
+        for pending in getattr(
+            self, "_protection_evidence_pending", []
+        ):
+            notices.append(
+                {
+                    "kind": "protection_evidence_pending",
+                    "evidence_id": pending.get("evidence_id"),
+                    "memory_id": pending.get("memory_id"),
+                    "ledger_seq": pending.get("ledger_seq"),
+                    "at": pending.get("ts"),
                 }
             )
         frozen = getattr(self, "_controlled_frozen_reason", None)
