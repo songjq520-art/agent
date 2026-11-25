@@ -21,6 +21,11 @@
 #   - 签发口径：范围超出受控动作全集、空范围、非正有效期都签不出。
 #
 # 全程离线：嵌入/判官打桩为 None，同 test_controlled_entry 口径。
+#
+# H1 补修口径更新（2026-11-25）：执行路径提案必须绑版本，
+# 本文件的执行成功类用例改带 expected_version=当时行戳；
+# 原断言不变。被拒类用例（无凭据/过期/越界/篡改/撤销）都
+# 在会话校验段就被拒、先于版本必填段，不受影响。
 
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -92,7 +97,8 @@ def test_valid_direct_session_executes(store):
     store.controlled_entry_execution_enabled = True
     sess = _direct(store)
     receipt = store.submit_controlled_proposal(
-        _prop(memory_id=mid, session=sess)
+        _prop(memory_id=mid, session=sess,
+              expected_version=store.controlled_entry_version(mid))
     )
     assert receipt["status"] == "executed"
     assert receipt["detail"]["session_id"] == sess.session_id
@@ -176,7 +182,8 @@ def test_out_of_scope_refused_in_scope_executes(store):
     assert refused["status"] == "refused"
     assert refused["reason"] == "out_of_scope"
     ok = store.submit_controlled_proposal(
-        _prop(action="mark_dormant", memory_id=mid, session=sess)
+        _prop(action="mark_dormant", memory_id=mid, session=sess,
+              expected_version=store.controlled_entry_version(mid))
     )
     assert ok["status"] == "executed"
 
@@ -200,6 +207,7 @@ def test_sensitive_action_requires_owner_direct(store):
         _prop(
             action="set_protection_tier", memory_id=mid,
             params={"tier": "pinned"}, session=direct,
+            expected_version=store.controlled_entry_version(mid),
         )
     )
     assert ok["status"] == "executed"

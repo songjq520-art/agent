@@ -23,6 +23,13 @@
 # 本文件的执行类用例改带 issue_session 签发的主人直达会话
 # （_session 助手）；原断言不变，凭据本身的验收在
 # test_session_auth_20261125.py。
+#
+# H1 补修口径更新（2026-11-25，贵妃第十六封互查后）：执行路径
+# 的提案必须绑版本（expected_version 必填），本文件的执行类
+# 用例改带 expected_version=当时的行戳；重复提交用例的三次
+# 提交带同一戳（同键同指纹才算 duplicate）。原断言一条没改、
+# 没改弱；新行为（版本必填/参数严验/同键冲突/提交恢复/
+# 不变量闸口）的验收在 test_controlled_entry_fixes_20261125.py。
 
 import json
 import uuid
@@ -119,7 +126,8 @@ def test_demote_executes_and_frees_seat(store):
     assert store.core_seat_snapshot()["seats_used"] == 1
     _enable(store)
     receipt = store.submit_controlled_proposal(
-        _prop(memory_id=mid, session=_session(store))
+        _prop(memory_id=mid, session=_session(store),
+              expected_version=store.controlled_entry_version(mid))
     )
     assert receipt["ok"] is True and receipt["status"] == "executed"
     assert receipt["duplicate"] is False
@@ -143,6 +151,7 @@ def test_set_protection_tier_via_entry(store):
         _prop(
             action="set_protection_tier", memory_id=mid,
             params={"tier": "pinned"}, session=_session(store),
+            expected_version=store.controlled_entry_version(mid),
         )
     )
     assert receipt["status"] == "executed"
@@ -163,6 +172,7 @@ def test_set_core_drawer_via_entry(store):
         _prop(
             action="set_core_drawer", memory_id=mid,
             params={"drawer": "money_decisions"}, session=_session(store),
+            expected_version=store.controlled_entry_version(mid),
         )
     )
     assert receipt["status"] == "executed"
@@ -176,7 +186,8 @@ def test_mark_dormant_via_entry(store):
     _enable(store)
     receipt = store.submit_controlled_proposal(
         _prop(action="mark_dormant", memory_id=mid,
-              session=_session(store))
+              session=_session(store),
+              expected_version=store.controlled_entry_version(mid))
     )
     assert receipt["status"] == "executed"
     assert _row(store, mid)["meta"]["decay_state"] == "dormant"
@@ -252,11 +263,15 @@ def test_duplicate_key_no_reexecution(store, tmp_path):
     mid = _add_user(store, "用户养了一只猫")
     _enable(store)
     key = uuid.uuid4().hex
+    stamp = store.controlled_entry_version(mid)
     first = store.submit_controlled_proposal(
-        _prop(memory_id=mid, key=key, session=_session(store))
+        _prop(memory_id=mid, key=key, session=_session(store),
+              expected_version=stamp)
     )
     assert first["status"] == "executed"
-    second = store.submit_controlled_proposal(_prop(memory_id=mid, key=key))
+    second = store.submit_controlled_proposal(
+        _prop(memory_id=mid, key=key, expected_version=stamp)
+    )
     assert second["duplicate"] is True and second["status"] == "duplicate"
     assert second["ok"] is True  # 原回执副本：当时是执行成功的
     executed = [
@@ -266,7 +281,9 @@ def test_duplicate_key_no_reexecution(store, tmp_path):
     assert len(executed) == 1
     # 重启重放：同目录新实例、同键，仍只回 duplicate、不再执行
     store2 = SQLiteStore(memory_dir=str(tmp_path / "memory"))
-    third = store2.submit_controlled_proposal(_prop(memory_id=mid, key=key))
+    third = store2.submit_controlled_proposal(
+        _prop(memory_id=mid, key=key, expected_version=stamp)
+    )
     assert third["duplicate"] is True and third["status"] == "duplicate"
 
 
@@ -363,7 +380,8 @@ def test_receipt_shape_stable(store):
     )
     receipts.append(
         store.submit_controlled_proposal(
-            _prop(memory_id=mid, session=_session(store))
+            _prop(memory_id=mid, session=_session(store),
+                  expected_version=store.controlled_entry_version(mid))
         )  # executed
     )
     receipts.append(
