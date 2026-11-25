@@ -93,8 +93,8 @@ class PendingQuestions:
 
     path 不传时默认 memory_dir/pending_questions.json；
     memory_dir 也不传时默认当前目录下的 memory/pending_questions.json
-    （测试传 tmp_path 更方便）。文件坏了/读不出来时按空算，不崩——
-    问题丢了可以再攒，绝不能因为问题文件坏了拦住聊天。
+    （测试传 tmp_path 更方便）。文件坏了不崩，但不许静默按空算
+    （追加决定十五）：原件先改名保全、load_error 报警，store 启动恢复按存活记录重建能重建的部分；文件不存在是第一次跑，不算坏。
     """
 
     def __init__(self, path=None, memory_dir=None):
@@ -105,21 +105,78 @@ class PendingQuestions:
         else:
             self._path = Path("memory") / "pending_questions.json"
         self._lock = threading.RLock()
+        self.load_error = None
         self._questions = self._load()
 
+    def _preserve_corrupt(self, reason):
+        """保全损坏的问题文件原件并报警（崩溃恢复，追加决定十五）。
+
+        原件改名为 pending_questions.json.corrupt-<时间戳> 留在同
+        目录——坏成什么样就是什么样，死无对证的事不许干。改名
+        失败（权限之类）也照样把 load_error 记下来：报警不能丢，
+        store 的 pending_notices 会把它带到结论可见处。"""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        backup = self._path.with_name(
+            "%s.corrupt-%s" % (self._path.name, stamp)
+        )
+        n = 2
+        while backup.exists():
+            backup = self._path.with_name(
+                "%s.corrupt-%s-%d" % (self._path.name, stamp, n)
+            )
+            n += 1
+        moved = False
+        try:
+            os.replace(self._path, backup)
+            moved = True
+        except OSError:
+            logger.error(
+                "pending_questions 文件损坏且保全改名失败：%s",
+                self._path, exc_info=True,
+            )
+        self.load_error = {
+            "path": str(self._path),
+            "backup_path": str(backup) if moved else None,
+            "reason": reason,
+            "at": _now_iso(),
+        }
+        logger.error(
+            "pending_questions 文件损坏（%s）：原件保全到 %s，"
+            "本次按空加载，待启动恢复按存活记录重建。",
+            reason, str(backup) if moved else "（改名失败，原地保留）",
+        )
+
+    def recovery_report(self):
+        """文件损坏的痕迹：没坏过返回 None；坏过返回 load_error
+        副本（原件保全在哪、坏在哪、什么时候）。"""
+        if not self.load_error:
+            return None
+        return dict(self.load_error)
+
     def _load(self):
+        # 文件不存在是第一次跑，不算损坏；文件在却读不出/解析
+        # 不了/形状不对 = 损坏（追加决定十五）：不许再静默按空
+        # 算——先保全原件、记 load_error 报警，再按空起步，问题
+        # 由 store 启动恢复按账本/入口留痕重建能重建的部分。
+        self.load_error = None
+        if not self._path.exists():
+            return []
         try:
             raw = self._path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as exc:
+            self._preserve_corrupt("read_failed: %s" % exc)
             return []
         try:
             data = json.loads(raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
+            self._preserve_corrupt("bad_json: %s" % exc)
             return []
         if not isinstance(data, dict):
+            self._preserve_corrupt("bad_shape: top level is not an object")
             return []
         items = data.get("questions") or []
         if not isinstance(items, list):
+            self._preserve_corrupt("bad_shape: questions is not a list")
             return []
         out = []
         for item in items:

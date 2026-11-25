@@ -933,6 +933,50 @@ class SQLiteStore:
             )
         return []
 
+    def _ledger_overlays(self):
+        """扫一遍账本事件，算出账本对每条记忆的最新一笔覆盖：
+        (promote_meta, decay_marks, slot_map, revived_keys)。
+
+        promote_meta：每个 key 最新一笔 PROMOTE 的完整 meta（晋升、
+        保护档、抽屉都记这笔）；decay_marks：当前还沉底/待删的
+        key → decay_state（REVIVE 来了就摘掉）；slot_map：最新一笔
+        SLOT 的槽位；revived_keys：沉底过、又被 REVIVE 摘掉的 key
+        （账本折叠态已回原话态）。reconcile 重建缺失行和启动修复
+        已有行共用这一份口径，不许两边各算一套。读账本失败抛给
+        调用方按各自口径兜底。"""
+        promote_meta = {}
+        decay_marks = {}
+        slot_map = {}
+        revived_keys = set()
+        _events, _info = _ledger.read_events(self.ledger_path)
+        for _event in _events:
+            _etype = _event.get("type")
+            _key = _event.get("key") or _event.get("memory_id")
+            if _etype == _ledger.LEDGER_EVENT_PROMOTE:
+                _meta = _event.get("meta") or {}
+                if _key and _meta:
+                    promote_meta[_key] = _meta
+            elif _etype == _ledger.LEDGER_EVENT_SLOT and _key:
+                # R-7（2026-11-24）：槽位标的账本事件，重建/修复
+                # 时把 slot 一并带回来（最新一笔赢）。
+                if _event.get("slot"):
+                    slot_map[_key] = _event["slot"]
+            elif _etype == _ledger.LEDGER_EVENT_DORMANT and _key:
+                # 3b（2026-11-24）：沉底/待删标记在账本里有事件，
+                # 重建/修复时把 decay_state 一并带回来。
+                decay_marks[_key] = (
+                    _decay.DECAY_STATE_DELETE_DUE
+                    if _event.get("delete_due")
+                    else _decay.DECAY_STATE_DORMANT
+                )
+                revived_keys.discard(_key)
+            elif _etype == _ledger.LEDGER_EVENT_REVIVE and _key:
+                if _key in decay_marks:
+                    decay_marks.pop(_key, None)
+                    revived_keys.add(_key)
+        return promote_meta, decay_marks, slot_map, revived_keys
+
+
     def reconcile_ledger_index(self):
         """启动对账：账本里有、SQLite 里没有的，按账本重建索引。
 
@@ -950,35 +994,13 @@ class SQLiteStore:
             #（推断版/episodic），升级就丢了。只覆盖这 4 个晋升字段，
             # 不碰 last_used_at / seen_*（那是后来的使用记录，PROMOTE
             # 那一刻的值是旧的）。
-            promote_meta = {}
-            decay_marks = {}
-            slot_map = {}
             try:
-                _events, _info = _ledger.read_events(self.ledger_path)
-                for _event in _events:
-                    _etype = _event.get("type")
-                    _key = _event.get("key") or _event.get("memory_id")
-                    if _etype == _ledger.LEDGER_EVENT_PROMOTE:
-                        _meta = _event.get("meta") or {}
-                        if _key and _meta:
-                            promote_meta[_key] = _meta
-                    elif _etype == _ledger.LEDGER_EVENT_SLOT and _key:
-                        # R-7（2026-11-24）：补槽位标的账本事件，
-                        # 重建缺失行时把 slot 一并带回来（最新一笔赢）。
-                        if _event.get("slot"):
-                            slot_map[_key] = _event["slot"]
-                    elif _etype == _ledger.LEDGER_EVENT_DORMANT and _key:
-                        # 3b（2026-11-24）：沉底/待删标记在账本里有
-                        # 事件，重建时把 decay_state 一并带回来。
-                        decay_marks[_key] = (
-                            _decay.DECAY_STATE_DELETE_DUE
-                            if _event.get("delete_due")
-                            else _decay.DECAY_STATE_DORMANT
-                        )
-                    elif _etype == _ledger.LEDGER_EVENT_REVIVE and _key:
-                        decay_marks.pop(_key, None)
+                promote_meta, decay_marks, slot_map, _revived_keys = (
+                    self._ledger_overlays()
+                )
             except Exception:
                 logger.warning("读账本 PROMOTE 事件失败：重建时不应用晋升。", exc_info=True)
+                promote_meta, decay_marks, slot_map = {}, {}, {}
             touch_map = (state or {}).get("last_touched") or {}
             added = 0
             for record in (state or {}).get("adds") or []:
@@ -1029,6 +1051,281 @@ class SQLiteStore:
                 self._insert_memory_row(key, text, meta, vec)
                 added += 1
             return added
+
+    def repair_projection_from_ledger(self):
+        """按账本修已有行的半截状态（崩溃恢复，追加决定十五）。
+
+        账本是唯一真相源、SQLite 是投影：两步写之间硬崩溃留下的
+        半截状态，一律按账本折叠态修正投影，绝不反过来改账本
+        （账本只追加、不改写历史行）。修的窗口：
+          - 顶替（_supersede_row 先标 SQLite 再写账本）：进程死在
+            两步之间 → SQLite 有 superseded 标记、账本没事件 →
+            按账本撤标记；反过来账本有顶替/删除事件、SQLite 没标
+            （如恢复了旧备份的库）→ 按事件补标；
+          - 晋升/保护档/抽屉/槽位/沉底/最后使用时间：都是账本
+            先行、SQLite 后写，死在中间 → 按账本最新一笔覆盖
+            补齐（字段口径与 reconcile_ledger_index 重建缺失行
+            完全一致，同一份 _ledger_overlays）；
+          - 作废（voided）行不碰标记：作废是终局标记，它自己
+            也有 delete 账本事件兜底，检索口径只认 voided。
+        SQLite 里有、账本里没有 add 的行：不删、不改，只计数
+        报警——来历不明删了就是丢记忆，等 BOOS 裁（账本本身缺
+        行由 verify_ledger 的序号缺口另行报警）。
+        返回报告 dict；内部异常向上抛，调用方（启动恢复）拦。"""
+        with self._lock:
+            report = {
+                "rows_checked": 0,
+                "superseded_fixed": 0,
+                "deleted_fixed": 0,
+                "meta_fixed": 0,
+                "extra_rows": 0,
+            }
+            state = self.ledger_state()
+            key_states = (state or {}).get("key_states") or {}
+            by_id = (state or {}).get("by_id") or {}
+            touch_map = (state or {}).get("last_touched") or {}
+            known_keys = set(key_states) | set(by_id)
+            for _record in (state or {}).get("adds") or []:
+                if _record.get("key"):
+                    known_keys.add(_record["key"])
+            try:
+                promote_meta, decay_marks, slot_map, revived_keys = (
+                    self._ledger_overlays()
+                )
+            except Exception:
+                logger.warning(
+                    "读账本覆盖层失败：本次只修状态标记。", exc_info=True
+                )
+                promote_meta, decay_marks, slot_map, revived_keys = (
+                    {}, {}, {}, set()
+                )
+            rows = self._conn.execute(
+                "SELECT id, metadata_json, superseded, deleted, voided"
+                " FROM memories"
+            ).fetchall()
+            for rid, meta_json, sup, dele, voided in rows:
+                report["rows_checked"] += 1
+                if rid not in known_keys:
+                    report["extra_rows"] += 1
+                    logger.warning(
+                        "启动修复：账本里没有的行（不删不改，等 BOOS 裁）：%s",
+                        rid,
+                    )
+                    continue
+                expected = key_states.get(rid)
+                if expected is None:
+                    expected = (by_id.get(rid) or {}).get("state")
+                new_sup, new_del = sup, dele
+                if not voided:
+                    if expected == _ledger.LEDGER_STATE_SUPERSEDED and not sup:
+                        new_sup = 1
+                    elif expected in (
+                        _ledger.LEDGER_STATE_CURRENT,
+                        _ledger.LEDGER_STATE_DORMANT,
+                    ) and sup:
+                        new_sup = 0
+                    if expected == _ledger.LEDGER_STATE_DELETED and not dele:
+                        new_del = 1
+                    elif expected in (
+                        _ledger.LEDGER_STATE_CURRENT,
+                        _ledger.LEDGER_STATE_DORMANT,
+                        _ledger.LEDGER_STATE_SUPERSEDED,
+                    ) and dele:
+                        new_del = 0
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
+                new_meta = meta
+                _promoted = promote_meta.get(rid) or {}
+                _slot = slot_map.get(rid)
+                _touched = touch_map.get(rid)
+                _mark = decay_marks.get(rid)
+                if _promoted or _slot or _touched or _mark or (
+                    rid in revived_keys
+                ):
+                    new_meta = dict(meta)
+                    if _promoted:
+                        for _field in (
+                            "source", "user_confirmed", "decay_kind",
+                            "importance", "tone", "tone_evidence",
+                            "tone_source",
+                        ):
+                            if _promoted.get(_field) is not None:
+                                new_meta[_field] = _promoted[_field]
+                        # 核心上限字段：以「键在不在」为准（同
+                        # reconcile）——显式写 None 是摘档/摘格。
+                        for _field in ("protection_tier", "core_drawer"):
+                            if _field in _promoted:
+                                new_meta[_field] = _promoted[_field]
+                    if _slot and not new_meta.get("slot"):
+                        new_meta["slot"] = _slot
+                    if _touched and _touched > str(
+                        new_meta.get("last_used_at") or ""
+                    ):
+                        new_meta["last_used_at"] = _touched
+                    if _mark:
+                        new_meta["decay_state"] = _mark
+                    elif rid in revived_keys and new_meta.get(
+                        "decay_state"
+                    ) in (
+                        _decay.DECAY_STATE_DORMANT,
+                        _decay.DECAY_STATE_DELETE_DUE,
+                    ):
+                        new_meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
+                meta_changed = new_meta != meta
+                if new_sup != sup:
+                    report["superseded_fixed"] += 1
+                if new_del != dele:
+                    report["deleted_fixed"] += 1
+                if meta_changed:
+                    report["meta_fixed"] += 1
+                if new_sup != sup or new_del != dele or meta_changed:
+                    self._conn.execute(
+                        "UPDATE memories SET superseded=?, deleted=?,"
+                        " metadata_json=?, decay_kind=?, source=?,"
+                        " user_confirmed=?, importance=?, slot=?"
+                        " WHERE id=?",
+                        (
+                            new_sup,
+                            new_del,
+                            json.dumps(new_meta, ensure_ascii=False),
+                            new_meta.get("decay_kind"),
+                            new_meta.get("source"),
+                            1 if new_meta.get("user_confirmed") else 0,
+                            new_meta.get("importance"),
+                            new_meta.get("slot"),
+                            rid,
+                        ),
+                    )
+            self._conn.commit()
+            return report
+
+    def rebuild_pending_questions(self):
+        """待问文件损坏后按存活记录重建（崩溃恢复，追加决定十五）。
+
+        只在 pending_questions 报告文件坏过（load_error）时由启动
+        恢复调用。能重建的只有两类——它们在别处留了痕：
+          - 转述授权声称：记忆行 meta 里还带着
+            auth_claim=relayed_unverified，按原队列函数重新攒；
+          - 入口挂起：intake_log.jsonl 里有 HOLD 留痕、且原文
+            还没被存成活记忆的，按原队列函数重新攒。
+        其余种类（importance / conflict / core_capacity /
+        change_attempt 留痕）的问题、以及「已答过」的裁决痕迹，
+        只活在问题文件里，文件没了就没了——这里明说不重建，
+        不许假装全恢复了。返回重建计数 dict。"""
+        rebuilt = {"auth_claim": 0, "intake_hold": 0}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall()
+            live_texts = set()
+            for rid, text, meta_json in rows:
+                live_texts.add(_normalize_memory_text(text or ""))
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
+                if meta.get("auth_claim") == _auth_guard.AUTH_CLAIM_RELAYED:
+                    before = self.pending_questions.count_unanswered()
+                    self._queue_auth_question(
+                        text or "",
+                        rid,
+                        "待问文件损坏后按记忆行标记重建（崩溃恢复）。",
+                    )
+                    if self.pending_questions.count_unanswered() > before:
+                        rebuilt["auth_claim"] += 1
+            try:
+                held_entries = []
+                if self._intake_log_path.exists():
+                    for _line in self._intake_log_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines():
+                        try:
+                            _entry = json.loads(_line)
+                        except (ValueError, TypeError):
+                            continue
+                        if (
+                            _entry.get("verdict") == _intake.VERDICT_HOLD
+                            and _entry.get("text")
+                        ):
+                            held_entries.append(_entry)
+                for _entry in held_entries:
+                    _text = _entry["text"]
+                    if _normalize_memory_text(_text) in live_texts:
+                        continue  # 已存成活记忆：挂起已经裁完了
+                    before = self.pending_questions.count_unanswered()
+                    self._queue_intake_hold(
+                        _text,
+                        _entry.get("category") or "",
+                        _entry.get("reason")
+                        or "待问文件损坏后按入口留痕重建（崩溃恢复）。",
+                        turn_id=_entry.get("turn_id"),
+                    )
+                    if self.pending_questions.count_unanswered() > before:
+                        rebuilt["intake_hold"] += 1
+            except Exception:
+                logger.warning(
+                    "按入口留痕重建挂起问题失败。", exc_info=True
+                )
+        rebuilt["unrecoverable_kinds"] = [
+            _pq.QUESTION_KIND_IMPORTANCE,
+            _pq.QUESTION_KIND_CONFLICT,
+            _pq.QUESTION_KIND_CORE_CAPACITY,
+            "auth_claim/change_attempt",
+        ]
+        return rebuilt
+
+    def startup_recovery(self):
+        """启动崩溃恢复（追加决定十五）：verify → repair（账本
+        残行）→ 按账本修投影 → 待问文件痕迹与重建，最后才轮到
+        create_sqlite_store 里的 reconcile 补缺行。顺序是死规矩：
+        账本残行不先修掉，折叠态就少最后一截，后面的修复全对
+        不齐。每步失败只记日志、不拦启动（记忆系统出问题不能
+        把聊天也堵死）。账本序号缺口只报警不硬修：缺的事件编
+        不出来，硬补就是造假账——留给 BOOS/自检裁（同
+        verify_ledger 原口径）。返回报告 dict。"""
+        report = {
+            "verify": None,
+            "ledger_repair": None,
+            "projection": None,
+            "pending": None,
+            "pending_rebuilt": None,
+        }
+        try:
+            report["verify"] = _ledger.verify_ledger(self.ledger_path)
+            if not (report["verify"] or {}).get("ok"):
+                logger.error(
+                    "启动恢复：账本校验不干净（缺口/残行/坏行）：%s",
+                    report["verify"],
+                )
+        except Exception:
+            logger.warning("启动恢复：账本校验失败。", exc_info=True)
+        try:
+            report["ledger_repair"] = _ledger.repair_ledger(
+                self.ledger_path
+            )
+        except Exception:
+            logger.warning("启动恢复：账本残行修复失败。", exc_info=True)
+        try:
+            report["projection"] = self.repair_projection_from_ledger()
+        except Exception:
+            logger.warning("启动恢复：投影修复失败。", exc_info=True)
+        try:
+            report["pending"] = self.pending_questions.recovery_report()
+            if report["pending"]:
+                report["pending_rebuilt"] = self.rebuild_pending_questions()
+                logger.error(
+                    "启动恢复：待问文件曾损坏（原件保全于 %s），"
+                    "按存活记录重建 %s；其余种类与已答痕迹无法重建。",
+                    report["pending"].get("backup_path"),
+                    report["pending_rebuilt"],
+                )
+        except Exception:
+            logger.warning("启动恢复：待问文件恢复失败。", exc_info=True)
+        return report
+
 
     def import_from_mem0(self, mem0_store):
         """一次性迁移：把只活在 Chroma 里的旧记忆搬进来（2026-11-21 核实）。
@@ -7107,7 +7404,23 @@ class SQLiteStore:
             }
 
     def pending_notices(self):
-        return []
+        """待问文件损坏的结论可见痕迹（崩溃恢复，追加决定十五）：
+        文件坏过就报一条（原件保全在哪、为什么坏、什么时候），
+        没坏过返回空——和以前桩的口径一致，不打扰正常流程。"""
+        try:
+            info = self.pending_questions.recovery_report()
+        except Exception:
+            return []
+        if not info:
+            return []
+        return [
+            {
+                "kind": "pending_questions_corrupt",
+                "backup_path": info.get("backup_path"),
+                "reason": info.get("reason"),
+                "at": info.get("at"),
+            }
+        ]
 
     # ---------- 启动时要调的（接口兼容，SQLite 版里是空操作） ----------
 
@@ -7228,15 +7541,20 @@ def _blob_to_vector(blob):
 def create_sqlite_store(budget_tracker=None, **kwargs):
     """建一个 SQLiteStore；建不好时返回 None（降级成“没有记忆也能聊”）。
 
-    建好后顺手对一次账（reconcile_ledger_index）：账本里有、索引里
-    没有的，按账本重建索引——写索引那步崩了、或索引坏过，重启后
-    靠这一笔把记忆捞回来。对账本身不抛异常、只记日志。
+    建好后先跑启动崩溃恢复（startup_recovery：校验账本、修残行、
+    按账本修投影的半截状态、待问文件损坏保全与重建），再对一次账
+    （reconcile_ledger_index）补缺行——两步写之间崩了、或索引坏过，
+    重启后靠这两笔把记忆捞回来。都不抛异常、只记日志。
     """
     try:
         store = SQLiteStore(budget_tracker=budget_tracker, **kwargs)
     except Exception as exc:
         logger.warning("SQLite 记忆未启用：%s，本次不带记忆运行。", exc)
         return None
+    try:
+        store.startup_recovery()
+    except Exception:
+        logger.warning("启动崩溃恢复失败：继续启动，后面对账照常。", exc_info=True)
     try:
         store.reconcile_ledger_index()
     except Exception:
