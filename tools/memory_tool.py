@@ -570,8 +570,12 @@ def _run_add_memory(args):
             "error": None,
         }
     try:
+        # intake_bypass：本工具是 BOOS 当轮明确让记的通道（同
+        # 「记住」直存原语），当场拦管的是自动抽取路，不拦本人
+        # 明令直存（实测问题三与 round3 删除工具测试的衔接口径）。
         result = store.add_memory_text(text, source="user",
-                                       semantic_judge=True)
+                                       semantic_judge=True,
+                                       intake_bypass=True)
     except Exception as exc:  # noqa: BLE001 - 存失败也算执行失败
         return {"ok": False, "data": None, "error": f"存记忆失败：{exc}"}
     event = (result or {}).get("event")

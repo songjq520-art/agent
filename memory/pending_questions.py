@@ -28,6 +28,9 @@ QUESTION_KIND_IMPORTANCE = "importance"
 QUESTION_KIND_CONFLICT = "conflict"
 QUESTION_KIND_CORE_CAPACITY = "core_capacity"
 QUESTION_KIND_AUTH_CLAIM = "auth_claim"
+# 入口挂起问题（四件套·实测问题三，追加决定七）：入口当场拦
+# 拿不准的候选不落记忆行、先挂起，BOOS 裁这句存还是不存。
+QUESTION_KIND_INTAKE_HOLD = "intake_hold"
 
 # 冲突保护问题的选项（固定两个）：换成新的 = 按答案取代旧记忆；
 # 不换 = 两条都留着，这对冲突记为已裁决，不再重复问。
@@ -41,6 +44,9 @@ CORE_CAPACITY_QUESTION_OPTIONS = ("先留作候选", "不要了")
 # 那条删掉。非本人通道改记忆被拒的留痕问题只用「知道了」。
 AUTH_CLAIM_QUESTION_OPTIONS = ("是真的", "不是真的")
 CHANGE_ATTEMPT_QUESTION_OPTIONS = ("知道了",)
+# 入口挂起问题的选项：存 = 按 BOOS 裁决把原文回存；不存 =
+# 这句就不要了（本来就没落行，只消耗问题）。
+INTAKE_HOLD_QUESTION_OPTIONS = ("存", "不存")
 
 # 问题状态：pending（攒着、还没问过）、asked（已在某轮回复里问过、
 # 等回答）、answered（已回答、按答案处理完）。

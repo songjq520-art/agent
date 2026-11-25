@@ -443,8 +443,17 @@ def handle_remember(budget_tracker, text):
     if store is None:
         print("记忆未启用：请先配置 DEEPSEEK_API_KEY。")
         return
+    # 不传多余参数：工厂给的库只保证 add_memory_text(原文) 这条
+    # 原语（鸭子类型）。入口当场拦（实测问题三）的结果按 event
+    # 如实播报——被拦/挂起时不许谎报「已记住」。
     result = store.add_memory_text(content)
-    if result:
+    _event = result.get("event") if isinstance(result, dict) else None
+    if _event == "INTAKE_DROPPED":
+        print("没存：这句被入口当场拦下了（%s）。"
+              % (result.get("reason") or "不像要记的事实"))
+    elif _event == "INTAKE_HELD":
+        print("先没存：这句拿不准，已挂起待你裁（存 / 不存）。")
+    elif result:
         print("已记住。")
     else:
         print("没记住：保存失败，记忆库可能出了问题，稍后再试。")

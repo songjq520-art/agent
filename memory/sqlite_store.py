@@ -39,6 +39,7 @@ from pathlib import Path
 
 from memory import core_cap as _core_cap
 from memory import auth_guard as _auth_guard
+from memory import intake_gate as _intake
 from memory import decay as _decay
 from memory import graph as _graph_mod
 from memory import ledger as _ledger
@@ -600,6 +601,17 @@ class SQLiteStore:
         self._judge_provider = judge_provider
         # 待问 BOOS 的问题（Phase 2 #4）：攒批 + 回答，落盘不丢。
         self.pending_questions = _pq.PendingQuestions(memory_dir=self.memory_dir)
+        # 入口当场拦/当场判（实测问题三）：intake_marker 是对话
+        # 当场模型实现的标记器（可调用对象，入参 (候选, messages)，
+        # 返回标记列表）；None = 不可用，save_turn 自动回退老管道。
+        self.intake_marker = None
+        self._intake_log_path = self.memory_dir / "intake_log.jsonl"
+        self._intake_log_lock = threading.Lock()
+        # 同轮裁决缓存 {(turn_id, 归一化原文): (verdict, info)}：
+        # save_turn 逐句循环里带当场判标记合并裁决过的句子，下游
+        # 内部直存（槽位路、收尾直存）复用同一裁决——不许二次屏
+        # 在没有标记上下文的情况下把已放行的句子判回挂起。
+        self._intake_verdict_cache = {}
         # 核心座位上限（四件套第 1 块）：默认契约定的 150，
         # 测试可调小验证容量门。
         self.core_seat_limit = _core_cap.CORE_SEAT_LIMIT
@@ -1154,6 +1166,41 @@ class SQLiteStore:
                 "memory": text,
                 "reason": "含敏感信息",
             }
+        # 入口当场拦（实测问题三，追加决定七）：所有落行路的共同
+        # 入口先过当场拦——明确垃圾当场丢（INTAKE_DROPPED）、拿不准
+        # 挂起（INTAKE_HELD、进待问），都不落记忆行，留痕在
+        # intake_log。锁内的 auth_guard 授权硬判照常跑，两道门
+        # 并存、互不绕过：本门判 store 的才走得到它。
+        # intake_bypass 只给已裁决路径（待问答「存」后的回存、
+        # 工具路与 CLI 的「记住」命令——BOOS 当轮明确让记的原语
+        # 通道），外部调用方不许乱传。另：调用方显式传了
+        # decay_kind 的，等于已经定了存储类别（同 judge_importance
+        # 「已传 decay_kind 的不问」的既有先例），不当场拦二次
+        # 干预——save_turn 的句子在逐句循环里已过合并屏，不漏。
+        if (
+            not kwargs.get("intake_bypass")
+            and not kwargs.get("decay_kind")
+            and source in ("user", "inferred")
+        ):
+            _verdict, _info = self._intake_screen(
+                text, turn_id=turn_id, source=source,
+                mark=kwargs.get("intake_mark"),
+            )
+            if _verdict == _intake.VERDICT_DROP:
+                return {
+                    "event": "INTAKE_DROPPED",
+                    "memory": text,
+                    "reason": _info["reason"],
+                    "intake_category": _info["category"],
+                }
+            if _verdict == _intake.VERDICT_HOLD:
+                return {
+                    "event": "INTAKE_HELD",
+                    "memory": text,
+                    "reason": _info["reason"],
+                    "intake_category": _info["category"],
+                    "question_id": _info.get("question_id"),
+                }
         with self._lock:
             created_at = _now_iso()
             today = _shanghai_today().isoformat()
@@ -2954,6 +3001,129 @@ class SQLiteStore:
             turn_id=turn_id,
         )
 
+    def _log_intake(self, text, verdict, category, reason, mark=None,
+                    turn_id=None, source="user"):
+        """入口当场拦留痕（实测问题三）：被拦/挂起的候选不进账本
+        （账本只记记忆事件），另记一份 intake_log.jsonl——原文、
+        裁决、类别、理由、当场判标记都在，事后可查可对账。
+        写失败只记日志，不拦聊天。"""
+        entry = {
+            "ts": _now_iso(),
+            "text": text,
+            "verdict": verdict,
+            "category": category,
+            "reason": reason,
+            "mark": mark,
+            "turn_id": turn_id,
+            "source": source,
+        }
+        try:
+            with self._intake_log_lock:
+                with open(self._intake_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.warning("入口拦截留痕写失败。", exc_info=True)
+
+    def _queue_intake_hold(self, text, category, reason, turn_id=None):
+        """拿不准的候选挂起（实测问题三）：不落记忆行，进待问等
+        BOOS 裁（存/不存）——挂起不是丢弃，问题和原文都在
+        pending_questions 里查得到。同一原文已有未答的挂起问题
+        时不重复攒。返回问题 dict。"""
+        for q in self.pending_questions.find_questions(
+            kind=_pq.QUESTION_KIND_INTAKE_HOLD,
+            statuses=(_pq.QUESTION_STATUS_PENDING,
+                      _pq.QUESTION_STATUS_ASKED),
+        ):
+            if (q.get("held_text") or "") == text:
+                return q
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_INTAKE_HOLD,
+            "这句我拿不准要不要记，先挂起了，你裁一下：%s" % text,
+            _pq.INTAKE_HOLD_QUESTION_OPTIONS,
+            reason,
+            memory_id=None,
+            turn_id=turn_id,
+            extra={"held_text": text, "intake_category": category},
+        )
+
+    def _intake_screen(self, text, turn_id=None, mark=None, source="user"):
+        """入口当场拦＋当场判合并裁决（实测问题三）。
+
+        返回 (verdict, info)：info 带 category/reason/mark，HOLD
+        时带 question_id。DROP/HOLD 都在这里留痕（日志；HOLD 另
+        攒待问），调用方只管按 verdict 决定落不落行。"""
+        cache_key = None
+        if turn_id:
+            cache_key = (turn_id, _normalize_memory_text(text))
+            cached = self._intake_verdict_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        pv, category, preason = _intake.classify_program(
+            text, _looks_like_fact
+        )
+        verdict, reason, used_mark = _intake.combine(pv, preason, mark)
+        info = {
+            "category": category, "reason": reason, "mark": used_mark,
+            "question_id": None,
+        }
+        if verdict == _intake.VERDICT_DROP:
+            self._log_intake(text, verdict, category, reason,
+                             used_mark, turn_id, source)
+        elif verdict == _intake.VERDICT_HOLD:
+            q = self._queue_intake_hold(text, category, reason, turn_id)
+            info["question_id"] = (q or {}).get("id")
+            self._log_intake(text, verdict, category, reason,
+                             used_mark, turn_id, source)
+        if cache_key is not None:
+            if len(self._intake_verdict_cache) > 512:
+                self._intake_verdict_cache.clear()
+            self._intake_verdict_cache[cache_key] = (verdict, info)
+        return verdict, info
+
+    def _answer_intake_hold_question(self, question, choice):
+        """BOOS 回答入口挂起问题（实测问题三）：「存」→ 把挂起的
+        原文按已裁决回存（intake_bypass，不再过当场拦——BOOS 本人
+        就是裁决）；「不存」→ 只消耗问题（本来就没落行）。回存
+        失败时如实报 ok=False、问题留着可再答（P1-5 同款顺序：
+        先执行成功、再消耗问题）。"""
+        question_id = question.get("id")
+        if choice not in _pq.INTAKE_HOLD_QUESTION_OPTIONS:
+            return {
+                "ok": False,
+                "reason": "选项不对，只能选：存 / 不存。",
+                "question_id": question_id,
+            }
+        if choice == "不存":
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "dropped",
+                "question_id": question_id,
+            }
+        held_text = (question.get("held_text") or "").strip()
+        if not held_text:
+            return {
+                "ok": False,
+                "reason": "挂起的原文丢了，没法存。",
+                "question_id": question_id,
+            }
+        saved = self.add_memory_text(
+            held_text, source="user",
+            turn_id=question.get("turn_id"), intake_bypass=True,
+        )
+        if (saved or {}).get("event") not in ("ADD", "UNCHANGED"):
+            return {
+                "ok": False,
+                "reason": "没存进去（%s），问题先留着，可以再答。"
+                          % ((saved or {}).get("event") or "未知"),
+                "question_id": question_id,
+            }
+        self.pending_questions.answer(question_id, choice)
+        return {
+            "ok": True, "applied": "stored",
+            "question_id": question_id,
+            "memory_id": (saved or {}).get("id"),
+        }
+
     def _queue_auth_question(self, text, memory_id, reason, turn_id=None):
         """为一条转述授权声称攒待问（实测问题一）：BOOS 本人裁这话
         是不是他说的。返回问题 dict；同一条记忆已有未回答的授权
@@ -3280,6 +3450,9 @@ class SQLiteStore:
         if question.get("kind") == _pq.QUESTION_KIND_AUTH_CLAIM:
             # 转述授权核实问题（实测问题一）：选项和处理都不同，单独走。
             return self._answer_auth_claim_question(question, choice)
+        if question.get("kind") == _pq.QUESTION_KIND_INTAKE_HOLD:
+            # 入口挂起问题（实测问题三）：选项和处理都不同，单独走。
+            return self._answer_intake_hold_question(question, choice)
         if choice not in ("进核心", "当一次性经历", "不存"):
             return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
         if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
@@ -3615,7 +3788,7 @@ class SQLiteStore:
         while len(self._turn_receipts) > _TURN_RECEIPTS_MAX:
             self._turn_receipts.pop(next(iter(self._turn_receipts)))
 
-    def save_turn(self, messages, turn_id=None):
+    def save_turn(self, messages, turn_id=None, intake_marks=None):
         """一轮对话的收尾：同步把用户亲口说的事实原样存下来，留回执。
 
         和 mem0 那条路最大的不同：没有待定区、没有 60 秒定时器、
@@ -3663,6 +3836,7 @@ class SQLiteStore:
             "considered": [],
             "stored": [],
             "dropped": [],
+            "held": [],
             "retracted": False,
             "dropped_count": 0,
             "results": [],
@@ -3800,6 +3974,28 @@ class SQLiteStore:
                                   "method": "plan_change"},
                     }
                     sentences = _strip_correction_sentences(latest_user)
+        # 当场判（实测问题三，契约三「当场判机制口径」）：收尾时
+        # 由对话当场的模型顺手给候选打标记（记/不记/拿不准＋理由）。
+        # 标记来源：调用方显式传 intake_marks，或本库绑的
+        # intake_marker（可调用对象，入参 (候选列表, messages)）。
+        # 标记器不可用/抛错/格式不对时一律回退老管道（程序屏＋
+        # 事后判官），不许比老路差；标记只是提案，逐句循环里经
+        # _intake_screen 与程序屏合并，落账仍走原有各道门。
+        _marks_by_norm = {}
+        _marks_trace = []
+        _raw_marks = intake_marks
+        if _raw_marks is None and self.intake_marker is not None:
+            try:
+                _raw_marks = self.intake_marker(list(sentences), messages)
+            except Exception:
+                logger.warning("当场判标记器不可用，回退老管道。", exc_info=True)
+                _raw_marks = None
+        for _raw_mark in _raw_marks or []:
+            _valid_mark = _intake.validate_mark(_raw_mark)
+            if _valid_mark is not None:
+                _marks_by_norm[
+                    _normalize_memory_text(_valid_mark["text"])
+                ] = _valid_mark
         live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
         new_questions = []  # 本轮拿不准重要性的问题（Phase 2 #4）
         touched_ids = set()  # 本轮触碰到的记忆 id（第 8 条实时整理用）
@@ -3847,6 +4043,41 @@ class SQLiteStore:
             ok, reason = _looks_like_fact(sentence)
             if not ok:
                 receipt["dropped"].append({"text": sentence, "reason": reason})
+                continue
+            # 入口当场拦＋当场判（实测问题三）：过了 _looks_like_fact
+            # 的句子还要过当场拦——程序明确垃圾当场丢、拿不准挂起，
+            # 都不落行；当场判标记在这里合并（标记不许绕过任何门，
+            # 落账仍走下面的槽位/判官/容量/授权各道原门）。
+            _mark = (
+                _marks_by_norm.get(_normalize_memory_text(sentence))
+                or _marks_by_norm.get(
+                    _normalize_memory_text(receipt["considered"][-1])
+                )
+            )
+            _verdict, _info = self._intake_screen(
+                sentence, turn_id=turn_id, mark=_mark, source="user"
+            )
+            if _mark is not None:
+                _marks_trace.append({
+                    "text": sentence,
+                    "mark": _mark["mark"],
+                    "reason": _mark.get("reason") or "",
+                    "verdict": _verdict,
+                })
+            if _verdict == _intake.VERDICT_DROP:
+                receipt["dropped"].append({
+                    "text": sentence,
+                    "reason": "入口当场拦：" + _info["reason"],
+                    "intake_category": _info["category"],
+                })
+                continue
+            if _verdict == _intake.VERDICT_HOLD:
+                receipt["held"].append({
+                    "text": sentence,
+                    "reason": _info["reason"],
+                    "intake_category": _info["category"],
+                    "question_id": _info.get("question_id"),
+                })
                 continue
             # 存原话：去掉句尾的 。！（？的已经当问句 drop 了，不会到这里）。
             sentence = sentence.rstrip("。！")
@@ -3947,6 +4178,19 @@ class SQLiteStore:
             elif (saved or {}).get("event") == "PENDING":
                 # 同槽位裁决：新说法可信度低于旧的，挂起来待确认，不存。
                 receipt["dropped"].append({"text": sentence, "reason": "槽位冲突待确认"})
+            elif (saved or {}).get("event") == "INTAKE_DROPPED":
+                # 其他路（槽位/判官路内部直存）被当场拦拦下时，
+                # 和 SENSITIVE 同款，如实记回执，不落行。
+                receipt["dropped"].append({
+                    "text": sentence,
+                    "reason": "入口当场拦：" + ((saved or {}).get("reason") or ""),
+                })
+            elif (saved or {}).get("event") == "INTAKE_HELD":
+                receipt["held"].append({
+                    "text": sentence,
+                    "reason": (saved or {}).get("reason") or "",
+                    "question_id": (saved or {}).get("question_id"),
+                })
             elif (saved or {}).get("event") in ("STALE", "ASK"):
                 # 同槽位裁决：新说法比旧的还早（STALE），或分不出先后（ASK），不存。
                 receipt["dropped"].append({"text": sentence, "reason": "槽位冲突未裁决"})
@@ -4028,6 +4272,10 @@ class SQLiteStore:
         # 问题二）：回执里的纠正状态只是各路的自报，落没落账要
         # 回查新旧两行在库里的真实状态才算数；没落账的如实标
         # 出来并留痕，不许拿“当场答对了”结案。
+        if _marks_trace:
+            # 当场判留痕：每条标记的原文、标记、理由、最终裁决都
+            # 进回执，抽查时能还原当时为何这样标（契约验收口径）。
+            receipt["intake_marks"] = _marks_trace
         if receipt.get("correction") is not None:
             self._verify_correction_landed(
                 receipt["correction"], receipt, turn_id=turn_id
