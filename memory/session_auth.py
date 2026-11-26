@@ -101,34 +101,48 @@ def _canonical_payload(session_id, speaker, scope, issued_at,
     )
 
 
+_MISSING = object()  # 字段缺失哨兵：__slots__ 槽位可被 delattr 摘除，
+# 安全取值时用它区分「字段不在」与「字段值恰好是 None」。
+
+
 def _is_aware_datetime(value):
     """是不是带时区的 datetime（签发只产出这种时间戳；朴素
-    时间与非 datetime 一律是签发方不可能产出的形状）。"""
-    return (
-        isinstance(value, datetime)
-        and value.tzinfo is not None
-        and value.tzinfo.utcoffset(value) is not None
-    )
+    时间与非 datetime 一律是签发方不可能产出的形状）。
+
+    tzinfo.utcoffset 本身可能抛异常（畸形时区实现）——异常
+    时区按「不是 aware」处理（补修 F3 残留）：这是签发/验证
+    两端所有时间前验的共同入口，绝不许把异常抛出去。"""
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    try:
+        return value.tzinfo.utcoffset(value) is not None
+    except Exception:
+        return False
 
 
 def _credential_shape_ok(credential):
     """凭据字段形状前验（补修 F3）：字段被改成签发方不可能
     产出的类型/形状时，先于摘要计算判畸形——摘要路径对畸形
     字段（不可哈希的 id、None 时间、非 str 摘要……）会抛
-    异常，验签绝不许抛。"""
-    if not isinstance(credential.speaker, str) or not credential.speaker:
+    异常，验签绝不许抛。字段一律 getattr 安全取值（补修
+    F3 残留）：__slots__ 槽位可被 delattr 摘除、未初始化
+    对象根本没有字段——缺字段直接判畸形，不许抛
+    AttributeError。"""
+    speaker = getattr(credential, "speaker", _MISSING)
+    if not isinstance(speaker, str) or not speaker:
         return False
-    if not isinstance(credential.scope, frozenset):
+    scope = getattr(credential, "scope", _MISSING)
+    if not isinstance(scope, frozenset):
         return False
-    if not all(isinstance(a, str) for a in credential.scope):
+    if not all(isinstance(a, str) for a in scope):
         return False
-    if not _is_aware_datetime(credential.issued_at):
+    if not _is_aware_datetime(getattr(credential, "issued_at", _MISSING)):
         return False
-    if not _is_aware_datetime(credential.expires_at):
+    if not _is_aware_datetime(getattr(credential, "expires_at", _MISSING)):
         return False
-    if not isinstance(credential.owner_direct, bool):
+    if not isinstance(getattr(credential, "owner_direct", _MISSING), bool):
         return False
-    if not isinstance(credential.digest, str):
+    if not isinstance(getattr(credential, "digest", _MISSING), str):
         return False
     return True
 
@@ -290,11 +304,13 @@ class SessionAuthority:
                    "session_id": None}
         if not isinstance(credential, SessionCredential):
             return verdict
-        if not isinstance(credential.session_id, str):
-            # session_id 被改成不可哈希/非 str 的形状：连登记
-            # 都查不了，按「不是本权威签的」结构化拒绝。
+        session_id = getattr(credential, "session_id", None)
+        if not isinstance(session_id, str):
+            # session_id 被改成不可哈希/非 str 的形状，或槽位
+            # 被摘除/对象未初始化（补修 F3 残留）：连登记都
+            # 查不了，按「不是本权威签的」结构化拒绝，绝不抛。
             return verdict
-        verdict["session_id"] = credential.session_id
+        verdict["session_id"] = session_id
         if not isinstance(action, str):
             verdict["reason"] = REASON_OUT_OF_SCOPE
             return verdict
@@ -304,8 +320,8 @@ class SessionAuthority:
             verdict["reason"] = REASON_SESSION_TAMPERED
             return verdict
         with self._lock:
-            record = self._records.get(credential.session_id)
-            revoked = credential.session_id in self._revoked
+            record = self._records.get(session_id)
+            revoked = session_id in self._revoked
         if record is None:
             return verdict
         if revoked:
@@ -316,7 +332,7 @@ class SessionAuthority:
             return verdict
         try:
             payload = _canonical_payload(
-                credential.session_id, credential.speaker,
+                session_id, credential.speaker,
                 credential.scope, credential.issued_at,
                 credential.expires_at, credential.owner_direct,
             )
@@ -346,7 +362,7 @@ class SessionAuthority:
             # 撤销复查（补修，撤销语义钉死）：验签途中凭据被
             # 撤销的，不许把这次验签放行成 ok——撤销返回后
             # 开始的判定必须看到已撤销。
-            if credential.session_id in self._revoked:
+            if session_id in self._revoked:
                 verdict["reason"] = REASON_SESSION_REVOKED
                 return verdict
         verdict["ok"] = True
