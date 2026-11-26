@@ -8810,12 +8810,17 @@ class SQLiteStore:
 
     def issue_session(self, *, speaker="owner", scope=None,
                       ttl_seconds=3600, owner_direct=False,
-                      issuance_source=None):
-        """签发受控入口会话凭据（立项 H2）；口径不合返回 None。
+                      issuance_source):
+        """签发受控入口会话凭据（立项 H2；F1 补修收口）；
+        口径不合返回 None。
 
-        只供宿主内部流程与测试：scope 不传时默认受控动作全集，
-        调用方应按最小够用传窄范围。主人直达凭据必须显式
-        issuance_source="owner" 才签得出（见 session_auth 口径）；
+        只供宿主内部流程与测试：issuance_source 必传、无默认
+        值——签发来源必须由调用方显式声明，未标来源在
+        session_auth 层一律拒签，不许再靠默认参数裸签出
+        「owner 说话人＋全范围＋无来源」的凭据。scope 不传时
+        默认受控动作全集，调用方应按最小够用传窄范围。主人
+        直达凭据必须显式 issuance_source="owner" 且
+        speaker="owner" 才签得出（见 session_auth 口径）；
         web 层不许自签，只许透传宿主签发的凭据。
         """
         return self._session_authority.issue(
@@ -8828,8 +8833,17 @@ class SQLiteStore:
         )
 
     def revoke_session(self, session_id):
-        """撤销一张会话凭据（立项 H2；H3 撤销接口的凭据侧接缝）。"""
-        return self._session_authority.revoke(session_id)
+        """撤销一张会话凭据（立项 H2；H3 撤销接口的凭据侧接缝）。
+
+        撤销语义（H2 补修钉死）：撤销与受控入口的执行共用
+        本实例的锁串行化——撤销返回时，不可能还有一笔受控
+        执行正在半途；撤销返回之后开始的验签必然看到已撤
+        销状态，已开始但尚未落笔的执行由落笔前复查阻断
+        （见 submit / revoke_controlled_change 的落笔前
+        复查）。即：撤销返回后，尚未落笔的执行必须被阻断。
+        """
+        with self._lock:
+            return self._session_authority.revoke(session_id)
 
     def _queue_controlled_entry_question(self, action, memory_id,
                                          instruction_source, block_reason):
@@ -9207,9 +9221,18 @@ class SQLiteStore:
             # 由 session_auth 给（no_session / session_expired /
             # out_of_scope / not_owner_direct / session_tampered /
             # session_revoked），不落任何状态。
-            verdict = self._session_authority.validate(
-                proposal.get("session"), action
-            )
+            try:
+                verdict = self._session_authority.validate(
+                    proposal.get("session"), action
+                )
+            except Exception:
+                # 验签绝不许把异常抛穿受控入口（补修 F3）：
+                # 畸形凭据按篡改类结构化拒绝，不落任何状态。
+                logger.warning("会话验签异常（提交）", exc_info=True)
+                verdict = {
+                    "ok": False, "reason": "session_tampered",
+                    "session_id": None,
+                }
             if not verdict["ok"]:
                 return _finish(
                     "refused", verdict["reason"],
@@ -9275,6 +9298,21 @@ class SQLiteStore:
                 )
                 return _finish(
                     "refused", "intent_persist_failed", register=False
+                )
+            # 落笔前撤销复查（H2 补修，撤销语义钉死）：验签
+            # 通过之后、真正落笔之前，凭据可能刚被撤销——
+            # 撤销返回后尚未落笔的执行必须被阻断，这里复查
+            # 一次撤销状态：已撤销按 session_revoked 拒，
+            # 意图按 aborted 收尾，不落任何状态变更。
+            if self._session_authority.is_revoked(
+                verdict["session_id"]
+            ):
+                intent["status"] = "aborted"
+                intent["abort_reason"] = "session_revoked"
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "refused", "session_revoked",
+                    detail={"session_reason": "session_revoked"},
                 )
             # —— 执行：只走既有 store 路径，不新开写库逻辑；
             # 状态变更的账本事件带 op_id＋idem_key 贯通对照 ——
@@ -10013,9 +10051,18 @@ class SQLiteStore:
                 )
             # —— 会话认证（H2 口径）：按原动作验范围；敏感
             # 动作（保护变更）只认主人直达 ——
-            verdict = self._session_authority.validate(
-                request.get("session"), action
-            )
+            try:
+                verdict = self._session_authority.validate(
+                    request.get("session"), action
+                )
+            except Exception:
+                # 同 submit 口径（补修 F3）：验签异常转结构化
+                # 回执，不许抛穿撤销入口。
+                logger.warning("会话验签异常（撤销）", exc_info=True)
+                verdict = {
+                    "ok": False, "reason": "session_tampered",
+                    "session_id": None,
+                }
             if not verdict["ok"]:
                 return _finish(
                     "refused", verdict["reason"],
@@ -10052,6 +10099,20 @@ class SQLiteStore:
                 return _finish(
                     "refused", "intent_persist_failed",
                     register=False,
+                )
+            # 落笔前撤销复查（H2 补修，同 submit 口径）：验签
+            # 通过后、补偿落笔前凭据被撤销的，本次补偿必须
+            # 被阻断——按 session_revoked 拒，撤销意图按
+            # aborted 收尾，不落任何补偿。
+            if self._session_authority.is_revoked(
+                verdict["session_id"]
+            ):
+                rev_intent["status"] = "aborted"
+                rev_intent["abort_reason"] = "session_revoked"
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "refused", "session_revoked",
+                    detail={"session_reason": "session_revoked"},
                 )
             # —— 执行补偿：只走既有路径，账本先行 ——
             detail = {

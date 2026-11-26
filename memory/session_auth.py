@@ -18,12 +18,28 @@
     也碰不了敏感动作。
   - 转述/第三方来源永远拿不到直达凭据：签发直达凭据必须显式走
     主人通道（issuance_source == "owner"），auth_guard 口径下
-    非本人来源连普通凭据都签不出来。签发是新接口、没有老调用方，
-    所以这里不沿用 is_owner_instruction 对 None 的放行——直达
-    签发必须显式标 "owner"，None 不算。
+    非本人来源连普通凭据都签不出来。
   - 无法验证来源一律 fail-closed：没凭据、凭据不是本权威签的、
     过期、越界、字段被篡改、已被撤销——执行前全部拒绝，原因码
     分清（见 REASON_*），不落任何状态。
+
+H2 补修轮（2026-11-25，贵妃第二十五份复查 F1/F3/F4＋撤销语义）：
+  - F1 签发 fail-closed 钉死：issuance_source 必须显式给出且只认
+    "owner" / "system"——未标来源（None）不再是「宿主内部路径」，
+    任何凭据都签不出来（旧口径把 None 释为内部路径，与 fail-closed
+    自相矛盾，本轮废止）。且来源与说话人必须互相印证：主人通道
+    只给主人本人签（speaker 必须是 "owner"），自称 "owner" 的
+    凭据也只许从主人通道出（"system" 内部路径不许冒名签 owner）；
+    自填的来源字符串单独不构成可信，组合对不上一律拒签。
+  - F3 畸形一律结构化拒绝：issue / validate 对 session_id、
+    scope、时间、digest、ttl 等字段先验类型与形状，畸形只返回
+    拒签 / 拒绝原因码，绝不抛异常；ttl 必须为有限正数
+    （NaN / inf / <= 0 拒签）。
+  - F4 到期边界钉死：now >= expires_at 即失效（到期即失效）。
+  - 撤销语义钉死：撤销返回后，尚未落笔的执行必须被阻断——
+    validate 在给出 ok 前复查撤销状态；store 层在执行落笔前
+    再复查一次（见 sqlite_store 的落笔前复查），且 store 的
+    revoke_session 与受控执行共用同一把锁串行化。
 
 载体与边界（诚实说明）：
   - 凭据是内存对象：签发登记与签名密钥只活在签发权威的进程内存
@@ -42,6 +58,7 @@
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import threading
 from datetime import datetime, timedelta, timezone
@@ -61,8 +78,9 @@ REASON_SESSION_REVOKED = "session_revoked"      # 凭据已被撤销（H3 接缝
 # 休眠）是整理员的常规动作，凭据在范围内即可。
 SENSITIVE_ACTIONS = frozenset({"set_protection_tier"})
 
-# 允许签发凭据的来源：主人通道与宿主内部系统路径。转述/第三方
-# 显式来源一律拒签（与 auth_guard 的非本人判定同口径）。
+# 允许签发凭据的来源：主人通道与宿主内部系统路径。必须显式
+# 给出——未标来源（None）一律拒签（补修 F1）；转述/第三方
+# 显式来源同样拒签（与 auth_guard 的非本人判定同口径）。
 _ISSUANCE_SOURCES = frozenset({_auth_guard.INSTRUCTION_SOURCE_OWNER, "system"})
 
 
@@ -81,6 +99,38 @@ def _canonical_payload(session_id, speaker, scope, issued_at,
         sort_keys=True,
         ensure_ascii=False,
     )
+
+
+def _is_aware_datetime(value):
+    """是不是带时区的 datetime（签发只产出这种时间戳；朴素
+    时间与非 datetime 一律是签发方不可能产出的形状）。"""
+    return (
+        isinstance(value, datetime)
+        and value.tzinfo is not None
+        and value.tzinfo.utcoffset(value) is not None
+    )
+
+
+def _credential_shape_ok(credential):
+    """凭据字段形状前验（补修 F3）：字段被改成签发方不可能
+    产出的类型/形状时，先于摘要计算判畸形——摘要路径对畸形
+    字段（不可哈希的 id、None 时间、非 str 摘要……）会抛
+    异常，验签绝不许抛。"""
+    if not isinstance(credential.speaker, str) or not credential.speaker:
+        return False
+    if not isinstance(credential.scope, frozenset):
+        return False
+    if not all(isinstance(a, str) for a in credential.scope):
+        return False
+    if not _is_aware_datetime(credential.issued_at):
+        return False
+    if not _is_aware_datetime(credential.expires_at):
+        return False
+    if not isinstance(credential.owner_direct, bool):
+        return False
+    if not isinstance(credential.digest, str):
+        return False
+    return True
 
 
 class SessionCredential:
@@ -143,41 +193,74 @@ class SessionAuthority:
         scope            授权范围（可执行的动作集），必须是
                          allowed_actions 的子集（动作全集由受控
                          入口定义，本模块不另立第二份口径）；
-        ttl_seconds      有效期秒数，必须为正；
+        ttl_seconds      有效期秒数，必须为有限正数（NaN /
+                         inf / <= 0 拒签，补修 F3）；
         owner_direct     是否主人直达凭据——只许 issuance_source
-                         显式为 "owner" 时签发，转述/第三方/未标
-                         来源一律拒签直达；
-        issuance_source  签发来源：只认 "owner" / "system" / None
-                         （宿主内部路径）；其余显式来源（relayed、
-                         third_party 等）连普通凭据都拒签；
-        now              时钟注入（测试用），默认当前 UTC 时间。
+                         显式为 "owner"（且 speaker 为 "owner"）
+                         时签发，转述/第三方/未标来源一律拒签；
+        issuance_source  签发来源：必须显式给出，只认 "owner" /
+                         "system"；未标来源（None）一律拒签
+                         （补修 F1：无法验证来源 fail-closed，
+                         不再有「内部路径默认放行」）。来源与
+                         说话人必须互相印证：主人通道只给
+                         speaker="owner" 签，speaker="owner"
+                         也只许从主人通道出；
+        now              时钟注入（测试用），默认当前 UTC 时间；
+                         注入值必须是带时区的 datetime。
         """
         if not speaker or not isinstance(speaker, str):
+            return None
+        # —— 签发来源 fail-closed（补修 F1）——
+        if (
+            not isinstance(issuance_source, str)
+            or issuance_source not in _ISSUANCE_SOURCES
+        ):
+            # 未标来源（None）、转述/第三方显式来源（relayed、
+            # third_party……）、畸形来源：一律拒签，与
+            # auth_guard「非本人来源不认」的口径一致。
+            return None
+        if (
+            issuance_source == _auth_guard.INSTRUCTION_SOURCE_OWNER
+        ) != (speaker == _auth_guard.INSTRUCTION_SOURCE_OWNER):
+            # 可信组合钉死：来源与说话人对不上（拿主人通道给
+            # 别人签、或拿系统路径冒名签 owner）一律拒签——
+            # 自填的来源字符串单独不构成可信。
+            return None
+        if owner_direct and (
+            issuance_source != _auth_guard.INSTRUCTION_SOURCE_OWNER
+        ):
+            # 直达签发必须显式走主人通道（组合校验已保证此时
+            # speaker 同为 "owner"）。
             return None
         try:
             scope = frozenset(scope or ())
         except TypeError:
             return None
-        allowed = frozenset(allowed_actions or ())
+        if not all(isinstance(a, str) for a in scope):
+            return None
+        try:
+            allowed = frozenset(allowed_actions or ())
+        except TypeError:
+            return None
         if not scope or not scope.issubset(allowed):
             return None
-        if not isinstance(ttl_seconds, (int, float)) or ttl_seconds <= 0:
-            return None
-        if (
-            issuance_source is not None
-            and issuance_source not in _ISSUANCE_SOURCES
+        if isinstance(ttl_seconds, bool) or not isinstance(
+            ttl_seconds, (int, float)
         ):
-            # 转述/第三方显式来源（relayed、third_party……）拒签：
-            # 与 auth_guard「非本人来源不认」的口径一致。
             return None
-        if owner_direct and (
-            issuance_source != _auth_guard.INSTRUCTION_SOURCE_OWNER
-        ):
-            # 直达签发必须显式走主人通道：None（未标来源）不算，
-            # 这是新接口、没有老调用方的兼容包袱。
+        try:
+            ttl_value = float(ttl_seconds)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(ttl_value) or ttl_value <= 0:
+            return None
+        if now is not None and not _is_aware_datetime(now):
             return None
         issued_at = now or datetime.now(timezone.utc)
-        expires_at = issued_at + timedelta(seconds=float(ttl_seconds))
+        try:
+            expires_at = issued_at + timedelta(seconds=ttl_value)
+        except OverflowError:
+            return None
         session_id = secrets.token_hex(16)
         payload = _canonical_payload(
             session_id, speaker, scope, issued_at, expires_at,
@@ -198,13 +281,28 @@ class SessionAuthority:
 
         返回 {"ok", "reason", "session_id"}：ok 时 reason 为空串；
         不 ok 时 reason 是 REASON_* 之一。判定顺序：存在性 →
-        撤销 → 摘要（防篡改）→ 过期 → 范围 → 敏感动作直达要求。
+        撤销 → 字段形状（补修 F3）→ 摘要（防篡改）→ 过期 →
+        范围 → 敏感动作直达要求 → 撤销复查（给出 ok 前最后一
+        眼，补修撤销语义）。任何畸形输入只返回结构化拒绝，
+        绝不抛异常。
         """
         verdict = {"ok": False, "reason": REASON_NO_SESSION,
                    "session_id": None}
         if not isinstance(credential, SessionCredential):
             return verdict
+        if not isinstance(credential.session_id, str):
+            # session_id 被改成不可哈希/非 str 的形状：连登记
+            # 都查不了，按「不是本权威签的」结构化拒绝。
+            return verdict
         verdict["session_id"] = credential.session_id
+        if not isinstance(action, str):
+            verdict["reason"] = REASON_OUT_OF_SCOPE
+            return verdict
+        if now is not None and not _is_aware_datetime(now):
+            # 时钟注入畸形（非 datetime / 无时区）：结构化拒绝，
+            # 不拿它去和凭据时间比较（比较会抛 TypeError）。
+            verdict["reason"] = REASON_SESSION_TAMPERED
+            return verdict
         with self._lock:
             record = self._records.get(credential.session_id)
             revoked = credential.session_id in self._revoked
@@ -213,21 +311,29 @@ class SessionAuthority:
         if revoked:
             verdict["reason"] = REASON_SESSION_REVOKED
             return verdict
-        payload = _canonical_payload(
-            credential.session_id, credential.speaker,
-            credential.scope, credential.issued_at,
-            credential.expires_at, credential.owner_direct,
-        )
-        if (
-            not hmac.compare_digest(self._digest(payload),
-                                    credential.digest or "")
-            or not hmac.compare_digest(record["digest"],
-                                       credential.digest or "")
-        ):
+        if not _credential_shape_ok(credential):
+            verdict["reason"] = REASON_SESSION_TAMPERED
+            return verdict
+        try:
+            payload = _canonical_payload(
+                credential.session_id, credential.speaker,
+                credential.scope, credential.issued_at,
+                credential.expires_at, credential.owner_direct,
+            )
+            digest_ok = hmac.compare_digest(
+                self._digest(payload), credential.digest
+            ) and hmac.compare_digest(
+                record["digest"], credential.digest
+            )
+        except Exception:
+            verdict["reason"] = REASON_SESSION_TAMPERED
+            return verdict
+        if not digest_ok:
             verdict["reason"] = REASON_SESSION_TAMPERED
             return verdict
         moment = now or datetime.now(timezone.utc)
-        if moment > credential.expires_at:
+        if moment >= credential.expires_at:
+            # 到期即失效（补修 F4）：now == expires_at 已算过期。
             verdict["reason"] = REASON_SESSION_EXPIRED
             return verdict
         if action not in credential.scope:
@@ -236,9 +342,27 @@ class SessionAuthority:
         if action in SENSITIVE_ACTIONS and not credential.owner_direct:
             verdict["reason"] = REASON_NOT_OWNER_DIRECT
             return verdict
+        with self._lock:
+            # 撤销复查（补修，撤销语义钉死）：验签途中凭据被
+            # 撤销的，不许把这次验签放行成 ok——撤销返回后
+            # 开始的判定必须看到已撤销。
+            if credential.session_id in self._revoked:
+                verdict["reason"] = REASON_SESSION_REVOKED
+                return verdict
         verdict["ok"] = True
         verdict["reason"] = ""
         return verdict
+
+    def is_revoked(self, session_id):
+        """这张凭据当前是否已被撤销（store 落笔前复查用）。
+
+        session_id 形状不对（非 str）按已撤销处理（fail-closed）：
+        这个接口只服务于「落笔前最后一道闸」，拿不准就拦。
+        """
+        if not isinstance(session_id, str):
+            return True
+        with self._lock:
+            return session_id in self._revoked
 
     def revoke(self, session_id):
         """撤销一张凭据（H3 接缝：凭据侧撤销登记）。
@@ -246,7 +370,10 @@ class SessionAuthority:
         撤销后该凭据一律 session_revoked 拒绝。返回这张凭据
         是否存在过（已撤销的重复撤销返回 False，不二次生效）。
         已执行变更的反向补偿不在这里——那是 H3 撤销接口本体。
+        session_id 形状不对（非 str）返回 False，不抛异常。
         """
+        if not isinstance(session_id, str):
+            return False
         with self._lock:
             if session_id not in self._records:
                 return False
