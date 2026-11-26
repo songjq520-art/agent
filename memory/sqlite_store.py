@@ -8214,20 +8214,27 @@ class SQLiteStore:
             self._controlled_reconcile_intents()
         except Exception:
             logger.warning("受控入口启动对账失败", exc_info=True)
-        # 跨重启承接冻结（补修三轮，贵妃第二十二份复查 A）：
-        # 已决意图里带着冻结级最终原因的，冻结事实不许随进
-        # 程重启蒸发——在新进程里按 final_reason 重建同一面
-        # 冻结旗。解冻沿用现有口径：干净恢复/复检只解
-        # recovery_unclean 来源，本来源不被顺手解掉（与同进
-        # 程语义一致：不变量失败类冻结在进程内本来也不自动
+        # 跨重启承接冻结（补修三轮，贵妃第二十二份复查
+        # A；补修四轮，第二十三份复查 A 第二条断链）：
+        # 已决意图里带着冻结级痕迹的，冻结事实不许随进
+        # 程重启蒸发——在新进程里按 status（提交未定案）
+        # 与 final_reason（不变量结论）两条来源重建同一
+        # 面冻结旗。解冻沿用现有口径：干净恢复/复检只解
+        # recovery_unclean 来源，本来源不被顺手解掉（与
+        # 同进程语义一致：这类冻结在进程内本来也不自动
         # 解，重启更不许成为意外的解冻键）。
         try:
             self._controlled_carry_intent_freezes()
         except Exception:
             logger.warning("受控入口冻结承接失败", exc_info=True)
 
-    # 哪些已决意图的最终原因要在重启后重建冻结（与
-    # _CONTROLLED_FREEZE_KINDS 里执行结论类的三种对齐）。
+    # 哪些已决意图的最终原因（不变量结论）要在重启后
+    # 重建冻结（与 _CONTROLLED_FREEZE_KINDS 里执行结论
+    # 类的三种对齐）。注意 commit_unverified 的主承接
+    # 来源是意图 status 本身（见
+    # _controlled_carry_intent_freezes）：生产者从不往
+    # final_reason 写这个值，它留在集合里只为带此值的
+    # 落盘数据兜底。
     _CONTROLLED_CARRY_FREEZE_REASONS = frozenset({
         "invariant_failed",
         "commit_unverified",
@@ -8235,23 +8242,55 @@ class SQLiteStore:
     })
 
     def _controlled_carry_intent_freezes(self):
-        """按已落盘意图的 final_reason 重建受控入口冻结旗
-        （补修三轮，复查 A）：进程 1 里执行结论为不变量失
-        败/提交待核实的笔，意图已落盘；进程 2 构造时在这里
-        把同一原因的冻结重新置上，健康痕迹如实记
-        carried_from_intent——失败回执保留之外，冻结本身
-        也必须保留。pending 意图不归这里（对账管），没有
-        final_reason 的老意图不推定、不承接。"""
+        """按已落盘意图重建受控入口冻结旗（补修三轮，复查
+        A；补修四轮，第二十三份复查 A 的第二条断链）：进
+        程 1 里执行结论带冻结级痕迹的笔，意图已落盘；进
+        程 2 构造时在这里把同一原因的冻结重新置上——失
+        败回执保留之外，冻结本身也必须保留。pending 意
+        图不归这里（对账管），aborted 是没执行成，都不
+        承接。
+
+        两条承接来源分开看、分开标注，不许混：
+        - carried_from_status：「提交未定案」这个事实看
+          status 本身——status == "committed_unverified"
+          的已决意图无条件以 commit_unverified 承接。
+          final_reason 只记不变量结论（两个生产者只写
+          ""/invariant_failed），未定案那笔的
+          final_reason 天生是空串；三轮时拿它当承接闸
+          口，等于把这类冻结挡在门外——同进程冻着、重
+          启解冻的断链正在这里。
+        - carried_from_intent：不变量结论看 final_reason
+          ——命中 _CONTROLLED_CARRY_FREEZE_REASONS 的按
+          原口径承接。
+        同一笔两条都命中时先记 status 来源（与进程内的
+        产生顺序一致：未定案留痕在不变量结论之前，冻结
+        原因以最早的为准）；status 来源已承接
+        commit_unverified 的，final_reason 同值不再重复
+        记一笔。"""
         for intent in self._controlled_intents.values():
             if intent.get("status") not in (
                 "committed", "committed_unverified",
             ):
                 # 只承接已决执行（提交点已落账/待核实）；
-                # pending 归对账、aborted 是没执行成，都不
-                # 许凭一个 final_reason 字段冻结。
+                # pending 归对账、aborted 是没执行成，都不承接。
                 continue
+            status_carried = (
+                intent.get("status") == "committed_unverified"
+            )
+            if status_carried:
+                self._controlled_note_health(
+                    "commit_unverified",
+                    {
+                        "carried_from_status": intent.get("op_id"),
+                        "action": intent.get("action"),
+                        "memory_id": intent.get("memory_id"),
+                    },
+                )
             reason = intent.get("final_reason")
             if reason in self._CONTROLLED_CARRY_FREEZE_REASONS:
+                if status_carried and reason == "commit_unverified":
+                    # 同一事实已由 status 来源承接，不重复记。
+                    continue
                 self._controlled_note_health(
                     reason,
                     {
