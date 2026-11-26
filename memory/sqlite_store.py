@@ -11136,6 +11136,10 @@ class SQLiteStore:
                         history.append(event)
             except Exception:
                 logger.warning("删除范围读账本历史失败。", exc_info=True)
+                # 读不出来＝存疑（H3 补修轮 2 F2-R2）：历史为空是
+                # 「没读到」，不是「没有历史」；删除预览必须如实
+                # 标存疑，不许让删除审批看着空历史＋不存疑做决定。
+                _scope_ledger_doubtful = True
             return {
                 "scope": "single",
                 "memory_id": memory_id,

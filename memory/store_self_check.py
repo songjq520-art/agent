@@ -41,11 +41,31 @@ class _StoreSelfCheckAdapter:
 
     def supersede_events_since(self, days):
         """最近 days 天内被取代的记忆（账本 supersede 事件）。
-        事件没时间戳的跳过（定不了是哪天的，不猜）。"""
+        事件没时间戳的跳过（定不了是哪天的，不猜）。
+
+        账本读失败或不完整（坏行/截断）时抛 RuntimeError 把存疑
+        传出去（H3 补修轮 2 F2-R1）：这份结果要进自检报告的
+        replaced_last_month——残缺结果冒充完整、读失败冒充
+        「最近没有取代事件」，都会让报告看着健康实则没查。
+        自检框架的承接方式就是异常：run_self_check 不吞适配器
+        异常，外层维护调度/体检适配器会把整轮自检记为失败，
+        不会记成一份干净的空报告。"""
         try:
             events, _info = _ledger.read_events(self._store.ledger_path)
-        except Exception:
-            return []
+        except Exception as exc:
+            raise RuntimeError(
+                "账本读取失败，取代事件查不了：%s" % exc
+            ) from exc
+        if (_info or {}).get("bad_lines") or (_info or {}).get("truncated"):
+            raise RuntimeError(
+                "账本不完整（坏行 %s 行%s），取代事件只能读出一部分，"
+                "不冒充完整结果。"
+                % (
+                    (_info or {}).get("bad_lines") or 0,
+                    "、末尾有写一半的残行"
+                    if (_info or {}).get("truncated") else "",
+                )
+            )
         try:
             days = float(days)
         except (TypeError, ValueError):
@@ -77,10 +97,25 @@ class _StoreSelfCheckAdapter:
 
     def verify_backup(self):
         """备份恢复演练：从当前库建一份备份、写临时文件、读回来验。
-        演练完临时文件就删，不留备份。返回 {"ok", "detail"}。"""
+        演练完临时文件就删，不留备份。返回 {"ok", "detail"}。
+        源账本不完整（坏行/截断）时直接 ok=False：读出的事件集合
+        是残的，拿残账本建的备份再自洽，也证明不了源账本完整
+        （H3 补修轮 2 F2-R1）。"""
         try:
             items = self._store.get_all(include_sensitive=True) or []
             events, _info = _ledger.read_events(self._store.ledger_path)
+            if (_info or {}).get("bad_lines") or (_info or {}).get("truncated"):
+                parts = []
+                if (_info or {}).get("bad_lines"):
+                    parts.append("坏行 %d 行" % _info["bad_lines"])
+                if (_info or {}).get("truncated"):
+                    parts.append("末尾有写一半的残行")
+                return {
+                    "ok": False,
+                    "detail": "备份演练没通过：源账本不完整（%s），"
+                    "读出的事件集合不全，不拿残缺账本建备份。"
+                    % "、".join(parts),
+                }
             backup = _backup.build_backup(items, events)
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "self-check-backup.json"
