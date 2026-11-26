@@ -706,7 +706,16 @@ def load_ledger_state(ledger_path, snapshot_path):
     snapshot = None
     if any(e.get("type") == LEDGER_EVENT_SNAPSHOT for e in events):
         snapshot = read_snapshot(snapshot_path)
-    return resolve_state(events, snapshot=snapshot)
+    state = resolve_state(events, snapshot=snapshot)
+    if _info.get("bad_lines") or _info.get("truncated"):
+        # 账本残缺（补修 H3 复查 F2）：折叠态是残缺投影，
+        # 如实标注 ledger_doubtful。这里不抛——修复/对账
+        # 路径要能读坏账才能修；下定案的消费方（受控入口
+        # 三态读、各类核对）另有 fail-closed 口径，不许静
+        # 默把残缺折叠当完整账本用。
+        state = dict(state)
+        state["ledger_doubtful"] = True
+    return state
 
 
 def compact_ledger(ledger_path, snapshot_path):
@@ -723,6 +732,13 @@ def compact_ledger(ledger_path, snapshot_path):
     ledger_path = Path(ledger_path)
     repaired = repair_ledger(ledger_path)
     events, _info = read_events(ledger_path)
+    if _info.get("bad_lines"):
+        # 坏行是解析不出的整行事件：压进快照等于静默丢事
+        # 件、还把账本截成一行无从恢复——拒绝压缩，留给
+        # 人工处置（补修 H3 复查 F2）。
+        raise ValueError(
+            "账本有坏行（%s 行），拒绝压缩" % _info.get("bad_lines")
+        )
     state = resolve_state(events)
     seq_max = state["seq_max"]
     write_snapshot(snapshot_path, state, seq_max)

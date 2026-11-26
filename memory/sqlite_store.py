@@ -905,12 +905,19 @@ class SQLiteStore:
         if self._graph_cache is not None and stamp == self._graph_stamp:
             return self._graph_cache
         graph = _graph_mod.MemoryGraph()
+        _info = None
         try:
             events, _info = _ledger.read_events(self.ledger_path)
             graph.rebuild_from_events(events)
         except Exception:
             logger.warning("图谱重建失败：本次不用图。", exc_info=True)
             graph = _graph_mod.MemoryGraph()
+        if _info is not None and self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：图是残缺折叠，
+            # 本次照用（检索少一路可降级），但不进缓存——
+            # 不许把残缺折叠当定案缓存下来，账本修好后下
+            # 次调用重建。
+            return graph
         self._graph_cache = graph
         self._graph_stamp = self._ledger_stamp()
         return graph
@@ -1044,6 +1051,12 @@ class SQLiteStore:
         slot_map = {}
         revived_keys = set()
         _events, _info = _ledger.read_events(self.ledger_path)
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：覆盖层是折叠结
+            # 论，残缺折叠不许当定案——抛给调用方按各自兜
+            # 底口径跳过覆盖层（对账/修复的既有 except 路
+            # 径；只读复检则向上抛由启动恢复处置）。
+            raise ValueError("ledger_doubtful")
         for _event in _events:
             _etype = _event.get("type")
             _key = _event.get("key") or _event.get("memory_id")
@@ -2002,6 +2015,21 @@ class SQLiteStore:
             deleted_texts = set()
             try:
                 events, _info = _ledger.read_events(self.ledger_path)
+                if self._controlled_ledger_doubtful(_info):
+                    # 账本残缺（补修 H3 复查 F2）：删除过滤
+                    # 集合不可信——漏掉的 delete 事件会让已
+                    # 删记忆被重新迁入。fail-closed：整笔迁
+                    # 移中止、如实回报。
+                    logger.warning(
+                        "账本残缺：一次性迁移中止（删除过滤不可信）。"
+                    )
+                    return {
+                        "imported": 0,
+                        "skipped_existing": 0,
+                        "skipped_deleted": 0,
+                        "skipped_sensitive": 0,
+                        "ledger_doubtful": True,
+                    }
                 for event in events:
                     if event.get("type") == "delete":
                         text = (event.get("text") or "").strip()
@@ -6095,6 +6123,11 @@ class SQLiteStore:
             events, _info = _ledger.read_events(self.ledger_path)
         except Exception:
             return None
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：「本轮已纠正过」
+            # 是折叠结论，残缺账本定不了——不拦，交回正常
+            # 纠正流程，不许拿残缺折叠挡真纠正。
+            return None
         for ev in reversed(events):
             if (ev.get("type") == _ledger.LEDGER_EVENT_SUPERSEDE
                     and ev.get("memory_id") == live_id):
@@ -7816,6 +7849,11 @@ class SQLiteStore:
             (state or {}).get("key_states") or {},
             limit=self.core_seat_limit,
         )
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：重算结果是残缺
+            # 折叠，不许报 reconciled——如实标存疑。
+            snap["ledger_doubtful"] = True
+            snap["reconciled"] = False
         snap["generated_at"] = _now_iso()
         return snap
 
@@ -8426,6 +8464,16 @@ class SQLiteStore:
     _LEDGER_OP_ABSENT = "absent"
     _LEDGER_OP_UNDETERMINED = "undetermined"
 
+    @staticmethod
+    def _controlled_ledger_doubtful(info):
+        """账本完整性存疑：有坏行或被截断——解析出的事件
+        集合不完整，任何基于折叠的结论都不许当定案（补修
+        H3 复查 F2 的统一口径，受控入口各消费点共用）。"""
+        return bool(
+            (info or {}).get("bad_lines")
+            or (info or {}).get("truncated")
+        )
+
     def _controlled_ledger_op_state(self, op_id):
         """按 op_id 查账本，三态返回 (state, event)：
         found → (found, 事件)；absent → (absent, None)（账本
@@ -8439,10 +8487,7 @@ class SQLiteStore:
             logger.warning("受控入口按 op_id 查账本失败", exc_info=True)
             self._controlled_op_read_failed = True
             return (self._LEDGER_OP_UNDETERMINED, None)
-        doubtful = bool(
-            (_info or {}).get("bad_lines")
-            or (_info or {}).get("truncated")
-        )
+        doubtful = self._controlled_ledger_doubtful(_info)
         for event in events:
             if event.get("op_id") == op_id:
                 self._controlled_op_read_failed = False
@@ -8472,6 +8517,12 @@ class SQLiteStore:
             if intent.get("status") == "pending"
         ]
         if not pending:
+            # 没有待决意图也要跑成对恢复（补修 H3 复查
+            # F1）：补偿已落账、原意图已撤销标记没落盘的崩
+            # 溃窗口与 pending 无关，只靠 pending 触发会漏。
+            report["revocation_pairs_recovered"] = (
+                self._controlled_recover_revocation_pairs()
+            )
             self._controlled_reconcile_report = report
             return report
         try:
@@ -8490,9 +8541,7 @@ class SQLiteStore:
         # 账本有坏行/被截断时（复查 E）：解析出的事件集合不
         # 完整，「没找到 op_id」不能当成确定没落账——待决意
         # 图留 pending 按未定案处理，并留冻结痕迹。
-        ledger_doubtful = bool(
-            (_info or {}).get("bad_lines") or (_info or {}).get("truncated")
-        )
+        ledger_doubtful = self._controlled_ledger_doubtful(_info)
         by_op = {}
         for event in events:
             op = event.get("op_id")
@@ -8528,8 +8577,47 @@ class SQLiteStore:
             )
         if changed:
             self._controlled_save_intents_quiet()
+        # 成对恢复（补修 H3 复查 F1）：本轮刚补成 committed
+        # 的撤销意图，若原意图的已撤销标记没落盘，在这里
+        # 一并补上——只补提交状态不补成对关系，幂等防线在
+        # 崩溃窗口后是断的。
+        report["revocation_pairs_recovered"] = (
+            self._controlled_recover_revocation_pairs()
+        )
         self._controlled_reconcile_report = report
         return report
+
+    def _controlled_recover_revocation_pairs(self):
+        """成对恢复（补修 H3 复查 F1）：撤销补偿已落账（撤
+        销意图已 committed/committed_unverified）、但原意
+        图的 revoked_by 标记没来得及落盘就猝死的窗口——按
+        revokes_op_id 回填原意图 revoked_by/revoked_at。
+        撤销回执登记不伪造：登记丢了的回执在查询时按撤销
+        意图重建（_controlled_revocation_receipt_from_
+        intent），与正向同口径。返回恢复的对数；原意图找
+        不到、或已被别的撤销标记的，不动。"""
+        recovered = 0
+        changed = False
+        for intent in list(self._controlled_intents.values()):
+            if intent.get("kind") != "revocation":
+                continue
+            if intent.get("status") not in (
+                "committed", "committed_unverified",
+            ):
+                continue
+            orig_id = intent.get("revokes_op_id")
+            if not orig_id:
+                continue
+            orig = self._controlled_intents.get(orig_id)
+            if orig is None or orig.get("revoked_by"):
+                continue
+            orig["revoked_by"] = intent.get("op_id")
+            orig["revoked_at"] = intent.get("ts") or _now_iso()
+            recovered += 1
+            changed = True
+        if changed:
+            self._controlled_save_intents_quiet()
+        return recovered
 
     def controlled_entry_reconcile(self):
         """手动对账未完操作意图（启动时已自动跑一次）；返回
@@ -8590,6 +8678,110 @@ class SQLiteStore:
             "ts": _now_iso(),
         }
 
+    def _controlled_revocation_receipt_from_intent(self, rev_intent):
+        """撤销回执登记丢了时，按已提交的撤销意图重建一份
+        duplicate 回执（与正向 _controlled_receipt_from_
+        intent 同规）：最终结论以意图里存的 final_ok/
+        final_reason 为准；崩溃窗口里的撤销意图没有
+        final_*（补偿落账了但核对没跑完）——按未核实交回
+        （ok=False、reason=committed_unverified），不许冒
+        充干净成功。"""
+        status = rev_intent.get("status")
+        detail = {
+            "revokes_op_id": rev_intent.get("revokes_op_id"),
+            "revocation_op_id": rev_intent.get("op_id"),
+            "commit_state": status,
+            "ledger_seq": rev_intent.get("ledger_seq"),
+            "reconstructed_from_intent": True,
+        }
+        if rev_intent.get("version_after") is None:
+            detail["version_after_missing"] = True
+        if status == "committed" and "final_ok" in rev_intent:
+            ok = bool(rev_intent.get("final_ok"))
+            reason = rev_intent.get("final_reason") or ""
+        elif status == "committed":
+            ok = False
+            reason = "committed_unverified"
+            detail["unverified_reconstruction"] = True
+        elif status == "committed_unverified":
+            ok = False
+            reason = (
+                rev_intent.get("final_reason")
+                or "committed_unverified"
+            )
+        else:
+            ok = False
+            reason = rev_intent.get("final_reason") or ""
+        return {
+            "ok": ok,
+            "status": "duplicate",
+            "reason": reason,
+            "revokes_op_id": rev_intent.get("revokes_op_id"),
+            "revocation_op_id": rev_intent.get("op_id"),
+            "action": rev_intent.get("action"),
+            "memory_id": rev_intent.get("memory_id"),
+            "idempotency_key": rev_intent.get("idempotency_key"),
+            "duplicate": True,
+            "question_id": None,
+            "trace_index": None,
+            "version_before": rev_intent.get("expected_version"),
+            "version_after": rev_intent.get("version_after"),
+            "detail": detail,
+            "ts": _now_iso(),
+        }
+
+    def _controlled_prior_revocation(self, rev_key, fingerprint,
+                                     target_op_id):
+        """按撤销键＋目标查先行撤销（补修 H3 复查 F1）：回
+        执登记之外必须查持久化撤销意图——登记没落盘的崩
+        溃窗口只查登记，会让同键重入穿到执行段二次补偿。
+        返回 (kind, payload)：("duplicate", 重建回执) /
+        ("conflict", 先行指纹) / ("unresolved", 撤销意图)
+        / ("already_revoked", 撤销意图) / (None, None)。
+        与正向 _controlled_prior 同口径：异指纹先判冲突；
+        pending 先对账，对账后仍定不了生死按 unresolved，
+        绝不放行穿到执行段；aborted 是证明没执行成，不
+        拦。target_op_id 给出时还查「同目标、别的键」的已
+        决撤销（换键再撤同一笔）。"""
+        matches = [
+            intent for intent in self._controlled_intents.values()
+            if intent.get("kind") == "revocation"
+            and intent.get("idempotency_key") == rev_key
+        ]
+        for intent in matches:
+            if intent.get("fingerprint") != fingerprint:
+                return ("conflict", intent.get("fingerprint"))
+        for intent in matches:
+            if intent.get("status") == "pending":
+                self._controlled_reconcile_intents()
+                intent = self._controlled_intents.get(
+                    intent.get("op_id"), intent
+                )
+            if intent.get("status") == "pending":
+                return ("unresolved", intent)
+            if intent.get("status") in (
+                "committed", "committed_unverified",
+            ):
+                return (
+                    "duplicate",
+                    self._controlled_revocation_receipt_from_intent(
+                        intent
+                    ),
+                )
+        if target_op_id:
+            for intent in self._controlled_intents.values():
+                if intent.get("kind") != "revocation":
+                    continue
+                if intent.get("revokes_op_id") != target_op_id:
+                    continue
+                if intent.get("status") in (
+                    "committed", "committed_unverified",
+                ):
+                    return ("already_revoked", intent)
+                if intent.get("status") == "pending":
+                    return ("unresolved", intent)
+        return (None, None)
+
     def _controlled_prior(self, idem_key, fingerprint):
         """按幂等键查先行处理：返回 (kind, payload)——
         ("duplicate", 回执副本) / ("conflict", 先行指纹) /
@@ -8639,6 +8831,55 @@ class SQLiteStore:
                 )
         return (None, None)
 
+    def _controlled_members_match_ledger(self, events):
+        """成员 ID 集合与账本折叠一致（正向不变量与撤销核
+        对共用同一份口径）：投影侧读 SQLite 活行、账本侧
+        读折叠后未死状态的 meta，两侧都走 core_cap.
+        classify，成员/占座/钉死/临时钉死四组 ID 集合逐组
+        相等才算一致。调用方负责账本完整性判定：坏行/截
+        断时不许拿本方法的结论下定案。"""
+        folded = _core_cap.fold_ledger_metas(events)
+        states = _ledger.resolve_state(events).get(
+            "key_states", {}
+        )
+
+        def _id_sets(pairs):
+            members, seats, pinned, temp = set(), set(), set(), set()
+            for mid, m in pairs:
+                c = _core_cap.classify(m, live=True)
+                if c["protection_tier"] == _core_cap.TIER_PINNED:
+                    pinned.add(mid)
+                elif (
+                    c["protection_tier"]
+                    == _core_cap.TIER_TEMP_PINNED
+                ):
+                    temp.add(mid)
+                if c["member"]:
+                    members.add(mid)
+                    if c["occupies_seat"]:
+                        seats.add(mid)
+            return members, seats, pinned, temp
+
+        ledger_pairs = [
+            (key, meta)
+            for key, meta in folded.items()
+            if states.get(key)
+            not in _core_cap._LEDGER_DEAD_STATES
+        ]
+        proj_rows = self._conn.execute(
+            "SELECT id, metadata_json FROM memories"
+            " WHERE voided=0 AND deleted=0 AND superseded=0"
+        ).fetchall()
+        proj_pairs = []
+        for rid, mjson in proj_rows:
+            try:
+                proj_pairs.append(
+                    (rid, json.loads(mjson or "{}"))
+                )
+            except (ValueError, TypeError):
+                proj_pairs.append((rid, {}))
+        return _id_sets(proj_pairs) == _id_sets(ledger_pairs)
+
     def _controlled_check_invariants(self, memory_id, before_text,
                                      before_meta, action):
         """执行后不变量健康闸口（补修轮扩项）：逐项查——
@@ -8661,49 +8902,15 @@ class SQLiteStore:
             # 全部活行先算（与 count_seats 的计数顺序一致），
             # 成员/占座再按成员资格筛。
             events, _info = _ledger.read_events(self.ledger_path)
-            folded = _core_cap.fold_ledger_metas(events)
-            states = _ledger.resolve_state(events).get(
-                "key_states", {}
-            )
-
-            def _id_sets(pairs):
-                members, seats, pinned, temp = set(), set(), set(), set()
-                for mid, m in pairs:
-                    c = _core_cap.classify(m, live=True)
-                    if c["protection_tier"] == _core_cap.TIER_PINNED:
-                        pinned.add(mid)
-                    elif (
-                        c["protection_tier"]
-                        == _core_cap.TIER_TEMP_PINNED
-                    ):
-                        temp.add(mid)
-                    if c["member"]:
-                        members.add(mid)
-                        if c["occupies_seat"]:
-                            seats.add(mid)
-                return members, seats, pinned, temp
-
-            ledger_pairs = [
-                (key, meta)
-                for key, meta in folded.items()
-                if states.get(key)
-                not in _core_cap._LEDGER_DEAD_STATES
-            ]
-            proj_rows = self._conn.execute(
-                "SELECT id, metadata_json FROM memories"
-                " WHERE voided=0 AND deleted=0 AND superseded=0"
-            ).fetchall()
-            proj_pairs = []
-            for rid, mjson in proj_rows:
-                try:
-                    proj_pairs.append(
-                        (rid, json.loads(mjson or "{}"))
-                    )
-                except (ValueError, TypeError):
-                    proj_pairs.append((rid, {}))
-            checks["members_match_ledger"] = (
-                _id_sets(proj_pairs) == _id_sets(ledger_pairs)
-            )
+            if self._controlled_ledger_doubtful(_info):
+                # 账本残缺（补修 H3 复查 F2）：残余事件折
+                # 出的成员集合可能恰好与残缺投影自洽，不
+                # 许判一致——按不一致（未定案）处理。
+                checks["members_match_ledger"] = False
+            else:
+                checks["members_match_ledger"] = (
+                    self._controlled_members_match_ledger(events)
+                )
         except Exception:
             checks["members_match_ledger"] = False
         row = self._conn.execute(
@@ -8741,6 +8948,11 @@ class SQLiteStore:
         # 以账本折出的 meta 为准比 SQLite 里的 meta）。
         try:
             events, _info = _ledger.read_events(self.ledger_path)
+            if self._controlled_ledger_doubtful(_info):
+                # 账本残缺（补修 H3 复查 F2）：折叠口径不可
+                # 信，保护/抽屉/确认标记不许拿残缺折叠判一
+                # 致——走 except 的不一致口径。
+                raise ValueError("ledger_doubtful")
             ledger_metas = _core_cap.fold_ledger_metas(events)
             ledger_meta = ledger_metas.get(memory_id)
             if ledger_meta is None:
@@ -9672,6 +9884,12 @@ class SQLiteStore:
         except Exception:
             logger.warning("撤销重建字段读账本失败", exc_info=True)
             return None
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：残余事件折出的
+            # before 可能是错的（缺失的较近 PROMOTE 会改
+            # 变真 before）——不猜、如实拒，调用方按
+            # before_state_unavailable 回。
+            return None
         op_event = None
         for event in events:
             if event.get("seq") == ledger_seq and \
@@ -9702,10 +9920,23 @@ class SQLiteStore:
                                       pre_meta, action):
         """补偿后核对（调用方持锁）：目标字段已恢复到 before
         值、原文逐字未变、补偿只动了那一个字段、账本口径与
-        库内一致、座位账自洽。返回 {"ok", "checks"}。"""
+        库内一致、座位账自洽。返回 {"ok", "checks"}。
+
+        补修 H3 复查 F3：核对口径与正向
+        _controlled_check_invariants 对齐——独立
+        user_confirmed 列与 meta 一致（columns_match_meta，
+        含终态旗）、成员 ID 集合与账本一致
+        （members_match_ledger）必须在场：demote 补偿是两
+        段写（meta/账本先落、独立列后写），第二段失败留下
+        的列/meta 分叉不许被弱核对洗成干净成功。
+        补修 H3 复查 F2：账本有坏行/截断时折叠结论不可
+        信，ledger_matches 与 members_match_ledger 直接判
+        False 并标 ledger_doubtful，不许让核对被坏行洗过。"""
         checks = {}
         row = self._conn.execute(
-            "SELECT text, metadata_json FROM memories WHERE id=?",
+            "SELECT text, metadata_json, user_confirmed,"
+            " superseded, deleted, voided FROM memories"
+            " WHERE id=?",
             (memory_id,),
         ).fetchone()
         if row is None:
@@ -9716,6 +9947,12 @@ class SQLiteStore:
             meta_after = json.loads(row[1] or "{}")
         except Exception:
             meta_after = {}
+        # 独立确认列与 meta 一致、终态旗没被误动（与正向
+        # columns_match_meta 同口径）。
+        checks["columns_match_meta"] = (
+            bool(row[2]) == bool(meta_after.get("user_confirmed"))
+            and not row[3] and not row[4] and not row[5]
+        )
         current = self._controlled_before_fields(meta_after)
         checks["field_restored"] = current.get(field) == before_value
         pre_meta = pre_meta or {}
@@ -9725,8 +9962,10 @@ class SQLiteStore:
             if pre_meta.get(f) != meta_after.get(f)
         }
         checks["fields_confined"] = changed <= {field}
+        ledger_doubtful = False
         try:
             events, _info = _ledger.read_events(self.ledger_path)
+            ledger_doubtful = self._controlled_ledger_doubtful(_info)
             if action == "mark_dormant":
                 state = _ledger.resolve_state(events)
                 key_states = (state or {}).get("key_states") or {}
@@ -9743,16 +9982,44 @@ class SQLiteStore:
                         ledger_meta
                     ).get(field) == before_value
                 )
+            # 成员 ID 集合与账本一致（与正向
+            # members_match_ledger 同口径、同一份折叠）。
+            checks["members_match_ledger"] = (
+                self._controlled_members_match_ledger(events)
+            )
         except Exception:
             checks["ledger_matches"] = False
+            checks["members_match_ledger"] = False
+        if ledger_doubtful:
+            # 账本残缺：上面折出来的「一致」不可信，一律
+            # 判不干净并留痕（F2），不许被坏行洗过。
+            checks["ledger_doubtful"] = True
+            checks["ledger_matches"] = False
+            checks["members_match_ledger"] = False
         snap = self.core_seat_snapshot()
         checks["seats_reconciled"] = bool(snap.get("reconciled"))
         return {"ok": all(checks.values()), "checks": checks}
 
     def controlled_revocation_receipt(self, idempotency_key):
-        """按撤销幂等键查已登记的撤销回执；没有返回 None。"""
+        """按撤销幂等键查已登记的撤销回执；登记里没有时按
+        已提交的撤销意图重建一份（提交/恢复协议，同正向
+        controlled_entry_receipt 口径，补修 H3 复查 F1）；
+        都没有返回 None。"""
         receipt = self._controlled_revocations.get(idempotency_key)
-        return dict(receipt) if receipt is not None else None
+        if receipt is not None:
+            return dict(receipt)
+        for intent in self._controlled_intents.values():
+            if intent.get("kind") != "revocation":
+                continue
+            if intent.get("idempotency_key") != idempotency_key:
+                continue
+            if intent.get("status") in (
+                "committed", "committed_unverified",
+            ):
+                return self._controlled_revocation_receipt_from_intent(
+                    intent
+                )
+        return None
 
     def revoke_controlled_change(self, request):
         """撤销接口：回滚一笔经受控入口已执行的变更，返回统一回执。
@@ -9943,6 +10210,59 @@ class SQLiteStore:
                          "status": "duplicate"},
                     )
                 return dup
+            # —— 撤销幂等查重（意图侧，补修 H3 复查 F1）：
+            # 登记里没有时查持久化撤销意图——补偿已落账、
+            # 回执登记没落盘的崩溃窗口只查登记会漏，同键
+            # 重入会穿到执行段二次补偿。
+            prior_kind, prior_payload = \
+                self._controlled_prior_revocation(
+                    rev_key, fingerprint, None
+                )
+            if prior_kind == "conflict":
+                return _finish(
+                    "refused", "idempotency_conflict",
+                    detail={
+                        "fingerprint": fingerprint,
+                        "prior_fingerprint": prior_payload,
+                    },
+                    register=False,
+                )
+            if prior_kind == "unresolved":
+                return _finish(
+                    "refused", "unresolved_revocation",
+                    detail={
+                        "revocation_op_id":
+                            (prior_payload or {}).get("op_id"),
+                        "commit_state": "pending",
+                        "frozen_reason":
+                            self._controlled_frozen_reason,
+                    },
+                    register=False,
+                )
+            if prior_kind == "duplicate":
+                dup = dict(prior_payload)
+                receipt["action"] = dup.get("action")
+                receipt["memory_id"] = dup.get("memory_id")
+                receipt["revokes_op_id"] = dup.get("revokes_op_id")
+                receipt["revocation_op_id"] = \
+                    dup.get("revocation_op_id")
+                receipt["detail"] = dup.get("detail") or {}
+                try:
+                    dup["trace_index"] = _trace(
+                        "duplicate", dup.get("reason") or ""
+                    )
+                except Exception:
+                    logger.warning(
+                        "撤销接口留痕写失败（duplicate）",
+                        exc_info=True,
+                    )
+                    dup["trace_index"] = None
+                    self._controlled_note_health(
+                        "audit_write_failed",
+                        {"idempotency_key": rev_key,
+                         "status": "duplicate"},
+                    )
+                return dup
             # —— 定位原执行 ——
             intent = self._controlled_find_intent(
                 op_id=target_op_id, idempotency_key=target_key,
@@ -9976,6 +10296,30 @@ class SQLiteStore:
                     detail={
                         "revocation_op_id": intent.get("revoked_by"),
                     },
+                )
+            # 同目标先行撤销意图兜底（换键重提，补修 F1）：
+            # 原意图的 revoked_by 一般已由成对恢复补上；万
+            # 一撤销意图已决而标记仍缺，这里再兜一层，不许
+            # 换个键把同一笔撤第二遍；未定案的同目标撤销在
+            # 场时同样不许穿到执行段。
+            _pk, _pp = self._controlled_prior_revocation(
+                rev_key, fingerprint, intent.get("op_id")
+            )
+            if _pk == "already_revoked":
+                return _finish(
+                    "refused", "already_revoked",
+                    detail={
+                        "revocation_op_id": (_pp or {}).get("op_id"),
+                    },
+                )
+            if _pk == "unresolved":
+                return _finish(
+                    "refused", "unresolved_revocation",
+                    detail={
+                        "revocation_op_id": (_pp or {}).get("op_id"),
+                        "commit_state": "pending",
+                    },
+                    register=False,
                 )
             # —— 载行 ——
             row = self._conn.execute(
@@ -10309,6 +10653,23 @@ class SQLiteStore:
             detail["verify_ok"] = verify["ok"]
             # 撤销的最终结论同样落进撤销意图（补修二轮，
             # 复查 B 的一致性要求）。
+            # 最终结论合成（补修 H3 复查 F4）：提交未定案
+            # （committed_unverified）优先于核对结论——补
+            # 偿可能已落账是事实（status 保留 revoked），
+            # 但生死没定案不许报干净成功；final_* 同口径
+            # 落盘，不许 final_ok=True＋空 reason 把未定案
+            # 洗白（冻结已由 commit_unverified 在定案时留
+            # 痕承接）。
+            if rev_intent.get("status") == "committed_unverified":
+                detail["commit_state"] = "committed_unverified"
+                rev_intent["final_ok"] = False
+                rev_intent["final_reason"] = "committed_unverified"
+                rev_intent["invariant_checks"] = verify["checks"]
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "revoked", "committed_unverified",
+                    detail=detail, ok_override=False,
+                )
             rev_intent["final_ok"] = bool(verify["ok"])
             rev_intent["final_reason"] = (
                 "" if verify["ok"] else "invariant_failed"
@@ -10461,7 +10822,14 @@ class SQLiteStore:
             events, _info = _ledger.read_events(self.ledger_path)
         except Exception:
             logger.warning("保护迁移历史读账本失败", exc_info=True)
+            self._protection_history_ledger_doubtful = True
             return [], {}
+        # 账本残缺（补修 H3 复查 F2）：派生轨迹是残缺折
+        # 叠，存疑标记留给核对路径（verify_protection_
+        # migration）判未定案；列表类只读展示照常返回。
+        self._protection_history_ledger_doubtful = (
+            self._controlled_ledger_doubtful(_info)
+        )
         recorded_ids = {
             rec.get("evidence_id")
             for rec in self._read_protection_evidence()[0]
@@ -10578,6 +10946,13 @@ class SQLiteStore:
         history, final_tiers = (
             self._protection_tier_history_from_ledger()
         )
+        if getattr(
+            self, "_protection_history_ledger_doubtful", False
+        ):
+            # 账本残缺（补修 H3 复查 F2）：轨迹与终点档位
+            # 都是残缺折叠，核对不许下「完成」定案。
+            result["checks"]["ledger_complete"] = False
+            result["mismatches"].append("ledger_doubtful")
         target = None
         if evidence_id is not None:
             target = next(
@@ -10673,6 +11048,12 @@ class SQLiteStore:
         if evidence is not None and evidence.get("version_after"):
             try:
                 events, _info = _ledger.read_events(self.ledger_path)
+                if self._controlled_ledger_doubtful(_info):
+                    # 账本残缺（补修 H3 复查 F2）：事件集合
+                    # 不完整，「这笔是不是最后一笔」定不
+                    # 了——跳过戳比对（同读失败口径），不许
+                    # 拿残缺集合下结论。
+                    events = []
             except Exception:
                 events = []
             my_seqs = [
@@ -10739,6 +11120,7 @@ class SQLiteStore:
                     "metadata": json.loads(row[2] or "{}"),
                 }
             history = []
+            _scope_ledger_doubtful = False
             try:
                 # read_events 返回 (events, info) 二元组，不是事件列表本身：
                 # 直接 for 遍历会拿到 events 列表再拿 info 字典，dict
@@ -10746,6 +11128,9 @@ class SQLiteStore:
                 # 抛 AttributeError，try 包着所以历史永远是空的
                 # （2026-11-22 修：先解包再遍历事件）。
                 events, _info = _ledger.read_events(self.ledger_path)
+                _scope_ledger_doubtful = (
+                    self._controlled_ledger_doubtful(_info)
+                )
                 for event in events:
                     if (event or {}).get("key") == key or (event or {}).get("memory_id") == key:
                         history.append(event)
@@ -10758,6 +11143,7 @@ class SQLiteStore:
                 "memory": memory,
                 "history_entries": history,
                 "history_count": len(history),
+                "ledger_doubtful": _scope_ledger_doubtful,
                 "in_scope": [memory],
                 "out_of_scope": [],
             }

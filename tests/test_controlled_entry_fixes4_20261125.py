@@ -198,9 +198,13 @@ def test_revoke_commit_unverified_freeze_carried_across_restart(
     assert rev["reason"] != "execute_failed", rev
     rev_intent = store._controlled_intents[rev["revocation_op_id"]]
     assert rev_intent["status"] == "committed_unverified"
-    # 撤销生产者同病同断：核验通过 → final_reason 天生空串。
-    assert rev_intent["final_ok"] is True
-    assert rev_intent["final_reason"] == ""
+    # final_* 口径已按 H3 复查 F4 裁决改判（2026-11-26）：
+    # 提交未定案优先于核对结论——final_ok=False、
+    # final_reason=committed_unverified，不许核验通过就把
+    # 未定案洗成干净成功；本测试要保的是冻结承接（靠
+    # status，不靠 final_reason），下面照旧。
+    assert rev_intent["final_ok"] is False
+    assert rev_intent["final_reason"] == "committed_unverified"
     assert store._controlled_frozen_reason == "commit_unverified"
 
     # —— 进程 2：全新实例，状态只许来自落盘文件 ——
