@@ -10,6 +10,9 @@
 #       provider 的记账汇合点，它们在记完预算账后把同一笔转写到这里；
 #       provider 没带 budget_tracker 时，由 provider 直接调这里补记；
 #       tools/cli.py 的翻译直连也在这里落账（堵绕过口子）。
+# 崩溃恢复口径（2026-11-28 补）：进程写到一半死掉会留下无换行的半行，
+#       读取按行容错——坏行跳过但计数（corrupt_lines），不许静默吞；
+#       再追加时先给半行补换行封口，新行另起一行，绝不粘连连丢。
 # 约束：本模块只用标准库，不 import config / providers（防循环导入）；
 #       记账是旁路——写失败只打印醒目提醒并返回 False，绝不抛异常
 #       打断业务调用（口径错误如非法 purpose 除外，那是编程错误要响）。
@@ -108,8 +111,19 @@ def record_call(*, provider, model, cost_usd, usage=None, purpose="日常",
     target = _resolve_path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        prefix = ""
+        if target.exists() and target.stat().st_size > 0:
+            with target.open("rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    # 尾行没有换行：上一笔多半是写到一半进程就没了。
+                    # 先补一个换行把半行封口，新行另起一行——直接续写
+                    # 会和半行粘成一坨，两行都解析不了，等于连丢两笔。
+                    # 只追加一个换行字节，不改已有内容，半行本身留作
+                    # 坏行证据（读取时跳过并计入 corrupt_lines）。
+                    prefix = "\n"
         with target.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.write(prefix + json.dumps(row, ensure_ascii=False) + "\n")
     except OSError as exc:
         print(
             f"【记账失败】大模型调用账本写入失败（{target}）：{exc}。"
@@ -119,34 +133,56 @@ def record_call(*, provider, model, cost_usd, usage=None, purpose="日常",
     return True
 
 
-def read_calls(month=None, path=None):
-    """读账本，返回记录列表（每项一个字典，按写入顺序）。
+def _load_rows(path=None):
+    """读账本全部行，返回 (rows, corrupt_lines)。
 
-    参数 month："YYYY-MM" 时只返回 ts 以该月开头的记录；不传返回全部。
-    文件不存在返回空列表；坏行（解析不了的行）跳过，不报错——账本是
-    append-only 的，尾巴上偶尔有一行写一半是可能的，不能整本读不出。
+    rows 是能解析成字典的记录（按写入顺序，不按月过滤）；
+    corrupt_lines 是坏行数：非空但解析不了、或解析出来不是字典的
+    行——多半是进程写到一半崩溃留下的半行。坏行读不出时间戳，
+    没法按月归属，所以计数是整本账本口径，调用方别把它当当月数。
+
+    文件不存在/读不了按空账本处理（[], 0），读账本不许崩。解码用
+    errors="replace" 容错：半行可能把多字节字符写断，硬解码抛
+    UnicodeDecodeError 会把整本账拖下水；替换后该行自然解析失败、
+    计入坏行，好行不受影响。
     """
     target = _resolve_path(path)
     if not target.exists():
-        return []
-    rows = []
+        return [], 0
     try:
-        lines = target.read_text(encoding="utf-8").splitlines()
+        text = target.read_bytes().decode("utf-8", errors="replace")
     except OSError:
-        return []
-    for line in lines:
+        return [], 0
+    rows = []
+    corrupt = 0
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             row = json.loads(line)
         except ValueError:
+            corrupt += 1
             continue
         if not isinstance(row, dict):
-            continue
-        if month and not str(row.get("ts") or "").startswith(month):
+            corrupt += 1
             continue
         rows.append(row)
+    return rows, corrupt
+
+
+def read_calls(month=None, path=None):
+    """读账本，返回记录列表（每项一个字典，按写入顺序）。
+
+    参数 month："YYYY-MM" 时只返回 ts 以该月开头的记录；不传返回全部。
+    文件不存在返回空列表；坏行（解析不了的行）跳过并计入坏行数
+    （见 monthly_summary 的 corrupt_lines），不报错——账本是
+    append-only 的，尾巴上偶尔有一行写一半是可能的，不能整本读不出。
+    """
+    rows, _corrupt = _load_rows(path)
+    if month:
+        rows = [row for row in rows
+                if str(row.get("ts") or "").startswith(month)]
     return rows
 
 
@@ -155,10 +191,13 @@ def monthly_summary(month, path=None):
 
     {month, calls（总笔数）, total_usd（只汇总 cost 非 null 的笔）,
      unknown_cost_calls（status == "unknown_cost" 的笔数）,
+     corrupt_lines（整本账本的坏行数，坏行无时间戳、无法按月归属）,
      by_model / by_purpose（分项：{名字: {"calls": 笔数,
      "total_usd": 金额}}）}
     """
-    rows = read_calls(month=month, path=path)
+    all_rows, corrupt = _load_rows(path)
+    rows = [row for row in all_rows
+            if str(row.get("ts") or "").startswith(month)]
     total = 0.0
     unknown = 0
     by_model = {}
@@ -182,6 +221,7 @@ def monthly_summary(month, path=None):
         "calls": len(rows),
         "total_usd": round(total, 6),
         "unknown_cost_calls": unknown,
+        "corrupt_lines": corrupt,
         "by_model": by_model,
         "by_purpose": by_purpose,
     }
@@ -193,7 +233,7 @@ def reconcile(month, platform_total_usd, path=None,
 
     {month, ledger_total_usd（账本）, platform_total_usd（平台）,
      diff_usd（账本 - 平台）, diff_ratio（|diff| / 平台，平台为 0 时
-     None）, unknown_cost_calls, ok}
+     None）, unknown_cost_calls, corrupt_lines（整本账本坏行数）, ok}
 
     ok 的条件（两个都要满足）：本月没有成本未知的笔
     （unknown_cost_calls == 0），且 |diff| 不超过
@@ -215,6 +255,7 @@ def reconcile(month, platform_total_usd, path=None,
         "diff_usd": diff,
         "diff_ratio": diff_ratio,
         "unknown_cost_calls": summary["unknown_cost_calls"],
+        "corrupt_lines": summary["corrupt_lines"],
         "ok": ok,
     }
 
@@ -228,6 +269,7 @@ def _print_summary(summary):
     print(f"调用笔数：{summary['calls']}")
     print(f"总金额（美元，只算成本已知的笔）：{summary['total_usd']:.6f}")
     print(f"成本未知笔数：{summary['unknown_cost_calls']}")
+    print(f"坏行数（整本账本，写一半崩溃留下的半行）：{summary['corrupt_lines']}")
     print("按模型：")
     for name, item in sorted(summary["by_model"].items()):
         print(f"  {name or '(空)'}：{item['calls']} 笔，{item['total_usd']:.6f} 美元")

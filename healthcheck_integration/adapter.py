@@ -9,8 +9,13 @@
 #   models()    —— 判官（config.SEMANTIC_JUDGE）与聊天（默认模型）
 #                  各一次极小真实调用（max_tokens=1）；当月花费读
 #                  logs/budget_usage.json（BudgetTracker 的账本），
-#                  上限 config.MONTHLY_BUDGET_USD。密钥只经
-#                  config.get_api_key 交给 Provider，不落日志、不回传。
+#                  上限 config.MONTHLY_BUDGET_USD。外加两件（2026-
+#                  11-28 并入本项证据）：记账自对账——accounting
+#                  持久账本当月总额 vs BudgetTracker 当月总额跑
+#                  reconcile，对不上本项判异常；DeepSeek 平台余额
+#                  （U9）——只读官方余额接口，查不到标未知、不影响
+#                  本项结论。密钥只经 config.get_api_key 交给
+#                  Provider/请求头，不落日志、不回传。
 #   resources() —— Windows ctypes 读系统 CPU/内存；库与账本体积读
 #                  文件大小（磁盘剩余由模块自己实测）
 #   backups()   —— 只读 memory/drive_backup 的状态：最近成功时间 +
@@ -273,13 +278,80 @@ class ShierHealthcheckAdapter:
 
     # ---------- 3. 模型接口 ----------
 
+    def _accounting_check(self, month, counterpart_total_usd):
+        """当月记账自对账（只读）：持久账本 vs BudgetTracker 当月总额。
+
+        对方口径：DeepSeek 没有逐笔用量接口，平台账单拉不到自动版；
+        BudgetTracker 是服务内所有模型调用的记账汇合点，它的当月
+        总额本该与 accounting 持久账本一分不差——哪边漏记、哪条路
+        绕过记账，差额就会冒出来（阈值与 accounting.reconcile 的
+        既定口径一致：max(2%, $0.07)，有成本未知的笔直接判对不上）。
+        与真平台账单的人工对账仍走 accounting.py 的 reconcile 命令行。
+        账本坏行数（写一半崩溃的半行）一并报出，不静默吞。本方法
+        任何异常都收进结果返回，绝不让体检整体崩。
+        """
+        try:
+            import accounting
+            verdict = accounting.reconcile(month, counterpart_total_usd)
+            summary = accounting.monthly_summary(month)
+            return {
+                "month": month,
+                "calls": summary["calls"],
+                "ledger_total_usd": verdict["ledger_total_usd"],
+                "counterpart": "BudgetTracker 当月账本总额（budget_usage.json）",
+                "counterpart_total_usd": verdict["platform_total_usd"],
+                "diff_usd": verdict["diff_usd"],
+                "unknown_cost_calls": verdict["unknown_cost_calls"],
+                "corrupt_lines": verdict["corrupt_lines"],
+                "ok": verdict["ok"],
+            }
+        except Exception as exc:
+            return {"month": month, "ok": False,
+                    "error": f"记账对账执行失败：{str(exc)[:200]}"}
+
+    def _deepseek_balance(self, api_key):
+        """查 DeepSeek 平台余额（U9）：只读官方接口，不产生费用。
+
+        返回 (balances, is_available, error)：balances 是 balance_infos
+        净化后的列表（只留币种与三类余额），查不到时 balances=None、
+        error 给原因。Key 只进 Authorization 请求头，不落日志、
+        不进返回值。
+        """
+        request = urllib.request.Request(
+            "https://api.deepseek.com/user/balance",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            return None, None, f"余额接口不通：{str(exc)[:200]}"
+        infos = payload.get("balance_infos") if isinstance(payload, dict) else None
+        if not isinstance(infos, list):
+            return None, None, "余额接口返回结构异常（无 balance_infos）"
+        balances = []
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            balances.append({
+                "currency": info.get("currency"),
+                "total_balance": info.get("total_balance"),
+                "granted_balance": info.get("granted_balance"),
+                "topped_up_balance": info.get("topped_up_balance"),
+            })
+        return balances, payload.get("is_available"), None
+
     def models(self):
         """判官/聊天各一次极小真实探活 + 当月真实花费。
 
         花费口径：logs/budget_usage.json 是 BudgetTracker 的账本
         （judge/chat/tool 所有模型调用都记在里面），月份对不上按
         0 算（新月还没花）。上限是 config.MONTHLY_BUDGET_USD。
-        整理路由自己的当月花费（上限 3 美元）附在证据里一起报。"""
+        整理路由自己的当月花费（上限 3 美元）附在证据里一起报。
+        另附记账自对账（accounting 持久账本 vs BudgetTracker 当月
+        总额，对不上本项判异常）与 DeepSeek 平台余额（查不到标
+        未知、不影响结论），细口径见 _accounting_check /
+        _deepseek_balance。"""
         import config as repo_config
 
         result = {"judge": False, "chat": False}
@@ -302,11 +374,31 @@ class ShierHealthcheckAdapter:
         except Exception:
             pass
 
+        # 记账自对账（当月）：在探活写账之前算，读到的就是探活前
+        # 的账面；对方总额用上面刚读的 BudgetTracker 当月花费。
+        month = datetime.now().strftime("%Y-%m")
+        result["accounting"] = self._accounting_check(
+            month, result["month_spent"])
+        result["accounting_ok"] = result["accounting"].get("ok") is True
+
         api_key = repo_config.get_api_key("deepseek")
         if not api_key:
             result["reason"] = "未配置 DEEPSEEK_API_KEY（只查在不在，未读值）"
+            result["deepseek_balance"] = {
+                "status": "跳过", "reason": "未配置 DEEPSEEK_API_KEY"}
             result["ok"] = False
             return result
+
+        # 平台余额（U9）：查不到标未知并说明原因，不影响本项结论，
+        # 更不许假装查到。
+        balances, is_available, balance_error = self._deepseek_balance(api_key)
+        if balance_error:
+            result["deepseek_balance"] = {
+                "status": "未知", "reason": balance_error}
+        else:
+            result["deepseek_balance"] = {
+                "status": "已查", "is_available": is_available,
+                "balances": balances}
         from providers.deepseek import DeepSeekProvider
 
         judge_cfg = repo_config.SEMANTIC_JUDGE or {}
@@ -334,7 +426,8 @@ class ShierHealthcheckAdapter:
                 result[label + "_error"] = str(exc)[:200]
         result["ok"] = bool(
             result["judge"] and result["chat"]
-            and 0 <= result["month_spent"] < result["month_limit"])
+            and 0 <= result["month_spent"] < result["month_limit"]
+            and result["accounting_ok"])
         return result
 
     # ---------- 4. 身体资源 ----------
