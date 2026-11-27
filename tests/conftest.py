@@ -5,10 +5,24 @@
 # 向量和判官都打桩——判官返回 None 即走程序降级路，不联网、不花钱），
 # 供还需要真实记忆库的流程测试（对话、工具、网页层）使用。
 
+import os
 import tempfile
 from pathlib import Path
 
 import pytest
+
+# ---------- 大模型逐笔账本的测试隔离（2026-11-27，feat/llm-accounting） ----------
+#
+# BudgetTracker / provider 记账时会把每笔调用转写进 accounting 的持久
+# 账本（默认 logs/llm_calls.jsonl）。测试里用的是假 tracker、假调用，
+# 这些假账绝不能写进真账本——否则在真仓库跑一遍全套，真账就被测试
+# 污染、月度对账永远对不上。这里在整个测试会话层把账本路径指到临时
+# 文件；单个测试仍可用 monkeypatch.setenv 指向自己的临时路径
+# （monkeypatch 退出时恢复成这里的值，不受影响）。
+os.environ.setdefault(
+    "SHIER_LLM_CALLS_PATH",
+    str(Path(tempfile.mkdtemp(prefix="llm_calls_test_")) / "llm_calls.jsonl"),
+)
 
 from memory.sqlite_store import SQLiteStore
 
