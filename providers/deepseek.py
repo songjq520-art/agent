@@ -41,6 +41,7 @@
 
 import requests
 
+import accounting
 from config import MAX_OUTPUT_TOKENS, MODEL_CONFIG
 
 
@@ -90,7 +91,8 @@ class DeepSeekProvider:
             self.price_output = cfg["price_output_per_1m"]
             self.price_cached_input = cfg["price_cached_input_per_1m"]
 
-    def chat(self, prompt, ledger="chat", task_id=None, trace_id=None, thinking=None):
+    def chat(self, prompt, ledger="chat", task_id=None, trace_id=None, thinking=None,
+             purpose="日常", caller=""):
         """向 DeepSeek 提一个问题（单次问答），返回字典。
 
         返回格式：{"text": 回答文本, "usage": Token 使用量或 None,
@@ -115,10 +117,13 @@ class DeepSeekProvider:
             task_id=task_id,
             trace_id=trace_id,
             thinking=thinking,
+            purpose=purpose,
+            caller=caller,
         )
 
     def chat_messages(self, messages, ledger="chat", task_id=None, trace_id=None,
-                      thinking=None, model=None, max_tokens=None):
+                      thinking=None, model=None, max_tokens=None,
+                      purpose="日常", caller=""):
         """用完整消息历史向 DeepSeek 提问（多轮对话），返回字典。
 
         参数 messages：消息历史列表，按时间顺序排列，每项为
@@ -127,6 +132,12 @@ class DeepSeekProvider:
         参数 ledger：记到哪个账本，"chat"（默认，平时聊天 + 记忆提取）
         或 "tool"（工具循环里的每一轮）；task_id / trace_id 用来把
         模型请求、工具请求、授权、执行结果和费用串起来查。
+        参数 purpose / caller：逐笔记账用（见 accounting.py）——
+        purpose 是用途（"日常"/"测试"/"探针"，默认 "日常"，体检探针
+        传 "探针"），caller 是调用方标识，不传时记
+        "deepseek.chat_messages"。每笔真实调用都会落进持久账本：
+        有 budget_tracker 时由 tracker 转写，没有时本方法直接写，
+        两条路只走一条，不重复记。
         参数 thinking：见 chat()——工具循环的最后一次回答传
         "enabled"（2026-11-13 改，原来传 "disabled"），中间调工具那几轮
         传 "disabled"；平时聊天不传（行为和原来一样）。
@@ -252,9 +263,20 @@ class DeepSeekProvider:
         #    注意：usage 缺失时不能当成零成本，要标记成本未知并提醒，等人工核对。
         usage = data.get("usage")
         cost_usd = None
+        eff_caller = caller or "deepseek.chat_messages"
         if not usage:
+            # 成本未知也要在持久账本留一笔 unknown 行，不能让这笔
+            # 调用凭空消失：有 tracker 走 tracker 转写，没有直接写。
             if self.budget_tracker is not None:
-                self.budget_tracker.mark_unknown_cost()
+                self.budget_tracker.mark_unknown_cost(
+                    provider="deepseek", model=effective_model,
+                    purpose=purpose, caller=eff_caller)
+            else:
+                accounting.record_call(
+                    provider="deepseek", model=effective_model,
+                    cost_usd=None, purpose=purpose, caller=eff_caller,
+                    ledger_book=ledger, task_id=task_id or "",
+                    trace_id=trace_id or "", status="unknown_cost")
         if usage:
             prompt_tokens = usage.get("prompt_tokens", 0) or 0
             completion_tokens = usage.get("completion_tokens", 0) or 0
@@ -277,7 +299,18 @@ class DeepSeekProvider:
                     task_id=task_id,
                     trace_id=trace_id,
                     usage=usage,
+                    purpose=purpose,
+                    caller=eff_caller,
+                    provider="deepseek",
                 )
+            else:
+                # 没带 tracker：预算账没人记，但持久账本必须记，直接
+                # 写一行（有 tracker 时不走这里，tracker 已转写过）。
+                accounting.record_call(
+                    provider="deepseek", model=effective_model,
+                    cost_usd=cost_usd, usage=usage, purpose=purpose,
+                    caller=eff_caller, ledger_book=ledger,
+                    task_id=task_id or "", trace_id=trace_id or "")
 
         return {
             "text": text,
@@ -373,7 +406,8 @@ class DeepSeekProvider:
                     f"{reasoning_field} 原样带回来，不要补空字符串。"
                 )
 
-    def chat_with_tools(self, messages, tools, thinking="disabled", ledger="tool", task_id=None, trace_id=None):
+    def chat_with_tools(self, messages, tools, thinking="disabled", ledger="tool", task_id=None, trace_id=None,
+                        purpose="日常", caller=""):
         """带工具定义的提问（多轮，工具循环专用），返回字典。
 
         参数 messages：循环内消息历史（system + 本轮 user + 循环各轮），
@@ -384,6 +418,9 @@ class DeepSeekProvider:
         "enabled"（开思考）；开关通过请求体顶层 "thinking" 字段传。
         参数 ledger：默认 "tool"（工具循环里的每一轮都算工具账本）；
         task_id / trace_id 用来串联记账和审计。
+        参数 purpose / caller：逐笔记账用（见 accounting.py），
+        口径与 chat_messages 相同，caller 不传时记
+        "deepseek.chat_with_tools"。
         返回：{"text": 回答文本（可能为空字符串）, "tool_calls": 模型要调的
         工具列表（普通 dict，每项 id / type / function.name / arguments，
         不调工具时为空列表）, "reasoning_content": 本轮推理内容或 None,
@@ -474,9 +511,19 @@ class DeepSeekProvider:
         #    推理 Token 已含在 completion_tokens 里，不重复加）。
         usage = data.get("usage")
         cost_usd = None
+        eff_caller = caller or "deepseek.chat_with_tools"
         if not usage:
+            # 成本未知也要在持久账本留一笔 unknown 行（同 chat_messages）。
             if self.budget_tracker is not None:
-                self.budget_tracker.mark_unknown_cost()
+                self.budget_tracker.mark_unknown_cost(
+                    provider="deepseek", model=self.model,
+                    purpose=purpose, caller=eff_caller)
+            else:
+                accounting.record_call(
+                    provider="deepseek", model=self.model,
+                    cost_usd=None, purpose=purpose, caller=eff_caller,
+                    ledger_book=ledger, task_id=task_id or "",
+                    trace_id=trace_id or "", status="unknown_cost")
         if usage:
             prompt_tokens = usage.get("prompt_tokens", 0) or 0
             completion_tokens = usage.get("completion_tokens", 0) or 0
@@ -496,7 +543,17 @@ class DeepSeekProvider:
                     task_id=task_id,
                     trace_id=trace_id,
                     usage=usage,
+                    purpose=purpose,
+                    caller=eff_caller,
+                    provider="deepseek",
                 )
+            else:
+                # 没带 tracker：直接写持久账本（同 chat_messages）。
+                accounting.record_call(
+                    provider="deepseek", model=self.model,
+                    cost_usd=cost_usd, usage=usage, purpose=purpose,
+                    caller=eff_caller, ledger_book=ledger,
+                    task_id=task_id or "", trace_id=trace_id or "")
 
         return {
             "text": text,

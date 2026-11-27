@@ -15,6 +15,7 @@
 
 import requests
 
+import accounting
 from config import MAX_OUTPUT_TOKENS, MODEL_CONFIG
 
 
@@ -46,7 +47,7 @@ class MuseProvider:
         self.price_output = cfg["price_output_per_1m"]
         self.price_cached_input = cfg["price_cached_input_per_1m"]
 
-    def chat(self, prompt):
+    def chat(self, prompt, purpose="日常", caller=""):
         """向 Muse 提一个问题（单次问答），返回字典。
 
         返回格式：{"text": 回答文本, "usage": Token 使用量或 None,
@@ -54,15 +55,25 @@ class MuseProvider:
         本方法是 chat_messages() 的单次问答包装：只发一条 user 消息，
         行为与原来完全一致。多轮对话请用 chat_messages(messages)。
         其余行为（无 Key、预算文件损坏、usage 缺失）见 chat_messages()。
+        参数 purpose / caller：逐笔记账用，透传给 chat_messages()。
         """
-        return self.chat_messages([{"role": "user", "content": prompt}])
+        return self.chat_messages(
+            [{"role": "user", "content": prompt}],
+            purpose=purpose,
+            caller=caller,
+        )
 
-    def chat_messages(self, messages):
+    def chat_messages(self, messages, purpose="日常", caller=""):
         """用完整消息历史向 Muse 提问（多轮对话），返回字典。
 
         参数 messages：消息历史列表，按时间顺序排列，每项为
         {"role": "user" 或 "assistant", "content": 文本}，
         应包含本轮及之前所有轮次的消息。
+        参数 purpose / caller：逐笔记账用（见 accounting.py）——
+        purpose 是用途（"日常"/"测试"/"探针"，默认 "日常"），caller
+        是调用方标识，不传时记 "muse.chat_messages"。每笔真实调用
+        都会落进持久账本：有 budget_tracker 时由 tracker 转写，
+        没有时本方法直接写，两条路只走一条，不重复记。
         返回格式与 chat() 相同。
         - 无 Key 时：抛出明确错误，不返回假成功。
         - 预算文件损坏时：抛出明确错误（原因见 status_reason），不偷偷调用。
@@ -140,9 +151,19 @@ class MuseProvider:
         #    注意：usage 缺失时不能当成零成本，要标记成本未知并提醒，等人工核对。
         usage = data.get("usage")
         cost_usd = None
+        eff_caller = caller or "muse.chat_messages"
         if not usage:
+            # 成本未知也要在持久账本留一笔 unknown 行，不能让这笔
+            # 调用凭空消失：有 tracker 走 tracker 转写，没有直接写。
             if self.budget_tracker is not None:
-                self.budget_tracker.mark_unknown_cost()
+                self.budget_tracker.mark_unknown_cost(
+                    provider="muse", model=self.model,
+                    purpose=purpose, caller=eff_caller)
+            else:
+                accounting.record_call(
+                    provider="muse", model=self.model,
+                    cost_usd=None, purpose=purpose, caller=eff_caller,
+                    ledger_book="chat", status="unknown_cost")
         if usage:
             prompt_tokens = usage.get("prompt_tokens", 0) or 0
             completion_tokens = usage.get("completion_tokens", 0) or 0
@@ -156,7 +177,16 @@ class MuseProvider:
                 + completion_tokens / 1_000_000 * self.price_output
             )
             if self.budget_tracker is not None:
-                self.budget_tracker.add_cost(cost_usd, model=self.model)
+                self.budget_tracker.add_cost(
+                    cost_usd, model=self.model, usage=usage,
+                    purpose=purpose, caller=eff_caller, provider="muse")
+            else:
+                # 没带 tracker：预算账没人记，但持久账本必须记，直接
+                # 写一行（有 tracker 时不走这里，tracker 已转写过）。
+                accounting.record_call(
+                    provider="muse", model=self.model,
+                    cost_usd=cost_usd, usage=usage, purpose=purpose,
+                    caller=eff_caller, ledger_book="chat")
 
         return {
             "text": text,

@@ -68,10 +68,51 @@ def _fail(message, code=1):
     raise SystemExit(code)
 
 
+def _record_translate_call(usage):
+    """给 _deepseek_translate 的直连调用补记一笔持久账本（堵绕过口子）。
+
+    这条翻译路是 requests 直连 DeepSeek、不经 provider，所以以前完全
+    不记账（2026-11 月查账时发现的绕过路径之一）。这里按
+    config.MODEL_CONFIG["deepseek"] 的 Flash 价格、用与 provider
+    相同的公式（缓存按缓存价、普通输入按普通价、输出按输出价）算
+    成本，写进 accounting 的持久账本；没 usage 就记一笔成本未知。
+    记账是旁路：导入或写入出任何问题都只打印提醒，绝不影响翻译
+    结果本身（翻译失败回落原文的原有行为不变）。
+    """
+    try:
+        import accounting
+        from config import MODEL_CONFIG
+
+        cfg = MODEL_CONFIG["deepseek"]
+        if usage:
+            prompt_tokens = usage.get("prompt_tokens", 0) or 0
+            completion_tokens = usage.get("completion_tokens", 0) or 0
+            details = usage.get("prompt_tokens_details") or {}
+            cached_tokens = details.get("cached_tokens", 0) or 0
+            cached_tokens = min(cached_tokens, prompt_tokens)
+            cost_usd = (
+                (prompt_tokens - cached_tokens) / 1_000_000 * cfg["price_input_per_1m"]
+                + cached_tokens / 1_000_000 * cfg["price_cached_input_per_1m"]
+                + completion_tokens / 1_000_000 * cfg["price_output_per_1m"]
+            )
+            accounting.record_call(
+                provider="deepseek", model="deepseek-flash",
+                cost_usd=cost_usd, usage=usage, purpose="日常",
+                caller="tools.cli.translate")
+        else:
+            accounting.record_call(
+                provider="deepseek", model="deepseek-flash",
+                cost_usd=None, purpose="日常",
+                caller="tools.cli.translate", status="unknown_cost")
+    except Exception as exc:  # 记账坏了也不能连累翻译
+        print(f"【记账提醒】翻译调用补记失败：{exc}。翻译结果不受影响，月度对账会发现差额。")
+
+
 def _deepseek_translate(text, target):
     """CLI 用的 DeepSeek 翻译：只翻查询/标题/摘要。Key 从 DEEPSEEK_API_KEY
     环境变量读；翻失败抛错，调用方（SearchService）会回落原文，不影响搜索本身。
-    成本：一次搜索约多花 $0.0002，一个月最坏约 $0.5–1。"""
+    成本：一次搜索约多花 $0.0002，一个月最坏约 $0.5–1。
+    这笔直连调用会补记进持久账本（见 _record_translate_call）。"""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise ToolError("没有 DEEPSEEK_API_KEY，无法翻译")
@@ -99,9 +140,13 @@ def _deepseek_translate(text, target):
     if response.status_code != 200:
         raise ToolError(f"翻译调用失败：HTTP {response.status_code}")
     try:
-        translated = response.json()["choices"][0]["message"]["content"].strip()
+        data = response.json()
+        translated = data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, AttributeError) as exc:
         raise ToolError("翻译返回解析失败") from exc
+    # 解析成功 = 这笔钱已经花出去了，先补记账再往下走（记账失败不
+    # 影响翻译，见 _record_translate_call）。
+    _record_translate_call(data.get("usage"))
     if not translated:
         raise ToolError("翻译返回为空")
     return translated

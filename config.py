@@ -193,6 +193,23 @@ def get_model_status():
     return status
 
 
+def _write_llm_ledger(**kwargs):
+    """把一笔大模型调用转写到持久账本（accounting.py 的 llm_calls.jsonl）。
+
+    BudgetTracker 的逐笔 records 只留最近 500 笔、还随月份清零，逐笔
+    账要靠 accounting 的 append-only 账本才一笔不丢（见 accounting.py
+    文件头）。这是旁路记账：accounting 导入失败或写失败都只打印提醒，
+    绝不影响 BudgetTracker 原有的返回值与行为；漏记的笔会在月度
+    自对账时以「总额对不上」的形式被发现。
+    """
+    try:
+        import accounting
+
+        accounting.record_call(**kwargs)
+    except Exception as exc:  # 旁路记账坏了也不能连累预算账
+        print(f"【记账提醒】持久账本转写失败：{exc}。预算账不受影响，月度对账会发现差额。")
+
+
 class BudgetTracker:
     """预算跟踪器（简单版，不要过度设计）。
 
@@ -420,11 +437,15 @@ class BudgetTracker:
             encoding="utf-8",
         )
 
-    def mark_unknown_cost(self):
+    def mark_unknown_cost(self, provider="", model="", purpose="日常", caller=""):
         """标记一次调用成本未知：只记标记、打印一次提醒，不拦后续调用，
         等人工核对过官方后台的实际消费后，再调 clear_unknown_cost() 清除。
 
-        预算文件损坏时不写文件（_save() 本身也会拦截），直接返回。
+        参数 provider / model / purpose / caller（可选）：这次未知调用
+        是谁、哪个模型、什么用途、哪个调用方，转写到持久账本时用
+        （见 _write_llm_ledger）；旧调用不传也能跑，记空字符串。
+        预算文件损坏时不写文件（_save() 本身也会拦截），直接返回，
+        持久账本也不写（损坏状态下不落任何账）。
         """
         if self.corrupted:
             return
@@ -432,6 +453,14 @@ class BudgetTracker:
         self.unknown_cost = True
         self._save()
         print("提醒：本次调用成本未知（模型没有返回 usage），请去官方后台核对实际消费。")
+        _write_llm_ledger(
+            provider=provider,
+            model=model,
+            cost_usd=None,
+            purpose=purpose,
+            caller=caller,
+            status="unknown_cost",
+        )
 
     def clear_unknown_cost(self):
         """清除未知成本标记：只有人工核对过官方后台的实际消费后才能调用。
@@ -447,7 +476,7 @@ class BudgetTracker:
         self.unknown_cost = False
         self._save()
 
-    def add_cost(self, cost_usd, model=None, ledger="chat", task_id=None, trace_id=None, usage=None, estimated=False):
+    def add_cost(self, cost_usd, model=None, ledger="chat", task_id=None, trace_id=None, usage=None, estimated=False, purpose="日常", caller="", provider=""):
         """记一笔成本。cost 为 None 时不记，返回当前累计。
 
         参数 model：这次调用用的模型名（例如 "deepseek-flash"），
@@ -462,6 +491,9 @@ class BudgetTracker:
         有就记进每笔记录里；没有（成本未知）时不记 Token 数。
         参数 estimated：True 表示这笔是估算（没有真实 usage），
         不能伪装成精确金额。
+        参数 purpose / caller / provider（可选）：这笔调用的用途
+        （"日常"/"测试"/"探针"）、调用方标识、服务商名，只用于转写
+        持久账本（见 _write_llm_ledger），不影响预算账本身。
         注意：提醒只看工具账本 tool_cost_usd，小计只是明细；总数和
         小计之和可能不一致（例如直接调 add_cost 没传模型时），以总数为准。
         到 5 美元（100%）时打印一次提醒（只在工具账本刚跨过 5 美元那次打印，
@@ -509,6 +541,21 @@ class BudgetTracker:
             and self.tool_cost_usd >= MONTHLY_BUDGET_USD
         ):
             print("提醒：本月工具调用已花到 5 美元（100%），请你自己决定是否继续。")
+        # 预算账记完后，把同一笔转写到持久账本（一笔不丢，见
+        # _write_llm_ledger）；转写失败不影响上面的记账结果。
+        _write_llm_ledger(
+            provider=provider,
+            model=model or "",
+            cost_usd=amount,
+            usage=usage,
+            purpose=purpose,
+            caller=caller,
+            ledger_book=ledger,
+            task_id=task_id or "",
+            trace_id=trace_id or "",
+            status="estimated" if estimated else "ok",
+            estimated=bool(estimated),
+        )
         return self.total_cost_usd
 
     def cost_for_ledger(self, ledger):

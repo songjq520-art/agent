@@ -324,7 +324,8 @@ class ShierHealthcheckAdapter:
                     model=model)
                 out = provider.chat_messages(
                     [{"role": "user", "content": "ping"}],
-                    max_tokens=1, ledger="chat", thinking="disabled")
+                    max_tokens=1, ledger="chat", thinking="disabled",
+                    purpose="探针", caller="healthcheck")
                 result[label] = bool(
                     out and (out.get("text") is not None or out.get("usage")))
                 result[label + "_model"] = model
