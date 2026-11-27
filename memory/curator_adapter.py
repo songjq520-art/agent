@@ -64,39 +64,83 @@ def build_proposal_fields(row):
     }
 
 
+class PendingQuestionsUnavailable(RuntimeError):
+    """待问读取失败：状态未知，不许冒充「无待问」（互查 F1）。"""
+
+
 def pending_memory_ids(store):
-    """当前有未答待问的 memory_id 集合（pending_classification 用）。"""
-    ids = set()
+    """当前有未答待问的 memory_id 集合（pending_classification 用）。
+
+    读取失败抛 PendingQuestionsUnavailable——「读不到」是未知，
+    不是「确定没有」。旧实现吞异常返回空集，把未知洗成无待
+    问、评估门随之失效（贵妃互查 F1，2026-11-27）；调用方必须
+    显式处理未知，不许默认放行。
+    """
     try:
         questions = store.list_pending_questions()
-    except Exception:
-        return ids
+    except Exception as exc:
+        raise PendingQuestionsUnavailable(
+            "pending questions unreadable: %r" % (exc,)) from exc
+    ids = set()
     for q in questions or []:
         if isinstance(q, dict) and q.get("memory_id"):
             ids.add(q["memory_id"])
     return ids
 
 
+def _protection_resolved(store, memory_id):
+    """逐条保护核实（互查 F2）：只认宿主 H5 核对函数的正面结论。
+
+    口径来源：store.verify_protection_migration（立项 H5 保护
+    迁移证据的核对口，以账本为准）——迁移过的行查当场证据与
+    账本档位链、投影是否一致；从未迁移的行查出生档（账本 ADD
+    口径）与投影是否一致。核对函数缺失、抛错、行不存在或任一
+    项对不上，一律 False（未核实），朝安全侧倒。core_cap 的
+    classify 只做分类（成员/档位/座位），算得出分类不等于保
+    护身份已核实——旧口径拿它充数，被互查 F2 否掉。
+    """
+    if not memory_id:
+        return False
+    verify = getattr(store, "verify_protection_migration", None)
+    if verify is None:
+        return False
+    try:
+        out = verify(memory_id=memory_id)
+    except Exception:
+        return False
+    return isinstance(out, dict) and out.get("ok") is True
+
+
 def build_current(store, row, *, pending_ids=None):
     """H4 快照行 → review_proposal 的 current（现状）dict。
 
     每个键都由宿主现行口径现算，不许调用方手填（映射表第二
-    节）。protection_resolved 的口径：classify 是宿主的正面
-    裁定（只认 pinned/temp_pinned、其余即普通），算得出即已
-    裁定；meta 损坏算不出 → False，朝安全侧倒。
+    节）。两项证据口径（贵妃互查 F1/F2，2026-11-27 修）：
+      - protection_resolved：逐条走 H5 核对函数
+        verify_protection_migration 的正面结论（见
+        _protection_resolved），不再拿 classify 算得出充数；
+      - pending_classification：待问读取失败＝未知，未知按
+        「有待问」落 True 并另置 pending_unknown=True 显式标
+        记，不许把读不到洗成确定无待问。
     """
     meta = row.get("meta") or {}
     live = bool(row.get("live"))
-    classification = _classify_or_none(meta, live)
-    if pending_ids is None:
-        pending_ids = pending_memory_ids(store)
     memory_id = row.get("memory_id") or row.get("id")
+    pending_unknown = False
+    if pending_ids is None:
+        try:
+            pending_ids = pending_memory_ids(store)
+        except PendingQuestionsUnavailable:
+            pending_ids = set()
+            pending_unknown = True
     current = build_proposal_fields(row)
     current.update({
         "live": live,
-        "protection_resolved": classification is not None,
+        "protection_resolved": _protection_resolved(store, memory_id),
         "readonly_projection": bool(meta.get("persona_projection")),
-        "pending_classification": memory_id in pending_ids,
+        "pending_classification": (
+            pending_unknown or memory_id in pending_ids),
+        "pending_unknown": pending_unknown,
         "metadata": copy.deepcopy(meta),
     })
     return current
@@ -178,6 +222,14 @@ def correction_evidence(store, receipt, *, turn_id):
     memory_id=新行），它的 seq 即三方共用的 event_id，写作
     "ledger-seq:<seq>"（映射表第五节）。折叠里查不到这条关联
     时如实留 None，她侧判 incomplete，朝安全侧倒。
+
+    回查口径（贵妃互查 F5，2026-11-27 修）：旧行是否真被顶
+    替、新行是否真活，必须回到同一份稳定快照里按真实状态确
+    认——旧行在快照里 state 须为 superseded 且非活行，新行在
+    同一快照里须为活行；账本折叠与快照任一对不上（如折叠说
+    已顶替、快照里旧行还活着），old_row 如实报未顶替、她侧
+    判 incomplete，不许只凭折叠合成 superseded=True 报完成。
+    账本读或快照读失败时对应证据留空，同样朝 incomplete 倒。
     """
     receipt = receipt or {}
     new_id = receipt.get("memory_id")
@@ -192,7 +244,14 @@ def correction_evidence(store, receipt, *, turn_id):
     new_row = {}
     if not new_id:
         return evidence_receipt, old_row, new_row
+    # 同一份稳定快照：新旧两行的真实状态同源同刻读齐。
+    try:
+        snap = store.take_stable_snapshot()
+        rows = snap.get("rows") or {}
+    except Exception:
+        rows = {}
     event_id = None
+    old_id = None
     try:
         by_id = (store.ledger_state() or {}).get("by_id") or {}
     except Exception:
@@ -201,22 +260,25 @@ def correction_evidence(store, receipt, *, turn_id):
         if (isinstance(folded, dict)
                 and folded.get("state") == "superseded"
                 and folded.get("superseded_by") == new_id):
-            evidence_receipt["old_id"] = mid
+            old_id = mid
             if folded.get("seq") is not None:
                 event_id = "ledger-seq:%s" % folded["seq"]
-            old_row = {
-                "id": mid,
-                "superseded": True,
-                "superseded_by": new_id,
-                "event_id": event_id,
-            }
             break
+    evidence_receipt["old_id"] = old_id
     evidence_receipt["event_id"] = event_id
-    try:
-        snap = store.take_stable_snapshot()
-        rows = snap.get("rows") or {}
-    except Exception:
-        rows = {}
+    if old_id is not None:
+        snap_old = rows.get(old_id)
+        confirmed = (
+            isinstance(snap_old, dict)
+            and snap_old.get("state") == "superseded"
+            and not snap_old.get("live")
+        )
+        old_row = {
+            "id": old_id,
+            "superseded": bool(confirmed),
+            "superseded_by": new_id if confirmed else None,
+            "event_id": event_id,
+        }
     new_snap = rows.get(new_id)
     if new_snap is not None:
         new_meta = new_snap.get("meta") or {}

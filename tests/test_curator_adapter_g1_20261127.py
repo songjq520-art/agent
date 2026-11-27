@@ -147,16 +147,17 @@ def test_pinned_row_held_protected(store):
 
 
 def test_persona_projection_row_held_readonly(store):
-    row = {
-        "memory_id": "proj-1",
-        "version": "stamp-x",
-        "live": True,
-        "state": "current",
-        "meta": {"persona_projection": True, "source": "user",
-                 "user_confirmed": True},
-    }
+    # 用宿主真机制种出的性情投影行（壳→记忆只读复印件）：
+    # F2 修复后 protection_resolved 走 H5 逐条核对——投影行
+    # 出生档 pinned 与账本一致、核对能过，复核应停在只读关，
+    # 不是更早的保护未核实关。旧写法拿合成行冒充（库里根本
+    # 没有这行），核对必然查无此行，已换成真行。
+    seeded = store.ensure_identity_memories()["soul"]
+    mid = seeded["memory_id"]
+    row = _snap_row(store, mid)
     current = _adapter.build_current(store, row, pending_ids=set())
     assert current["readonly_projection"] is True
+    assert current["protection_resolved"] is True
     proposal = _adapter.build_proposal_fields(row)
     assert _review(store, proposal, current) == "hold_readonly_or_unknown"
 

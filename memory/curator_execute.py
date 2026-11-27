@@ -41,8 +41,10 @@ def execute_demote(store, row, *, judge_status, instruction_source=None,
     memory_id 键）。返回结果 dict：
       {outcome, stage, assess, review, receipt, summary}
       outcome ∈ held / shadow / executed / refused / duplicate
-      held 时 stage 指出停在哪段（assess / review），后段字段
-      为 None 且保证没有提交过 H1。
+      held 时 stage 指出停在哪段（assess / review / pending），
+      后段字段为 None 且保证没有提交过 H1。pending 段是待问
+      状态未知（读取失败）时的短路（互查 F1）：未知＝有待问，
+      执行层自己守住提交口，不只寄托在 review_fn 身上。
     """
     if not idempotency_key:
         raise ValueError("idempotency_key required: 整理员执行必须由 "
@@ -59,6 +61,14 @@ def execute_demote(store, row, *, judge_status, instruction_source=None,
                 "review": None, "receipt": None, "summary": None}
     proposal_fields = _adapter.build_proposal_fields(row)
     current = _adapter.build_current(store, row)
+    if current.get("pending_unknown"):
+        # 待问状态未知（读取失败）：停在本段、不提交（互查
+        # F1）。她侧 review 对 pending_classification 非 False
+        # 本也会 hold，但执行路径不许把这道门只押在注入的
+        # review_fn 上——本层先短路，再谈复核。
+        return {"outcome": "held", "stage": "pending",
+                "assess": verdict, "review": None, "receipt": None,
+                "summary": None}
     review = review_fn(proposal_fields, current)
     if review != "shadow_proposal_only":
         return {"outcome": "held", "stage": "review", "assess": verdict,

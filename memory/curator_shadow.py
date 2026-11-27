@@ -5,9 +5,12 @@
 execution_allowed 恒 False，不提交受控入口、不动宿主账本。
 
 设计口径：
-  - 批次人口＝宿主账本折叠里的全部活行（按 memory_id 排序
-    保证同快照同批次可复现）；挑不挑得动由她侧 review 判定
-    决定，本模块不预筛、不改判。
+  - 批次人口＝快照里的全部活行（按 live 标记筛，按 memory_id
+    排序保证同快照同批次可复现）；挑不挑得动由她侧 review
+    判定决定，本模块不预筛判定、不改判。人口筛活行与快照绑
+    定是贵妃互查 F3/F4（2026-11-27）的修复口径：快照 rows
+    本含死行，旧实现不筛 live、且落盘的 snapshot_id 收调用
+    方任意值与实际组装所用快照对不上号，都已改掉。
   - 她侧协议类（Proposal / BatchJournal）由调用方注入，
     与 G1/G2 同规：协议所有权在她侧代码，本模块只组装。
   - 观察窗规则（G3-U4 定版）：policy_version 一变，旧批次
@@ -27,23 +30,40 @@ class SegmentNotWired(PermissionError):
     """她侧协议件未注入时拒跑，不自造协议。"""
 
 
-def build_batch_items(store, *, proposal_cls, memory_ids=None):
-    """组装一批 (Proposal, current)：人口＝全部活行。
+def _resolve_snapshot(store, snapshot_id):
+    """取本批要用的那份快照（互查 F4）。
 
-    memory_ids 给定时只取其中活行（顺序按账本折叠排序，
-    不按传入顺序）。行不存在或已非活行直接报错，不静默跳过。
+    给了 id：按 id 取回宿主已登记快照——批次内容必须出自这
+    个 id 名下的那份快照，取不回如实报错，不许另取一份顶替
+    冒充。没给 id：现取一份新快照，其真实 id 即本批绑定 id。
     """
-    if proposal_cls is None:
-        raise SegmentNotWired("proposal class not injected")
-    snap = store.take_stable_snapshot()
+    if snapshot_id is None:
+        return store.take_stable_snapshot()
+    try:
+        return store.get_stable_snapshot(snapshot_id)
+    except KeyError:
+        raise ValueError(
+            f"snapshot not registered: {snapshot_id}") from None
+
+
+def _items_from_snapshot(store, snap, *, proposal_cls, memory_ids=None):
+    """从一份已定快照组装 (Proposal, current)：人口只算活行。
+
+    快照 rows 含死行（已顶替/删除/作废），人口按 live 标记
+    筛（互查 F3）。memory_ids 显式点名时（顺序按账本折叠排
+    序，不按传入顺序），点到不存在或已非活行的直接报错，
+    不静默接受、也不静默跳过。
+    """
     rows = snap["rows"]
     if memory_ids is None:
-        ids = sorted(rows)
+        ids = sorted(
+            mid for mid, row in rows.items() if row.get("live"))
     else:
         ids = sorted(set(memory_ids))
-        missing = [mid for mid in ids if mid not in rows]
-        if missing:
-            raise ValueError(f"memory not live in snapshot: {missing}")
+        bad = [mid for mid in ids
+               if mid not in rows or not rows[mid].get("live")]
+        if bad:
+            raise ValueError(f"memory not live in snapshot: {bad}")
     items = []
     for mid in ids:
         row = dict(rows[mid])
@@ -54,15 +74,37 @@ def build_batch_items(store, *, proposal_cls, memory_ids=None):
     return items
 
 
-def run_shadow_batch(store, journal, *, batch_id, snapshot_id,
+def build_batch_items(store, *, proposal_cls, memory_ids=None):
+    """组装一批 (Proposal, current)：人口＝全部活行。
+
+    现取一份新快照组装。要把组装绑到某份已登记快照上，走
+    run_shadow_batch 并传 snapshot_id。
+    """
+    if proposal_cls is None:
+        raise SegmentNotWired("proposal class not injected")
+    snap = store.take_stable_snapshot()
+    return _items_from_snapshot(
+        store, snap, proposal_cls=proposal_cls, memory_ids=memory_ids)
+
+
+def run_shadow_batch(store, journal, *, batch_id, snapshot_id=None,
                      proposal_cls, memory_ids=None):
-    """落一期影子批次，返回她侧 payload（execution_allowed=False）。"""
+    """落一期影子批次，返回她侧 payload（execution_allowed=False）。
+
+    snapshot_id 给定：必须是宿主已登记快照的 id，批次 items
+    就从那份快照组装、落盘 id 与之一字不差；取不回直接拒绝
+    （互查 F4：不许落一个跟实际内容对不上号的 id）。没给：
+    现取一份新快照，落盘其真实 id。
+    """
     if journal is None:
         raise SegmentNotWired("batch journal not injected")
-    items = build_batch_items(store, proposal_cls=proposal_cls,
-                              memory_ids=memory_ids)
+    if proposal_cls is None:
+        raise SegmentNotWired("proposal class not injected")
+    snap = _resolve_snapshot(store, snapshot_id)
+    items = _items_from_snapshot(
+        store, snap, proposal_cls=proposal_cls, memory_ids=memory_ids)
     return journal.collect(
-        batch_id, snapshot_id, _adapter.POLICY_VERSION, items,
+        batch_id, snap["snapshot_id"], _adapter.POLICY_VERSION, items,
         protected=lambda meta: _adapter.host_protected(store, meta),
         classify=_adapter.host_classify,
     )

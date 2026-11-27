@@ -55,10 +55,14 @@ def _journal(tmp_path, name="shadow"):
     return _her_batch.BatchJournal(tmp_path / name)
 
 
-def _run(store, journal, batch_id="batch-g4"):
+def _run(store, journal, batch_id="batch-g4", snapshot_id=None):
+    # F4 修复后口径：批次必须绑真实快照——先取一份已登记
+    # 快照、把它的真实 id 传进去，不许再编 "snap-*" 假 id。
+    if snapshot_id is None:
+        snapshot_id = store.take_stable_snapshot()["snapshot_id"]
     return _shadow.run_shadow_batch(
         store, journal, batch_id=batch_id,
-        snapshot_id="snap-" + batch_id,
+        snapshot_id=snapshot_id,
         proposal_cls=_her_review.Proposal,
     )
 
@@ -87,8 +91,11 @@ def test_gate1_protected_rows_never_proposed(store, tmp_path):
 def test_gate2_recollect_idempotent(store, tmp_path):
     _add_user(store, "用户每天定投五块钱买基金")
     journal = _journal(tmp_path)
-    first = _run(store, journal)
-    second = _run(store, journal)
+    # 同批重收＝同证据重收：证据就是同一份已登记快照，两次
+    # 都绑它（F4 口径），不是两次各取一份新快照冒充同批。
+    snap_id = store.take_stable_snapshot()["snapshot_id"]
+    first = _run(store, journal, snapshot_id=snap_id)
+    second = _run(store, journal, snapshot_id=snap_id)
     assert first == second
 
 
