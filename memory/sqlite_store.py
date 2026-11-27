@@ -34,11 +34,23 @@ import os
 import re
 import sqlite3
 import threading
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from memory import core_cap as _core_cap
+from memory import auth_guard as _auth_guard
+from memory import session_auth as _session_auth
+from memory import intake_gate as _intake
+from memory import reanchor as _reanchor
+from memory import persona_shell as _persona_shell
 from memory import decay as _decay
+from memory import graph as _graph_mod
 from memory import ledger as _ledger
+from memory.graph_entities import (
+    extract_entities_free as _extract_entities_free,
+    normalize_entity_name as _normalize_entity_name,
+)
 from memory import pending_questions as _pq
 from memory import provenance as _provenance
 from memory.correction_text import (
@@ -581,12 +593,106 @@ class SQLiteStore:
         self.ledger_path = self.memory_dir / "memory_events.jsonl"
         self.snapshot_path = self.memory_dir / "graph_snapshot.json"
         self.db_path = self.memory_dir / "memories.sqlite3"
+        # 图谱二期（2026-11-24）：图是账本的投影（索引），按账本文件
+        # 指纹（mtime+大小）缓存，账本一变就从事件重建。注意别和
+        # snapshot_path 混了——那个名叫 graph_snapshot.json 的文件
+        # 是账本状态快照（load_ledger_state 用），不是图。
+        self._graph_cache = None
+        self._graph_stamp = None
         self.budget_tracker = budget_tracker
         # 语义判官对象（2026-11-22 混合法）：测试注入 mock 用；
         # None 时每次判断按 config.py 的 SEMANTIC_JUDGE 解析（默认 DeepSeek flash）。
         self._judge_provider = judge_provider
         # 待问 BOOS 的问题（Phase 2 #4）：攒批 + 回答，落盘不丢。
         self.pending_questions = _pq.PendingQuestions(memory_dir=self.memory_dir)
+        # 性情区原件在壳（追加决定八）：壳 SOUL.md 路径——默认
+        # 仓库根（persona_shell.default_shell_path），测试可经
+        # shell_soul_path 注入临时壳。本店只读它、永不写它。
+        self._shell_soul_path = Path(
+            kwargs.get("shell_soul_path")
+            or _persona_shell.default_shell_path()
+        )
+        # 入口当场拦/当场判（实测问题三）：intake_marker 是对话
+        # 当场模型实现的标记器（可调用对象，入参 (候选, messages)，
+        # 返回标记列表）；None = 不可用，save_turn 自动回退老管道。
+        self.intake_marker = None
+        self._intake_log_path = self.memory_dir / "intake_log.jsonl"
+        self._intake_log_lock = threading.Lock()
+        # 统一受控入口（立项 H1，2026-11-25）：整理员侧状态变更的正门。
+        # 回执登记落盘（幂等键 → 回执），重启重放不重复执行；留痕走
+        # 独立 append-only 日志（先例：intake_log.jsonl），不进账本折叠。
+        self._controlled_log_path = self.memory_dir / "controlled_entry_log.jsonl"
+        self._controlled_log_lock = threading.Lock()
+        self._controlled_receipts_path = (
+            self.memory_dir / "controlled_entry_receipts.json"
+        )
+        # 生产执行开关：默认关。入口只接受影子/测试调用（走完全部门禁、
+        # 出回执、不落状态）；打开的前置（H2 会话认证）已就位——开关
+        # 打开后入口强制验会话凭据（见 session_auth）。生产接线仍未
+        # 授权（放行四关未过），本开关保持关。
+        self.controlled_entry_execution_enabled = False
+        # 会话认证（立项 H2，2026-11-25）：开关打开后、执行前验凭据
+        # 的签发权威——登记与签名密钥只活在内存里（进程级），不落盘、
+        # 不进账本；签发只供宿主内部流程与测试，不存在默认后门凭据；
+        # web 层无会话概念（现状保留），接缝以本层的凭据校验为准。
+        self._session_authority = _session_auth.SessionAuthority()
+        self._controlled_receipts = {}
+        self._controlled_receipts_load_error = None
+        self._controlled_trace_index = 0
+        # 补修轮（2026-11-25）：操作意图登记（提交/恢复协议）、
+        # 提案指纹登记、健康冻结标记——都在 _load 里载入/对账。
+        self._controlled_intents_path = (
+            self.memory_dir / "controlled_entry_intents.json"
+        )
+        self._controlled_intents = {}
+        self._controlled_intents_load_error = None
+        self._controlled_fingerprints = {}
+        # 撤销接口（立项 H3，2026-11-25）：撤销回执与撤销指纹
+        # 登记，与提案回执同文件落盘（见 _controlled_save_receipts）。
+        self._controlled_revocations = {}
+        self._controlled_revocation_fingerprints = {}
+        # 持锁稳定版本快照（立项 H4，2026-11-25）：整理员提案绑
+        # 版本用的冻结视图，只活在进程内登记里——不落盘、不进账
+        # 本，进程重启即全失效（get/diff 如实 KeyError，不给假数
+        # 据）；口径见下方快照节。
+        self._stable_snapshots = {}
+        # 保护迁移完成证据（立项 H5，2026-11-25）：保护档迁移的
+        # 追加式证据日志（先例：controlled_entry_log.jsonl）——只
+        # 追加、本类不提供改/删接口；进程内另记「已迁移待补证」
+        # 清单，供 pending_notices 露头与核对函数对照。
+        self._protection_evidence_path = (
+            self.memory_dir / "protection_migration_evidence.jsonl"
+        )
+        self._protection_evidence_lock = threading.Lock()
+        self._protection_evidence_pending = []
+        # 恢复健康度（立项 H6，2026-11-25）：最近一次启动恢复的
+        # 健康结论落盘于 memory 目录下 recovery_health.json，
+        # 跨重启可查（补决定十五的缺口：待问 load_error 只活在
+        # 进程里、重启即消失、报警无留存）。构造时先读回上一
+        # 份（_load_recovery_health）；上一轮恢复不干净且冻的
+        # 是危险写时，本进程先承接冻结、等本轮
+        # startup_recovery 重新裁决。口径见 startup_recovery
+        # 之后的 H6 节。
+        self._recovery_health_path = (
+            self.memory_dir / "recovery_health.json"
+        )
+        self._recovery_health_latest = None
+        self._recovery_health_own = False
+        self._recovery_health_load_error = None
+        self._recovery_health_lock = threading.Lock()
+        self._controlled_frozen_reason = None
+        self._controlled_health_issues = []
+        self._controlled_reconcile_report = None
+        self._load_controlled_entry_state()
+        self._load_recovery_health()
+        # 同轮裁决缓存 {(turn_id, 归一化原文): (verdict, info)}：
+        # save_turn 逐句循环里带当场判标记合并裁决过的句子，下游
+        # 内部直存（槽位路、收尾直存）复用同一裁决——不许二次屏
+        # 在没有标记上下文的情况下把已放行的句子判回挂起。
+        self._intake_verdict_cache = {}
+        # 核心座位上限（四件套第 1 块）：默认契约定的 150，
+        # 测试可调小验证容量门。
+        self.core_seat_limit = _core_cap.CORE_SEAT_LIMIT
         self.user_id = kwargs.get("user_id", "boos")
         self._lock = threading.RLock()
         self._ledger_lock = threading.Lock()
@@ -731,6 +837,10 @@ class SQLiteStore:
                     "slot": metadata.get("slot"),
                     "is_rule": metadata.get("is_rule", False),
                     "curated": metadata.get("curated", False),
+                    # 核心上限字段（第 1 块）：保护档与分类抽屉必须
+                    # 进账本，不然按账本重算座位时这两样会丢。
+                    "protection_tier": metadata.get("protection_tier"),
+                    "core_drawer": metadata.get("core_drawer"),
                     "decay_kind": metadata.get("decay_kind"),
                     "importance": metadata.get("importance"),
                     "event_date": metadata.get("event_date"),
@@ -741,6 +851,24 @@ class SQLiteStore:
                     "decay_state": metadata.get("decay_state"),
                     "seen_dates": metadata.get("seen_dates"),
                     "seen_sessions": metadata.get("seen_sessions"),
+                    # 授权标记（实测问题一）：auth_claim 不进账本
+                    # 的话，行丢了按账本重建时标记就没了——待问
+                    # 文件损坏后按行 meta 标记重建 auth_claim 问题
+                    # 时，捞回来的行永远缺这个标记、问题永远漏
+                    # 掉（2026-11-25 互查 (b)，同核心字段进账本
+                    # 的先例口径）。
+                    "auth_claim": metadata.get("auth_claim"),
+                    "auth_reason": metadata.get("auth_reason"),
+                    "claimed_source": metadata.get("claimed_source"),
+                    # 性情投影标记（追加决定八）：不进账本的话，
+                    # 按账本重建时标记与重印戳会丢、复印件就没
+                    # 人认得出是投影（同核心字段进账本的口径）。
+                    "persona_projection": metadata.get(
+                        "persona_projection"
+                    ),
+                    "persona_shell_sha256": metadata.get(
+                        "persona_shell_sha256"
+                    ),
                 },
             },
             lock=self._ledger_lock,
@@ -754,6 +882,208 @@ class SQLiteStore:
             return {"by_id": {}, "adds": [], "relations": [],
                     "key_states": {}, "id_to_key": {}, "inferences": {},
                     "seq_max": 0, "snapshot_seq": None}
+
+    # ---------- 图谱二期：图投影与边维护 ----------
+
+    def _ledger_stamp(self):
+        """账本文件指纹：(mtime_ns, 大小)；文件不在返回 None。"""
+        try:
+            st = os.stat(self.ledger_path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _get_graph(self):
+        """拿当前图（账本投影）：账本没变用缓存，变了从事件重建。
+
+        重建走 MemoryGraph.rebuild_from_events：关系边由事件重放时
+        自动判，同义词边的新增/作废按 graph_edge 事件重放，边的
+        有效期按账本状态同步。图建不出来返回空图——检索少一路，
+        不拦路（和 BM25 坏掉只丢一路同口径）。
+        """
+        stamp = self._ledger_stamp()
+        if self._graph_cache is not None and stamp == self._graph_stamp:
+            return self._graph_cache
+        graph = _graph_mod.MemoryGraph()
+        _info = None
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+            graph.rebuild_from_events(events)
+        except Exception:
+            logger.warning("图谱重建失败：本次不用图。", exc_info=True)
+            graph = _graph_mod.MemoryGraph()
+        if _info is not None and self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：图是残缺折叠，
+            # 本次照用（检索少一路可降级），但不进缓存——
+            # 不许把残缺折叠当定案缓存下来，账本修好后下
+            # 次调用重建。
+            return graph
+        self._graph_cache = graph
+        self._graph_stamp = self._ledger_stamp()
+        return graph
+
+    def add_synonym_edge(self, name_a, name_b, scope, provenance="",
+                         evidence=""):
+        """落一条同义词边：先写账本 graph_edge 事件，再按账本重建图。
+
+        scope 必填（契约：无作用域不许建；默认只在提出它的上下文
+        内生效，全局要明写 global）。审批分级（普通词判官放行、
+        人名/称呼双模型核，拍板 5）是调用方的事——这里只负责
+        「边带 scope 与出处、账本留痕、检索按 scope 过滤」这套
+        机制。实体名先归一化再写账，免得同一实体两种写法对不上。
+        返回 {"ok": bool, ...}；ok 只表示账写上了，applied 表示
+        重建后的图里这条边确实有效（同对同 scope 已有有效边时
+        applied 为 True 且不重复连）。
+        """
+        a = _normalize_entity_name(name_a)
+        b = _normalize_entity_name(name_b)
+        if not a or not b or a == b:
+            return {"ok": False, "reason": "bad_entities"}
+        if not isinstance(scope, str) or not scope.strip():
+            return {"ok": False, "reason": "scope_required"}
+        scope = scope.strip()
+        try:
+            record = _ledger.append_event(
+                self.ledger_path,
+                {
+                    "type": _ledger.LEDGER_EVENT_GRAPH_EDGE,
+                    "action": "add",
+                    "kind": _graph_mod.EDGE_SYNONYM,
+                    "entity_a": a,
+                    "entity_b": b,
+                    "scope": scope,
+                    "provenance": provenance or "",
+                    "evidence": evidence or "",
+                    "valid_at": _now_iso(),
+                },
+                lock=self._ledger_lock,
+            )
+        except Exception:
+            logger.warning("同义词边写账本失败。", exc_info=True)
+            return {"ok": False, "reason": "ledger_failed"}
+        self._graph_cache = None
+        graph = self._get_graph()
+        pair = {_graph_mod.entity_node_id(a), _graph_mod.entity_node_id(b)}
+        applied = any(
+            edge.get("kind") == _graph_mod.EDGE_SYNONYM
+            and not edge.get("invalid_at")
+            and edge.get("scope") == scope
+            and {edge.get("from"), edge.get("to")} == pair
+            for edge in graph.edges
+        )
+        return {"ok": True, "applied": applied, "seq": record.get("seq")}
+
+    def void_graph_edge(self, kind, name_a=None, name_b=None,
+                        from_key=None, to_key=None, reason=""):
+        """作废一条边：写账本 graph_edge(invalidate) 事件，边不删。
+
+        同义词边按实体名认（kind="synonym" + name_a/name_b），
+        关系边按记忆 key 认（kind 为四种关系之一 + from_key/
+        to_key，取代边方向按 from=旧、to=新）。作废后检索不再
+        走这条边；边本身留在账本与图里，edge_history 查得到
+        （含作废时间与理由）。返回 {"ok": bool, ...}。
+        """
+        event = {
+            "type": _ledger.LEDGER_EVENT_GRAPH_EDGE,
+            "action": "invalidate",
+            "kind": kind,
+            "invalid_at": _now_iso(),
+            "reason": reason or "",
+        }
+        if kind == _graph_mod.EDGE_SYNONYM:
+            a = _normalize_entity_name(name_a)
+            b = _normalize_entity_name(name_b)
+            if not a or not b:
+                return {"ok": False, "reason": "entities_required"}
+            event["entity_a"] = a
+            event["entity_b"] = b
+        else:
+            if not from_key or not to_key:
+                return {"ok": False, "reason": "keys_required"}
+            event["from_key"] = from_key
+            event["to_key"] = to_key
+        try:
+            record = _ledger.append_event(
+                self.ledger_path, event, lock=self._ledger_lock
+            )
+        except Exception:
+            logger.warning("图边作废写账本失败。", exc_info=True)
+            return {"ok": False, "reason": "ledger_failed"}
+        self._graph_cache = None
+        return {"ok": True, "seq": record.get("seq")}
+
+    def graph_edge_history(self, name_a=None, name_b=None,
+                           from_key=None, to_key=None, kind=None):
+        """查两个节点之间的边全史（有效 + 作废，带出处与作废理由）。
+
+        同义词边按实体名查，关系边按记忆 key 查；都不给返回 []。
+        """
+        graph = self._get_graph()
+        a = _normalize_entity_name(name_a)
+        b = _normalize_entity_name(name_b)
+        if a and b:
+            return graph.edge_history(
+                _graph_mod.entity_node_id(a),
+                _graph_mod.entity_node_id(b),
+                kind=kind,
+            )
+        if from_key and to_key:
+            return graph.edge_history(
+                _graph_mod.memory_node_id(from_key),
+                _graph_mod.memory_node_id(to_key),
+                kind=kind,
+            )
+        return []
+
+    def _ledger_overlays(self):
+        """扫一遍账本事件，算出账本对每条记忆的最新一笔覆盖：
+        (promote_meta, decay_marks, slot_map, revived_keys)。
+
+        promote_meta：每个 key 最新一笔 PROMOTE 的完整 meta（晋升、
+        保护档、抽屉都记这笔）；decay_marks：当前还沉底/待删的
+        key → decay_state（REVIVE 来了就摘掉）；slot_map：最新一笔
+        SLOT 的槽位；revived_keys：沉底过、又被 REVIVE 摘掉的 key
+        （账本折叠态已回原话态）。reconcile 重建缺失行和启动修复
+        已有行共用这一份口径，不许两边各算一套。读账本失败抛给
+        调用方按各自口径兜底。"""
+        promote_meta = {}
+        decay_marks = {}
+        slot_map = {}
+        revived_keys = set()
+        _events, _info = _ledger.read_events(self.ledger_path)
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：覆盖层是折叠结
+            # 论，残缺折叠不许当定案——抛给调用方按各自兜
+            # 底口径跳过覆盖层（对账/修复的既有 except 路
+            # 径；只读复检则向上抛由启动恢复处置）。
+            raise ValueError("ledger_doubtful")
+        for _event in _events:
+            _etype = _event.get("type")
+            _key = _event.get("key") or _event.get("memory_id")
+            if _etype == _ledger.LEDGER_EVENT_PROMOTE:
+                _meta = _event.get("meta") or {}
+                if _key and _meta:
+                    promote_meta[_key] = _meta
+            elif _etype == _ledger.LEDGER_EVENT_SLOT and _key:
+                # R-7（2026-11-24）：槽位标的账本事件，重建/修复
+                # 时把 slot 一并带回来（最新一笔赢）。
+                if _event.get("slot"):
+                    slot_map[_key] = _event["slot"]
+            elif _etype == _ledger.LEDGER_EVENT_DORMANT and _key:
+                # 3b（2026-11-24）：沉底/待删标记在账本里有事件，
+                # 重建/修复时把 decay_state 一并带回来。
+                decay_marks[_key] = (
+                    _decay.DECAY_STATE_DELETE_DUE
+                    if _event.get("delete_due")
+                    else _decay.DECAY_STATE_DORMANT
+                )
+                revived_keys.discard(_key)
+            elif _etype == _ledger.LEDGER_EVENT_REVIVE and _key:
+                if _key in decay_marks:
+                    decay_marks.pop(_key, None)
+                    revived_keys.add(_key)
+        return promote_meta, decay_marks, slot_map, revived_keys
+
 
     def reconcile_ledger_index(self):
         """启动对账：账本里有、SQLite 里没有的，按账本重建索引。
@@ -772,35 +1102,13 @@ class SQLiteStore:
             #（推断版/episodic），升级就丢了。只覆盖这 4 个晋升字段，
             # 不碰 last_used_at / seen_*（那是后来的使用记录，PROMOTE
             # 那一刻的值是旧的）。
-            promote_meta = {}
-            decay_marks = {}
-            slot_map = {}
             try:
-                _events, _info = _ledger.read_events(self.ledger_path)
-                for _event in _events:
-                    _etype = _event.get("type")
-                    _key = _event.get("key") or _event.get("memory_id")
-                    if _etype == _ledger.LEDGER_EVENT_PROMOTE:
-                        _meta = _event.get("meta") or {}
-                        if _key and _meta:
-                            promote_meta[_key] = _meta
-                    elif _etype == _ledger.LEDGER_EVENT_SLOT and _key:
-                        # R-7（2026-11-24）：补槽位标的账本事件，
-                        # 重建缺失行时把 slot 一并带回来（最新一笔赢）。
-                        if _event.get("slot"):
-                            slot_map[_key] = _event["slot"]
-                    elif _etype == _ledger.LEDGER_EVENT_DORMANT and _key:
-                        # 3b（2026-11-24）：沉底/待删标记在账本里有
-                        # 事件，重建时把 decay_state 一并带回来。
-                        decay_marks[_key] = (
-                            _decay.DECAY_STATE_DELETE_DUE
-                            if _event.get("delete_due")
-                            else _decay.DECAY_STATE_DORMANT
-                        )
-                    elif _etype == _ledger.LEDGER_EVENT_REVIVE and _key:
-                        decay_marks.pop(_key, None)
+                promote_meta, decay_marks, slot_map, _revived_keys = (
+                    self._ledger_overlays()
+                )
             except Exception:
                 logger.warning("读账本 PROMOTE 事件失败：重建时不应用晋升。", exc_info=True)
+                promote_meta, decay_marks, slot_map = {}, {}, {}
             touch_map = (state or {}).get("last_touched") or {}
             added = 0
             for record in (state or {}).get("adds") or []:
@@ -832,8 +1140,15 @@ class SQLiteStore:
                                    "tone", "tone_evidence", "tone_source"):
                         if _promoted.get(_field) is not None:
                             meta[_field] = _promoted[_field]
-                if _slot and not meta.get("slot"):
-                    # R-7：add 那笔还没有槽位标，按 SLOT 事件补上
+                    # 核心上限字段（第 1 块）：以「键在不在」为准——
+                    # 显式写 None 是摘档/摘格，重建时照样摘掉。
+                    for _field in ("protection_tier", "core_drawer"):
+                        if _field in _promoted:
+                            meta[_field] = _promoted[_field]
+                if _slot:
+                    # R-7＋口径对齐（2026-11-25）：账本最新 SLOT 事件赢——
+                    # ADD 自带旧槽位也要被后来的 SLOT 事件盖掉，与
+                    # repair_projection_from_ledger 同口径
                     # （_insert_memory_row 会把 meta 里的 slot 写进列）。
                     meta["slot"] = _slot
                 if _touched and _touched > str(meta.get("last_used_at") or ""):
@@ -846,6 +1161,843 @@ class SQLiteStore:
                 self._insert_memory_row(key, text, meta, vec)
                 added += 1
             return added
+
+    def repair_projection_from_ledger(self):
+        """按账本修已有行的半截状态（崩溃恢复，追加决定十五）。
+
+        账本是唯一真相源、SQLite 是投影：两步写之间硬崩溃留下的
+        半截状态，一律按账本折叠态修正投影，绝不反过来改账本
+        （账本只追加、不改写历史行）。修的窗口：
+          - 顶替（_supersede_row 先标 SQLite 再写账本）：进程死在
+            两步之间 → SQLite 有 superseded 标记、账本没事件 →
+            按账本撤标记；反过来账本有顶替/删除事件、SQLite 没标
+            （如恢复了旧备份的库）→ 按事件补标；
+          - 晋升/保护档/抽屉/槽位/沉底/最后使用时间：都是账本
+            先行、SQLite 后写，死在中间 → 按账本最新一笔覆盖
+            补齐（字段口径与 reconcile_ledger_index 重建缺失行
+            完全一致，同一份 _ledger_overlays）；
+          - 作废（voided）行不碰标记：作废是终局标记，它自己
+            也有 delete 账本事件兜底，检索口径只认 voided。
+        SQLite 里有、账本里没有 add 的行：不删、不改，只计数
+        报警——来历不明删了就是丢记忆，等 BOOS 裁（账本本身缺
+        行由 verify_ledger 的序号缺口另行报警）。
+        返回报告 dict；内部异常向上抛，调用方（启动恢复）拦。"""
+        with self._lock:
+            report = {
+                "rows_checked": 0,
+                "superseded_fixed": 0,
+                "deleted_fixed": 0,
+                "meta_fixed": 0,
+                "extra_rows": 0,
+            }
+            state = self.ledger_state()
+            key_states = (state or {}).get("key_states") or {}
+            by_id = (state or {}).get("by_id") or {}
+            touch_map = (state or {}).get("last_touched") or {}
+            known_keys = set(key_states) | set(by_id)
+            for _record in (state or {}).get("adds") or []:
+                if _record.get("key"):
+                    known_keys.add(_record["key"])
+            try:
+                promote_meta, decay_marks, slot_map, revived_keys = (
+                    self._ledger_overlays()
+                )
+            except Exception:
+                logger.warning(
+                    "读账本覆盖层失败：本次只修状态标记。", exc_info=True
+                )
+                promote_meta, decay_marks, slot_map, revived_keys = (
+                    {}, {}, {}, set()
+                )
+            rows = self._conn.execute(
+                "SELECT id, metadata_json, superseded, deleted, voided,"
+                " user_confirmed"
+                " FROM memories"
+            ).fetchall()
+            for rid, meta_json, sup, dele, voided, uc in rows:
+                report["rows_checked"] += 1
+                if rid not in known_keys:
+                    report["extra_rows"] += 1
+                    logger.warning(
+                        "启动修复：账本里没有的行（不删不改，等 BOOS 裁）：%s",
+                        rid,
+                    )
+                    continue
+                expected = key_states.get(rid)
+                if expected is None:
+                    expected = (by_id.get(rid) or {}).get("state")
+                new_sup, new_del = sup, dele
+                if not voided and expected is not None:
+                    # 按折叠终态精确对齐（2026-11-25 互查修复三）：
+                    # 终态是哪个，标记就是哪个，另一个必须清掉。
+                    # 旧写法不对称——expected=superseded 会清
+                    # deleted，反过来 expected=deleted 不清
+                    # superseded，能留下 deleted=1 且 superseded=1
+                    # 的双标行。voided 行照旧不碰：作废是投影侧
+                    # 终局标记，账本折叠态里没有对应状态（见方法
+                    # docstring），只认它自己的事件兜底。
+                    if expected == _ledger.LEDGER_STATE_SUPERSEDED:
+                        new_sup, new_del = 1, 0
+                    elif expected == _ledger.LEDGER_STATE_DELETED:
+                        new_sup, new_del = 0, 1
+                    elif expected in (
+                        _ledger.LEDGER_STATE_CURRENT,
+                        _ledger.LEDGER_STATE_DORMANT,
+                    ):
+                        new_sup, new_del = 0, 0
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
+                new_meta = meta
+                _promoted = promote_meta.get(rid) or {}
+                _slot = slot_map.get(rid)
+                _touched = touch_map.get(rid)
+                _mark = decay_marks.get(rid)
+                if _promoted or _slot or _touched or _mark or (
+                    rid in revived_keys
+                ):
+                    new_meta = dict(meta)
+                    if _promoted:
+                        for _field in (
+                            "source", "user_confirmed", "decay_kind",
+                            "importance", "tone", "tone_evidence",
+                            "tone_source",
+                        ):
+                            if _promoted.get(_field) is not None:
+                                new_meta[_field] = _promoted[_field]
+                        # 核心上限字段：以「键在不在」为准（同
+                        # reconcile）——显式写 None 是摘档/摘格。
+                        for _field in ("protection_tier", "core_drawer"):
+                            if _field in _promoted:
+                                new_meta[_field] = _promoted[_field]
+                    if _slot:
+                        # 槽位与同函数其他字段同口径：有最新 SLOT
+                        # 事件就无条件按最新一笔覆盖（账本为准）。
+                        # 旧写法只填空——meta 里先有别的槽位时，
+                        # 账本的新标永远盖不上，投影与账本长期
+                        # 对不齐（2026-11-25 互查修复一）。
+                        new_meta["slot"] = _slot
+                    if _touched and _touched > str(
+                        new_meta.get("last_used_at") or ""
+                    ):
+                        new_meta["last_used_at"] = _touched
+                    if _mark:
+                        new_meta["decay_state"] = _mark
+                    elif rid in revived_keys and new_meta.get(
+                        "decay_state"
+                    ) in (
+                        _decay.DECAY_STATE_DORMANT,
+                        _decay.DECAY_STATE_DELETE_DUE,
+                    ):
+                        new_meta["decay_state"] = _decay.DECAY_STATE_VERBATIM
+                meta_changed = new_meta != meta
+                # user_confirmed 独立列无条件核对（贵妃第十八
+                # 份复查 F）：demote 两段写之间硬崩会留下 meta
+                # 已与账本一致、列还停在旧值的分叉；旧写法只
+                # 在旗或 meta 变化时才连列一起 UPDATE，这种
+                # 分叉永远修不到。列与修复后 meta 对不上就强
+                # 制进 UPDATE（UPDATE 本来就写这一列），计数
+                # 并入 meta_fixed，报告键集不变。voided 行照
+                # 旧不碰。
+                column_diverged = (
+                    not voided
+                    and (1 if uc else 0)
+                    != (1 if new_meta.get("user_confirmed") else 0)
+                )
+                if new_sup != sup:
+                    report["superseded_fixed"] += 1
+                if new_del != dele:
+                    report["deleted_fixed"] += 1
+                if meta_changed or column_diverged:
+                    report["meta_fixed"] += 1
+                if (
+                    new_sup != sup or new_del != dele
+                    or meta_changed or column_diverged
+                ):
+                    self._conn.execute(
+                        "UPDATE memories SET superseded=?, deleted=?,"
+                        " metadata_json=?, decay_kind=?, source=?,"
+                        " user_confirmed=?, importance=?, slot=?"
+                        " WHERE id=?",
+                        (
+                            new_sup,
+                            new_del,
+                            json.dumps(new_meta, ensure_ascii=False),
+                            new_meta.get("decay_kind"),
+                            new_meta.get("source"),
+                            1 if new_meta.get("user_confirmed") else 0,
+                            new_meta.get("importance"),
+                            new_meta.get("slot"),
+                            rid,
+                        ),
+                    )
+            self._conn.commit()
+            return report
+
+    def rebuild_pending_questions(self):
+        """待问文件损坏后按存活记录重建（崩溃恢复，追加决定十五）。
+
+        只在 pending_questions 报告文件坏过（load_error）时由启动
+        恢复调用。能重建的只有两类——它们在别处留了痕：
+          - 转述授权声称：记忆行 meta 里还带着
+            auth_claim=relayed_unverified，按原队列函数重新攒；
+          - 入口挂起：intake_log.jsonl 里有 HOLD 留痕、且原文
+            还没被存成活记忆的，按原队列函数重新攒。
+        其余种类（importance / conflict / core_capacity /
+        change_attempt 留痕）的问题、以及「已答过」的裁决痕迹，
+        只活在问题文件里，文件没了就没了——这里明说不重建，
+        不许假装全恢复了。返回重建计数 dict。"""
+        rebuilt = {"auth_claim": 0, "intake_hold": 0}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text, metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall()
+            live_texts = set()
+            for rid, text, meta_json in rows:
+                live_texts.add(_normalize_memory_text(text or ""))
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
+                if meta.get("auth_claim") == _auth_guard.AUTH_CLAIM_RELAYED:
+                    before = self.pending_questions.count_unanswered()
+                    self._queue_auth_question(
+                        text or "",
+                        rid,
+                        "待问文件损坏后按记忆行标记重建（崩溃恢复）。",
+                    )
+                    if self.pending_questions.count_unanswered() > before:
+                        rebuilt["auth_claim"] += 1
+            try:
+                held_entries = []
+                if self._intake_log_path.exists():
+                    for _line in self._intake_log_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines():
+                        try:
+                            _entry = json.loads(_line)
+                        except (ValueError, TypeError):
+                            continue
+                        if (
+                            _entry.get("verdict") == _intake.VERDICT_HOLD
+                            and _entry.get("text")
+                        ):
+                            held_entries.append(_entry)
+                for _entry in held_entries:
+                    _text = _entry["text"]
+                    if _normalize_memory_text(_text) in live_texts:
+                        continue  # 已存成活记忆：挂起已经裁完了
+                    before = self.pending_questions.count_unanswered()
+                    self._queue_intake_hold(
+                        _text,
+                        _entry.get("category") or "",
+                        _entry.get("reason")
+                        or "待问文件损坏后按入口留痕重建（崩溃恢复）。",
+                        turn_id=_entry.get("turn_id"),
+                    )
+                    if self.pending_questions.count_unanswered() > before:
+                        rebuilt["intake_hold"] += 1
+            except Exception:
+                logger.warning(
+                    "按入口留痕重建挂起问题失败。", exc_info=True
+                )
+        rebuilt["unrecoverable_kinds"] = [
+            _pq.QUESTION_KIND_IMPORTANCE,
+            _pq.QUESTION_KIND_CONFLICT,
+            _pq.QUESTION_KIND_CORE_CAPACITY,
+            "auth_claim/change_attempt",
+        ]
+        return rebuilt
+
+    def startup_recovery(self):
+        """启动崩溃恢复（追加决定十五）：verify → repair（账本
+        残行）→ 按账本修投影 → 待问文件痕迹与重建，最后才轮到
+        create_sqlite_store 里的 reconcile 补缺行。顺序是死规矩：
+        账本残行不先修掉，折叠态就少最后一截，后面的修复全对
+        不齐。每步失败只记日志、不拦启动（记忆系统出问题不能
+        把聊天也堵死）。账本序号缺口只报警不硬修：缺的事件编
+        不出来，硬补就是造假账——留给 BOOS/自检裁（同
+        verify_ledger 原口径）。返回报告 dict。"""
+        report = {
+            "verify": None,
+            "ledger_repair": None,
+            "projection": None,
+            "pending": None,
+            "pending_rebuilt": None,
+        }
+        try:
+            report["verify"] = _ledger.verify_ledger(self.ledger_path)
+            if not (report["verify"] or {}).get("ok"):
+                logger.error(
+                    "启动恢复：账本校验不干净（缺口/残行/坏行）：%s",
+                    report["verify"],
+                )
+        except Exception:
+            logger.warning("启动恢复：账本校验失败。", exc_info=True)
+        try:
+            report["ledger_repair"] = _ledger.repair_ledger(
+                self.ledger_path
+            )
+        except Exception:
+            logger.warning("启动恢复：账本残行修复失败。", exc_info=True)
+        try:
+            report["projection"] = self.repair_projection_from_ledger()
+        except Exception:
+            logger.warning("启动恢复：投影修复失败。", exc_info=True)
+        try:
+            report["pending"] = self.pending_questions.recovery_report()
+            if report["pending"]:
+                report["pending_rebuilt"] = self.rebuild_pending_questions()
+                logger.error(
+                    "启动恢复：待问文件曾损坏（原件保全于 %s），"
+                    "按存活记录重建 %s；其余种类与已答痕迹无法重建。",
+                    report["pending"].get("backup_path"),
+                    report["pending_rebuilt"],
+                )
+        except Exception:
+            logger.warning("启动恢复：待问文件恢复失败。", exc_info=True)
+        # 恢复健康度收尾（立项 H6）：结论落盘，不干净时冻结
+        # 危险写（见 startup_recovery 之后的 H6 节）。收尾永
+        # 不抛——健康度落盘失败不能反过来堵住启动。
+        try:
+            self._finalize_recovery_health(report)
+        except Exception:
+            logger.warning("启动恢复：健康度收尾失败。", exc_info=True)
+        # 性情区一致性校验（追加决定八第 ⑤ 环）：启动时对一遍
+        # 壳↔复印件，冲突只挂待问、不覆盖任何一边（校验函数
+        # 内处理）；没行/只有种子行不吵。永不抛——校验失败
+        # 不能反过来堵住启动。
+        try:
+            report["persona"] = self._persona_startup_check()
+        except Exception:
+            logger.warning("启动恢复：性情区校验失败。", exc_info=True)
+        return report
+
+
+    # ---------- 恢复健康度（立项 H6，2026-11-25） ----------
+    #
+    # 三件：健康度落盘、结论页映射、危险写冻结。
+    #
+    # 【落盘】每次 startup_recovery 收尾把健康结论写进
+    # memory 目录下 recovery_health.json（{version,
+    # updated_at, latest, history}，history 留最近 10 份、
+    # 最新在前，原子换名不留半截 JSON）。进程重启后读得出
+    # 上一份——补决定十五的缺口（待问 load_error 只活在进
+    # 程里，重启即消失、报警无留存）。
+    #
+    # 【结论页映射】沿既有消费通道接，不新造页面：
+    #   - recovery_health() 返回最近一份记录（本进程产出的
+    #     优先，没有读落盘的上一份），结论页/健康检查从同
+    #     一份记录取数；
+    #   - pending_notices() 新增 kind=recovery_health：状态
+    #     为 frozen 时必出（带 residuals 种类列表与
+    #     frozen_reason）；本进程还没产出自己的记录时，上
+    #     一进程落盘的未净记录（attention/frozen）也出——
+    #     跨重启可见。字段对应：record.status → 总状态；
+    #     record.residuals[].kind → 异常项；
+    #     record.controlled_entry.frozen/frozen_reason → 冻
+    #     结状态与原因；record.recovery.* → 恢复各步明细；
+    #     record.controlled_entry.
+    #     protection_evidence_pending_count → H5 待补证计数；
+    #   - 冻结本身另沿既有 kind=controlled_entry_frozen 露
+    #     头（reason=recovery_unclean）。attention 级残余各
+    #     有既有 kind 露头（pending_questions_corrupt /
+    #     protection_evidence_pending /
+    #     controlled_entry_health），不在 recovery_health
+    #     条里重复汇总。
+    #
+    # 【危险写冻结】不另造第二套：仍是
+    # _controlled_frozen_reason 这一面旗、submit/revoke 同
+    # 一道闸口（执行路径拒 entry_frozen，影子与拒绝照常）。
+    # 恢复不干净时经 _controlled_note_health(
+    # "recovery_unclean", ...) 置旗（已并入
+    # _CONTROLLED_FREEZE_KINDS；置过不覆盖、保留最早原因的
+    # 既有口径不变）。解冻只许两种：① 下一次
+    # startup_recovery 结论无冻结级残余；②
+    # recovery_health_recheck() 显式只读复检通过。两种都
+    # 只解 recovery_unclean 这一来源；持久化故障类冻结
+    # （receipts_load_error 等）照旧不自动解、复检也不碰。
+    # 跨重启承接：构造时读回上一份记录，status=frozen 且
+    # frozen_reason=recovery_unclean 的，先承接冻结等本轮
+    # 恢复重新裁决（_load_recovery_health）。
+    #
+    # 【不干净判据（本轮核定）】
+    # 冻结级：verify 缺失（步骤抛错）或 ok 非 True（账本序
+    # 号缺口/残行/坏行——账本本身不可信）；ledger_repair /
+    # projection 步骤抛错（报告字段为 None）；投影修复后
+    # 复检仍有分叉（行状态旗对、保护档/抽屉、槽位、
+    # user_confirmed 列与 meta 分叉，与账本折叠不符，复检
+    # 口径与 repair_projection_from_ledger 对
+    # 应段一致，只查受控入口安全所系字段）；账本里没有的
+    # 行 extra_rows > 0（repair 明定不删不改、等 BOOS
+    # 裁——投影与账本对不上且恢复自己解不开，冻到人工处
+    # 置后靠干净恢复/复检解冻）；待问文件损坏且重建没跑
+    # 成（pending 非空但 pending_rebuilt 为 None）。
+    # 注意级（记录、不冻结）：待问损坏但已重建；H5 待补证
+    # 计数 > 0；受控入口非冻结类健康痕迹非空。冻结类痕迹
+    # （不变量失败/提交待核实/持久化故障/对账未定案——补
+    # 修二轮起同在 _CONTROLLED_FREEZE_KINDS）不算注意级：
+    # 它们经 _controlled_frozen_reason 直接定 frozen，并在
+    # 残余清单里以 controlled_entry_frozen 冻结级列明。
+    # status：无残余 = clean；只有注意级 = attention；有
+    # 冻结级残余或入口已冻结 = frozen。
+
+    _RECOVERY_HEALTH_HISTORY_KEEP = 10
+    _RECOVERY_FREEZE_REASON = "recovery_unclean"
+
+    def _projection_residual_mismatches(self):
+        """投影修复后的只读复检（H6）：拿账本折叠比对行状
+        态旗对（superseded/deleted）、保护档/抽屉、槽位——
+        口径与 repair_projection_from_ledger 的对应段一致，
+        只查不修。返回 {"mismatch_count", "sample_ids",
+        "extra_rows"}。voided 行照 repair 口径不碰、不算分
+        叉；账本里没有的行单记 extra_rows，不混进分叉数。
+        内部异常向上抛，调用方拦。"""
+        with self._lock:
+            state = self.ledger_state() or {}
+            key_states = state.get("key_states") or {}
+            by_id = state.get("by_id") or {}
+            known_keys = set(key_states) | set(by_id)
+            for _record in state.get("adds") or []:
+                if _record.get("key"):
+                    known_keys.add(_record["key"])
+            promote_meta, _decay_marks, slot_map, _revived = (
+                self._ledger_overlays()
+            )
+            mismatched = []
+            extra_rows = 0
+            rows = self._conn.execute(
+                "SELECT id, metadata_json, superseded, deleted, voided,"
+                " user_confirmed"
+                " FROM memories"
+            ).fetchall()
+            for rid, meta_json, sup, dele, voided, uc in rows:
+                if rid not in known_keys:
+                    extra_rows += 1
+                    continue
+                if voided:
+                    continue
+                expected = key_states.get(rid)
+                if expected is None:
+                    expected = (by_id.get(rid) or {}).get("state")
+                bad = False
+                if expected is not None:
+                    if expected == _ledger.LEDGER_STATE_SUPERSEDED:
+                        want = (1, 0)
+                    elif expected == _ledger.LEDGER_STATE_DELETED:
+                        want = (0, 1)
+                    elif expected in (
+                        _ledger.LEDGER_STATE_CURRENT,
+                        _ledger.LEDGER_STATE_DORMANT,
+                    ):
+                        want = (0, 0)
+                    else:
+                        want = None
+                    if want is not None and (sup, dele) != want:
+                        bad = True
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
+                if not bad and (1 if uc else 0) != (
+                    1 if meta.get("user_confirmed") else 0
+                ):
+                    # user_confirmed 独立列与 meta 分叉（复查
+                    # F）：demote 两段写中间窗口的残留，复检必
+                    # 须看得见——旧复检根本不查这一列。
+                    bad = True
+                if not bad:
+                    promoted = promote_meta.get(rid) or {}
+                    for _field in ("protection_tier", "core_drawer"):
+                        if _field in promoted and (
+                            meta.get(_field) != promoted[_field]
+                        ):
+                            bad = True
+                            break
+                    if not bad:
+                        _slot = slot_map.get(rid)
+                        if _slot and meta.get("slot") != _slot:
+                            bad = True
+                if bad:
+                    mismatched.append(rid)
+            return {
+                "mismatch_count": len(mismatched),
+                "sample_ids": mismatched[:10],
+                "extra_rows": extra_rows,
+            }
+
+    def _recovery_residuals(self, report, residual, recheck=False):
+        """按 H6 节头判据组装残余异常清单。residual 是
+        _projection_residual_mismatches 的返回（None = 复检
+        没跑成，本身按冻结级记）。recheck=True 时
+        ledger_repair/projection 两步不在复检范围，报告里
+        的占位不作数、跳过对应判据。返回 (residuals,
+        freezing)：residuals 每条 {kind, detail, freezing}，
+        freezing = 有没有冻结级残余。"""
+        residuals = []
+        verify = (report or {}).get("verify")
+        if verify is None:
+            residuals.append({
+                "kind": "ledger_verify_failed",
+                "detail": "账本校验步骤没跑成（报告缺失）",
+                "freezing": True,
+            })
+        elif not verify.get("ok"):
+            residuals.append({
+                "kind": "ledger_verify_failed",
+                "detail": {
+                    "gaps": verify.get("gaps"),
+                    "truncated": verify.get("truncated"),
+                    "bad_lines": verify.get("bad_lines"),
+                },
+                "freezing": True,
+            })
+        if not recheck:
+            if (report or {}).get("ledger_repair") is None:
+                residuals.append({
+                    "kind": "ledger_repair_failed",
+                    "detail": "账本残行修复步骤没跑成（报告缺失）",
+                    "freezing": True,
+                })
+            if (report or {}).get("projection") is None:
+                residuals.append({
+                    "kind": "projection_repair_failed",
+                    "detail": "投影修复步骤没跑成（报告缺失）",
+                    "freezing": True,
+                })
+        if residual is None:
+            residuals.append({
+                "kind": "projection_residual_mismatch",
+                "detail": "投影修复后复检没跑成",
+                "freezing": True,
+            })
+        elif residual.get("mismatch_count"):
+            residuals.append({
+                "kind": "projection_residual_mismatch",
+                "detail": {
+                    "count": residual["mismatch_count"],
+                    "sample_ids": residual["sample_ids"],
+                },
+                "freezing": True,
+            })
+        extra = None
+        projection = (report or {}).get("projection")
+        if isinstance(projection, dict) and projection.get(
+            "extra_rows"
+        ) is not None:
+            extra = projection.get("extra_rows") or 0
+        elif residual is not None:
+            extra = residual.get("extra_rows") or 0
+        if extra:
+            residuals.append({
+                "kind": "projection_extra_rows",
+                "detail": {"count": extra},
+                "freezing": True,
+            })
+        pending = (report or {}).get("pending")
+        if pending:
+            if (report or {}).get("pending_rebuilt") is None:
+                residuals.append({
+                    "kind": "pending_questions_unrecovered",
+                    "detail": {
+                        "backup_path": pending.get("backup_path"),
+                        "reason": pending.get("reason"),
+                    },
+                    "freezing": True,
+                })
+            else:
+                residuals.append({
+                    "kind": "pending_questions_corrupt",
+                    "detail": {
+                        "backup_path": pending.get("backup_path"),
+                        "reason": pending.get("reason"),
+                    },
+                    "freezing": False,
+                })
+        if getattr(self, "_protection_evidence_pending", []):
+            residuals.append({
+                "kind": "protection_evidence_pending",
+                "detail": {
+                    "count": len(self._protection_evidence_pending),
+                },
+                "freezing": False,
+            })
+        other_issues = [
+            i for i in getattr(self, "_controlled_health_issues", [])
+            if i.get("kind") != self._RECOVERY_FREEZE_REASON
+        ]
+        # 补修二轮（复查 A）：冻结类痕迹（不变量失败/提交待
+        # 核实/持久化故障/对账未定案）在残余清单里定冻结级，
+        # 不再混进注意级的 controlled_entry_health——冻结事
+        # 实以 _controlled_frozen_reason 为准，这里只是把同
+        # 一事实如实列进恢复结论页。
+        freeze_issues = [
+            i for i in other_issues
+            if i.get("kind") in self._CONTROLLED_FREEZE_KINDS
+        ]
+        plain_issues = [
+            i for i in other_issues
+            if i.get("kind") not in self._CONTROLLED_FREEZE_KINDS
+        ]
+        if freeze_issues:
+            residuals.append({
+                "kind": "controlled_entry_frozen",
+                "detail": {
+                    "count": len(freeze_issues),
+                    "kinds": [i.get("kind") for i in freeze_issues],
+                },
+                "freezing": True,
+            })
+        if plain_issues:
+            residuals.append({
+                "kind": "controlled_entry_health",
+                "detail": {
+                    "count": len(plain_issues),
+                    "kinds": [i.get("kind") for i in plain_issues],
+                },
+                "freezing": False,
+            })
+        freezing = any(r["freezing"] for r in residuals)
+        return residuals, freezing
+
+    def _finalize_recovery_health(self, report, source="startup_recovery"):
+        """恢复健康度收尾（H6）：复检投影残余 → 组装残余
+        → 冻结/解冻裁决 → 组装记录并落盘。返回健康记录
+        dict。本函数自己拦异常（落盘失败只记痕、不抛），
+        调用方（startup_recovery）外层再兜一层。"""
+        try:
+            residual = self._projection_residual_mismatches()
+        except Exception:
+            logger.warning(
+                "恢复健康度：投影残余复检失败。", exc_info=True
+            )
+            residual = None
+        residuals, freezing = self._recovery_residuals(
+            report, residual, recheck=(source == "recheck")
+        )
+        unfrozen = None
+        if freezing:
+            # recovery_unclean 只记恢复自身判出的冻结级残余；
+            # 受控入口自身的冻结类痕迹（controlled_entry_
+            # frozen）不是恢复的账，别替它背、也别在恢复重
+            # 启时替它解冻（它有自己的解冻条件）。
+            recovery_caused = any(
+                r["freezing"] and r["kind"] != "controlled_entry_frozen"
+                for r in residuals
+            )
+            already = any(
+                i.get("kind") == self._RECOVERY_FREEZE_REASON
+                for i in self._controlled_health_issues
+            )
+            if recovery_caused and not already:
+                self._controlled_note_health(
+                    self._RECOVERY_FREEZE_REASON,
+                    {
+                        "residual_kinds": [
+                            r["kind"] for r in residuals if r["freezing"]
+                        ],
+                        "source": source,
+                    },
+                )
+        elif (
+            self._controlled_frozen_reason
+            == self._RECOVERY_FREEZE_REASON
+        ):
+            # 解冻只解 recovery_unclean 这一来源（判据：本轮
+            # 无冻结级残余）；持久化故障类冻结不在这里动。
+            self._controlled_frozen_reason = None
+            unfrozen = {"previous_reason": self._RECOVERY_FREEZE_REASON}
+        frozen_now = bool(self._controlled_frozen_reason)
+        if frozen_now:
+            status = "frozen"
+        elif residuals:
+            status = "attention"
+        else:
+            status = "clean"
+        record = {
+            "version": 1,
+            "recorded_at": _now_iso(),
+            "source": source,
+            "status": status,
+            "clean": status == "clean",
+            "recovery": {
+                "verify": (report or {}).get("verify"),
+                "ledger_repair": (report or {}).get("ledger_repair"),
+                "projection": (report or {}).get("projection"),
+                "projection_residual_mismatches": (
+                    residual.get("mismatch_count")
+                    if residual else None
+                ),
+                "pending_corrupt": (report or {}).get("pending"),
+                "pending_rebuilt": (report or {}).get("pending_rebuilt"),
+            },
+            "residuals": residuals,
+            "controlled_entry": {
+                "frozen": frozen_now,
+                "frozen_reason": self._controlled_frozen_reason,
+                "health_issue_count": len(
+                    getattr(self, "_controlled_health_issues", [])
+                ),
+                "protection_evidence_pending_count": len(
+                    getattr(self, "_protection_evidence_pending", [])
+                ),
+            },
+        }
+        if unfrozen:
+            record["unfrozen"] = unfrozen
+        self._recovery_health_latest = record
+        self._recovery_health_own = True
+        self._persist_recovery_health(record)
+        return record
+
+    def _persist_recovery_health(self, record):
+        """健康记录落盘（H6）：recovery_health.json =
+        {version, updated_at, latest, history}，history 留
+        最近 10 份（最新在前）。临时文件＋replace 原子换
+        名，不留半截 JSON。落盘失败只记日志与 load_error
+        痕迹、不抛（不堵启动的既有口径）。"""
+        with self._recovery_health_lock:
+            try:
+                history = []
+                try:
+                    raw = self._recovery_health_path.read_text(
+                        encoding="utf-8"
+                    )
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and isinstance(
+                        data.get("history"), list
+                    ):
+                        history = [
+                            h for h in data["history"]
+                            if isinstance(h, dict)
+                        ]
+                except Exception:
+                    history = []
+                history = [record] + history
+                history = history[: self._RECOVERY_HEALTH_HISTORY_KEEP]
+                payload = {
+                    "version": 1,
+                    "updated_at": _now_iso(),
+                    "latest": record,
+                    "history": history,
+                }
+                tmp = self._recovery_health_path.parent / (
+                    self._recovery_health_path.name + ".tmp"
+                )
+                tmp.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, self._recovery_health_path)
+            except Exception as exc:
+                self._recovery_health_load_error = "%s: %s" % (
+                    type(exc).__name__, exc,
+                )
+                logger.warning(
+                    "恢复健康度落盘失败：%s", exc, exc_info=True
+                )
+
+    def _load_recovery_health(self):
+        """构造时读回上一份健康记录（H6，永不抛）：进程重
+        启后上一轮的恢复结论还在（recovery_health() 与
+        pending_notices 跨重启取数）。上一份若 status=
+        frozen 且冻结来源是 recovery_unclean，先承接冻结
+        ——等本进程的 startup_recovery 重新裁决（干净才
+        解，见 _finalize_recovery_health）；持久化故障类冻
+        结不靠这里承接，它们在 _load_controlled_entry_state
+        里按文件现状重新派生。"""
+        try:
+            raw = self._recovery_health_path.read_text(
+                encoding="utf-8"
+            )
+            data = json.loads(raw)
+            latest = (
+                data.get("latest") if isinstance(data, dict) else None
+            )
+            if isinstance(latest, dict):
+                self._recovery_health_latest = latest
+                entry = latest.get("controlled_entry") or {}
+                if (
+                    latest.get("status") == "frozen"
+                    and entry.get("frozen_reason")
+                    == self._RECOVERY_FREEZE_REASON
+                ):
+                    self._controlled_note_health(
+                        self._RECOVERY_FREEZE_REASON,
+                        {
+                            "carried_from": latest.get("recorded_at"),
+                            "residual_kinds": [
+                                r.get("kind")
+                                for r in latest.get("residuals") or []
+                                if r.get("freezing")
+                            ],
+                        },
+                    )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self._recovery_health_load_error = "%s: %s" % (
+                type(exc).__name__, exc,
+            )
+            logger.warning("读回恢复健康记录失败。", exc_info=True)
+
+    def recovery_health(self):
+        """最近一份恢复健康记录（H6）：本进程产出的优先，
+        没有就读落盘的上一份；从来没有过返回 None。深拷
+        贝，调用方改它污染不了登记原件。结论页/健康检查
+        从这一份取数（映射见 H6 节头）。"""
+        latest = getattr(self, "_recovery_health_latest", None)
+        if latest is None:
+            try:
+                raw = self._recovery_health_path.read_text(
+                    encoding="utf-8"
+                )
+                data = json.loads(raw)
+                if isinstance(data, dict) and isinstance(
+                    data.get("latest"), dict
+                ):
+                    latest = data["latest"]
+                    self._recovery_health_latest = latest
+            except Exception:
+                latest = None
+        return copy.deepcopy(latest) if latest is not None else None
+
+    def recovery_health_recheck(self):
+        """显式只读复检（H6）：不跑修复，只重验账本、复检
+        投影残余、看待问损坏痕迹。干净且当前冻的是
+        recovery_unclean 时解冻，并落一条 source=recheck
+        的健康记录；不干净、或冻的是持久化故障类来源时，
+        只落记录、不解冻（那种冻结照旧等对账/人工处置）。
+        待问一项复检不重判重建：痕迹在时按最近一份记录的
+        重建结果记账（没有记录可依就按未恢复记，宁严勿
+        松）。返回健康记录 dict。"""
+        report = {
+            "verify": None,
+            "ledger_repair": {"recheck": True, "repaired": False,
+                              "dropped": 0},
+            "projection": None,
+            "pending": None,
+            "pending_rebuilt": None,
+        }
+        try:
+            report["verify"] = _ledger.verify_ledger(self.ledger_path)
+        except Exception:
+            logger.warning("健康复检：账本校验失败。", exc_info=True)
+        try:
+            report["pending"] = self.pending_questions.recovery_report()
+        except Exception:
+            report["pending"] = None
+        if report["pending"]:
+            latest = getattr(self, "_recovery_health_latest", None)
+            if latest:
+                report["pending_rebuilt"] = (
+                    (latest.get("recovery") or {}).get("pending_rebuilt")
+                )
+        return self._finalize_recovery_health(
+            report, source="recheck"
+        )
 
     def import_from_mem0(self, mem0_store):
         """一次性迁移：把只活在 Chroma 里的旧记忆搬进来（2026-11-21 核实）。
@@ -863,6 +2015,21 @@ class SQLiteStore:
             deleted_texts = set()
             try:
                 events, _info = _ledger.read_events(self.ledger_path)
+                if self._controlled_ledger_doubtful(_info):
+                    # 账本残缺（补修 H3 复查 F2）：删除过滤
+                    # 集合不可信——漏掉的 delete 事件会让已
+                    # 删记忆被重新迁入。fail-closed：整笔迁
+                    # 移中止、如实回报。
+                    logger.warning(
+                        "账本残缺：一次性迁移中止（删除过滤不可信）。"
+                    )
+                    return {
+                        "imported": 0,
+                        "skipped_existing": 0,
+                        "skipped_deleted": 0,
+                        "skipped_sensitive": 0,
+                        "ledger_doubtful": True,
+                    }
                 for event in events:
                     if event.get("type") == "delete":
                         text = (event.get("text") or "").strip()
@@ -984,6 +2151,41 @@ class SQLiteStore:
                 "memory": text,
                 "reason": "含敏感信息",
             }
+        # 入口当场拦（实测问题三，追加决定七）：所有落行路的共同
+        # 入口先过当场拦——明确垃圾当场丢（INTAKE_DROPPED）、拿不准
+        # 挂起（INTAKE_HELD、进待问），都不落记忆行，留痕在
+        # intake_log。锁内的 auth_guard 授权硬判照常跑，两道门
+        # 并存、互不绕过：本门判 store 的才走得到它。
+        # intake_bypass 只给已裁决路径（待问答「存」后的回存、
+        # 工具路与 CLI 的「记住」命令——BOOS 当轮明确让记的原语
+        # 通道），外部调用方不许乱传。另：调用方显式传了
+        # decay_kind 的，等于已经定了存储类别（同 judge_importance
+        # 「已传 decay_kind 的不问」的既有先例），不当场拦二次
+        # 干预——save_turn 的句子在逐句循环里已过合并屏，不漏。
+        if (
+            not kwargs.get("intake_bypass")
+            and not kwargs.get("decay_kind")
+            and source in ("user", "inferred")
+        ):
+            _verdict, _info = self._intake_screen(
+                text, turn_id=turn_id, source=source,
+                mark=kwargs.get("intake_mark"),
+            )
+            if _verdict == _intake.VERDICT_DROP:
+                return {
+                    "event": "INTAKE_DROPPED",
+                    "memory": text,
+                    "reason": _info["reason"],
+                    "intake_category": _info["category"],
+                }
+            if _verdict == _intake.VERDICT_HOLD:
+                return {
+                    "event": "INTAKE_HELD",
+                    "memory": text,
+                    "reason": _info["reason"],
+                    "intake_category": _info["category"],
+                    "question_id": _info.get("question_id"),
+                }
         with self._lock:
             created_at = _now_iso()
             today = _shanghai_today().isoformat()
@@ -997,6 +2199,14 @@ class SQLiteStore:
             is_rule = bool(kwargs.get("is_rule", False))
             curated = bool(kwargs.get("curated", False))
             user_confirmed = source == "user"
+            # 授权硬判（实测问题一，追加决定十二）：转述来的授权
+            # 断言只算未核实声称——不管调用方传的 source 是什么，
+            # 都不许落已确认、不许走槽位/晋升的已确认路，存完攒
+            # 一条待问等 BOOS 本人裁。纯程序判定（auth_guard 正则
+            # 信号），不依赖模型当场判断。
+            _auth_reason = _auth_guard.detect_relayed_authorization(text)
+            if _auth_reason:
+                user_confirmed = False
             write_seq = _next_write_seq()
             decay_kind = kwargs.get("decay_kind") or _decay.classify_decay_kind(
                 source, False, is_rule
@@ -1031,6 +2241,10 @@ class SQLiteStore:
                     # episodic——问句永远不许 stable（importance
                     # 只在 important 时才 high，问句到不了那一步）。
                     decay_kind = _decay.DECAY_KIND_EPISODIC
+            if _auth_reason:
+                # 未核实声称不许 stable：调用方（如 save_turn 的
+                # 重要性判断）传进来的 decay_kind 一并压回 episodic。
+                decay_kind = _decay.DECAY_KIND_EPISODIC
             # 同文去重（2026-11-22 Bug 2 治本）：只看归一化文本，不看来源——
             # 用户亲口说的（工具直存、save_turn）都记 source="user"（已确认），
             # 模型推断直存的才记 source="inferred"，来源不同不是两条事实。
@@ -1099,7 +2313,19 @@ class SQLiteStore:
                             old_meta = new_meta
                     # 同一条事实又出现一次：记出现集合，够 3 天 + 3 会就晋升。
                     self._record_occurrence(row[0], old_meta, today, turn_id, text)
+                    if _auth_reason:
+                        self._queue_auth_question(
+                            text, row[0], _auth_reason, turn_id
+                        )
+                        return {"id": row[0], "memory": text,
+                                "event": "UNCHANGED",
+                                "auth_unverified": True,
+                                "auth_reason": _auth_reason}
                     return {"id": row[0], "memory": text, "event": "UNCHANGED"}
+            if _auth_reason:
+                # 未核实声称不进槽位裁决：不许顶掉任何已有行，
+                # 也不许被当成某个槽位的新版本落核心。
+                slot = None
             # 同槽位裁决：slot 相同、文本不同的活记忆是同一件事的新版本。
             # 先只裁决、不取代：pending/keep/ask 都直接返回不存；全是
             # supersede_old 时才继续存，存好新行再取代旧行（新 key 要
@@ -1179,13 +2405,18 @@ class SQLiteStore:
             # 的 add_memory、web/server.py 的“记住”直存）；save_turn
             # 逐句循环里已经判过了，调这里时传 semantic_judge=False，
             # 不重复问。
-            if not slot and kwargs.get("semantic_judge", False):
+            if not slot and not _auth_reason and kwargs.get("semantic_judge", False):
                 _judged, _verdict, _trig = self._judge_preference_supersede(text)
                 if _judged is not None:
                     to_supersede.append(_judged)
             metadata = {
-                "source": source,
-                "confidence": 1.0 if source == "user" else 0.7,
+                # 授权硬判命中时来源只许落 unconfirmed（provenance
+                # 规整后即最低可信档）；声称的原来源记 claimed_source。
+                "source": "unconfirmed" if _auth_reason else source,
+                "confidence": (
+                    0.5 if _auth_reason
+                    else (1.0 if source == "user" else 0.7)
+                ),
                 # confirmed 不存在这里：它是 user_confirmed 的短名字，
                 # 读时由 _normalize_metadata 现算（和 mem0 的规矩一致）；
                 # 存两份以后会打架，只留 user_confirmed 一个真相。
@@ -1196,6 +2427,15 @@ class SQLiteStore:
                 "slot": slot,
                 "is_rule": is_rule,
                 "curated": curated,
+                # 核心上限字段（第 1 块）：只认合法值，传错当没标
+                # （普通档 / 未入格），不猜——和 _normalize_metadata
+                # 一个规矩；没传记 None，老调用方行为不变。
+                "protection_tier": _core_cap.normalize_protection_tier(
+                    {"protection_tier": kwargs.get("protection_tier")}
+                ),
+                "core_drawer": _core_cap.normalize_core_drawer(
+                    {"core_drawer": kwargs.get("core_drawer")}
+                ),
                 "decay_kind": decay_kind,
                 "importance": kwargs.get(
                     "importance",
@@ -1205,6 +2445,11 @@ class SQLiteStore:
                 "last_used_at": created_at,
                 "decay_state": _decay.DECAY_STATE_VERBATIM,
             }
+            if _auth_reason:
+                metadata["auth_claim"] = _auth_guard.AUTH_CLAIM_RELAYED
+                metadata["auth_reason"] = _auth_reason
+                metadata["claimed_source"] = source
+                metadata["importance"] = "normal"
             # 语气落账（webfix 二）：本地筛当场能认出的语气（玩笑/
             # 测试/假设的明确说法）直接写进 meta——以前 SQLite 路
             # 从来不写 tone，§16 的“带标记不计晋升”在晋升侧认
@@ -1230,6 +2475,8 @@ class SQLiteStore:
             key = self._append_new_memory(text, metadata)
             if key is None:
                 return {}
+            if _auth_reason:
+                self._queue_auth_question(text, key, _auth_reason, turn_id)
             if _importance_decision == "unsure":
                 # 判不准的问题攒进 pending，下次聊天顺带问（见 save_turn）。
                 self._queue_importance_question(
@@ -1265,7 +2512,11 @@ class SQLiteStore:
             # 否则下一次“撤回”会误作废上一轮（2026-11-21 Gemini 第三轮真 Bug）。
             # save_turn 内部也调这里，但它在循环结束后才重设标记，顺序不冲突。
             self._last_stored_turn_id = None
-            return {"id": key, "memory": text, "event": "ADD"}
+            _add_result = {"id": key, "memory": text, "event": "ADD"}
+            if _auth_reason:
+                _add_result["auth_unverified"] = True
+                _add_result["auth_reason"] = _auth_reason
+            return _add_result
 
     def _append_new_memory(self, text, metadata):
         """写一条新记忆：先写账本 add，再写 SQLite 行。返回 key；
@@ -1367,43 +2618,96 @@ class SQLiteStore:
         meta["seen_sessions"] = _decay._dump_seen_list(sessions)
         meta["last_used_at"] = _now_iso()
         promoted = False
-        if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and _decay.should_promote(
-            dates, sessions,
-            # 2026-11-23 Phase 2 #2 根因：is_core 不能按“已确认”认——
-            # save_turn 存的用户亲口说的事实都是已确认的（含一次性经历），
-            # 按 _is_core_memory（confirmed 或有槽位）认，会把已确认的
-            # 一次性经历也当核心，3 天 3 次兜底永远走不到。核心记忆本来
-            # 就是稳定的（见 should_promote），这里 decay_kind 已保证
-            # 不是 stable，is_core 恒为 False。
-            is_core=False,
-            tone=meta.get("tone"),
-        ):
-            # R-4（2026-11-24）：账本先行——PROMOTE 写不进去就
-            # 不晋升，SQLite 不许跑到账本前面。以前写失败只警告、
-            # 照样把 decay_kind 改成 stable，账本里没有这笔晋升，
-            # 两边静默分叉（对账只补缺失行、不修已有行）。出现
-            # 记录（seen_*）照常写回，下次出现时再试晋升。
-            promoted_meta = dict(meta)
-            promoted_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+        # 写回前复核合并（F-G4-1，2026-11-27）：传进来的 metadata
+        # 可能是调用方早先读下的快照——后台整理线程在
+        # _organize_turn_memories 开头读行、中间隔着模型调用才走到
+        # 这里，主线程在这段时间里可能已经记了新的出现、甚至已经
+        # 把这行晋升了。按快照整行写回会把那些新事实整体打回
+        # （账本里 PROMOTE 还在、投影却退回去，两边分叉）。所以
+        # 真正落盘前在锁内复读现行行：以现行 meta 为底（快照里有、
+        # 现行没有的键补进来），出现集合取并集，状态由下面按合并
+        # 后的事实重算；现行已晋升的把 decay_kind 对齐到 stable，
+        # 绝不打回。复读失败就按原样走（不让复核本身挡住记账）。
+        with self._lock:
             try:
-                _ledger.append_event(
-                    self.ledger_path,
-                    {"type": _ledger.LEDGER_EVENT_PROMOTE,
-                     "memory_id": memory_id, "key": memory_id,
-                     "text": text,
-                     "meta": promoted_meta},
-                    lock=self._ledger_lock,
-                )
+                _cur = self._conn.execute(
+                    "SELECT metadata_json FROM memories"
+                    " WHERE id=?",
+                    (memory_id,),
+                ).fetchone()
             except Exception:
-                logger.warning("晋升记账失败：本次不晋升（账本为准）。", exc_info=True)
-            else:
-                meta["decay_kind"] = _decay.DECAY_KIND_STABLE
-                promoted = True
-        self._conn.execute(
-            "UPDATE memories SET metadata_json=?, decay_kind=? WHERE id=?",
-            (json.dumps(meta, ensure_ascii=False), meta.get("decay_kind"), memory_id),
-        )
-        self._conn.commit()
+                _cur = None
+            if _cur is not None:
+                try:
+                    _cur_meta = json.loads(_cur[0] or "{}")
+                except Exception:
+                    _cur_meta = None
+                if isinstance(_cur_meta, dict):
+                    for _d in _decay._parse_seen_list(
+                        _cur_meta.get("seen_dates")
+                    ):
+                        if _d not in dates:
+                            dates.append(_d)
+                    for _s in _decay._parse_seen_list(
+                        _cur_meta.get("seen_sessions")
+                    ):
+                        if _s not in sessions:
+                            sessions.append(_s)
+                    _merged = dict(_cur_meta)
+                    for _k, _v in meta.items():
+                        if _k not in _merged:
+                            _merged[_k] = _v
+                    meta = _merged
+                    meta["seen_dates"] = _decay._dump_seen_list(dates)
+                    meta["seen_sessions"] = _decay._dump_seen_list(
+                        sessions
+                    )
+                    meta["last_used_at"] = _now_iso()
+                    if (
+                        _cur_meta.get("decay_kind")
+                        == _decay.DECAY_KIND_STABLE
+                    ):
+                        meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+            # 授权硬判：转述未核实声称（auth_claim=relayed_unverified）
+            # 不许走出现次数晋升路——重复出现再多次也还是未核实，
+            # 等 BOOS 在待问里裁过（改成 owner_confirmed）才解禁。
+            if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and meta.get("auth_claim") != _auth_guard.AUTH_CLAIM_RELAYED and _decay.should_promote(
+                dates, sessions,
+                # 2026-11-23 Phase 2 #2 根因：is_core 不能按“已确认”认——
+                # save_turn 存的用户亲口说的事实都是已确认的（含一次性经历），
+                # 按 _is_core_memory（confirmed 或有槽位）认，会把已确认的
+                # 一次性经历也当核心，3 天 3 次兜底永远走不到。核心记忆本来
+                # 就是稳定的（见 should_promote），这里 decay_kind 已保证
+                # 不是 stable，is_core 恒为 False。
+                is_core=False,
+                tone=meta.get("tone"),
+            ):
+                # R-4（2026-11-24）：账本先行——PROMOTE 写不进去就
+                # 不晋升，SQLite 不许跑到账本前面。以前写失败只警告、
+                # 照样把 decay_kind 改成 stable，账本里没有这笔晋升，
+                # 两边静默分叉（对账只补缺失行、不修已有行）。出现
+                # 记录（seen_*）照常写回，下次出现时再试晋升。
+                promoted_meta = dict(meta)
+                promoted_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                try:
+                    _ledger.append_event(
+                        self.ledger_path,
+                        {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                         "memory_id": memory_id, "key": memory_id,
+                         "text": text,
+                         "meta": promoted_meta},
+                        lock=self._ledger_lock,
+                    )
+                except Exception:
+                    logger.warning("晋升记账失败：本次不晋升（账本为准）。", exc_info=True)
+                else:
+                    meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                    promoted = True
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, decay_kind=? WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False), meta.get("decay_kind"), memory_id),
+            )
+            self._conn.commit()
         return promoted
 
     # 晋升聚合的相似门槛（2026-11-24）：余弦和内容二字组都要够高
@@ -2057,6 +3361,10 @@ class SQLiteStore:
             return True
         if meta.get("slot") in _provenance.KNOWN_SLOTS:
             return True
+        if meta.get("persona_projection"):
+            # 性情投影行（追加决定八）：哪怕槽位标丢了，投影
+            # 标记本身也单独算核心保护——只读投影不许自动动。
+            return True
         return bool(meta.get("is_rule") or meta.get("curated"))
 
     def _sweep_extra_conflicts(self, slot, conflicts, new_key, new_text,
@@ -2231,6 +3539,48 @@ class SQLiteStore:
         if old_value not in old_text:
             return fact
         return old_text.replace(old_value, value, 1)
+
+    def _complete_plan_change(self, new_value, old_value):
+        """计划斜改的整句补全（2026-11-25 实测问题二）：按用户亲口
+        否定的旧值在活行里定位要改的那条，把旧值换成新值、拼回
+        旧行原文——和碎片补句同一种换值法，只是定位键是旧值本身，
+        且只认行程类行（带去/出差/行程/旅标记），不拿食物偏好这
+        类同名行开刀。核心/置顶行不在这里排除：定位到之后照样走
+        correct_memory，那里的 G7 护栏会挂起问 BOOS，不放宽。
+        返回 (fact, old_text, candidates)：
+        - 恰好一条候选 → (换好的整句, 旧行原文, [])；
+        - 多条候选 → (新值原样, None, [{"id","text"}, ...])，
+          调用方记 ambiguous、不猜；
+        - 零条 → (新值原样, None, [])，调用方按普通陈述存整句
+          （没有可顶的旧行，不存在并存问题）。"""
+        new_value = (new_value or "").strip()
+        old_value = (old_value or "").strip()
+        if not new_value or not old_value or new_value == old_value:
+            return new_value, None, []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall()
+        cands = []
+        for mid, text in rows:
+            text = text or ""
+            if old_value not in text:
+                continue
+            if not any(m in text for m in ("去", "出差", "行程", "旅")):
+                continue
+            if _normalize_memory_text(text) == \
+                    _normalize_memory_text(new_value):
+                continue
+            cands.append((mid, text))
+        if len(cands) > 1:
+            return new_value, None, [
+                {"id": mid, "text": text} for mid, text in cands
+            ]
+        if not cands:
+            return new_value, None, []
+        _mid, old_text = cands[0]
+        return old_text.replace(old_value, new_value, 1), old_text, []
 
     def _retry_correction_by_slot(self, correction, fact, turn_id=None):
         """纠错分不清改哪条（ambiguous）时，按单值槽位再筛一次：新说法
@@ -2690,6 +4040,268 @@ class SQLiteStore:
             turn_id=turn_id,
         )
 
+    def _log_intake(self, text, verdict, category, reason, mark=None,
+                    turn_id=None, source="user"):
+        """入口当场拦留痕（实测问题三）：被拦/挂起的候选不进账本
+        （账本只记记忆事件），另记一份 intake_log.jsonl——原文、
+        裁决、类别、理由、当场判标记都在，事后可查可对账。
+        写失败只记日志，不拦聊天。"""
+        entry = {
+            "ts": _now_iso(),
+            "text": text,
+            "verdict": verdict,
+            "category": category,
+            "reason": reason,
+            "mark": mark,
+            "turn_id": turn_id,
+            "source": source,
+        }
+        try:
+            with self._intake_log_lock:
+                with open(self._intake_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.warning("入口拦截留痕写失败。", exc_info=True)
+
+    def _queue_intake_hold(self, text, category, reason, turn_id=None):
+        """拿不准的候选挂起（实测问题三）：不落记忆行，进待问等
+        BOOS 裁（存/不存）——挂起不是丢弃，问题和原文都在
+        pending_questions 里查得到。同一原文已有未答的挂起问题
+        时不重复攒。返回问题 dict。"""
+        for q in self.pending_questions.find_questions(
+            kind=_pq.QUESTION_KIND_INTAKE_HOLD,
+            statuses=(_pq.QUESTION_STATUS_PENDING,
+                      _pq.QUESTION_STATUS_ASKED),
+        ):
+            if (q.get("held_text") or "") == text:
+                return q
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_INTAKE_HOLD,
+            "这句我拿不准要不要记，先挂起了，你裁一下：%s" % text,
+            _pq.INTAKE_HOLD_QUESTION_OPTIONS,
+            reason,
+            memory_id=None,
+            turn_id=turn_id,
+            extra={"held_text": text, "intake_category": category},
+        )
+
+    def _intake_screen(self, text, turn_id=None, mark=None, source="user"):
+        """入口当场拦＋当场判合并裁决（实测问题三）。
+
+        返回 (verdict, info)：info 带 category/reason/mark，HOLD
+        时带 question_id。DROP/HOLD 都在这里留痕（日志；HOLD 另
+        攒待问），调用方只管按 verdict 决定落不落行。"""
+        cache_key = None
+        if turn_id:
+            cache_key = (turn_id, _normalize_memory_text(text))
+            cached = self._intake_verdict_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        pv, category, preason = _intake.classify_program(
+            text, _looks_like_fact
+        )
+        verdict, reason, used_mark = _intake.combine(pv, preason, mark)
+        info = {
+            "category": category, "reason": reason, "mark": used_mark,
+            "question_id": None,
+        }
+        if verdict == _intake.VERDICT_DROP:
+            self._log_intake(text, verdict, category, reason,
+                             used_mark, turn_id, source)
+        elif verdict == _intake.VERDICT_HOLD:
+            q = self._queue_intake_hold(text, category, reason, turn_id)
+            info["question_id"] = (q or {}).get("id")
+            self._log_intake(text, verdict, category, reason,
+                             used_mark, turn_id, source)
+        if cache_key is not None:
+            if len(self._intake_verdict_cache) > 512:
+                self._intake_verdict_cache.clear()
+            self._intake_verdict_cache[cache_key] = (verdict, info)
+        return verdict, info
+
+    def _answer_intake_hold_question(self, question, choice):
+        """BOOS 回答入口挂起问题（实测问题三）：「存」→ 把挂起的
+        原文按已裁决回存（intake_bypass，不再过当场拦——BOOS 本人
+        就是裁决）；「不存」→ 只消耗问题（本来就没落行）。回存
+        失败时如实报 ok=False、问题留着可再答（P1-5 同款顺序：
+        先执行成功、再消耗问题）。"""
+        question_id = question.get("id")
+        if choice not in _pq.INTAKE_HOLD_QUESTION_OPTIONS:
+            return {
+                "ok": False,
+                "reason": "选项不对，只能选：存 / 不存。",
+                "question_id": question_id,
+            }
+        if choice == "不存":
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "dropped",
+                "question_id": question_id,
+            }
+        held_text = (question.get("held_text") or "").strip()
+        if not held_text:
+            return {
+                "ok": False,
+                "reason": "挂起的原文丢了，没法存。",
+                "question_id": question_id,
+            }
+        saved = self.add_memory_text(
+            held_text, source="user",
+            turn_id=question.get("turn_id"), intake_bypass=True,
+        )
+        if (saved or {}).get("event") not in ("ADD", "UNCHANGED"):
+            return {
+                "ok": False,
+                "reason": "没存进去（%s），问题先留着，可以再答。"
+                          % ((saved or {}).get("event") or "未知"),
+                "question_id": question_id,
+            }
+        self.pending_questions.answer(question_id, choice)
+        return {
+            "ok": True, "applied": "stored",
+            "question_id": question_id,
+            "memory_id": (saved or {}).get("id"),
+        }
+
+    def _queue_auth_question(self, text, memory_id, reason, turn_id=None):
+        """为一条转述授权声称攒待问（实测问题一）：BOOS 本人裁这话
+        是不是他说的。返回问题 dict；同一条记忆已有未回答的授权
+        问题时返回已有的那条（PendingQuestions.add 自带去重）。"""
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "有人转述说你授权过这件事，我没认，只按未核实存了：%s" % text,
+            _pq.AUTH_CLAIM_QUESTION_OPTIONS,
+            reason,
+            memory_id=memory_id,
+            turn_id=turn_id,
+        )
+
+    def _queue_change_attempt_question(self, action, memory_id,
+                                       instruction_source):
+        """非本人通道试图改记忆、被受控入口拒绝后攒一条待问留痕
+        （实测问题一）。问题本身不挂目标记忆（memory_id=None），
+        目标 id 放 extra——BOOS 答这条只表示知悉，不对目标记忆
+        做任何变更（见 _answer_auth_claim_question 的
+        change_attempt 分支）。返回问题 dict 或 None。"""
+        action_cn = {"delete": "删除", "revive": "恢复"}.get(action, action)
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "有人（非本人通道，来源标记：%s）试图%s一条记忆，"
+            "已按授权硬判拒绝、没有执行。目标记忆 id：%s"
+            % (instruction_source, action_cn, memory_id),
+            _pq.CHANGE_ATTEMPT_QUESTION_OPTIONS,
+            "改记忆类动作只认 BOOS 本人指令，转述指令不许执行"
+            "（实测问题一）。",
+            memory_id=None,
+            extra={"auth_action": "change_attempt",
+                   "target_memory_id": memory_id,
+                   "attempted_action": action},
+        )
+
+    def _answer_auth_claim_question(self, question, choice):
+        """BOOS 回答授权核实问题（实测问题一）。
+
+        change_attempt 留痕问题：答复只消耗问题，不动任何记忆。
+        声称类问题：
+          是真的——这话确实出自 BOOS 本人：那条按本人确认升级
+            （账本 PROMOTE 先行、再改 SQLite：source 改 user、
+            确认位置 1、auth_claim 改 owner_confirmed；decay 保持
+            episodic——授权内容本身不是要钉住的事实）；
+          不是真的——转述不实：那条走批准删除路删掉（先删成功、
+            再消耗问题，和 R-10 同款顺序）。
+        别的选项一律不认，什么都不改。
+        """
+        question_id = question.get("id")
+        if question.get("auth_action") in ("change_attempt", "controlled_entry_blocked"):
+            if choice not in (question.get("options") or []):
+                return {"ok": False, "reason": "选项不对。"}
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "attempt_acknowledged",
+                "question_id": question_id, "memory_id": None,
+            }
+        if choice not in _pq.AUTH_CLAIM_QUESTION_OPTIONS:
+            return {"ok": False, "reason": "选项不对，只能选：是真的 / 不是真的。"}
+        memory_id = question.get("memory_id")
+        if choice == "不是真的":
+            if not memory_id:
+                self.pending_questions.answer(question_id, choice)
+                return {
+                    "ok": True, "applied": "rejected_no_memory",
+                    "question_id": question_id, "memory_id": memory_id,
+                }
+            deleted = self.delete_memory(memory_id, approve=True)
+            deleted_ok = (
+                deleted.get("deleted") is True
+                if isinstance(deleted, dict)
+                else bool(deleted)
+            )
+            if not deleted_ok:
+                return {
+                    "ok": False,
+                    "reason": "没删掉（%s），问题先留着，可以再答。"
+                    % (
+                        (deleted.get("reason") or "未知原因")
+                        if isinstance(deleted, dict)
+                        else "未知原因"
+                    ),
+                    "question_id": question_id, "memory_id": memory_id,
+                    "deleted": False,
+                }
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "rejected_deleted",
+                "question_id": question_id, "memory_id": memory_id,
+                "deleted": True,
+            }
+        # 是真的：BOOS 本人认下这句授权，升级为本人确认。
+        if not memory_id:
+            return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "reason": "这条记忆已经不在库里了。"}
+            if row[2] or row[3] or row[4]:
+                return {"ok": False, "reason": "这条记忆已被取代/删除/作废，不能再确认。"}
+            meta = json.loads(row[1] or "{}")
+            if meta.get("user_confirmed"):
+                self.pending_questions.answer(question_id, choice)
+                return {
+                    "ok": True, "applied": "owner_confirmed",
+                    "question_id": question_id, "memory_id": memory_id,
+                    "already_confirmed": True,
+                }
+            new_meta = dict(meta)
+            new_meta["source"] = "user"
+            new_meta["user_confirmed"] = True
+            new_meta["auth_claim"] = _auth_guard.AUTH_CLAIM_OWNER_CONFIRMED
+            try:
+                _ledger.append_event(
+                    self.ledger_path,
+                    {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                     "memory_id": memory_id, "key": memory_id,
+                     "text": row[0] or "", "meta": dict(new_meta)},
+                    lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("授权核实确认记账失败：本次不升级。", exc_info=True)
+                return {"ok": False, "reason": "账本写不进去，这次没确认成，问题先留着。"}
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, source=?,"
+                " user_confirmed=1 WHERE id=?",
+                (json.dumps(new_meta, ensure_ascii=False), "user", memory_id),
+            )
+            self._conn.commit()
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True, "applied": "owner_confirmed",
+                "question_id": question_id, "memory_id": memory_id,
+            }
+
     # ---------- 推断记忆保护（2026-11-24，BOOS 裁决） ----------
     # 背景：E 组重跑里，推断来源、未确认的旧记忆（可信度 0.7）被
     # 亲口新事实（1.0）在主目标裁决里直接顶掉。BOOS 定：“类似的
@@ -2871,6 +4483,15 @@ class SQLiteStore:
             # 推断记忆保护的冲突问题（2026-11-24）：选项和处理都
             # 不一样，单独走 _answer_conflict_question。
             return self._answer_conflict_question(question, choice)
+        if question.get("kind") == _pq.QUESTION_KIND_CORE_CAPACITY:
+            # 核心容量问题（第 1 块）：选项和处理都不同，单独走。
+            return self._answer_core_capacity_question(question, choice)
+        if question.get("kind") == _pq.QUESTION_KIND_AUTH_CLAIM:
+            # 转述授权核实问题（实测问题一）：选项和处理都不同，单独走。
+            return self._answer_auth_claim_question(question, choice)
+        if question.get("kind") == _pq.QUESTION_KIND_INTAKE_HOLD:
+            # 入口挂起问题（实测问题三）：选项和处理都不同，单独走。
+            return self._answer_intake_hold_question(question, choice)
         if choice not in ("进核心", "当一次性经历", "不存"):
             return {"ok": False, "reason": "选项不对，只能选：进核心 / 当一次性经历 / 不存。"}
         if question.get("kind") != _pq.QUESTION_KIND_IMPORTANCE:
@@ -2926,6 +4547,10 @@ class SQLiteStore:
             if row[2] or row[3] or row[4]:
                 return {"ok": False, "reason": "这条记忆已被取代/删除/作废，不能进核心。"}
             meta = json.loads(row[1] or "{}")
+            if meta.get("auth_claim") == _auth_guard.AUTH_CLAIM_RELAYED:
+                # 授权硬判：转述未核实声称不许走重要性路进核心，
+                # 先答授权核实问题、由 BOOS 本人裁。
+                return {"ok": False, "reason": "这条是转述来的授权声称、还没经你本人核实，不能进核心；请先答授权核实问题。"}
             if meta.get("decay_kind") == _decay.DECAY_KIND_STABLE:
                 self.pending_questions.answer(question_id, choice)
                 return {
@@ -3202,7 +4827,7 @@ class SQLiteStore:
         while len(self._turn_receipts) > _TURN_RECEIPTS_MAX:
             self._turn_receipts.pop(next(iter(self._turn_receipts)))
 
-    def save_turn(self, messages, turn_id=None):
+    def save_turn(self, messages, turn_id=None, intake_marks=None):
         """一轮对话的收尾：同步把用户亲口说的事实原样存下来，留回执。
 
         和 mem0 那条路最大的不同：没有待定区、没有 60 秒定时器、
@@ -3250,6 +4875,7 @@ class SQLiteStore:
             "considered": [],
             "stored": [],
             "dropped": [],
+            "held": [],
             "retracted": False,
             "dropped_count": 0,
             "results": [],
@@ -3305,16 +4931,31 @@ class SQLiteStore:
                     break
                 fact = inner_fact
             if fact:
-                # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
-                # 补不出来就原样走 correct_memory（找不到旧记忆时当新记忆存）。
-                fact = self._complete_correction_fragment(fact)
+                plan_old_text = None
+                plan_candidates = []
+                if detected.get("plan_change"):
+                    # 计划斜改（实测问题二）：不走槽位碎片补句——按
+                    # 用户亲口否定的旧值定位旧行、把新值换进旧行
+                    # 原文（_complete_plan_change）；定位不到唯一
+                    # 旧行时 fact 还是新值碎片，下面的事实门会拦住
+                    # 它，多候选时走后面的 ambiguous 留痕路。
+                    fact, plan_old_text, plan_candidates = (
+                        self._complete_plan_change(
+                            fact, detected.get("old_value") or ""
+                        )
+                    )
+                else:
+                    # 碎片新说法（“不对，应该是深圳”→“深圳”）先按槽位补成整句；
+                    # 补不出来就原样走 correct_memory（找不到旧记忆时当新记忆存）。
+                    fact = self._complete_correction_fragment(fact)
                 correction_fact_norm = _normalize_memory_text(fact)
                 # 当下的想法/问句不纠正（“我现在想喝茶了”不是在改一条记忆）：
                 # 检测到了也不走纠正分支，留给下面的正常循环按老规矩处理
                 # （当下的想法会被 _looks_like_fact 拦下、不存）。
                 if _looks_like_fact(fact)[0]:
                     correction = self.correct_memory(
-                        fact, fact, exclude_identical_to_new=True,
+                        plan_old_text or fact, fact,
+                        exclude_identical_to_new=True,
                         explicit_correction=True, turn_id=turn_id,
                     )
                     if (correction or {}).get("status") == "ambiguous":
@@ -3353,6 +4994,47 @@ class SQLiteStore:
                         sentences = kept + [fact]
                     else:
                         sentences = kept
+                elif plan_candidates:
+                    # 斜改对得上不止一条旧行、分不清改哪条：不猜、
+                    # 不顶任何一条，新值碎片也不单独存；回执记
+                    # ambiguous，收尾复核会标未落账并留痕
+                    # （纠正当轮落账，实测问题二）。
+                    correction = {
+                        "status": "ambiguous",
+                        "memory_id": None,
+                        "old_text": detected.get("old_value") or "",
+                        "new_text": fact,
+                        "candidates": plan_candidates,
+                        "reason": "这次改动对得上不止一条旧记忆，"
+                                  "分不清要改哪条，先没动",
+                        "layer": "plan_change",
+                        "resolution": "ambiguous",
+                        "audit": {"source": "user",
+                                  "method": "plan_change"},
+                    }
+                    sentences = _strip_correction_sentences(latest_user)
+        # 当场判（实测问题三，契约三「当场判机制口径」）：收尾时
+        # 由对话当场的模型顺手给候选打标记（记/不记/拿不准＋理由）。
+        # 标记来源：调用方显式传 intake_marks，或本库绑的
+        # intake_marker（可调用对象，入参 (候选列表, messages)）。
+        # 标记器不可用/抛错/格式不对时一律回退老管道（程序屏＋
+        # 事后判官），不许比老路差；标记只是提案，逐句循环里经
+        # _intake_screen 与程序屏合并，落账仍走原有各道门。
+        _marks_by_norm = {}
+        _marks_trace = []
+        _raw_marks = intake_marks
+        if _raw_marks is None and self.intake_marker is not None:
+            try:
+                _raw_marks = self.intake_marker(list(sentences), messages)
+            except Exception:
+                logger.warning("当场判标记器不可用，回退老管道。", exc_info=True)
+                _raw_marks = None
+        for _raw_mark in _raw_marks or []:
+            _valid_mark = _intake.validate_mark(_raw_mark)
+            if _valid_mark is not None:
+                _marks_by_norm[
+                    _normalize_memory_text(_valid_mark["text"])
+                ] = _valid_mark
         live_texts = None  # 懒加载：只有出现“记住”前缀时才查一次在库文本
         new_questions = []  # 本轮拿不准重要性的问题（Phase 2 #4）
         touched_ids = set()  # 本轮触碰到的记忆 id（第 8 条实时整理用）
@@ -3400,6 +5082,41 @@ class SQLiteStore:
             ok, reason = _looks_like_fact(sentence)
             if not ok:
                 receipt["dropped"].append({"text": sentence, "reason": reason})
+                continue
+            # 入口当场拦＋当场判（实测问题三）：过了 _looks_like_fact
+            # 的句子还要过当场拦——程序明确垃圾当场丢、拿不准挂起，
+            # 都不落行；当场判标记在这里合并（标记不许绕过任何门，
+            # 落账仍走下面的槽位/判官/容量/授权各道原门）。
+            _mark = (
+                _marks_by_norm.get(_normalize_memory_text(sentence))
+                or _marks_by_norm.get(
+                    _normalize_memory_text(receipt["considered"][-1])
+                )
+            )
+            _verdict, _info = self._intake_screen(
+                sentence, turn_id=turn_id, mark=_mark, source="user"
+            )
+            if _mark is not None:
+                _marks_trace.append({
+                    "text": sentence,
+                    "mark": _mark["mark"],
+                    "reason": _mark.get("reason") or "",
+                    "verdict": _verdict,
+                })
+            if _verdict == _intake.VERDICT_DROP:
+                receipt["dropped"].append({
+                    "text": sentence,
+                    "reason": "入口当场拦：" + _info["reason"],
+                    "intake_category": _info["category"],
+                })
+                continue
+            if _verdict == _intake.VERDICT_HOLD:
+                receipt["held"].append({
+                    "text": sentence,
+                    "reason": _info["reason"],
+                    "intake_category": _info["category"],
+                    "question_id": _info.get("question_id"),
+                })
                 continue
             # 存原话：去掉句尾的 。！（？的已经当问句 drop 了，不会到这里）。
             sentence = sentence.rstrip("。！")
@@ -3500,6 +5217,19 @@ class SQLiteStore:
             elif (saved or {}).get("event") == "PENDING":
                 # 同槽位裁决：新说法可信度低于旧的，挂起来待确认，不存。
                 receipt["dropped"].append({"text": sentence, "reason": "槽位冲突待确认"})
+            elif (saved or {}).get("event") == "INTAKE_DROPPED":
+                # 其他路（槽位/判官路内部直存）被当场拦拦下时，
+                # 和 SENSITIVE 同款，如实记回执，不落行。
+                receipt["dropped"].append({
+                    "text": sentence,
+                    "reason": "入口当场拦：" + ((saved or {}).get("reason") or ""),
+                })
+            elif (saved or {}).get("event") == "INTAKE_HELD":
+                receipt["held"].append({
+                    "text": sentence,
+                    "reason": (saved or {}).get("reason") or "",
+                    "question_id": (saved or {}).get("question_id"),
+                })
             elif (saved or {}).get("event") in ("STALE", "ASK"):
                 # 同槽位裁决：新说法比旧的还早（STALE），或分不出先后（ASK），不存。
                 receipt["dropped"].append({"text": sentence, "reason": "槽位冲突未裁决"})
@@ -3577,6 +5307,18 @@ class SQLiteStore:
                 # 下一句“撤回”作废的是这条新记忆，不是上一轮的。
                 with self._lock:
                     self._last_stored_turn_id = turn_id
+        # 纠正当轮落账·收尾复核（契约三、状态变更入口；实测
+        # 问题二）：回执里的纠正状态只是各路的自报，落没落账要
+        # 回查新旧两行在库里的真实状态才算数；没落账的如实标
+        # 出来并留痕，不许拿“当场答对了”结案。
+        if _marks_trace:
+            # 当场判留痕：每条标记的原文、标记、理由、最终裁决都
+            # 进回执，抽查时能还原当时为何这样标（契约验收口径）。
+            receipt["intake_marks"] = _marks_trace
+        if receipt.get("correction") is not None:
+            self._verify_correction_landed(
+                receipt["correction"], receipt, turn_id=turn_id
+            )
         # #4：本轮拿不准的问题先问，顺带把攒着的旧问题一起带出来
         # （一轮最多 3 条，含新问题）。R-2（2026-11-24）：以前只有
         # 本轮有新问题时才带旧问题——本轮没新问题时，攒着的旧问题
@@ -3607,6 +5349,139 @@ class SQLiteStore:
         self._schedule_turn_organize(sorted(touched_ids), turn_id=turn_id)
         self._store_turn_receipt(turn_id, receipt)
         return receipt
+
+    def _verify_correction_landed(self, correction, receipt,
+                                  turn_id=None):
+        """纠正当轮落账·收尾复核（契约三、状态变更入口「纠正当轮
+        落账」；2026-11-25 实测问题二）：回执里的纠正状态只是各路
+        的自报，落没落账要回查新旧两行在库里的真实状态才算数——
+          updated：旧行确已 superseded（至少没有同原文的活行
+            残留）、新行确是活行；
+          unchanged：新说法确有活行在库（本来就是对的，没啥可改）；
+          pending_question：护栏挂起未执行，如实标未落账（待问
+            本身就是留痕，不重复挂）；
+          ambiguous：候选还活着、新旧并存，未落账；只标不另挂
+            待问——conflict 待问按旧行去重，抢先挂一条会把后面
+            流程针对同一旧行的精确待问顶掉（webfix 回归实测）；
+          not_found：没有可顶的旧行时，新说法已存成活行就算
+            到位；同槽位还有别的活行冲突着，就是没落账；
+          failed 等其余状态：未落账，只标不挂问。
+        复核结论就地写回 correction：landed（True/False）、
+        verified=True；未落账时补 verify_note 说明卡在哪。
+        返回 landed。"""
+        if not isinstance(correction, dict):
+            return False
+        status = correction.get("status")
+        correction["verified"] = True
+        new_id = correction.get("memory_id")
+        new_text = correction.get("new_text") or ""
+        old_text = correction.get("old_text") or ""
+
+        def _is_live(mid):
+            if not mid:
+                return None
+            row = self._conn.execute(
+                "SELECT superseded, deleted, voided FROM memories"
+                " WHERE id=?", (mid,),
+            ).fetchone()
+            if row is None:
+                return None
+            return not (row[0] or row[1] or row[2])
+
+        def _live_id_by_text(text):
+            norm = _normalize_memory_text(text or "")
+            if not norm:
+                return None
+            for mid, t, sup, dele, voi in self._conn.execute(
+                "SELECT id, text, superseded, deleted, voided"
+                " FROM memories"
+            ).fetchall():
+                if sup or dele or voi:
+                    continue
+                if _normalize_memory_text(t or "") == norm:
+                    return mid
+            return None
+
+        def _any_row_by_text(text):
+            """按原文找一行（不论死活）：(id, is_live) 或 None。"""
+            norm = _normalize_memory_text(text or "")
+            if not norm:
+                return None
+            for mid, t, sup, dele, voi in self._conn.execute(
+                "SELECT id, text, superseded, deleted, voided"
+                " FROM memories"
+            ).fetchall():
+                if _normalize_memory_text(t or "") == norm:
+                    return mid, not (sup or dele or voi)
+            return None
+
+        landed = False
+        note = ""
+        with self._lock:
+            if status == "updated":
+                new_live = _is_live(new_id)
+                if new_live is None:
+                    new_live = _live_id_by_text(new_text) is not None
+                # 旧行：优先认 candidates 里原文对得上的那条（按
+                # id 查状态）；认不出就按原文全库找——找到活行
+                # 就是没顶掉，找不到或找到的是已顶替行都算过。
+                old_live = None
+                for cand in correction.get("candidates") or []:
+                    if not isinstance(cand, dict):
+                        continue
+                    if _normalize_memory_text(cand.get("text") or "") \
+                            == _normalize_memory_text(old_text):
+                        old_live = _is_live(cand.get("id"))
+                        break
+                if old_live is None:
+                    found = _any_row_by_text(old_text)
+                    if found is not None and found[0] != new_id:
+                        old_live = found[1]
+                if new_live and old_live is not True:
+                    landed = True
+                else:
+                    parts = []
+                    if not new_live:
+                        parts.append("新行不是活行")
+                    if old_live is True:
+                        parts.append("旧行还活着")
+                    note = "回查对不上：" + "、".join(parts) + "，纠正未落账"
+            elif status == "unchanged":
+                landed = (
+                    _is_live(new_id) is True
+                    or _live_id_by_text(new_text) is not None
+                )
+                if not landed:
+                    note = "回查对不上：新说法在库里没有活行，纠正未落账"
+            elif status == "pending_question":
+                landed = False
+                note = "纠正被护栏挂起、等 BOOS 裁决，未落账（待问已留痕）"
+            elif status == "ambiguous":
+                landed = False
+                note = "分不清要改哪条、新旧并存，未落账"
+            elif status == "not_found":
+                new_live_id = _live_id_by_text(new_text)
+                slot, value = _infer_fact_slot(new_text)
+                conflicts = (
+                    self._find_same_slot_conflicts(slot, value)
+                    if slot is not None and value is not None
+                    else []
+                )
+                if conflicts:
+                    landed = False
+                    note = "同槽位还有旧说法活着、新旧并存，未落账"
+                elif new_live_id:
+                    landed = True
+                else:
+                    landed = False
+                    note = "新说法没有存进库，纠正未落账"
+            else:  # failed 等其余状态
+                landed = False
+                note = "纠正未执行（%s），未落账" % (status or "未知状态")
+        correction["landed"] = landed
+        if not landed:
+            correction["verify_note"] = note
+        return landed
 
     def _find_correction_candidates(self, old_fact, new_fact=None, top_k=10,
                                         exclude_identical_to_new=False):
@@ -4298,6 +6173,11 @@ class SQLiteStore:
             events, _info = _ledger.read_events(self.ledger_path)
         except Exception:
             return None
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：「本轮已纠正过」
+            # 是折叠结论，残缺账本定不了——不拦，交回正常
+            # 纠正流程，不许拿残缺折叠挡真纠正。
+            return None
         for ev in reversed(events):
             if (ev.get("type") == _ledger.LEDGER_EVENT_SUPERSEDE
                     and ev.get("memory_id") == live_id):
@@ -4825,8 +6705,23 @@ class SQLiteStore:
             if not _contains_sensitive(it["text"] or "")
         ]
 
+    def confirmed_facts(self):
+        """当前全部「已确认事实」活行（回锚注入用，见 memory/reanchor.py）。
+
+        认定沿现行口径（reanchor.is_anchor_fact）：confirmed
+        （user_confirmed，含问题一 owner_confirmed 升级后写回的
+        user_confirmed=True）或核心受保护（身份槽位 / is_rule /
+        curated）。只返回活行（未作废、未删、未被取代），形状同
+        _all_live_memories。这里不截断——挑哪几条、怎么封顶由
+        reanchor.select_anchor_facts 按它写明的取舍规矩定。
+        """
+        return [
+            m for m in self._all_live_memories()
+            if _reanchor.is_anchor_fact(m)
+        ]
+
     def search(self, query, top_k=5, reinforce=False, include_history=False,
-               turn_id=None):
+               turn_id=None, scope=None):
         """搜记忆：宽召回（语义 top_k*4 + BM25 全库 top_k*4）→ RRF k=60
         融合 → 原样匹配在前 → 截断 top_k，不够再账本兜底（见 _search_inner，
         旧 mem0 search 的排名逻辑）。
@@ -4844,7 +6739,8 @@ class SQLiteStore:
             self._active_turn_id = turn_id
         try:
             results = self._search_inner(
-                query, top_k=top_k, include_history=include_history
+                query, top_k=top_k, include_history=include_history,
+                scope=scope,
             )
         except Exception:
             logger.warning("SQLite 检索失败。", exc_info=True)
@@ -4869,12 +6765,13 @@ class SQLiteStore:
                 logger.warning("检索强化写回失败：记忆本身还在。", exc_info=True)
         return results
 
-    def _search_inner(self, query, top_k=5, include_history=False):
+    def _search_inner(self, query, top_k=5, include_history=False,
+                      scope=None):
         """宽召回 → RRF 融合 → 先筛后截（旧 mem0 search 的排名逻辑，
         commit 7a69699“宽召回 + RRF 融合”，mem0_store.py search）。
 
         三路排名：语义（原始余弦分 ≥ 0.4，取 top_k*4）、BM25（全库打分，
-        取 top_k*4）、图谱（还没建，空路）。标准 RRF k=60 融合，再乘
+        取 top_k*4）、图谱（一跳联想扩展，二期接通）。标准 RRF k=60 融合，再乘
         衰减权重 × 类型权重（稳定偏好 1.25，见 _type_weight，2026-11-21
         Q3 修法）；原样匹配（基金代码/数字/整句，见
         memory/bm25.extract_exact_matches）的排在前面。
@@ -4896,8 +6793,12 @@ class SQLiteStore:
             也没有沉底态（decay_state）可拦；衰减接进来时闸门加在这里、
             截断之前。精选先查（旧逻辑第 0 步）也没接：库里 curated 行
             是 0 条，等精选清单那步再接。
-          - 图谱路是空列表：融合时等于没这一路（旧逻辑图坏了只丢图这路
-            的同款处理）；图上才找得到的记忆（source="graph"）现在没有。
+          - 图谱路（二期）：种子 = 查询抽到的实体 + 语义/BM25 已捞到
+            的记忆，顺有效边一跳扩展（同义词边按 scope 过滤、取代边
+            定向、冲突边不走、作废边不走）；图上才找得到的记忆以
+            source="graph" 进候选，score 只做展示（关键词重合度，
+            与 BM25 路同口径），排位交给 RRF。扩展纯读，不改图、
+            不改库；图坏了只丢这一路（和旧口径一致）。
         """
         with self._lock:
             import numpy as np
@@ -5015,8 +6916,39 @@ class SQLiteStore:
             for cid, item in candidates.items():
                 item.setdefault("exact_match", cid in exact_ids)
 
-            # 图谱路：还没建（已知缺口），空路进融合等于没这一路。
+            # 图谱路（二期）：一跳联想扩展，见上面 docstring 的口径。
             graph_ranked = []
+            try:
+                graph = self._get_graph()
+                seed_entities = [
+                    name for name, _kind in _extract_entities_free(query)
+                ]
+                seed_keys = [
+                    mid
+                    for mid in list(semantic_ranked) + list(bm25_ranked)
+                    if mid in by_id
+                ]
+                expanded = graph.expand_one_hop(
+                    seed_keys=seed_keys,
+                    seed_entities=seed_entities,
+                    scope=scope,
+                )
+                for gkey, _gscore in expanded.items():
+                    m = by_id.get(gkey)
+                    if m is None:
+                        continue
+                    graph_ranked.append(gkey)
+                    if gkey in candidates:
+                        continue
+                    if m["text"] in seen_texts:
+                        continue
+                    seen_texts.add(m["text"])
+                    candidates[gkey] = _result_item(
+                        m, _keyword_overlap(query, m["text"] or ""), "graph"
+                    )
+            except Exception:
+                logger.warning("图谱检索失败：本次只用语义/BM25 结果。", exc_info=True)
+                graph_ranked = []
             if _bm25 is not None:
                 fused = _bm25.reciprocal_rank_fusion(
                     [semantic_ranked, bm25_ranked, graph_ranked], k=60
@@ -5746,13 +7678,23 @@ class SQLiteStore:
 
     # ---------- 改 / 删（今天只实现删除；纠错后面再做） ----------
 
-    def delete_memory(self, memory_id, approve=False):
+    def delete_memory(self, memory_id, approve=False, instruction_source=None):
         """删一条记忆：要 BOOS 亲口确认（approve=True）才真删。
 
         账本记 delete，SQLite 标 deleted；原文留在账本里，可恢复。
         SQLite 里没有但账本里有该 key（账本兜底捞出的条目）时，同样
         记账删除，防止重启对账或兜底检索再次捞出。
         """
+        # 授权硬判（实测问题一）：改记忆类动作只认 BOOS 本人
+        # 通道的指令。调用方显式标了非本人来源（转述/第三方）时
+        # 直接拒绝，并攒一条待问留痕——转述指令不许执行。没标
+        # 来源的老调用（BOOS 自己的界面、内部路径）行为不变，
+        # 仍走下面的 approve 关。
+        if not _auth_guard.is_owner_instruction(instruction_source):
+            self._queue_change_attempt_question(
+                "delete", memory_id, instruction_source
+            )
+            return {"deleted": False, "reason": "not_owner_instruction"}
         if not approve:
             return {"deleted": False, "reason": "need_approve"}
         if not memory_id:
@@ -5809,7 +7751,7 @@ class SQLiteStore:
             self._conn.commit()
             return {"deleted": True, "memory_id": row[0]}
 
-    def revive_memory(self, memory_id):
+    def revive_memory(self, memory_id, instruction_source=None):
         """恢复一条被取代的记忆（2026-11-22，广州行被杭州错取代后恢复用）。
 
         只恢复 superseded=1 的行：SQLite 取消取代标记，账本记一笔 REVIVE
@@ -5819,6 +7761,14 @@ class SQLiteStore:
         not_found（删了的恢复走别的路，不在这里顺手复活）。
         账本写失败时把 SQLite 的标记撤回来再报 failed，两边保持一致。
         """
+        # 授权硬判（实测问题一）：同 delete_memory——显式标了非
+        # 本人来源的恢复指令直接拒绝并攒待问留痕。
+        if not _auth_guard.is_owner_instruction(instruction_source):
+            self._queue_change_attempt_question(
+                "revive", memory_id, instruction_source
+            )
+            return {"status": "rejected", "reason": "not_owner_instruction",
+                    "memory_id": memory_id}
         if not memory_id:
             return {"status": "not_found", "memory_id": memory_id}
         with self._lock:
@@ -5859,20 +7809,2937 @@ class SQLiteStore:
                     "seq": (event or {}).get("seq")}
 
     def confirm_memory(self, memory_id):
+        """BOOS 逐条确认一条记忆（确认后按 provenance 口径成为核心成员）。
+
+        容量门（四件套第 1 块）：确认会让一条记忆新占一个核心
+        座位、而座位已满时，不许确认——记忆保持未确认，攒一条
+        「核心已满」待问（kind=core_capacity），等 BOOS 拍板或
+        腾位后再说。已经是成员的再确认不新增占座，不受拦。
+        """
         with self._lock:
             row = self._conn.execute(
-                "SELECT metadata_json FROM memories WHERE id=?", (memory_id,)
+                "SELECT text, metadata_json, superseded, deleted, voided"
+                " FROM memories WHERE id=?",
+                (memory_id,),
             ).fetchone()
             if row is None:
                 return {"confirmed": False, "reason": "not_found"}
-            meta = json.loads(row[0] or "{}")
-            meta["user_confirmed"] = True
+            meta = json.loads(row[1] or "{}")
+            new_meta = dict(meta)
+            new_meta["user_confirmed"] = True
+            if not (row[2] or row[3] or row[4]):
+                before = _core_cap.classify(meta)
+                after = _core_cap.classify(new_meta)
+                if after["occupies_seat"] and not before["occupies_seat"]:
+                    snap = self.core_seat_snapshot()
+                    if snap["seats_used"] >= snap["limit"]:
+                        question = self._queue_core_capacity_question(
+                            memory_id, row[0] or "", snap
+                        )
+                        return {
+                            "confirmed": False,
+                            "reason": "core_full",
+                            "memory_id": memory_id,
+                            "question_id": (question or {}).get("id"),
+                            "seats_used": snap["seats_used"],
+                            "limit": snap["limit"],
+                        }
             self._conn.execute(
                 "UPDATE memories SET user_confirmed=1, metadata_json=? WHERE id=?",
-                (json.dumps(meta, ensure_ascii=False), memory_id),
+                (json.dumps(new_meta, ensure_ascii=False), memory_id),
             )
             self._conn.commit()
             return {"confirmed": True, "memory_id": memory_id}
+
+    # ---------- 核心上限（四件套第 1 块，2026-11-24） ----------
+
+    def _queue_core_capacity_question(self, memory_id, text, snap):
+        """满座拦下时攒一条待问：同条记忆已有未答的容量问题时
+        PendingQuestions.add 自带去重、返回已有的那条。"""
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_CORE_CAPACITY,
+            "核心记忆座位已满（%d/%d），这条先没进核心：%s"
+            % (snap["seats_used"], snap["limit"], text),
+            _pq.CORE_CAPACITY_QUESTION_OPTIONS,
+            "核心上限已满，按规矩不许顶掉旧记忆腾座；这条先留作"
+            "候选，等整理员腾位或你拍板。",
+            memory_id=memory_id,
+            extra={
+                "seats_used": snap["seats_used"],
+                "limit": snap["limit"],
+            },
+        )
+
+    def core_seat_snapshot(self):
+        """核心座位水位快照（只读，结论页/体检用）：持锁一次读全
+        活行，同一快照出数——总数、分抽屉、钉死/临时钉死、未入
+        格、水位都在里面，分块与总量对账见 count_seats 的
+        reconciled 自证。"""
+        with self._lock:
+            metas = []
+            for (mjson,) in self._conn.execute(
+                "SELECT metadata_json FROM memories"
+                " WHERE voided=0 AND deleted=0 AND superseded=0"
+            ).fetchall():
+                try:
+                    metas.append(json.loads(mjson or "{}"))
+                except Exception:
+                    metas.append({})
+            snap = _core_cap.count_seats(metas, limit=self.core_seat_limit)
+            snap["generated_at"] = _now_iso()
+            return snap
+
+    def recount_core_seats_from_ledger(self):
+        """按账本事件全量重算座位（对账用）：应与同时刻的
+        core_seat_snapshot 逐项相等，不等即缺陷。"""
+        events, _info = _ledger.read_events(self.ledger_path)
+        state = self.ledger_state()
+        snap = _core_cap.count_seats_from_ledger(
+            events,
+            (state or {}).get("key_states") or {},
+            limit=self.core_seat_limit,
+        )
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：重算结果是残缺
+            # 折叠，不许报 reconciled——如实标存疑。
+            snap["ledger_doubtful"] = True
+            snap["reconciled"] = False
+        snap["generated_at"] = _now_iso()
+        return snap
+
+    def set_protection_tier(self, memory_id, tier, _op_id=None,
+                            _idem_key=None, _source=None):
+        """改一条活记忆的保护档位：tier 是 "pinned"（钉死）/
+        "temp_pinned"（临时钉死）/ None（摘档回普通）。
+
+        摘档会让成员行新占座：满座时拒绝并攒待问，不许硬摘。
+        落库走 _update_core_fields（账本先行）。"""
+        if tier is not None and tier not in _core_cap.PROTECTION_TIERS:
+            return {"ok": False, "reason": "bad_tier", "memory_id": memory_id}
+        return self._update_core_fields(
+            memory_id, {_core_cap.PROTECTION_TIER_FIELD: tier},
+            _op_id=_op_id, _idem_key=_idem_key, _source=_source,
+        )
+
+    def set_core_drawer(self, memory_id, drawer, _op_id=None, _idem_key=None):
+        """改一条活记忆的分类抽屉：drawer 是五类键之一 / None
+        （摘回未入格）。只影响分块记账、不改变占座总数，不过
+        容量门；落库走 _update_core_fields（账本先行）。"""
+        if drawer is not None and (
+            not isinstance(drawer, str)
+            or drawer not in _core_cap.CORE_DRAWERS
+        ):
+            return {"ok": False, "reason": "bad_drawer", "memory_id": memory_id}
+        return self._update_core_fields(
+            memory_id, {_core_cap.DRAWER_FIELD: drawer},
+            _op_id=_op_id, _idem_key=_idem_key,
+        )
+
+    def _update_core_fields(self, memory_id, changes, _op_id=None,
+                            _idem_key=None, _source=None):
+        """核心上限字段（保护档/抽屉）的统一改法：持锁内复核
+        占座变化、过容量门、账本先行（PROMOTE 带改后的完整
+        meta，和语气打标同款）、再改 SQLite；账本写失败就
+        不改 SQLite，两边不许分叉。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted,"
+                " voided, user_confirmed FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "reason": "not_found", "memory_id": memory_id}
+            if row[2] or row[3] or row[4]:
+                return {"ok": False, "reason": "not_live", "memory_id": memory_id}
+            meta = json.loads(row[1] or "{}")
+            before = _core_cap.classify(meta)
+            new_meta = dict(meta)
+            for field, value in changes.items():
+                new_meta[field] = value
+            after = _core_cap.classify(new_meta)
+            # 保护迁移证据（立项 H5）：档位变化前后值与变更前
+            # 版本戳先算好，账本落笔后在函数尾组装证据。
+            _tier_field = _core_cap.PROTECTION_TIER_FIELD
+            tier_before = meta.get(_tier_field)
+            tier_after = new_meta.get(_tier_field)
+            version_before = self._controlled_version_stamp(
+                row[0] or "", meta, row[5]
+            )
+            if after["occupies_seat"] and not before["occupies_seat"]:
+                snap = self.core_seat_snapshot()
+                if snap["seats_used"] >= snap["limit"]:
+                    question = self._queue_core_capacity_question(
+                        memory_id, row[0] or "", snap
+                    )
+                    return {
+                        "ok": False,
+                        "reason": "core_full",
+                        "memory_id": memory_id,
+                        "question_id": (question or {}).get("id"),
+                        "seats_used": snap["seats_used"],
+                        "limit": snap["limit"],
+                    }
+            event = {
+                "type": _ledger.LEDGER_EVENT_PROMOTE,
+                "memory_id": memory_id,
+                "key": memory_id,
+                "text": row[0] or "",
+                "meta": dict(new_meta),
+            }
+            if _op_id:
+                # 受控入口执行时带贯通操作 ID（H1 补修）：账本
+                # 折叠只读命名字段，这两个字段不影响折叠/对账
+                # 口径；提交/恢复协议凭 op_id 在账本里定位这笔
+                # 变更，idem_key 与回执/审计三方对照。
+                event["op_id"] = _op_id
+                event["idem_key"] = _idem_key
+            ledger_record = None
+            try:
+                ledger_record = _ledger.append_event(
+                    self.ledger_path, event, lock=self._ledger_lock,
+                )
+            except Exception:
+                logger.warning("核心字段变更记账失败：本次不改。", exc_info=True)
+                return {
+                    "ok": False,
+                    "reason": "ledger_failed",
+                    "memory_id": memory_id,
+                }
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=? WHERE id=?",
+                (json.dumps(new_meta, ensure_ascii=False), memory_id),
+            )
+            self._conn.commit()
+            result = {"ok": True, "memory_id": memory_id}
+            result.update(changes)
+            if tier_after != tier_before:
+                # 保护档真变了：产一份迁移完成证据（立项 H5）。
+                # 证据追加失败不回滚——账本与投影已经一致落地，
+                # 回滚投影只会与账本分叉；如实标 pending 待补
+                # 证，核对函数（verify_protection_migration）
+                # 与 pending_notices 都会把缺证列出来。
+                evidence = {
+                    "evidence_id": "pme-%s" % (
+                        (ledger_record or {}).get("seq"),
+                    ),
+                    "memory_id": memory_id,
+                    "tier_before": tier_before,
+                    "tier_after": tier_after,
+                    "drawer_before": meta.get(_core_cap.DRAWER_FIELD),
+                    "drawer_after": new_meta.get(_core_cap.DRAWER_FIELD),
+                    "source": _source or "host_direct",
+                    "ts": _now_iso(),
+                    "ledger_seq": (ledger_record or {}).get("seq"),
+                    "ledger_ts": (ledger_record or {}).get("ts"),
+                    "op_id": _op_id,
+                    "idem_key": _idem_key,
+                    "version_before": version_before,
+                    "version_after": self._controlled_version_stamp(
+                        row[0] or "", new_meta, row[5]
+                    ),
+                    "text_hash": hashlib.sha256(
+                        (row[0] or "").encode("utf-8")
+                    ).hexdigest(),
+                }
+                recorded = self._append_protection_evidence(evidence)
+                result["protection_evidence"] = {
+                    "evidence_id": evidence["evidence_id"],
+                    "recorded": recorded,
+                    "pending": not recorded,
+                }
+                if not recorded:
+                    self._protection_evidence_pending.append(
+                        dict(evidence)
+                    )
+            return result
+
+    def _answer_core_capacity_question(self, question, choice):
+        """BOOS 回答核心容量问题（满座候选）：
+          先留作候选：只消耗问题，记忆保持原样（还没进核心）；
+          不要了：先删成功、再消耗问题（和重要性问题「不存」
+          同款顺序——删不掉问题留着、如实报，不许先消耗后删）。"""
+        if choice not in _pq.CORE_CAPACITY_QUESTION_OPTIONS:
+            return {
+                "ok": False,
+                "reason": "选项不对，只能选：先留作候选 / 不要了。",
+            }
+        question_id = question.get("id")
+        memory_id = question.get("memory_id")
+        if choice == "先留作候选":
+            self.pending_questions.answer(question_id, choice)
+            return {
+                "ok": True,
+                "applied": "held",
+                "question_id": question_id,
+                "memory_id": memory_id,
+            }
+        if not memory_id:
+            return {"ok": False, "reason": "这个问题没有对应的记忆。"}
+        deleted = self.delete_memory(memory_id, approve=True)
+        deleted_ok = (
+            deleted.get("deleted") is True
+            if isinstance(deleted, dict)
+            else bool(deleted)
+        )
+        if not deleted_ok:
+            return {
+                "ok": False,
+                "reason": "没删掉（%s），问题先留着，可以再答。"
+                % (
+                    (deleted.get("reason") or "未知原因")
+                    if isinstance(deleted, dict)
+                    else "未知原因"
+                ),
+                "question_id": question_id,
+                "memory_id": memory_id,
+                "deleted": False,
+            }
+        self.pending_questions.answer(question_id, choice)
+        return {
+            "ok": True,
+            "applied": "dropped",
+            "question_id": question_id,
+            "memory_id": memory_id,
+            "deleted": True,
+        }
+    # ---------- 统一受控入口（立项 H1，2026-11-25；补修轮同日） ----------
+    #
+    # 整理员（及任何程序化调用方）的状态变更只许走这道正门：
+    # submit_controlled_proposal 接结构化提案，门内顺序固定——
+    # 纯形状/参数校验（补修轮前移：影子路径也先过参数关）→
+    # 幂等查重（同键同指纹回 duplicate、同键异指纹拒
+    # idempotency_conflict）→ 载行 → 验来源 → 验保护 → 验版本
+    # （带了戳必须对上）→ 执行开关 → 健康冻结闸口 → 会话认证
+    # （H2）→ 动作前置检查 → 版本必填（仅执行路径）→ 操作意图
+    # 落盘 → 走既有 store 路径执行（状态变更的账本事件带贯通
+    # op_id）→ 事件关联核验 → 不变量健康闸口 → 回执登记。
+    # 不新开一套写库逻辑。删除永远不在动作集里：删除只走
+    # delete_memory(approve=True) 的 BOOS 批准路，整理员永无
+    # 删除权限（契约三）。
+    #
+    # 占键语义（补修轮定版）：纯形状/参数校验不过的拒绝不占键
+    # （提案本身没成形，改对了同键可再提）；过了校验的每种结局
+    # （执行/影子/各道门禁拒绝）都登记占键——同键同指纹重提回
+    # 当时的回执副本（duplicate），同键异指纹一律拒
+    # idempotency_conflict；被拒或影子之后想换个提法重试，
+    # 用新键。
+    #
+    # 提交/恢复协议（补修轮）：执行前先把操作意图（intent：
+    # op_id、提案指纹、目标、绑的版本）落盘为 pending；执行的
+    # 账本事件带 op_id＋idem_key，审计日志与回执同带 op_id，
+    # 三方凭 op_id＋幂等键对照。提交成功标 committed。启动时
+    # （及 controlled_entry_reconcile 手动调时）对账 pending
+    # 意图：账本里有这笔 op_id → 补标 committed；没有 → 标
+    # aborted（那次执行没落账，不许假装成功过）。回执登记文件
+    # 丢了/坏了时，先按意图重建 duplicate 回执，不重复执行；
+    # 登记/意图/审计任一持久化失败或损坏 → 入口冻结危险写
+    # （_controlled_frozen_reason 非空）：执行类动作一律拒
+    # entry_frozen，只许拒绝与影子，已落状态如实标已提交，
+    # 不假报 refused、更不许只回滚 SQLite 造成账本分叉。
+    #
+    # 写路清单（补修轮产出，全仓状态变更写路逐条点名）：
+    # 【已收口】submit_controlled_proposal —— 整理员唯一执行面。
+    # 【宿主自用，未收口，如实记录】add_memory_text / save_turn
+    # （对话写路：新增/晋升/取代）、correct_memory（BOOS 纠正
+    # 路）、answer_question（BOOS 答待问，可引发删/确认/恢复）、
+    # delete_memory(approve=True)（BOOS 批准删除路）、
+    # revive_memory / confirm_memory（BOOS 恢复/确认路）、
+    # set_protection_tier / set_core_drawer / _update_core_fields
+    # （宿主直改核心字段，无凭据概念——整理员的同名动作必须
+    # 走正门，不许直调这三个）、sweep_decay（宿主维护扫描，
+    # 直写 DORMANT 事件）、void_joke_memory（宿主作废玩笑路）、
+    # add_synonym_edge / void_graph_edge（图谱边写路）、
+    # import_from_mem0（一次性迁移）、reconcile_ledger_index /
+    # repair_projection_from_ledger / startup_recovery（恢复路：
+    # 只按账本修投影，不新造状态）。
+    # 【内部，非入口】_insert_memory_row / _supersede_row /
+    # _set_memory_slot / _ledger_append_add 等下划线方法，只被
+    # 上面各路调用，不单独对外。收口是渐进的：本轮只立正门并
+    # 点名其余写路，不封宿主自用路（封了宿主自己先断粮）。
+
+    CONTROLLED_ACTIONS = (
+        "demote",
+        "set_protection_tier",
+        "set_core_drawer",
+        "mark_dormant",
+    )
+
+    # 这些持久化故障一出现就冻结危险写：登记/意图/审计是提交
+    # 协议的地基，地基不稳时宁可只拒不写（见上方协议说明）。
+    _CONTROLLED_FREEZE_KINDS = frozenset({
+        "receipts_load_error",
+        "intents_load_error",
+        "receipts_save_failed",
+        "intents_save_failed",
+        "audit_write_failed",
+        # 补修二轮（贵妃第十八份复查 A/D/E）：不变量失败与
+        # 提交待核实是危险方向，对账定不了生死（读账本失败/
+        # 坏行存疑）同样——全部与持久化故障共用同一面冻结旗。
+        "invariant_failed",
+        "commit_unverified",
+        "reconcile_undetermined",
+        # 立项 H6：启动恢复结论不干净（判据见 H6 节）同样冻结
+        # 危险写，与持久化故障共用同一面冻结旗、同一道闸口。
+        "recovery_unclean",
+    })
+
+    def _controlled_note_health(self, kind, detail):
+        """记一笔受控入口健康痕迹（store 级标记＋pending_notices
+        留痕，与 H6 的落盘/结论页映射在这里留接缝：H6 建成后
+        从 _controlled_health_issues 与 _controlled_frozen_reason
+        取数落盘，本轮不另建落盘通道）。冻结类故障同时置冻结
+        标记，置过不覆盖（保留最早的原因）。"""
+        entry = {"kind": kind, "detail": detail, "at": _now_iso()}
+        self._controlled_health_issues.append(entry)
+        if (
+            kind in self._CONTROLLED_FREEZE_KINDS
+            and self._controlled_frozen_reason is None
+        ):
+            self._controlled_frozen_reason = kind
+        return entry
+
+    def _load_controlled_entry_state(self):
+        """载入受控入口的回执登记、提案指纹、操作意图与留痕
+        序号（构造时调，永不抛），并对账未完的操作意图。
+
+        登记/意图文件损坏时按待问文件先例：原文件改名保全、
+        load_error 记在实例上、从空开始——不许静默吞掉；且
+        损坏即冻结危险写（见 _CONTROLLED_FREEZE_KINDS），等
+        对账/人工处置，不许在登记不可信时继续执行。
+        """
+        try:
+            raw = self._controlled_receipts_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            receipts = data.get("receipts") if isinstance(data, dict) else None
+            if not isinstance(receipts, dict):
+                raise ValueError("receipts is not a dict")
+            self._controlled_receipts = {
+                str(k): v for k, v in receipts.items() if isinstance(v, dict)
+            }
+            fingerprints = (
+                data.get("fingerprints") if isinstance(data, dict) else None
+            )
+            if isinstance(fingerprints, dict):
+                self._controlled_fingerprints = {
+                    str(k): str(v) for k, v in fingerprints.items()
+                }
+            revocations = (
+                data.get("revocations") if isinstance(data, dict) else None
+            )
+            if isinstance(revocations, dict):
+                self._controlled_revocations = {
+                    str(k): v
+                    for k, v in revocations.items()
+                    if isinstance(v, dict)
+                }
+            rev_fingerprints = (
+                data.get("revocation_fingerprints")
+                if isinstance(data, dict) else None
+            )
+            if isinstance(rev_fingerprints, dict):
+                self._controlled_revocation_fingerprints = {
+                    str(k): str(v)
+                    for k, v in rev_fingerprints.items()
+                }
+        except FileNotFoundError:
+            self._controlled_receipts = {}
+        except Exception as exc:
+            self._controlled_receipts = {}
+            self._controlled_receipts_load_error = "%s: %s" % (
+                type(exc).__name__, exc,
+            )
+            self._controlled_note_health(
+                "receipts_load_error",
+                {"error": self._controlled_receipts_load_error},
+            )
+            try:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                os.replace(
+                    self._controlled_receipts_path,
+                    str(self._controlled_receipts_path) + ".corrupt-" + stamp,
+                )
+            except Exception:
+                logger.warning("受控入口回执登记保全失败", exc_info=True)
+        try:
+            raw = self._controlled_intents_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            intents = data.get("intents") if isinstance(data, dict) else None
+            if not isinstance(intents, dict):
+                raise ValueError("intents is not a dict")
+            self._controlled_intents = {
+                str(k): v for k, v in intents.items() if isinstance(v, dict)
+            }
+        except FileNotFoundError:
+            self._controlled_intents = {}
+        except Exception as exc:
+            self._controlled_intents = {}
+            self._controlled_intents_load_error = "%s: %s" % (
+                type(exc).__name__, exc,
+            )
+            self._controlled_note_health(
+                "intents_load_error",
+                {"error": self._controlled_intents_load_error},
+            )
+            try:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                os.replace(
+                    self._controlled_intents_path,
+                    str(self._controlled_intents_path) + ".corrupt-" + stamp,
+                )
+            except Exception:
+                logger.warning("受控入口操作意图保全失败", exc_info=True)
+        try:
+            with open(self._controlled_log_path, "r", encoding="utf-8") as fh:
+                self._controlled_trace_index = sum(1 for _ in fh)
+        except FileNotFoundError:
+            self._controlled_trace_index = 0
+        except Exception:
+            logger.warning("受控入口留痕计数失败", exc_info=True)
+            self._controlled_trace_index = 0
+        # 启动对账：上次进程死在「意图落盘后、标提交前」的
+        # pending 意图，按账本里有没有这笔 op_id 定生死。
+        try:
+            self._controlled_reconcile_intents()
+        except Exception:
+            logger.warning("受控入口启动对账失败", exc_info=True)
+        # 跨重启承接冻结（补修三轮，贵妃第二十二份复查
+        # A；补修四轮，第二十三份复查 A 第二条断链）：
+        # 已决意图里带着冻结级痕迹的，冻结事实不许随进
+        # 程重启蒸发——在新进程里按 status（提交未定案）
+        # 与 final_reason（不变量结论）两条来源重建同一
+        # 面冻结旗。解冻沿用现有口径：干净恢复/复检只解
+        # recovery_unclean 来源，本来源不被顺手解掉（与
+        # 同进程语义一致：这类冻结在进程内本来也不自动
+        # 解，重启更不许成为意外的解冻键）。
+        try:
+            self._controlled_carry_intent_freezes()
+        except Exception:
+            logger.warning("受控入口冻结承接失败", exc_info=True)
+
+    # 哪些已决意图的最终原因（不变量结论）要在重启后
+    # 重建冻结（与 _CONTROLLED_FREEZE_KINDS 里执行结论
+    # 类的三种对齐）。注意 commit_unverified 的主承接
+    # 来源是意图 status 本身（见
+    # _controlled_carry_intent_freezes）：生产者从不往
+    # final_reason 写这个值，它留在集合里只为带此值的
+    # 落盘数据兜底。
+    _CONTROLLED_CARRY_FREEZE_REASONS = frozenset({
+        "invariant_failed",
+        "commit_unverified",
+        "reconcile_undetermined",
+    })
+
+    def _controlled_carry_intent_freezes(self):
+        """按已落盘意图重建受控入口冻结旗（补修三轮，复查
+        A；补修四轮，第二十三份复查 A 的第二条断链）：进
+        程 1 里执行结论带冻结级痕迹的笔，意图已落盘；进
+        程 2 构造时在这里把同一原因的冻结重新置上——失
+        败回执保留之外，冻结本身也必须保留。pending 意
+        图不归这里（对账管），aborted 是没执行成，都不
+        承接。
+
+        两条承接来源分开看、分开标注，不许混：
+        - carried_from_status：「提交未定案」这个事实看
+          status 本身——status == "committed_unverified"
+          的已决意图无条件以 commit_unverified 承接。
+          final_reason 只记不变量结论（两个生产者只写
+          ""/invariant_failed），未定案那笔的
+          final_reason 天生是空串；三轮时拿它当承接闸
+          口，等于把这类冻结挡在门外——同进程冻着、重
+          启解冻的断链正在这里。
+        - carried_from_intent：不变量结论看 final_reason
+          ——命中 _CONTROLLED_CARRY_FREEZE_REASONS 的按
+          原口径承接。
+        同一笔两条都命中时先记 status 来源（与进程内的
+        产生顺序一致：未定案留痕在不变量结论之前，冻结
+        原因以最早的为准）；status 来源已承接
+        commit_unverified 的，final_reason 同值不再重复
+        记一笔。"""
+        for intent in self._controlled_intents.values():
+            if intent.get("status") not in (
+                "committed", "committed_unverified",
+            ):
+                # 只承接已决执行（提交点已落账/待核实）；
+                # pending 归对账、aborted 是没执行成，都不承接。
+                continue
+            status_carried = (
+                intent.get("status") == "committed_unverified"
+            )
+            if status_carried:
+                self._controlled_note_health(
+                    "commit_unverified",
+                    {
+                        "carried_from_status": intent.get("op_id"),
+                        "action": intent.get("action"),
+                        "memory_id": intent.get("memory_id"),
+                    },
+                )
+            reason = intent.get("final_reason")
+            if reason in self._CONTROLLED_CARRY_FREEZE_REASONS:
+                if status_carried and reason == "commit_unverified":
+                    # 同一事实已由 status 来源承接，不重复记。
+                    continue
+                self._controlled_note_health(
+                    reason,
+                    {
+                        "carried_from_intent": intent.get("op_id"),
+                        "action": intent.get("action"),
+                        "memory_id": intent.get("memory_id"),
+                    },
+                )
+
+    @staticmethod
+    def _controlled_write_json(path, payload):
+        """受控入口持久化落盘（补修二轮，复查第三节第 2 项）：
+        写临时文件 → flush + fsync 文件 → os.replace 原子换名
+        → 尽力 fsync 目录。旧写法 write_text + replace 只保证
+        进程崩溃不丢，断电时新文件可能只剩半截或根本没落盘
+        （回执/意图丢了，对账与重建都无从谈起）。目录 fsync
+        在 Windows 上可能打不开目录句柄，失败静默跳过——文
+        件级 fsync 是断电持久性的主要部分。"""
+        tmp = path.with_suffix(".tmp")
+        data = json.dumps(payload, ensure_ascii=False, indent=1)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+
+    def _controlled_save_receipts(self):
+        payload = {
+            "version": 3,
+            "receipts": self._controlled_receipts,
+            "fingerprints": self._controlled_fingerprints,
+            "revocations": self._controlled_revocations,
+            "revocation_fingerprints":
+                self._controlled_revocation_fingerprints,
+        }
+        self._controlled_write_json(
+            self._controlled_receipts_path, payload
+        )
+
+    def _controlled_save_intents(self):
+        payload = {"version": 1, "intents": self._controlled_intents}
+        self._controlled_write_json(
+            self._controlled_intents_path, payload
+        )
+
+    def _controlled_save_intents_quiet(self):
+        """落盘操作意图，失败只记健康痕迹＋冻结、不抛（调用方
+        多半正在处理另一笔失败，别让二次失败盖掉原始结论）。"""
+        try:
+            self._controlled_save_intents()
+        except Exception:
+            logger.warning("受控入口操作意图落盘失败", exc_info=True)
+            self._controlled_note_health("intents_save_failed", {})
+
+    def _controlled_trace(self, entry):
+        """往受控入口留痕日志追加一行，返回该行序号。
+
+        留痕通道独立于账本：提案被拒/影子这类没有状态变更的
+        事件不许污染账本折叠；真正执行的状态变更由既有路径
+        写账本事件（带 op_id），审计行同带 op_id＋提案指纹＋
+        参数＋绑的版本＋前后版本戳，三方凭 op_id＋幂等键对照。
+        写失败抛给调用方（_finish）按冻结协议处置，不吞。
+        """
+        with self._controlled_log_lock:
+            index = self._controlled_trace_index
+            record = {"index": index, "ts": _now_iso()}
+            record.update(entry)
+            with open(self._controlled_log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            self._controlled_trace_index = index + 1
+            return index
+
+    @staticmethod
+    def _controlled_version_stamp(text, meta, user_confirmed=None):
+        """目标行版本戳：正文＋完整 metadata 的哈希（提案绑版本用）。
+
+        注意（互查口径）：这是内容版本候选，不是单调修订号——
+        同一内容改回去会得到同一个戳；G1 再议独立列/授权保护
+        的版本覆盖，本轮先把「执行必绑版本」立住。
+
+        补修二轮（复查第三节第 1 项）：戳面补上 user_confirmed
+        独立列——demote 在 meta 之外单独写这一列，戳不覆盖它，
+        列被单独改动时版本比对看不见。user_confirmed 传 None
+        时退回 meta 里的同名字段（历史调用点兼容）。
+        """
+        if user_confirmed is None:
+            user_confirmed = (meta or {}).get("user_confirmed")
+        payload = (
+            (text or "")
+            + "\x00"
+            + json.dumps(meta or {}, sort_keys=True, ensure_ascii=False)
+            + "\x00uc="
+            + ("1" if user_confirmed else "0")
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _controlled_fingerprint(action, memory_id, params, source,
+                                expected_version):
+        """规范提案指纹：动作＋目标＋规范化参数＋来源＋绑的
+        版本的哈希。同键重提时比指纹——同指纹才是同一提案，
+        异指纹是同键冲突。会话凭据不进指纹：凭据是载体不是
+        提案内容，换一张有效凭据重提同一提案仍算同一提案。"""
+        payload = json.dumps(
+            {
+                "action": action,
+                "memory_id": memory_id,
+                "params": params or {},
+                "instruction_source": source,
+                "expected_version": expected_version,
+            },
+            sort_keys=True, ensure_ascii=False, default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    # 按 op 查账的三态结论（补修三轮，贵妃第二十二份复查
+    # D/E 收口）：找到 / 确定没落账 / 无法确定。读账本抛异
+    # 常、或账本有坏行/被截断（解析出的事件集合不完整）时，
+    # 「没找到」不许当成「确定没落账」——submit/revoke/
+    # reconcile 三条兄弟路径共用同一套三态，不许再各自加一
+    # 个只在部分调用者消费的旗。
+    _LEDGER_OP_FOUND = "found"
+    _LEDGER_OP_ABSENT = "absent"
+    _LEDGER_OP_UNDETERMINED = "undetermined"
+
+    @staticmethod
+    def _controlled_ledger_doubtful(info):
+        """账本完整性存疑：有坏行或被截断——解析出的事件
+        集合不完整，任何基于折叠的结论都不许当定案（补修
+        H3 复查 F2 的统一口径，受控入口各消费点共用）。"""
+        return bool(
+            (info or {}).get("bad_lines")
+            or (info or {}).get("truncated")
+        )
+
+    def _controlled_ledger_op_state(self, op_id):
+        """按 op_id 查账本，三态返回 (state, event)：
+        found → (found, 事件)；absent → (absent, None)（账本
+        完整且确无此 op）；undetermined → (undetermined,
+        None)（读失败或账本存疑，生死定不了）。同步维护
+        _controlled_op_read_failed：undetermined 时为 True
+        （含坏行/截断存疑，不只是抛异常）。"""
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            logger.warning("受控入口按 op_id 查账本失败", exc_info=True)
+            self._controlled_op_read_failed = True
+            return (self._LEDGER_OP_UNDETERMINED, None)
+        doubtful = self._controlled_ledger_doubtful(_info)
+        for event in events:
+            if event.get("op_id") == op_id:
+                self._controlled_op_read_failed = False
+                return (self._LEDGER_OP_FOUND, event)
+        if doubtful:
+            self._controlled_op_read_failed = True
+            return (self._LEDGER_OP_UNDETERMINED, None)
+        self._controlled_op_read_failed = False
+        return (self._LEDGER_OP_ABSENT, None)
+
+    def _controlled_ledger_op(self, op_id):
+        """兼容旧签名：返回事件或 None。None 可能是 absent
+        也可能是 undetermined——必须区分生死时用
+        _controlled_ledger_op_state；本方法同步维护
+        _controlled_op_read_failed（undetermined 时 True）。"""
+        _state, event = self._controlled_ledger_op_state(op_id)
+        return event
+
+    def _controlled_reconcile_intents(self):
+        """对账 pending 操作意图：账本有这笔 op_id → committed
+        （补上 ledger_seq）；没有 → aborted。返回对账报告并存
+        在实例上（controlled_entry_reconcile 转调这里）。"""
+        report = {"checked": 0, "committed": 0, "aborted": 0,
+                  "still_pending": 0}
+        pending = [
+            intent for intent in self._controlled_intents.values()
+            if intent.get("status") == "pending"
+        ]
+        if not pending:
+            # 没有待决意图也要跑成对恢复（补修 H3 复查
+            # F1）：补偿已落账、原意图已撤销标记没落盘的崩
+            # 溃窗口与 pending 无关，只靠 pending 触发会漏。
+            report["revocation_pairs_recovered"] = (
+                self._controlled_recover_revocation_pairs()
+            )
+            self._controlled_reconcile_report = report
+            return report
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            logger.warning("受控入口对账读账本失败", exc_info=True)
+            report["still_pending"] = len(pending)
+            # 读账本失败 = fail-closed（复查 D）：冻结危险写，
+            # 待决意图全部按未定案，不许按新提案放行。
+            self._controlled_note_health(
+                "reconcile_undetermined",
+                {"error": "ledger_read_failed", "pending": len(pending)},
+            )
+            self._controlled_reconcile_report = report
+            return report
+        # 账本有坏行/被截断时（复查 E）：解析出的事件集合不
+        # 完整，「没找到 op_id」不能当成确定没落账——待决意
+        # 图留 pending 按未定案处理，并留冻结痕迹。
+        ledger_doubtful = self._controlled_ledger_doubtful(_info)
+        by_op = {}
+        for event in events:
+            op = event.get("op_id")
+            if op:
+                by_op[op] = event
+        changed = False
+        undetermined = 0
+        for intent in pending:
+            report["checked"] += 1
+            event = by_op.get(intent.get("op_id"))
+            if event is not None:
+                intent["status"] = "committed"
+                intent["ledger_seq"] = event.get("seq")
+                report["committed"] += 1
+                intent["reconciled_at"] = _now_iso()
+                changed = True
+            elif ledger_doubtful:
+                undetermined += 1
+                report["still_pending"] += 1
+            else:
+                intent["status"] = "aborted"
+                report["aborted"] += 1
+                intent["reconciled_at"] = _now_iso()
+                changed = True
+        if undetermined:
+            self._controlled_note_health(
+                "reconcile_undetermined",
+                {
+                    "bad_lines": (_info or {}).get("bad_lines"),
+                    "truncated": (_info or {}).get("truncated"),
+                    "pending": undetermined,
+                },
+            )
+        if changed:
+            self._controlled_save_intents_quiet()
+        # 成对恢复（补修 H3 复查 F1）：本轮刚补成 committed
+        # 的撤销意图，若原意图的已撤销标记没落盘，在这里
+        # 一并补上——只补提交状态不补成对关系，幂等防线在
+        # 崩溃窗口后是断的。
+        report["revocation_pairs_recovered"] = (
+            self._controlled_recover_revocation_pairs()
+        )
+        self._controlled_reconcile_report = report
+        return report
+
+    def _controlled_recover_revocation_pairs(self):
+        """成对恢复（补修 H3 复查 F1）：撤销补偿已落账（撤
+        销意图已 committed/committed_unverified）、但原意
+        图的 revoked_by 标记没来得及落盘就猝死的窗口——按
+        revokes_op_id 回填原意图 revoked_by/revoked_at。
+        撤销回执登记不伪造：登记丢了的回执在查询时按撤销
+        意图重建（_controlled_revocation_receipt_from_
+        intent），与正向同口径。返回恢复的对数；原意图找
+        不到、或已被别的撤销标记的，不动。"""
+        recovered = 0
+        changed = False
+        for intent in list(self._controlled_intents.values()):
+            if intent.get("kind") != "revocation":
+                continue
+            if intent.get("status") not in (
+                "committed", "committed_unverified",
+            ):
+                continue
+            orig_id = intent.get("revokes_op_id")
+            if not orig_id:
+                continue
+            orig = self._controlled_intents.get(orig_id)
+            if orig is None or orig.get("revoked_by"):
+                continue
+            orig["revoked_by"] = intent.get("op_id")
+            orig["revoked_at"] = intent.get("ts") or _now_iso()
+            recovered += 1
+            changed = True
+        if changed:
+            self._controlled_save_intents_quiet()
+        return recovered
+
+    def controlled_entry_reconcile(self):
+        """手动对账未完操作意图（启动时已自动跑一次）；返回
+        {checked, committed, aborted, still_pending}。"""
+        with self._lock:
+            return self._controlled_reconcile_intents()
+
+    def _controlled_receipt_from_intent(self, intent):
+        """回执登记丢了时，按已提交的操作意图重建一份
+        duplicate 回执（提交点在意图里，账本可复核）——不
+        重新执行，只把当时的结论还给调用方。
+
+        最终结论以意图里存的 final_ok/final_reason 为准
+        （补修二轮，复查 B）：执行时不变量失败的笔，登记丢
+        了重建出来也必须是失败，不许对 committed 一律
+        ok=True 洗白。补修前的老意图没有 final_* 字段，属
+        于结论未经核实——按未核实交回（ok=False、
+        reason=committed_unverified、detail 标
+        unverified_reconstruction），不许冒充干净成功。"""
+        status = intent.get("status")
+        detail = {
+            "op_id": intent.get("op_id"),
+            "ledger_seq": intent.get("ledger_seq"),
+            "commit_state": status,
+            "reconstructed_from_intent": True,
+        }
+        if intent.get("version_after") is None:
+            # 执行后版本戳当时没记下（补修三轮，复查小
+            # 项①）：如实明示缺失，不许静默留空、让调用方
+            # 以为有戳可比；不强填现值、不伪造历史戳。
+            detail["version_after_missing"] = True
+        if status == "committed" and "final_ok" in intent:
+            ok = bool(intent.get("final_ok"))
+            reason = intent.get("final_reason") or ""
+        elif status == "committed":
+            ok = False
+            reason = "committed_unverified"
+            detail["unverified_reconstruction"] = True
+        elif status == "committed_unverified":
+            ok = False
+            reason = intent.get("final_reason") or "committed_unverified"
+        else:
+            ok = False
+            reason = intent.get("final_reason") or ""
+        return {
+            "ok": ok,
+            "status": "duplicate",
+            "reason": reason,
+            "action": intent.get("action"),
+            "memory_id": intent.get("memory_id"),
+            "idempotency_key": intent.get("idempotency_key"),
+            "duplicate": True,
+            "question_id": None,
+            "trace_index": None,
+            "version_before": intent.get("expected_version"),
+            "version_after": intent.get("version_after"),
+            "detail": detail,
+            "ts": _now_iso(),
+        }
+
+    def _controlled_revocation_receipt_from_intent(self, rev_intent):
+        """撤销回执登记丢了时，按已提交的撤销意图重建一份
+        duplicate 回执（与正向 _controlled_receipt_from_
+        intent 同规）：最终结论以意图里存的 final_ok/
+        final_reason 为准；崩溃窗口里的撤销意图没有
+        final_*（补偿落账了但核对没跑完）——按未核实交回
+        （ok=False、reason=committed_unverified），不许冒
+        充干净成功。"""
+        status = rev_intent.get("status")
+        detail = {
+            "revokes_op_id": rev_intent.get("revokes_op_id"),
+            "revocation_op_id": rev_intent.get("op_id"),
+            "commit_state": status,
+            "ledger_seq": rev_intent.get("ledger_seq"),
+            "reconstructed_from_intent": True,
+        }
+        if rev_intent.get("version_after") is None:
+            detail["version_after_missing"] = True
+        if status == "committed" and "final_ok" in rev_intent:
+            ok = bool(rev_intent.get("final_ok"))
+            reason = rev_intent.get("final_reason") or ""
+        elif status == "committed":
+            ok = False
+            reason = "committed_unverified"
+            detail["unverified_reconstruction"] = True
+        elif status == "committed_unverified":
+            ok = False
+            reason = (
+                rev_intent.get("final_reason")
+                or "committed_unverified"
+            )
+        else:
+            ok = False
+            reason = rev_intent.get("final_reason") or ""
+        return {
+            "ok": ok,
+            "status": "duplicate",
+            "reason": reason,
+            "revokes_op_id": rev_intent.get("revokes_op_id"),
+            "revocation_op_id": rev_intent.get("op_id"),
+            "action": rev_intent.get("action"),
+            "memory_id": rev_intent.get("memory_id"),
+            "idempotency_key": rev_intent.get("idempotency_key"),
+            "duplicate": True,
+            "question_id": None,
+            "trace_index": None,
+            "version_before": rev_intent.get("expected_version"),
+            "version_after": rev_intent.get("version_after"),
+            "detail": detail,
+            "ts": _now_iso(),
+        }
+
+    def _controlled_prior_revocation(self, rev_key, fingerprint,
+                                     target_op_id):
+        """按撤销键＋目标查先行撤销（补修 H3 复查 F1）：回
+        执登记之外必须查持久化撤销意图——登记没落盘的崩
+        溃窗口只查登记，会让同键重入穿到执行段二次补偿。
+        返回 (kind, payload)：("duplicate", 重建回执) /
+        ("conflict", 先行指纹) / ("unresolved", 撤销意图)
+        / ("already_revoked", 撤销意图) / (None, None)。
+        与正向 _controlled_prior 同口径：异指纹先判冲突；
+        pending 先对账，对账后仍定不了生死按 unresolved，
+        绝不放行穿到执行段；aborted 是证明没执行成，不
+        拦。target_op_id 给出时还查「同目标、别的键」的已
+        决撤销（换键再撤同一笔）。"""
+        matches = [
+            intent for intent in self._controlled_intents.values()
+            if intent.get("kind") == "revocation"
+            and intent.get("idempotency_key") == rev_key
+        ]
+        for intent in matches:
+            if intent.get("fingerprint") != fingerprint:
+                return ("conflict", intent.get("fingerprint"))
+        for intent in matches:
+            if intent.get("status") == "pending":
+                self._controlled_reconcile_intents()
+                intent = self._controlled_intents.get(
+                    intent.get("op_id"), intent
+                )
+            if intent.get("status") == "pending":
+                return ("unresolved", intent)
+            if intent.get("status") in (
+                "committed", "committed_unverified",
+            ):
+                return (
+                    "duplicate",
+                    self._controlled_revocation_receipt_from_intent(
+                        intent
+                    ),
+                )
+        if target_op_id:
+            for intent in self._controlled_intents.values():
+                if intent.get("kind") != "revocation":
+                    continue
+                if intent.get("revokes_op_id") != target_op_id:
+                    continue
+                if intent.get("status") in (
+                    "committed", "committed_unverified",
+                ):
+                    return ("already_revoked", intent)
+                if intent.get("status") == "pending":
+                    return ("unresolved", intent)
+        return (None, None)
+
+    def _controlled_prior(self, idem_key, fingerprint):
+        """按幂等键查先行处理：返回 (kind, payload)——
+        ("duplicate", 回执副本) / ("conflict", 先行指纹) /
+        (None, None)（没处理过，或只有已中止的同指纹意图，
+        可按新提案继续）。回执登记里有就先认登记；登记丢了
+        按操作意图找（提交点在意图里）。老登记（补修轮之前
+        落的、没指纹）认不出指纹，按 duplicate 处理并在报告
+        口径里如实说明——那批键是旧版影子/拒绝攒下的，不许
+        因为认不出就放行重执行。"""
+        prev = self._controlled_receipts.get(idem_key)
+        if prev is not None:
+            stored_fp = self._controlled_fingerprints.get(idem_key)
+            if stored_fp is not None and stored_fp != fingerprint:
+                return ("conflict", stored_fp)
+            dup = dict(prev)
+            if stored_fp is None:
+                # 无指纹的老回执（v1 时代，复查第三节第 6
+                # 项）：指纹绑定核对做不了，明示标
+                # legacy/unverified，不许冒充已核对的重复。
+                dup_detail = dict(dup.get("detail") or {})
+                dup_detail["legacy_receipt"] = True
+                dup_detail["unverified"] = True
+                dup["detail"] = dup_detail
+            return ("duplicate", dup)
+        matches = [
+            intent for intent in self._controlled_intents.values()
+            if intent.get("idempotency_key") == idem_key
+        ]
+        for intent in matches:
+            if intent.get("fingerprint") != fingerprint:
+                return ("conflict", intent.get("fingerprint"))
+        for intent in matches:
+            if intent.get("status") == "pending":
+                self._controlled_reconcile_intents()
+                intent = self._controlled_intents.get(
+                    intent.get("op_id"), intent
+                )
+            if intent.get("status") == "pending":
+                # 对账后仍定不了生死（读账本失败/坏行存疑已
+                # 在对账里冻结）：这笔到底执行没执行不知道，
+                # 绝不许按新提案放行（复查 D）。
+                return ("unresolved", intent)
+            if intent.get("status") in ("committed", "committed_unverified"):
+                return (
+                    "duplicate",
+                    self._controlled_receipt_from_intent(intent),
+                )
+        return (None, None)
+
+    def _controlled_members_match_ledger(self, events):
+        """成员 ID 集合与账本折叠一致（正向不变量与撤销核
+        对共用同一份口径）：投影侧读 SQLite 活行、账本侧
+        读折叠后未死状态的 meta，两侧都走 core_cap.
+        classify，成员/占座/钉死/临时钉死四组 ID 集合逐组
+        相等才算一致。调用方负责账本完整性判定：坏行/截
+        断时不许拿本方法的结论下定案。"""
+        folded = _core_cap.fold_ledger_metas(events)
+        states = _ledger.resolve_state(events).get(
+            "key_states", {}
+        )
+
+        def _id_sets(pairs):
+            members, seats, pinned, temp = set(), set(), set(), set()
+            for mid, m in pairs:
+                c = _core_cap.classify(m, live=True)
+                if c["protection_tier"] == _core_cap.TIER_PINNED:
+                    pinned.add(mid)
+                elif (
+                    c["protection_tier"]
+                    == _core_cap.TIER_TEMP_PINNED
+                ):
+                    temp.add(mid)
+                if c["member"]:
+                    members.add(mid)
+                    if c["occupies_seat"]:
+                        seats.add(mid)
+            return members, seats, pinned, temp
+
+        ledger_pairs = [
+            (key, meta)
+            for key, meta in folded.items()
+            if states.get(key)
+            not in _core_cap._LEDGER_DEAD_STATES
+        ]
+        proj_rows = self._conn.execute(
+            "SELECT id, metadata_json FROM memories"
+            " WHERE voided=0 AND deleted=0 AND superseded=0"
+        ).fetchall()
+        proj_pairs = []
+        for rid, mjson in proj_rows:
+            try:
+                proj_pairs.append(
+                    (rid, json.loads(mjson or "{}"))
+                )
+            except (ValueError, TypeError):
+                proj_pairs.append((rid, {}))
+        return _id_sets(proj_pairs) == _id_sets(ledger_pairs)
+
+    def _controlled_check_invariants(self, memory_id, before_text,
+                                     before_meta, action):
+        """执行后不变量健康闸口（补修轮扩项）：逐项查——
+        座位账自洽、成员集合与账本重算一致、原文未变、变更
+        只落在该动作该改的字段上、保护/抽屉/确认标记与账本
+        最新口径一致、SQLite 列与 meta 一致、终态旗没被误动；
+        mark_dormant 另查账本折叠态与 meta 的 decay_state 都
+        已沉底。返回 {"ok", "checks"}；调用方持锁。任一项
+        不过，执行结论不许报干净成功（走 invariant_failed）。
+        """
+        checks = {}
+        snap = self.core_seat_snapshot()
+        checks["seats_reconciled"] = bool(snap.get("reconciled"))
+        try:
+            # 成员按 ID 集合比对（贵妃第十八份复查附带项）：
+            # 只比四个计数时，同计数换一批成员也报一致，与
+            # 本项注释口径（成员集合一致）不符。两侧都走
+            # core_cap.classify 同一口径：投影侧读 SQLite 活
+            # 行，账本侧读折叠后未死状态的 meta；档位集合对
+            # 全部活行先算（与 count_seats 的计数顺序一致），
+            # 成员/占座再按成员资格筛。
+            events, _info = _ledger.read_events(self.ledger_path)
+            if self._controlled_ledger_doubtful(_info):
+                # 账本残缺（补修 H3 复查 F2）：残余事件折
+                # 出的成员集合可能恰好与残缺投影自洽，不
+                # 许判一致——按不一致（未定案）处理。
+                checks["members_match_ledger"] = False
+            else:
+                checks["members_match_ledger"] = (
+                    self._controlled_members_match_ledger(events)
+                )
+        except Exception:
+            checks["members_match_ledger"] = False
+        row = self._conn.execute(
+            "SELECT text, metadata_json, user_confirmed, superseded,"
+            " deleted, voided FROM memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            checks["row_present"] = False
+            return {"ok": False, "checks": checks}
+        checks["row_present"] = True
+        text_after = row[0] or ""
+        try:
+            meta_after = json.loads(row[1] or "{}")
+        except Exception:
+            meta_after = {}
+        # 原文未变：四个动作都不许动正文。
+        checks["text_unchanged"] = text_after == (before_text or "")
+        # 变更只落在该动作该改的字段上，其余字段（槽位/来源/
+        # 时间等）一律不许顺手改。
+        allowed = {
+            "demote": {"user_confirmed"},
+            "set_protection_tier": {_core_cap.PROTECTION_TIER_FIELD},
+            "set_core_drawer": {_core_cap.DRAWER_FIELD},
+            "mark_dormant": {"decay_state"},
+        }.get(action, set())
+        before_meta = before_meta or {}
+        changed = {
+            field
+            for field in set(before_meta) | set(meta_after)
+            if before_meta.get(field) != meta_after.get(field)
+        }
+        checks["fields_confined"] = changed <= allowed
+        # 保护/抽屉/确认标记与账本折叠口径一致（账本是真相源：
+        # 以账本折出的 meta 为准比 SQLite 里的 meta）。
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+            if self._controlled_ledger_doubtful(_info):
+                # 账本残缺（补修 H3 复查 F2）：折叠口径不可
+                # 信，保护/抽屉/确认标记不许拿残缺折叠判一
+                # 致——走 except 的不一致口径。
+                raise ValueError("ledger_doubtful")
+            ledger_metas = _core_cap.fold_ledger_metas(events)
+            ledger_meta = ledger_metas.get(memory_id)
+            if ledger_meta is None:
+                checks["protection_matches_ledger"] = False
+            else:
+                checks["protection_matches_ledger"] = (
+                    _core_cap.normalize_protection_tier(ledger_meta)
+                    == _core_cap.normalize_protection_tier(meta_after)
+                    and _core_cap.normalize_core_drawer(ledger_meta)
+                    == _core_cap.normalize_core_drawer(meta_after)
+                    and bool(ledger_meta.get("user_confirmed"))
+                    == bool(meta_after.get("user_confirmed"))
+                )
+            if action == "mark_dormant":
+                state = _ledger.resolve_state(events)
+                key_states = (state or {}).get("key_states") or {}
+                checks["dormant_matches_ledger"] = (
+                    key_states.get(memory_id)
+                    == _ledger.LEDGER_STATE_DORMANT
+                    and meta_after.get("decay_state")
+                    == _decay.DECAY_STATE_DORMANT
+                )
+        except Exception:
+            checks["protection_matches_ledger"] = False
+            if action == "mark_dormant":
+                checks["dormant_matches_ledger"] = False
+        # SQLite 列与 meta 一致；终态旗（取代/删除/作废）没被
+        # 这次变更误动（进来时验过是活行，出去还必须是活行）。
+        checks["columns_match_meta"] = (
+            bool(row[2]) == bool(meta_after.get("user_confirmed"))
+            and not row[3] and not row[4] and not row[5]
+        )
+        return {"ok": all(checks.values()), "checks": checks}
+
+    def controlled_entry_version(self, memory_id):
+        """目标行当前版本戳（提案绑版本用）；行不存在返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._controlled_version_stamp(
+                row[0] or "", json.loads(row[1] or "{}"), row[2]
+            )
+
+    def controlled_entry_receipt(self, idempotency_key):
+        """按幂等键查已登记回执；登记里没有时按已提交的操作
+        意图重建一份（提交/恢复协议）；都没有返回 None。"""
+        receipt = self._controlled_receipts.get(idempotency_key)
+        if receipt is not None:
+            out = dict(receipt)
+            if idempotency_key not in self._controlled_fingerprints:
+                detail = dict(out.get("detail") or {})
+                detail["legacy_receipt"] = True
+                detail["unverified"] = True
+                out["detail"] = detail
+            return out
+        for intent in self._controlled_intents.values():
+            if intent.get("idempotency_key") != idempotency_key:
+                continue
+            if intent.get("status") in ("committed", "committed_unverified"):
+                return self._controlled_receipt_from_intent(intent)
+        return None
+
+    def issue_session(self, *, speaker="owner", scope=None,
+                      ttl_seconds=3600, owner_direct=False,
+                      issuance_source):
+        """签发受控入口会话凭据（立项 H2；F1 补修收口）；
+        口径不合返回 None。
+
+        只供宿主内部流程与测试：issuance_source 必传、无默认
+        值——签发来源必须由调用方显式声明，未标来源在
+        session_auth 层一律拒签，不许再靠默认参数裸签出
+        「owner 说话人＋全范围＋无来源」的凭据。scope 不传时
+        默认受控动作全集，调用方应按最小够用传窄范围。主人
+        直达凭据必须显式 issuance_source="owner" 且
+        speaker="owner" 才签得出（见 session_auth 口径）；
+        web 层不许自签，只许透传宿主签发的凭据。
+        """
+        return self._session_authority.issue(
+            speaker=speaker,
+            scope=self.CONTROLLED_ACTIONS if scope is None else scope,
+            ttl_seconds=ttl_seconds,
+            owner_direct=owner_direct,
+            issuance_source=issuance_source,
+            allowed_actions=self.CONTROLLED_ACTIONS,
+        )
+
+    def revoke_session(self, session_id):
+        """撤销一张会话凭据（立项 H2；H3 撤销接口的凭据侧接缝）。
+
+        撤销语义（H2 补修钉死）：撤销与受控入口的执行共用
+        本实例的锁串行化——撤销返回时，不可能还有一笔受控
+        执行正在半途；撤销返回之后开始的验签必然看到已撤
+        销状态，已开始但尚未落笔的执行由落笔前复查阻断
+        （见 submit / revoke_controlled_change 的落笔前
+        复查）。即：撤销返回后，尚未落笔的执行必须被阻断。
+        """
+        with self._lock:
+            return self._session_authority.revoke(session_id)
+
+    def _queue_controlled_entry_question(self, action, memory_id,
+                                         instruction_source, block_reason):
+        """受控入口拦下的提案攒一条知情待问（先例：change_attempt）。
+
+        只知情、不执行：BOOS 答「知道了」只是确认知晓，永远不
+        因此放行被拦的提案。问题本体 memory_id=None（先例同），
+        目标 id、动作与拦截原因记在 extra 里备查。
+        """
+        action_cn = {
+            "demote": "降级",
+            "set_protection_tier": "改保护档",
+            "set_core_drawer": "改核心抽屉",
+            "mark_dormant": "标记休眠",
+            "revoke": "撤销受控变更",
+        }.get(action, action)
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "受控入口拦下一条%s提案（来源：%s，目标记忆 id：%s，"
+            "拦截原因：%s），已拒绝、未执行。"
+            % (action_cn, instruction_source, memory_id, block_reason),
+            _pq.CHANGE_ATTEMPT_QUESTION_OPTIONS,
+            "受控入口门禁：改记忆类动作只认 BOOS 本人指令，"
+            "核心保护行与钉死区不许自动变更（立项 H1）",
+            memory_id=None,
+            extra={
+                "auth_action": "controlled_entry_blocked",
+                "target_memory_id": memory_id,
+                "attempted_action": action,
+                "block_reason": block_reason,
+            },
+        )
+
+    def submit_controlled_proposal(self, proposal):
+        """统一受控入口：提交一条结构化状态变更提案，返回统一回执。
+
+        提案形状（dict）：
+          action             demote / set_protection_tier /
+                             set_core_drawer / mark_dormant
+          memory_id          目标记忆 id（非空 str）
+          reason             一句理由（只留痕，不参与判定）
+          instruction_source 指令来源（口径同 auth_guard：
+                             None / "owner" 才算 BOOS 本人指令）
+          idempotency_key    幂等键（必填非空 str；占键语义见
+                             本节头部注释）
+          params             动作参数（出现就必须是 dict）：
+                             set_protection_tier 必须显式给
+                             {"tier": "pinned"/"temp_pinned"/None}，
+                             set_core_drawer 必须显式给
+                             {"drawer": 五类键/None}——缺字段拒
+                             bad_params；显式 None 是「摘档/摘格」
+                             的显式决定，照办并在回执 detail 标
+                             explicit_clear，不许拿缺字段冒充清除
+          expected_version   提案时目标行的版本戳（见
+                             controlled_entry_version）。执行路径
+                             （开关打开时）必填：缺了拒
+                             missing_version；带了就必须与执行前
+                             锁内现算的戳一致，对不上拒
+                             version_stale。影子路径不强制，但
+                             带了戳照样验、对不上照样拒。
+          session            会话凭据对象（立项 H2，issue_session
+                             签发）；影子模式不验，执行开关打开后
+                             必验——无凭据/过期/越界/被篡改/被撤销
+                             一律拒，敏感动作（保护变更）只认
+                             主人直达会话（原因码见 session_auth）
+
+        回执形状（键恒定）：
+          {ok, status, reason, action, memory_id, idempotency_key,
+           duplicate, question_id, trace_index, version_before,
+           version_after, detail, ts}
+          status ∈ executed / refused / shadow / duplicate。
+          ok 只在真执行且不变量全过时为 True；执行落了状态但
+          不变量没过时 status=executed、reason=invariant_failed、
+          ok=False——已提交是事实，但不许报干净成功。
+          异常路径（留痕/登记落盘失败）回执照常返回，问题记在
+          detail 的 audit_write_failed / receipt_persist_failed
+          标记里，并冻结后续危险写（entry_frozen）。
+
+        version_before / version_after 的状态语义（补修轮定版）：
+          - 校验类早拒（unknown_action / missing_* / bad_* /
+            idempotency_conflict）：两者都 None（还没载行）；
+          - 载行后的拒绝（not_live 除外——它在算戳之前，两者
+            都 None；not_found 同）：version_before 是拒绝当时
+            的行戳，version_after 为 None（没落任何变更）；
+          - shadow：version_before 是当前行戳，version_after
+            为 None（影子不落目标记忆的状态；但会写审计行、
+            回执登记与可能的知情待问，别说「完全不落状态」）；
+          - duplicate：原回执副本，两戳即原回执当时的值；
+          - executed（含 invariant_failed）：两者都有值，
+            version_after 是变更后的行戳。
+        降级只改核心成员状态（user_confirmed 落 False）：不删原文、
+        不清保护标记；删除不在动作集里，永远走 BOOS 批准路。
+        """
+        if not isinstance(proposal, dict):
+            proposal = {}
+        action = proposal.get("action")
+        memory_id = proposal.get("memory_id")
+        idem_key = proposal.get("idempotency_key")
+        source = proposal.get("instruction_source")
+        expected_version = proposal.get("expected_version")
+        params_present = "params" in proposal
+        params = proposal.get("params")
+        fingerprint = None
+        receipt = {
+            "ok": False,
+            "status": "refused",
+            "reason": "",
+            "action": action,
+            "memory_id": memory_id,
+            "idempotency_key": idem_key,
+            "duplicate": False,
+            "question_id": None,
+            "trace_index": None,
+            "version_before": None,
+            "version_after": None,
+            "detail": {},
+            "ts": _now_iso(),
+        }
+
+        def _trace(event, reason):
+            entry = {
+                "event": event,
+                "action": action,
+                "memory_id": memory_id,
+                "idempotency_key": idem_key,
+                "instruction_source": source,
+                "reason": reason,
+                "proposal_reason": proposal.get("reason") or "",
+                "params": (
+                    params if isinstance(params, dict)
+                    else {"_raw_type": type(params).__name__}
+                ),
+                "expected_version": expected_version,
+                "fingerprint": fingerprint,
+                "version_before": receipt["version_before"],
+                "version_after": receipt["version_after"],
+            }
+            if receipt["detail"].get("op_id"):
+                entry["op_id"] = receipt["detail"]["op_id"]
+            if receipt["detail"].get("ledger_seq") is not None:
+                entry["ledger_seq"] = receipt["detail"]["ledger_seq"]
+            return self._controlled_trace(entry)
+
+        def _finish(status, reason, detail=None, question_id=None,
+                    register=True, ok_override=None):
+            receipt["status"] = status
+            receipt["reason"] = reason
+            receipt["ok"] = (
+                status == "executed" if ok_override is None
+                else bool(ok_override)
+            )
+            if detail:
+                receipt["detail"] = detail
+            if question_id:
+                receipt["question_id"] = question_id
+            try:
+                receipt["trace_index"] = _trace(status, reason)
+            except Exception:
+                # 留痕写失败：回执照常返回（已落的结论不许丢），
+                # 标记＋冻结后续危险写，重启对账兜底。
+                logger.warning("受控入口留痕写失败", exc_info=True)
+                receipt["trace_index"] = None
+                receipt["detail"]["audit_write_failed"] = True
+                self._controlled_note_health(
+                    "audit_write_failed",
+                    {"idempotency_key": idem_key, "status": status},
+                )
+            if register and idem_key:
+                self._controlled_receipts[idem_key] = dict(receipt)
+                if fingerprint is not None:
+                    self._controlled_fingerprints[idem_key] = fingerprint
+                try:
+                    self._controlled_save_receipts()
+                except Exception:
+                    logger.warning(
+                        "受控入口回执登记落盘失败", exc_info=True
+                    )
+                    receipt["detail"]["receipt_persist_failed"] = True
+                    self._controlled_receipts[idem_key] = dict(receipt)
+                    self._controlled_note_health(
+                        "receipts_save_failed",
+                        {"idempotency_key": idem_key},
+                    )
+            return dict(receipt)
+
+        with self._lock:
+            # —— 纯形状/参数校验（补修轮前移：不依赖行状态与
+            # 开关，影子路径也先过这一关；这一段拒绝不占键）——
+            if not isinstance(action, str) or action not in self.CONTROLLED_ACTIONS:
+                # 未知动作（含 delete）一律拒——删除不走这道门。
+                return _finish("refused", "unknown_action", register=False)
+            if idem_key is None or (
+                isinstance(idem_key, str) and not idem_key
+            ):
+                return _finish(
+                    "refused", "missing_idempotency_key", register=False
+                )
+            if not isinstance(idem_key, str):
+                return _finish(
+                    "refused", "bad_idempotency_key", register=False
+                )
+            if memory_id is None or (
+                isinstance(memory_id, str) and not memory_id
+            ):
+                return _finish("refused", "missing_target", register=False)
+            if not isinstance(memory_id, str):
+                return _finish("refused", "bad_target", register=False)
+            if source is not None and not isinstance(source, str):
+                return _finish("refused", "bad_source", register=False)
+            if expected_version is not None and (
+                not isinstance(expected_version, str)
+                or not expected_version
+            ):
+                return _finish(
+                    "refused", "bad_expected_version", register=False
+                )
+            if params_present and not isinstance(params, dict):
+                return _finish("refused", "bad_params", register=False)
+            if not params_present:
+                params = {}
+            # 参数值先验类型再查枚举（补修二轮，复查 C）：
+            # drawer 枚举是 dict，非字符串值（list/dict）做
+            # 成员测试会抛 TypeError——任何 JSON 值都只许走
+            # 结构化 bad_params，不许抛异常逃出入口。
+            tier_value = None
+            drawer_value = None
+            explicit_clear = False
+            if action == "set_protection_tier":
+                if "tier" not in params:
+                    return _finish(
+                        "refused", "bad_params",
+                        detail={"param_error": "missing_field:tier"},
+                        register=False,
+                    )
+                tier_value = params["tier"]
+                if tier_value is not None and (
+                    not isinstance(tier_value, str)
+                    or tier_value not in _core_cap.PROTECTION_TIERS
+                ):
+                    return _finish(
+                        "refused", "bad_params",
+                        detail={"param_error": "bad_value:tier"},
+                        register=False,
+                    )
+                explicit_clear = tier_value is None
+            elif action == "set_core_drawer":
+                if "drawer" not in params:
+                    return _finish(
+                        "refused", "bad_params",
+                        detail={"param_error": "missing_field:drawer"},
+                        register=False,
+                    )
+                drawer_value = params["drawer"]
+                if drawer_value is not None and (
+                    not isinstance(drawer_value, str)
+                    or drawer_value not in _core_cap.CORE_DRAWERS
+                ):
+                    return _finish(
+                        "refused", "bad_params",
+                        detail={"param_error": "bad_value:drawer"},
+                        register=False,
+                    )
+                explicit_clear = drawer_value is None
+            fingerprint = self._controlled_fingerprint(
+                action, memory_id, params, source, expected_version
+            )
+            # —— 幂等查重：同键同指纹回原结论，同键异指纹拒 ——
+            prior_kind, prior_payload = self._controlled_prior(
+                idem_key, fingerprint
+            )
+            if prior_kind == "conflict":
+                return _finish(
+                    "refused", "idempotency_conflict",
+                    detail={
+                        "fingerprint": fingerprint,
+                        "prior_fingerprint": prior_payload,
+                    },
+                    register=False,
+                )
+            if prior_kind == "unresolved":
+                return _finish(
+                    "refused", "prior_unresolved",
+                    detail={
+                        "op_id": (prior_payload or {}).get("op_id"),
+                        "commit_state": "pending",
+                        "frozen_reason": self._controlled_frozen_reason,
+                    },
+                    register=False,
+                )
+            if prior_kind == "duplicate":
+                dup = prior_payload
+                dup["duplicate"] = True
+                dup["status"] = "duplicate"
+                receipt["detail"] = dup.get("detail") or {}
+                try:
+                    dup["trace_index"] = _trace(
+                        "duplicate", dup.get("reason") or ""
+                    )
+                except Exception:
+                    logger.warning(
+                        "受控入口留痕写失败（duplicate）", exc_info=True
+                    )
+                    dup["trace_index"] = None
+                    self._controlled_note_health(
+                        "audit_write_failed",
+                        {"idempotency_key": idem_key,
+                         "status": "duplicate"},
+                    )
+                return dup
+            # —— 载行 ——
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted,"
+                " voided, user_confirmed FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return _finish("refused", "not_found")
+            if row[2] or row[3] or row[4]:
+                return _finish("refused", "not_live")
+            text = row[0] or ""
+            meta = json.loads(row[1] or "{}")
+            receipt["version_before"] = self._controlled_version_stamp(
+                text, meta, row[5]
+            )
+            # 验来源（授权硬判，实测问题一）：改记忆类动作只认
+            # BOOS 本人指令；非本人来源拒绝＋攒知情待问
+            # （先例：delete_memory 的 not_owner_instruction）。
+            if not _auth_guard.is_owner_instruction(source):
+                question = self._queue_controlled_entry_question(
+                    action, memory_id, source, "not_owner_instruction"
+                )
+                return _finish(
+                    "refused", "not_owner_instruction",
+                    question_id=(question or {}).get("id"),
+                )
+            # 验保护：核心保护行全动作拒绝；钉死/临时钉死行不许
+            # 被降级或标记休眠（降级不清保护标记，契约三）。
+            tier = _core_cap.normalize_protection_tier(meta)
+            if self._is_core_protected_row(meta) or (
+                action in ("demote", "mark_dormant") and tier is not None
+            ):
+                question = self._queue_controlled_entry_question(
+                    action, memory_id, source, "core_protected"
+                )
+                return _finish(
+                    "refused", "core_protected",
+                    detail={"protection_tier": tier},
+                    question_id=(question or {}).get("id"),
+                )
+            # 验版本（带了戳的）：提案绑的版本与锁内现算的戳
+            # 对不上，提案作废重判，不许拿旧批准改新内容
+            # （契约三）。影子路径同样验——带戳影子也不能拿
+            # 旧戳蒙混。
+            if (
+                expected_version is not None
+                and expected_version != receipt["version_before"]
+            ):
+                return _finish("refused", "version_stale")
+            # 执行开关：默认关——门禁全走完，只出影子回执，
+            # 不落目标记忆的任何状态（立项 H1）。
+            if not self.controlled_entry_execution_enabled:
+                return _finish("shadow", "execution_disabled")
+            # 健康冻结闸口（补修轮）：登记/意图/审计持久化出过
+            # 故障时，执行类动作一律拒，只许拒绝与影子。
+            if self._controlled_frozen_reason:
+                return _finish(
+                    "refused", "entry_frozen",
+                    detail={
+                        "frozen_reason": self._controlled_frozen_reason,
+                    },
+                )
+            # 会话认证（立项 H2）：开关打开后，执行前必须验提案
+            # 携带的会话凭据——有效、在范围内、未过期；敏感动作
+            # （保护变更）只认主人直达会话。验不过一律拒，原因码
+            # 由 session_auth 给（no_session / session_expired /
+            # out_of_scope / not_owner_direct / session_tampered /
+            # session_revoked），不落任何状态。
+            try:
+                verdict = self._session_authority.validate(
+                    proposal.get("session"), action
+                )
+            except Exception:
+                # 验签绝不许把异常抛穿受控入口（补修 F3）：
+                # 畸形凭据按篡改类结构化拒绝，不落任何状态。
+                logger.warning("会话验签异常（提交）", exc_info=True)
+                verdict = {
+                    "ok": False, "reason": "session_tampered",
+                    "session_id": None,
+                }
+            if not verdict["ok"]:
+                return _finish(
+                    "refused", verdict["reason"],
+                    detail={"session_reason": verdict["reason"]},
+                )
+            # 动作前置检查（纯读，先于落意图：不合的提案不许
+            # 在意图登记里留 pending 垃圾）。
+            if action == "demote" and not _core_cap.is_core_member(meta):
+                return _finish("refused", "not_core_member")
+            if (
+                action == "mark_dormant"
+                and meta.get("decay_state") == _decay.DECAY_STATE_DORMANT
+            ):
+                return _finish("refused", "already_dormant")
+            # 版本必填（补修轮，仅执行路径）：走到这里还没绑
+            # 版本的提案不许执行——不许探针式地「先改了再说」。
+            if expected_version is None:
+                return _finish("refused", "missing_version")
+            # —— 操作意图落盘（提交/恢复协议的提交点） ——
+            op_id = "op-" + uuid.uuid4().hex
+            # 执行前/后字段快照（立项 H3）：撤销接口靠它定恢复
+            # 目标与漂移检查；本轮之前的老意图没这两键，撤销时
+            # 按账本折叠重建（见 _controlled_derive_fields）。
+            if action == "demote":
+                _after_fields = {"user_confirmed": False}
+            elif action == "set_protection_tier":
+                _after_fields = {
+                    _core_cap.PROTECTION_TIER_FIELD: tier_value,
+                }
+            elif action == "set_core_drawer":
+                _after_fields = {_core_cap.DRAWER_FIELD: drawer_value}
+            else:  # mark_dormant
+                _after_fields = {
+                    "decay_state": _decay.DECAY_STATE_DORMANT,
+                }
+            intent = {
+                "op_id": op_id,
+                "idempotency_key": idem_key,
+                "fingerprint": fingerprint,
+                "action": action,
+                "memory_id": memory_id,
+                "expected_version": expected_version,
+                "status": "pending",
+                "ts": _now_iso(),
+                "ledger_seq": None,
+                "version_after": None,
+                "before_fields": self._controlled_before_fields(meta),
+                "after_fields": _after_fields,
+                "before_version": receipt["version_before"],
+            }
+            self._controlled_intents[op_id] = intent
+            try:
+                self._controlled_save_intents()
+            except Exception:
+                # 意图落不了盘就不许执行：没有提交点，崩溃后
+                # 无从对账——宁可拒，不许裸奔。
+                logger.warning(
+                    "受控入口操作意图落盘失败", exc_info=True
+                )
+                self._controlled_intents.pop(op_id, None)
+                self._controlled_note_health(
+                    "intents_save_failed", {"op_id": op_id},
+                )
+                return _finish(
+                    "refused", "intent_persist_failed", register=False
+                )
+            # 落笔前撤销复查（H2 补修，撤销语义钉死）：验签
+            # 通过之后、真正落笔之前，凭据可能刚被撤销——
+            # 撤销返回后尚未落笔的执行必须被阻断，这里复查
+            # 一次撤销状态：已撤销按 session_revoked 拒，
+            # 意图按 aborted 收尾，不落任何状态变更。
+            if self._session_authority.is_revoked(
+                verdict["session_id"]
+            ):
+                intent["status"] = "aborted"
+                intent["abort_reason"] = "session_revoked"
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "refused", "session_revoked",
+                    detail={"session_reason": "session_revoked"},
+                )
+            # —— 执行：只走既有 store 路径，不新开写库逻辑；
+            # 状态变更的账本事件带 op_id＋idem_key 贯通对照 ——
+            detail = {}
+            exec_failure = None
+            exec_error = None
+            try:
+                if action == "demote":
+                    result = self._update_core_fields(
+                        memory_id, {"user_confirmed": False},
+                        _op_id=op_id, _idem_key=idem_key,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                    else:
+                        # demote 的第二笔写：user_confirmed 列与
+                        # meta 同步（_update_core_fields 只写
+                        # meta＋账本）。两笔同属一个 op：账本
+                        # PROMOTE 已带 op_id，崩在两笔之间时
+                        # 启动对账按 op_id 认 committed，列与
+                        # meta 的分叉由不变量闸口与启动修复兜。
+                        self._conn.execute(
+                            "UPDATE memories SET user_confirmed=0"
+                            " WHERE id=?",
+                            (memory_id,),
+                        )
+                        self._conn.commit()
+                        detail = dict(result)
+                elif action == "set_protection_tier":
+                    result = self.set_protection_tier(
+                        memory_id, tier_value,
+                        _op_id=op_id, _idem_key=idem_key,
+                        _source=source,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                    else:
+                        detail = dict(result)
+                elif action == "set_core_drawer":
+                    result = self.set_core_drawer(
+                        memory_id, drawer_value,
+                        _op_id=op_id, _idem_key=idem_key,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                    else:
+                        detail = dict(result)
+                elif action == "mark_dormant":
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {
+                                "type": _ledger.LEDGER_EVENT_DORMANT,
+                                "memory_id": memory_id,
+                                "key": memory_id,
+                                "text": text,
+                                "op_id": op_id,
+                                "idem_key": idem_key,
+                            },
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "受控入口标记休眠写账本失败", exc_info=True
+                        )
+                        exec_failure = ("ledger_failed", {})
+                    else:
+                        new_meta = dict(meta)
+                        new_meta["decay_state"] = (
+                            _decay.DECAY_STATE_DORMANT
+                        )
+                        self._conn.execute(
+                            "UPDATE memories SET metadata_json=?"
+                            " WHERE id=?",
+                            (
+                                json.dumps(
+                                    new_meta, ensure_ascii=False
+                                ),
+                                memory_id,
+                            ),
+                        )
+                        self._conn.commit()
+                        detail = {
+                            "decay_state": _decay.DECAY_STATE_DORMANT,
+                        }
+            except Exception as exc:  # 执行半路炸：先对账再定性
+                exec_error = exc
+            if exec_failure is not None:
+                intent["status"] = "aborted"
+                intent["abort_reason"] = exec_failure[0]
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "refused", exec_failure[0], detail=exec_failure[1]
+                )
+            if exec_error is not None:
+                # 已落账就算已提交：不许假报 refused，更不许
+                # 只回滚 SQLite 造成账本分叉。
+                op_state, event = self._controlled_ledger_op_state(
+                    op_id
+                )
+                if op_state == self._LEDGER_OP_UNDETERMINED:
+                    # 账本读失败：到底落没落账定不了，不许按
+                    # 没落账判 aborted（复查 D）——按待核实
+                    # 落账走完后续核验，冻结由
+                    # commit_unverified 负责。
+                    intent["status"] = "committed_unverified"
+                    detail["commit_state"] = "committed_unverified"
+                    detail["ledger_undetermined"] = True
+                    detail["error"] = "%s: %s" % (
+                        type(exec_error).__name__, exec_error,
+                    )
+                    self._controlled_note_health(
+                        "commit_unverified",
+                        {
+                            "op_id": op_id,
+                            "memory_id": memory_id,
+                            "ledger_undetermined": True,
+                        },
+                    )
+                elif op_state == self._LEDGER_OP_ABSENT:
+                    intent["status"] = "aborted"
+                    intent["abort_reason"] = "execute_failed"
+                    self._controlled_save_intents_quiet()
+                    return _finish(
+                        "refused", "execute_failed",
+                        detail={
+                            "error": "%s: %s" % (
+                                type(exec_error).__name__, exec_error,
+                            ),
+                        },
+                    )
+                else:
+                    intent["status"] = "committed"
+                    intent["ledger_seq"] = event.get("seq")
+                    detail["commit_state"] = "committed_after_error"
+                    detail["error"] = "%s: %s" % (
+                        type(exec_error).__name__, exec_error,
+                    )
+            else:
+                # 事件关联核验：这笔 op 必须在账本里找得到，
+                # 找不到如实标「已提交/待核实」，不假报成功
+                # 细节、不假报 refused。
+                op_state, event = self._controlled_ledger_op_state(
+                    op_id
+                )
+                if op_state != self._LEDGER_OP_FOUND:
+                    intent["status"] = "committed_unverified"
+                    detail["commit_state"] = "committed_unverified"
+                    if op_state == self._LEDGER_OP_UNDETERMINED:
+                        detail["ledger_undetermined"] = True
+                    self._controlled_note_health(
+                        "commit_unverified",
+                        {
+                            "op_id": op_id, "action": action,
+                            "memory_id": memory_id,
+                        },
+                    )
+                else:
+                    intent["status"] = "committed"
+                    intent["ledger_seq"] = event.get("seq")
+                    detail["commit_state"] = "committed"
+                    detail["ledger_seq"] = event.get("seq")
+            detail["op_id"] = op_id
+            if explicit_clear:
+                detail["explicit_clear"] = True
+            row_after = self._conn.execute(
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row_after is not None:
+                receipt["version_after"] = self._controlled_version_stamp(
+                    row_after[0] or "",
+                    json.loads(row_after[1] or "{}"),
+                    row_after[2],
+                )
+                intent["version_after"] = receipt["version_after"]
+            try:
+                self._controlled_save_intents()
+            except Exception:
+                logger.warning(
+                    "受控入口操作意图提交标记落盘失败", exc_info=True
+                )
+                detail["intent_persist_failed"] = True
+                self._controlled_note_health(
+                    "intents_save_failed", {"op_id": op_id},
+                )
+            # —— 不变量健康闸口：执行后逐项验（座位/成员/原文/
+            # 字段范围/保护与账本/列与 meta），任一不过不许报
+            # 干净成功；不自动回滚（账本为准，回滚只会分叉），
+            # 落健康标记等恢复路与 H6 处置 ——
+            invariants = self._controlled_check_invariants(
+                memory_id, text, meta, action
+            )
+            detail["invariants"] = invariants["checks"]
+            detail["invariants_ok"] = invariants["ok"]
+            detail["session_id"] = verdict["session_id"]
+            # 最终结论落进意图再返回（补修二轮，复查 B）：
+            # 回执登记丢了时重建回执以此为准，失败不许被洗
+            # 成成功。落盘失败由 quiet 版自己记冻结痕迹。
+            intent["final_ok"] = bool(invariants["ok"])
+            intent["final_reason"] = (
+                "" if invariants["ok"] else "invariant_failed"
+            )
+            intent["invariant_checks"] = invariants["checks"]
+            self._controlled_save_intents_quiet()
+            if not invariants["ok"]:
+                self._controlled_note_health(
+                    "invariant_failed",
+                    {
+                        "op_id": op_id, "action": action,
+                        "memory_id": memory_id,
+                        "checks": invariants["checks"],
+                    },
+                )
+                return _finish(
+                    "executed", "invariant_failed", detail=detail,
+                    ok_override=False,
+                )
+            return _finish("executed", "", detail=detail)
+
+
+
+    # ---------- 撤销接口（立项 H3，2026-11-25） ----------
+    #
+    # 「后悔药」：经受控入口（submit_controlled_proposal）已经
+    # 执行落账的变更，发现错了能按 op 反向补偿，恢复到执行
+    # 前的字段状态。撤销对象范围（本轮核定）：只限受控入口
+    # 四动作（demote / set_protection_tier / set_core_drawer /
+    # mark_dormant）已提交（committed / committed_unverified）
+    # 的执行。宿主自用路（confirm_memory 晋升、delete/revive
+    # 批准路等）做出的变更不在本接口范围——那些仍归 BOOS
+    # 自己的路处置；凭据撤销是 H2 的 revoke_session（凭据
+    # 作废），与这里的变更回滚是两回事，命名不混。
+    #
+    # 口径：
+    #   - 补偿走账本先行的既有路径、带自己的 op_id；撤销意图
+    #     记 revokes_op_id 指回原 op，审计行同带两边 op_id；
+    #     原 op 的意图、回执、账本事件一律不删不改（追加式）。
+    #   - 补偿本身也是一笔受控变更：先落撤销意图（pending），
+    #     补偿落账后标 committed、原意图标 revoked_by；启动
+    #     对账（_controlled_reconcile_intents）同样管撤销意图。
+    #   - 门禁比照原执行从严：只认 BOOS 本人来源；执行开关
+    #     打开时必验会话凭据（按原动作验范围，敏感动作——
+    #     保护变更——只认主人直达，与 H2 同口径）；当前行已
+    #     成核心保护行（_is_core_protected_row）的一律拒，不
+    #     许借撤销绕护栏；入口冻结时拒；开关关时只出影子
+    #     回执、不落状态（与提案同口径）。
+    #   - 栈纪律（防踩踏）：目标字段的当前值必须还等于原 op
+    #     落下的值（after），说明没人动过它；被后来的变更改
+    #     过就拒 state_drifted——要撤先撤最近的那一笔。
+    #   - 幂等：撤销带自己的幂等键；同键同指纹重提回原回执
+    #     副本（duplicate）；原 op 已被别的键撤销 → 明确拒
+    #     already_revoked，不产生二次补偿。
+    #   - 撤销只回滚字段状态：不删记忆、不改原文（四动作本
+    #     就不动原文，补偿后逐字核对）、不碰无关字段；不许
+    #     借撤销之名走删除或改原文。
+    #   - 执行前字段快照：本轮起新执行的意图一律记
+    #     before_fields / after_fields（见 submit 处）；更早的
+    #     老意图没记时按账本折叠重建（_controlled_derive_fields），
+    #     mark_dormant 的旧 decay_state 账本折不出，老意图缺
+    #     快照时如实拒 before_state_unavailable，不猜。
+    #   - 注意：撤销意图的幂等键与提案键共用一套登记文件，
+    #     _controlled_prior 按意图 idem_key 找先行处理时可能
+    #     碰到撤销意图——指纹形状不同，只会往 idempotency_
+    #     conflict 的拒绝方向走，不会误放行。
+
+    @staticmethod
+    def _controlled_before_fields(meta):
+        """一份 meta 里受控四动作能动的字段的当前值（规范化
+        口径，与 core_cap 的 normalize 一致）：撤销的恢复目标
+        与漂移检查都按这份形状比。decay_state 取原值（缺失
+        记 None，恢复时按「键不存在」处理）。"""
+        meta = meta or {}
+        return {
+            "user_confirmed": bool(meta.get("user_confirmed")),
+            _core_cap.PROTECTION_TIER_FIELD:
+                _core_cap.normalize_protection_tier(meta),
+            _core_cap.DRAWER_FIELD:
+                _core_cap.normalize_core_drawer(meta),
+            "decay_state": meta.get("decay_state"),
+        }
+
+    @staticmethod
+    def _controlled_action_field(action):
+        """每个受控动作动的那一个字段（四动作都只动一个）。"""
+        return {
+            "demote": "user_confirmed",
+            "set_protection_tier": _core_cap.PROTECTION_TIER_FIELD,
+            "set_core_drawer": _core_cap.DRAWER_FIELD,
+            "mark_dormant": "decay_state",
+        }.get(action)
+
+    @staticmethod
+    def _controlled_revocation_fingerprint(target_op_id,
+                                           target_idem_key, source):
+        """规范撤销指纹：定位目标＋来源的哈希。同键重提时比
+        指纹——同指纹才是同一撤销，异指纹是同键冲突。会话
+        凭据不进指纹（同 submit 口径）。"""
+        payload = json.dumps(
+            {
+                "target_op_id": target_op_id,
+                "target_idempotency_key": target_idem_key,
+                "instruction_source": source,
+            },
+            sort_keys=True, ensure_ascii=False, default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _controlled_find_intent(self, op_id=None, idempotency_key=None):
+        """按 op_id 或原提案幂等键定位一笔受控入口执行意图；
+        找不到返回 None。撤销意图（kind=revocation）不算原
+        执行——不许拿这道接口去撤销一笔撤销。"""
+        if op_id:
+            intent = self._controlled_intents.get(op_id)
+            if intent is not None and \
+                    intent.get("kind") != "revocation":
+                return intent
+            return None
+        if idempotency_key:
+            for intent in self._controlled_intents.values():
+                if intent.get("kind") == "revocation":
+                    continue
+                if intent.get("idempotency_key") == idempotency_key:
+                    return intent
+        return None
+
+    def _controlled_derive_fields(self, intent):
+        """老意图（本轮之前落的）没记 before/after 字段时，按
+        账本重建：after 取原 op 那笔账本事件的完整 meta 快照
+        折出的字段值，before 取 seq 小于原 op 的事件折出的
+        同一记忆的字段值。重建不出（账本序号缺失、对不上、
+        mark_dormant 的旧 decay_state 无账本载体）返回 None，
+        调用方如实拒，不猜。"""
+        action = intent.get("action")
+        field = self._controlled_action_field(action)
+        if field is None:
+            return None
+        ledger_seq = intent.get("ledger_seq")
+        if ledger_seq is None:
+            return None
+        if action == "mark_dormant":
+            # 旧 decay_state 在账本里没有载体（DORMANT 事件不
+            # 带 meta、折叠不折 decay_state），折不出——不猜。
+            return None
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            logger.warning("撤销重建字段读账本失败", exc_info=True)
+            return None
+        if self._controlled_ledger_doubtful(_info):
+            # 账本残缺（补修 H3 复查 F2）：残余事件折出的
+            # before 可能是错的（缺失的较近 PROMOTE 会改
+            # 变真 before）——不猜、如实拒，调用方按
+            # before_state_unavailable 回。
+            return None
+        op_event = None
+        for event in events:
+            if event.get("seq") == ledger_seq and \
+                    event.get("op_id") == intent.get("op_id"):
+                op_event = event
+                break
+        if op_event is None or not op_event.get("meta"):
+            return None
+        after_fields = self._controlled_before_fields(
+            op_event.get("meta")
+        )
+        prior = [
+            e for e in events
+            if (e.get("seq") or 0) < ledger_seq
+        ]
+        folded = _core_cap.fold_ledger_metas(prior)
+        before_meta = folded.get(intent.get("memory_id"))
+        if before_meta is None:
+            return None
+        before_fields = self._controlled_before_fields(before_meta)
+        return {
+            "before_fields": before_fields,
+            "after_fields": after_fields,
+        }
+
+    def _controlled_verify_revocation(self, memory_id, field,
+                                      before_value, before_text,
+                                      pre_meta, action):
+        """补偿后核对（调用方持锁）：目标字段已恢复到 before
+        值、原文逐字未变、补偿只动了那一个字段、账本口径与
+        库内一致、座位账自洽。返回 {"ok", "checks"}。
+
+        补修 H3 复查 F3：核对口径与正向
+        _controlled_check_invariants 对齐——独立
+        user_confirmed 列与 meta 一致（columns_match_meta，
+        含终态旗）、成员 ID 集合与账本一致
+        （members_match_ledger）必须在场：demote 补偿是两
+        段写（meta/账本先落、独立列后写），第二段失败留下
+        的列/meta 分叉不许被弱核对洗成干净成功。
+        补修 H3 复查 F2：账本有坏行/截断时折叠结论不可
+        信，ledger_matches 与 members_match_ledger 直接判
+        False 并标 ledger_doubtful，不许让核对被坏行洗过。"""
+        checks = {}
+        row = self._conn.execute(
+            "SELECT text, metadata_json, user_confirmed,"
+            " superseded, deleted, voided FROM memories"
+            " WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "checks": {"row_present": False}}
+        checks["row_present"] = True
+        checks["text_unchanged"] = (row[0] or "") == (before_text or "")
+        try:
+            meta_after = json.loads(row[1] or "{}")
+        except Exception:
+            meta_after = {}
+        # 独立确认列与 meta 一致、终态旗没被误动（与正向
+        # columns_match_meta 同口径）。
+        checks["columns_match_meta"] = (
+            bool(row[2]) == bool(meta_after.get("user_confirmed"))
+            and not row[3] and not row[4] and not row[5]
+        )
+        current = self._controlled_before_fields(meta_after)
+        checks["field_restored"] = current.get(field) == before_value
+        pre_meta = pre_meta or {}
+        changed = {
+            f
+            for f in set(pre_meta) | set(meta_after)
+            if pre_meta.get(f) != meta_after.get(f)
+        }
+        checks["fields_confined"] = changed <= {field}
+        ledger_doubtful = False
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+            ledger_doubtful = self._controlled_ledger_doubtful(_info)
+            if action == "mark_dormant":
+                state = _ledger.resolve_state(events)
+                key_states = (state or {}).get("key_states") or {}
+                checks["ledger_matches"] = (
+                    key_states.get(memory_id)
+                    != _ledger.LEDGER_STATE_DORMANT
+                )
+            else:
+                ledger_metas = _core_cap.fold_ledger_metas(events)
+                ledger_meta = ledger_metas.get(memory_id)
+                checks["ledger_matches"] = (
+                    ledger_meta is not None
+                    and self._controlled_before_fields(
+                        ledger_meta
+                    ).get(field) == before_value
+                )
+            # 成员 ID 集合与账本一致（与正向
+            # members_match_ledger 同口径、同一份折叠）。
+            checks["members_match_ledger"] = (
+                self._controlled_members_match_ledger(events)
+            )
+        except Exception:
+            checks["ledger_matches"] = False
+            checks["members_match_ledger"] = False
+        if ledger_doubtful:
+            # 账本残缺：上面折出来的「一致」不可信，一律
+            # 判不干净并留痕（F2），不许被坏行洗过。
+            checks["ledger_doubtful"] = True
+            checks["ledger_matches"] = False
+            checks["members_match_ledger"] = False
+        snap = self.core_seat_snapshot()
+        checks["seats_reconciled"] = bool(snap.get("reconciled"))
+        return {"ok": all(checks.values()), "checks": checks}
+
+    def controlled_revocation_receipt(self, idempotency_key):
+        """按撤销幂等键查已登记的撤销回执；登记里没有时按
+        已提交的撤销意图重建一份（提交/恢复协议，同正向
+        controlled_entry_receipt 口径，补修 H3 复查 F1）；
+        都没有返回 None。"""
+        receipt = self._controlled_revocations.get(idempotency_key)
+        if receipt is not None:
+            return dict(receipt)
+        for intent in self._controlled_intents.values():
+            if intent.get("kind") != "revocation":
+                continue
+            if intent.get("idempotency_key") != idempotency_key:
+                continue
+            if intent.get("status") in (
+                "committed", "committed_unverified",
+            ):
+                return self._controlled_revocation_receipt_from_intent(
+                    intent
+                )
+        return None
+
+    def revoke_controlled_change(self, request):
+        """撤销接口：回滚一笔经受控入口已执行的变更，返回统一回执。
+
+        请求形状（dict）：
+          target_op_id / target_idempotency_key
+                             定位原执行（二选一，op_id 优先）；
+          reason             一句理由（只留痕，不参与判定）；
+          instruction_source 指令来源（口径同 auth_guard：
+                             只认 BOOS 本人）；
+          idempotency_key    撤销自己的幂等键（必填非空 str）；
+          session            会话凭据（issue_session 签发）；
+                             执行开关打开时必验——按原动作验
+                             范围，敏感动作（保护变更）只认
+                             主人直达（口径同 H2）。
+
+        回执形状（键恒定）：
+          {ok, status, reason, revokes_op_id, revocation_op_id,
+           action, memory_id, idempotency_key, duplicate,
+           question_id, trace_index, version_before,
+           version_after, detail, ts}
+          status ∈ revoked / refused / shadow / duplicate。
+          ok 只在真补偿且核对全过时为 True；补偿落了账但核对
+          没过时 status=revoked、reason=invariant_failed、
+          ok=False（已回滚是事实，但不许报干净成功）。
+          version_before 是补偿前的行戳，version_after 是补
+          偿后的行戳；校验类早拒两者都 None，载行后拒绝
+          version_after 为 None。
+        """
+        if not isinstance(request, dict):
+            request = {}
+        target_op_id = request.get("target_op_id")
+        target_key = request.get("target_idempotency_key")
+        rev_key = request.get("idempotency_key")
+        source = request.get("instruction_source")
+        fingerprint = self._controlled_revocation_fingerprint(
+            target_op_id if isinstance(target_op_id, str) else None,
+            target_key if isinstance(target_key, str) else None,
+            source if isinstance(source, str) else None,
+        )
+        receipt = {
+            "ok": False,
+            "status": "refused",
+            "reason": "",
+            "revokes_op_id": target_op_id,
+            "revocation_op_id": None,
+            "action": None,
+            "memory_id": None,
+            "idempotency_key": rev_key,
+            "duplicate": False,
+            "question_id": None,
+            "trace_index": None,
+            "version_before": None,
+            "version_after": None,
+            "detail": {},
+            "ts": _now_iso(),
+        }
+
+        def _trace(status, reason):
+            entry = {
+                "event": status,
+                "revocation": True,
+                "action": receipt["action"],
+                "memory_id": receipt["memory_id"],
+                "idempotency_key": rev_key,
+                "instruction_source": source,
+                "reason": reason,
+                "proposal_reason": request.get("reason") or "",
+                "revokes_op_id": receipt["revokes_op_id"],
+                "fingerprint": fingerprint,
+                "version_before": receipt["version_before"],
+                "version_after": receipt["version_after"],
+            }
+            if receipt["revocation_op_id"]:
+                entry["op_id"] = receipt["revocation_op_id"]
+            if receipt["detail"].get("ledger_seq") is not None:
+                entry["ledger_seq"] = receipt["detail"]["ledger_seq"]
+            return self._controlled_trace(entry)
+
+        def _finish(status, reason, detail=None, question_id=None,
+                    register=True, ok_override=None):
+            receipt["status"] = status
+            receipt["reason"] = reason
+            receipt["ok"] = (
+                status == "revoked" if ok_override is None
+                else bool(ok_override)
+            )
+            if detail:
+                receipt["detail"] = detail
+            if question_id:
+                receipt["question_id"] = question_id
+            try:
+                receipt["trace_index"] = _trace(status, reason)
+            except Exception:
+                logger.warning("撤销接口留痕写失败", exc_info=True)
+                receipt["trace_index"] = None
+                receipt["detail"]["audit_write_failed"] = True
+                self._controlled_note_health(
+                    "audit_write_failed",
+                    {"idempotency_key": rev_key, "status": status},
+                )
+            if register and rev_key:
+                self._controlled_revocations[rev_key] = dict(receipt)
+                self._controlled_revocation_fingerprints[rev_key] = \
+                    fingerprint
+                try:
+                    self._controlled_save_receipts()
+                except Exception:
+                    logger.warning(
+                        "撤销回执登记落盘失败", exc_info=True
+                    )
+                    receipt["detail"]["receipt_persist_failed"] = True
+                    self._controlled_revocations[rev_key] = \
+                        dict(receipt)
+                    self._controlled_note_health(
+                        "receipts_save_failed",
+                        {"idempotency_key": rev_key},
+                    )
+            return dict(receipt)
+
+        with self._lock:
+            # —— 纯形状校验（不占键，同 submit 口径）——
+            if rev_key is None or (
+                isinstance(rev_key, str) and not rev_key
+            ):
+                return _finish(
+                    "refused", "missing_idempotency_key",
+                    register=False,
+                )
+            if not isinstance(rev_key, str):
+                return _finish(
+                    "refused", "bad_idempotency_key", register=False
+                )
+            if target_op_id is not None and (
+                not isinstance(target_op_id, str) or not target_op_id
+            ):
+                return _finish(
+                    "refused", "bad_target", register=False
+                )
+            if target_key is not None and (
+                not isinstance(target_key, str) or not target_key
+            ):
+                return _finish(
+                    "refused", "bad_target", register=False
+                )
+            if target_op_id is None and target_key is None:
+                return _finish(
+                    "refused", "missing_target", register=False
+                )
+            if source is not None and not isinstance(source, str):
+                return _finish("refused", "bad_source", register=False)
+            # —— 撤销幂等查重 ——
+            prev = self._controlled_revocations.get(rev_key)
+            if prev is not None:
+                stored_fp = \
+                    self._controlled_revocation_fingerprints.get(
+                        rev_key
+                    )
+                if stored_fp is not None and stored_fp != fingerprint:
+                    return _finish(
+                        "refused", "idempotency_conflict",
+                        detail={
+                            "fingerprint": fingerprint,
+                            "prior_fingerprint": stored_fp,
+                        },
+                        register=False,
+                    )
+                dup = dict(prev)
+                dup["duplicate"] = True
+                dup["status"] = "duplicate"
+                receipt["action"] = dup.get("action")
+                receipt["memory_id"] = dup.get("memory_id")
+                receipt["revokes_op_id"] = dup.get("revokes_op_id")
+                receipt["detail"] = dup.get("detail") or {}
+                try:
+                    dup["trace_index"] = _trace(
+                        "duplicate", dup.get("reason") or ""
+                    )
+                except Exception:
+                    logger.warning(
+                        "撤销接口留痕写失败（duplicate）",
+                        exc_info=True,
+                    )
+                    dup["trace_index"] = None
+                    self._controlled_note_health(
+                        "audit_write_failed",
+                        {"idempotency_key": rev_key,
+                         "status": "duplicate"},
+                    )
+                return dup
+            # —— 撤销幂等查重（意图侧，补修 H3 复查 F1）：
+            # 登记里没有时查持久化撤销意图——补偿已落账、
+            # 回执登记没落盘的崩溃窗口只查登记会漏，同键
+            # 重入会穿到执行段二次补偿。
+            prior_kind, prior_payload = \
+                self._controlled_prior_revocation(
+                    rev_key, fingerprint, None
+                )
+            if prior_kind == "conflict":
+                return _finish(
+                    "refused", "idempotency_conflict",
+                    detail={
+                        "fingerprint": fingerprint,
+                        "prior_fingerprint": prior_payload,
+                    },
+                    register=False,
+                )
+            if prior_kind == "unresolved":
+                return _finish(
+                    "refused", "unresolved_revocation",
+                    detail={
+                        "revocation_op_id":
+                            (prior_payload or {}).get("op_id"),
+                        "commit_state": "pending",
+                        "frozen_reason":
+                            self._controlled_frozen_reason,
+                    },
+                    register=False,
+                )
+            if prior_kind == "duplicate":
+                dup = dict(prior_payload)
+                receipt["action"] = dup.get("action")
+                receipt["memory_id"] = dup.get("memory_id")
+                receipt["revokes_op_id"] = dup.get("revokes_op_id")
+                receipt["revocation_op_id"] = \
+                    dup.get("revocation_op_id")
+                receipt["detail"] = dup.get("detail") or {}
+                try:
+                    dup["trace_index"] = _trace(
+                        "duplicate", dup.get("reason") or ""
+                    )
+                except Exception:
+                    logger.warning(
+                        "撤销接口留痕写失败（duplicate）",
+                        exc_info=True,
+                    )
+                    dup["trace_index"] = None
+                    self._controlled_note_health(
+                        "audit_write_failed",
+                        {"idempotency_key": rev_key,
+                         "status": "duplicate"},
+                    )
+                return dup
+            # —— 定位原执行 ——
+            intent = self._controlled_find_intent(
+                op_id=target_op_id, idempotency_key=target_key,
+            )
+            if intent is None:
+                return _finish("refused", "op_not_found")
+            if intent.get("status") == "pending":
+                # 先对账再定性：可能只是提交标记没落盘。
+                self._controlled_reconcile_intents()
+                intent = self._controlled_intents.get(
+                    intent.get("op_id"), intent
+                )
+            receipt["revokes_op_id"] = intent.get("op_id")
+            receipt["action"] = intent.get("action")
+            receipt["memory_id"] = intent.get("memory_id")
+            action = intent.get("action")
+            memory_id = intent.get("memory_id")
+            field = self._controlled_action_field(action)
+            if field is None:
+                return _finish("refused", "op_not_found")
+            if intent.get("status") not in (
+                "committed", "committed_unverified",
+            ):
+                return _finish(
+                    "refused", "op_not_committed",
+                    detail={"intent_status": intent.get("status")},
+                )
+            if intent.get("revoked_by"):
+                return _finish(
+                    "refused", "already_revoked",
+                    detail={
+                        "revocation_op_id": intent.get("revoked_by"),
+                    },
+                )
+            # 同目标先行撤销意图兜底（换键重提，补修 F1）：
+            # 原意图的 revoked_by 一般已由成对恢复补上；万
+            # 一撤销意图已决而标记仍缺，这里再兜一层，不许
+            # 换个键把同一笔撤第二遍；未定案的同目标撤销在
+            # 场时同样不许穿到执行段。
+            _pk, _pp = self._controlled_prior_revocation(
+                rev_key, fingerprint, intent.get("op_id")
+            )
+            if _pk == "already_revoked":
+                return _finish(
+                    "refused", "already_revoked",
+                    detail={
+                        "revocation_op_id": (_pp or {}).get("op_id"),
+                    },
+                )
+            if _pk == "unresolved":
+                return _finish(
+                    "refused", "unresolved_revocation",
+                    detail={
+                        "revocation_op_id": (_pp or {}).get("op_id"),
+                        "commit_state": "pending",
+                    },
+                    register=False,
+                )
+            # —— 载行 ——
+            row = self._conn.execute(
+                "SELECT text, metadata_json, superseded, deleted,"
+                " voided, user_confirmed FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return _finish("refused", "not_found")
+            if row[2] or row[3] or row[4]:
+                return _finish("refused", "not_live")
+            text = row[0] or ""
+            meta = json.loads(row[1] or "{}")
+            receipt["version_before"] = \
+                self._controlled_version_stamp(text, meta, row[5])
+            # —— 验来源：撤销只认 BOOS 本人 ——
+            if not _auth_guard.is_owner_instruction(source):
+                question = self._queue_controlled_entry_question(
+                    "revoke", memory_id, source,
+                    "not_owner_instruction",
+                )
+                return _finish(
+                    "refused", "not_owner_instruction",
+                    question_id=(question or {}).get("id"),
+                )
+            # —— 验保护：当前行已成核心保护行的，撤销路不许
+            # 绕护栏碰它（要动走 BOOS 自己的路）——
+            if self._is_core_protected_row(meta):
+                question = self._queue_controlled_entry_question(
+                    "revoke", memory_id, source, "core_protected",
+                )
+                return _finish(
+                    "refused", "core_protected",
+                    question_id=(question or {}).get("id"),
+                )
+            # —— 恢复目标：意图里记了 before/after 就用它，
+            # 没记（老意图）按账本重建，重建不出如实拒 ——
+            before_fields = intent.get("before_fields")
+            after_fields = intent.get("after_fields")
+            if not isinstance(before_fields, dict) or \
+                    not isinstance(after_fields, dict):
+                derived = self._controlled_derive_fields(intent)
+                if derived is None:
+                    return _finish(
+                        "refused", "before_state_unavailable",
+                        detail={"action": action},
+                    )
+                before_fields = derived["before_fields"]
+                after_fields = derived["after_fields"]
+            before_value = before_fields.get(field)
+            after_value = after_fields.get(field)
+            # —— 栈纪律：字段当前值必须还是原 op 落下的值 ——
+            current_fields = self._controlled_before_fields(meta)
+            if current_fields.get(field) != after_value:
+                return _finish(
+                    "refused", "state_drifted",
+                    detail={
+                        "field": field,
+                        "expected_current": after_value,
+                        "actual_current": current_fields.get(field),
+                    },
+                )
+            # —— 执行开关：关时只出影子回执（同提案口径）——
+            if not self.controlled_entry_execution_enabled:
+                return _finish("shadow", "execution_disabled")
+            # —— 健康冻结闸口 ——
+            if self._controlled_frozen_reason:
+                return _finish(
+                    "refused", "entry_frozen",
+                    detail={
+                        "frozen_reason": self._controlled_frozen_reason,
+                    },
+                )
+            # —— 会话认证（H2 口径）：按原动作验范围；敏感
+            # 动作（保护变更）只认主人直达 ——
+            try:
+                verdict = self._session_authority.validate(
+                    request.get("session"), action
+                )
+            except Exception:
+                # 同 submit 口径（补修 F3）：验签异常转结构化
+                # 回执，不许抛穿撤销入口。
+                logger.warning("会话验签异常（撤销）", exc_info=True)
+                verdict = {
+                    "ok": False, "reason": "session_tampered",
+                    "session_id": None,
+                }
+            if not verdict["ok"]:
+                return _finish(
+                    "refused", verdict["reason"],
+                    detail={"session_reason": verdict["reason"]},
+                )
+            # —— 撤销意图落盘（补偿的提交点）——
+            rev_op_id = "op-" + uuid.uuid4().hex
+            receipt["revocation_op_id"] = rev_op_id
+            rev_intent = {
+                "op_id": rev_op_id,
+                "kind": "revocation",
+                "revokes_op_id": intent.get("op_id"),
+                "idempotency_key": rev_key,
+                "fingerprint": fingerprint,
+                "action": action,
+                "memory_id": memory_id,
+                "expected_version": receipt["version_before"],
+                "status": "pending",
+                "ts": _now_iso(),
+                "ledger_seq": None,
+                "version_after": None,
+            }
+            self._controlled_intents[rev_op_id] = rev_intent
+            try:
+                self._controlled_save_intents()
+            except Exception:
+                logger.warning(
+                    "撤销意图落盘失败", exc_info=True
+                )
+                self._controlled_intents.pop(rev_op_id, None)
+                self._controlled_note_health(
+                    "intents_save_failed", {"op_id": rev_op_id},
+                )
+                return _finish(
+                    "refused", "intent_persist_failed",
+                    register=False,
+                )
+            # 落笔前撤销复查（H2 补修，同 submit 口径）：验签
+            # 通过后、补偿落笔前凭据被撤销的，本次补偿必须
+            # 被阻断——按 session_revoked 拒，撤销意图按
+            # aborted 收尾，不落任何补偿。
+            if self._session_authority.is_revoked(
+                verdict["session_id"]
+            ):
+                rev_intent["status"] = "aborted"
+                rev_intent["abort_reason"] = "session_revoked"
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "refused", "session_revoked",
+                    detail={"session_reason": "session_revoked"},
+                )
+            # —— 执行补偿：只走既有路径，账本先行 ——
+            detail = {
+                "revokes_op_id": intent.get("op_id"),
+                "field": field,
+                "restored_value": before_value,
+                "session_id": verdict["session_id"],
+            }
+            exec_failure = None
+            try:
+                if action == "demote":
+                    result = self._update_core_fields(
+                        memory_id, {"user_confirmed": before_value},
+                        _op_id=rev_op_id, _idem_key=rev_key,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                    else:
+                        self._conn.execute(
+                            "UPDATE memories SET user_confirmed=?"
+                            " WHERE id=?",
+                            (1 if before_value else 0, memory_id),
+                        )
+                        self._conn.commit()
+                elif action == "set_protection_tier":
+                    result = self.set_protection_tier(
+                        memory_id, before_value,
+                        _op_id=rev_op_id, _idem_key=rev_key,
+                        _source="revocation",
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                elif action == "set_core_drawer":
+                    result = self.set_core_drawer(
+                        memory_id, before_value,
+                        _op_id=rev_op_id, _idem_key=rev_key,
+                    )
+                    if not result.get("ok"):
+                        exec_failure = (
+                            result.get("reason") or "execute_failed",
+                            result,
+                        )
+                elif action == "mark_dormant":
+                    try:
+                        _ledger.append_event(
+                            self.ledger_path,
+                            {
+                                "type": _ledger.LEDGER_EVENT_REVIVE,
+                                "memory_id": memory_id,
+                                "key": memory_id,
+                                "text": text,
+                                "op_id": rev_op_id,
+                                "idem_key": rev_key,
+                                "revokes_op_id": intent.get("op_id"),
+                            },
+                            lock=self._ledger_lock,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "撤销休眠写账本失败", exc_info=True
+                        )
+                        exec_failure = ("ledger_failed", {})
+                    else:
+                        new_meta = dict(meta)
+                        if before_value is None:
+                            new_meta.pop("decay_state", None)
+                        else:
+                            new_meta["decay_state"] = before_value
+                        self._conn.execute(
+                            "UPDATE memories SET metadata_json=?"
+                            " WHERE id=?",
+                            (
+                                json.dumps(
+                                    new_meta, ensure_ascii=False
+                                ),
+                                memory_id,
+                            ),
+                        )
+                        self._conn.commit()
+            except Exception as exc:
+                op_state, event = self._controlled_ledger_op_state(
+                    rev_op_id
+                )
+                if op_state == self._LEDGER_OP_ABSENT:
+                    rev_intent["status"] = "aborted"
+                    rev_intent["abort_reason"] = "execute_failed"
+                    self._controlled_save_intents_quiet()
+                    return _finish(
+                        "refused", "execute_failed",
+                        detail={
+                            "error": "%s: %s" % (
+                                type(exc).__name__, exc,
+                            ),
+                        },
+                    )
+                if op_state == self._LEDGER_OP_UNDETERMINED:
+                    # 读账失败/账本存疑（补修三轮，复查 D）：补
+                    # 偿到底落没落账定不了，不许记 aborted/
+                    # execute_failed 假报没执行——按已提交待核
+                    # 实落账，冻结由 commit_unverified 负责。
+                    rev_intent["status"] = "committed_unverified"
+                    detail["commit_state"] = "committed_unverified"
+                    detail["ledger_undetermined"] = True
+                    detail["error"] = "%s: %s" % (
+                        type(exc).__name__, exc,
+                    )
+                    self._controlled_note_health(
+                        "commit_unverified",
+                        {
+                            "op_id": rev_op_id,
+                            "revokes_op_id": intent.get("op_id"),
+                            "ledger_undetermined": True,
+                        },
+                    )
+                else:
+                    rev_intent["status"] = "committed"
+                    rev_intent["ledger_seq"] = event.get("seq")
+                    detail["commit_state"] = "committed_after_error"
+                    detail["error"] = "%s: %s" % (
+                        type(exc).__name__, exc,
+                    )
+            if exec_failure is not None:
+                rev_intent["status"] = "aborted"
+                rev_intent["abort_reason"] = exec_failure[0]
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "refused", exec_failure[0],
+                    detail=exec_failure[1],
+                )
+            if rev_intent["status"] not in (
+                "committed", "committed_unverified",
+            ):
+                # 事件关联核验：补偿必须在账本里找得到。
+                op_state, event = self._controlled_ledger_op_state(
+                    rev_op_id
+                )
+                if op_state != self._LEDGER_OP_FOUND:
+                    rev_intent["status"] = "committed_unverified"
+                    detail["commit_state"] = "committed_unverified"
+                    if op_state == self._LEDGER_OP_UNDETERMINED:
+                        detail["ledger_undetermined"] = True
+                    self._controlled_note_health(
+                        "commit_unverified",
+                        {
+                            "op_id": rev_op_id,
+                            "revokes_op_id": intent.get("op_id"),
+                        },
+                    )
+                else:
+                    rev_intent["status"] = "committed"
+                    rev_intent["ledger_seq"] = event.get("seq")
+                    detail["commit_state"] = "committed"
+                    detail["ledger_seq"] = event.get("seq")
+            detail["op_id"] = rev_op_id
+            # 原意图标已撤销（追加式标记，原记录不删不改）。
+            intent["revoked_by"] = rev_op_id
+            intent["revoked_at"] = _now_iso()
+            row_after = self._conn.execute(
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row_after is not None:
+                receipt["version_after"] = \
+                    self._controlled_version_stamp(
+                        row_after[0] or "",
+                        json.loads(row_after[1] or "{}"),
+                        row_after[2],
+                    )
+                rev_intent["version_after"] = \
+                    receipt["version_after"]
+            try:
+                self._controlled_save_intents()
+            except Exception:
+                logger.warning(
+                    "撤销提交标记落盘失败", exc_info=True
+                )
+                detail["intent_persist_failed"] = True
+                self._controlled_note_health(
+                    "intents_save_failed", {"op_id": rev_op_id},
+                )
+            # —— 补偿后核对：字段恢复/原文未变/只动一字段/
+            # 账本一致/座位自洽，任一不过不许报干净成功 ——
+            verify = self._controlled_verify_revocation(
+                memory_id, field, before_value, text, meta, action
+            )
+            detail["verify"] = verify["checks"]
+            detail["verify_ok"] = verify["ok"]
+            # 撤销的最终结论同样落进撤销意图（补修二轮，
+            # 复查 B 的一致性要求）。
+            # 最终结论合成（补修 H3 复查 F4）：提交未定案
+            # （committed_unverified）优先于核对结论——补
+            # 偿可能已落账是事实（status 保留 revoked），
+            # 但生死没定案不许报干净成功；final_* 同口径
+            # 落盘，不许 final_ok=True＋空 reason 把未定案
+            # 洗白（冻结已由 commit_unverified 在定案时留
+            # 痕承接）。
+            if rev_intent.get("status") == "committed_unverified":
+                detail["commit_state"] = "committed_unverified"
+                rev_intent["final_ok"] = False
+                rev_intent["final_reason"] = "committed_unverified"
+                rev_intent["invariant_checks"] = verify["checks"]
+                self._controlled_save_intents_quiet()
+                return _finish(
+                    "revoked", "committed_unverified",
+                    detail=detail, ok_override=False,
+                )
+            rev_intent["final_ok"] = bool(verify["ok"])
+            rev_intent["final_reason"] = (
+                "" if verify["ok"] else "invariant_failed"
+            )
+            rev_intent["invariant_checks"] = verify["checks"]
+            self._controlled_save_intents_quiet()
+            if not verify["ok"]:
+                self._controlled_note_health(
+                    "invariant_failed",
+                    {
+                        "op_id": rev_op_id,
+                        "revokes_op_id": intent.get("op_id"),
+                        "checks": verify["checks"],
+                    },
+                )
+                return _finish(
+                    "revoked", "invariant_failed", detail=detail,
+                    ok_override=False,
+                )
+            return _finish("revoked", "", detail=detail)
 
     def void_joke_memory(self, memory_id):
         """作废一条玩笑记忆：先记账本 delete（标记 voided），再标 SQLite voided=1。
@@ -5922,8 +10789,347 @@ class SQLiteStore:
             self._conn.commit()
             return {"ok": True, "voided": True, "memory_id": row[0]}
 
-    def list_protection_events(self, limit=50):
-        return []
+    # ---------- 保护迁移完成证据（立项 H5，2026-11-25） ----------
+    # 证据形态（十一核定）：双层——
+    # ① 当场证据：_update_core_fields 在保护档真变化时（账本
+    #    落笔＋投影落库之后、仍在店锁内）往
+    #    protection_migration_evidence.jsonl 追加一条完整证据，
+    #    evidence_id 与账本 seq 绑死（pme-<seq>）；只追加，
+    #    本类不提供任何改/删证据的接口。
+    # ② 账本派生：list_protection_events 从账本 ADD/PROMOTE
+    #    事件按 presence 口径折档位轨迹，H5 之前发生的迁移也
+    #    列得出，标 evidence_recorded=False（待补证）——缺证
+    #    只说明没有当场证据，不许据此推断「可降级」。
+    # 完成判定以账本为准（verify_protection_migration）：账本
+    # 确有这笔且档位对得上、投影现状与账本档位链终点一致、
+    # 当场证据在档，三者齐才算完成；对不上逐项列 mismatches，
+    # 不许汇总数字掩盖。
+
+    def _append_protection_evidence(self, evidence):
+        """把一份迁移证据追加进证据日志（fsync 落盘）；成功
+        True、失败 False——失败只记日志不抛：迁移本体已落
+        账本，处置口径见 _update_core_fields 尾部注释。"""
+        try:
+            with self._protection_evidence_lock:
+                with open(
+                    self._protection_evidence_path, "a",
+                    encoding="utf-8",
+                ) as fh:
+                    fh.write(
+                        json.dumps(evidence, ensure_ascii=False) + "\n"
+                    )
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            return True
+        except Exception:
+            logger.warning(
+                "保护迁移证据落盘失败（已迁移待补证）：%s",
+                (evidence or {}).get("evidence_id"),
+                exc_info=True,
+            )
+            return False
+
+    def _read_protection_evidence(self):
+        """读证据日志全量：返回 (records, bad_lines)；文件不
+        存在视作空。坏行跳过并计数，不许整份丢弃。"""
+        records = []
+        bad = 0
+        try:
+            with open(
+                self._protection_evidence_path, "r", encoding="utf-8"
+            ) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (ValueError, TypeError):
+                        bad += 1
+                        continue
+                    if isinstance(rec, dict):
+                        records.append(rec)
+                    else:
+                        bad += 1
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning("保护迁移证据日志读取失败", exc_info=True)
+        return records, bad
+
+    def _protection_tier_history_from_ledger(self):
+        """从账本派生全库保护档轨迹：返回 (history, final_tiers)。
+
+        history：迁移条目列表（seq 升序）——ADD 只定初始档、
+        不产条目；PROMOTE 起档位真变化产一条（带 evidence_id
+        pme-<seq> 与 evidence_recorded 对照当场证据日志）。
+        final_tiers：每条记忆账本口径的当前档位。
+        档位按 presence 口径读：事件 meta 里有 protection_tier
+        键才更新轨迹（键在值为 None = 摘档），与 core_cap 的
+        _PROMOTE_PRESENCE_FIELDS 对账口径一致；其他 PROMOTE
+        写入点带的完整 meta 里档位没变，自然不产条目。"""
+        try:
+            events, _info = _ledger.read_events(self.ledger_path)
+        except Exception:
+            logger.warning("保护迁移历史读账本失败", exc_info=True)
+            self._protection_history_ledger_doubtful = True
+            return [], {}
+        # 账本残缺（补修 H3 复查 F2）：派生轨迹是残缺折
+        # 叠，存疑标记留给核对路径（verify_protection_
+        # migration）判未定案；列表类只读展示照常返回。
+        self._protection_history_ledger_doubtful = (
+            self._controlled_ledger_doubtful(_info)
+        )
+        recorded_ids = {
+            rec.get("evidence_id")
+            for rec in self._read_protection_evidence()[0]
+        }
+        tiers = {}
+        history = []
+        for event in sorted(
+            (e for e in events if isinstance(e, dict)),
+            key=lambda e: e.get("seq") or 0,
+        ):
+            etype = event.get("type")
+            if etype not in (
+                _ledger.LEDGER_EVENT_ADD, _ledger.LEDGER_EVENT_PROMOTE,
+            ):
+                continue
+            mid = event.get("memory_id") or event.get("key")
+            meta = event.get("meta") or {}
+            if not mid or _core_cap.PROTECTION_TIER_FIELD not in meta:
+                continue
+            tier = meta.get(_core_cap.PROTECTION_TIER_FIELD)
+            if etype == _ledger.LEDGER_EVENT_ADD:
+                tiers[mid] = tier
+                continue
+            before = tiers.get(mid)
+            if tier != before:
+                seq = event.get("seq")
+                history.append(
+                    {
+                        "evidence_id": "pme-%s" % seq,
+                        "memory_id": mid,
+                        "tier_before": before,
+                        "tier_after": tier,
+                        "ledger_seq": seq,
+                        "ts": event.get("ts"),
+                        "op_id": event.get("op_id"),
+                        "idem_key": event.get("idem_key"),
+                        "source": (
+                            "controlled_entry"
+                            if event.get("op_id")
+                            else "host_direct"
+                        ),
+                        "evidence_recorded": (
+                            ("pme-%s" % seq) in recorded_ids
+                        ),
+                    }
+                )
+            tiers[mid] = tier
+        return history, tiers
+
+    def list_protection_events(self, memory_id=None, limit=50):
+        """保护档迁移事件（立项 H5 做真，原兼容桩返回 []）。
+
+        数据源为账本保护类事件派生轨迹（见
+        _protection_tier_history_from_ledger）：带 memory_id
+        返回该条的迁移历史（seq 升序）；不带返回全库最近
+        limit 条（seq 升序）。每条带 evidence_recorded：
+        False = 这笔迁移没有当场证据（H5 之前发生、或证据
+        落盘失败），属「待补证」。web/server.py 无参调用，
+        签名向后兼容（新增可选 memory_id），返回仍是 list、
+        键只增不减。"""
+        history, _tiers = self._protection_tier_history_from_ledger()
+        if memory_id is not None:
+            history = [
+                h for h in history if h["memory_id"] == memory_id
+            ]
+        if limit is not None and len(history) > limit:
+            history = history[-limit:]
+        return history
+
+    def get_protection_migration_evidence(self, evidence_id):
+        """取单份完整迁移证据：先查当场证据日志（完整版，带
+        前后版本戳与原文哈希）；没有时按 pme-<seq> 从账本
+        派生重建（reconstructed=True，前后版本戳等当场字段
+        如实置 None）；两处都对不上返回 None。"""
+        if not evidence_id:
+            return None
+        for rec in self._read_protection_evidence()[0]:
+            if rec.get("evidence_id") == evidence_id:
+                out = dict(rec)
+                out["reconstructed"] = False
+                return out
+        history, _tiers = self._protection_tier_history_from_ledger()
+        for entry in history:
+            if entry["evidence_id"] == evidence_id:
+                rebuilt = dict(entry)
+                rebuilt["reconstructed"] = True
+                rebuilt["version_before"] = None
+                rebuilt["version_after"] = None
+                rebuilt["text_hash"] = None
+                return rebuilt
+        return None
+
+    def verify_protection_migration(self, memory_id=None,
+                                    evidence_id=None):
+        """核对一笔保护迁移是否真完成（贵妃 G2 接线用）。
+
+        给 evidence_id：核对指定那一笔——证据与账本原事件逐
+        项对照（迁移前后档位），再看投影现状是否与账本档位
+        链终点一致；该笔之后又有更新的迁移时在
+        detail.superseded_by 注明，不算不一致。
+        只给 memory_id：核对它最新一笔迁移；从未迁移过的，
+        核对出生档（账本 ADD 口径）与投影一致，
+        evidence_id=None、detail.no_migration=True。
+        返回 {ok, memory_id, evidence_id, checks, mismatches,
+        detail}；ok 只在 mismatches 为空时为 True。"""
+        result = {
+            "ok": False,
+            "memory_id": memory_id,
+            "evidence_id": evidence_id,
+            "checks": {},
+            "mismatches": [],
+            "detail": {},
+        }
+        history, final_tiers = (
+            self._protection_tier_history_from_ledger()
+        )
+        if getattr(
+            self, "_protection_history_ledger_doubtful", False
+        ):
+            # 账本残缺（补修 H3 复查 F2）：轨迹与终点档位
+            # 都是残缺折叠，核对不许下「完成」定案。
+            result["checks"]["ledger_complete"] = False
+            result["mismatches"].append("ledger_doubtful")
+        target = None
+        if evidence_id is not None:
+            target = next(
+                (
+                    h for h in history
+                    if h["evidence_id"] == evidence_id
+                ),
+                None,
+            )
+            if target is None:
+                result["mismatches"].append(
+                    "evidence_not_found_in_ledger"
+                )
+                return result
+            memory_id = target["memory_id"]
+            result["memory_id"] = memory_id
+        elif memory_id is not None:
+            mine = [
+                h for h in history if h["memory_id"] == memory_id
+            ]
+            target = mine[-1] if mine else None
+            if target is not None:
+                evidence_id = target["evidence_id"]
+                result["evidence_id"] = evidence_id
+        else:
+            result["mismatches"].append("missing_target")
+            return result
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT text, metadata_json, user_confirmed"
+                " FROM memories"
+                " WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+        if row is None:
+            result["mismatches"].append("row_missing")
+            return result
+        row_meta = json.loads(row[1] or "{}")
+        row_tier = row_meta.get(_core_cap.PROTECTION_TIER_FIELD)
+        ledger_tier = final_tiers.get(memory_id)
+        result["checks"]["projection_tier"] = row_tier
+        result["checks"]["ledger_tier"] = ledger_tier
+        result["checks"]["projection_matches_ledger"] = (
+            row_tier == ledger_tier
+        )
+        if row_tier != ledger_tier:
+            result["mismatches"].append("projection_tier_mismatch")
+
+        if target is None:
+            # 从未迁移：出生档与投影一致即无迁移可核、算完成。
+            result["detail"]["no_migration"] = True
+            result["ok"] = not result["mismatches"]
+            return result
+
+        evidence = self.get_protection_migration_evidence(
+            evidence_id
+        )
+        recorded = bool(
+            evidence and not evidence.get("reconstructed")
+        )
+        result["checks"]["evidence_recorded"] = recorded
+        if not recorded:
+            result["mismatches"].append("evidence_record_missing")
+        if evidence is not None:
+            matches = (
+                evidence.get("tier_after") == target["tier_after"]
+                and evidence.get("tier_before")
+                == target["tier_before"]
+            )
+            result["checks"]["evidence_matches_ledger"] = matches
+            if evidence.get("tier_after") != target["tier_after"]:
+                result["mismatches"].append(
+                    "evidence_tier_after_mismatch"
+                )
+            if evidence.get("tier_before") != target["tier_before"]:
+                result["mismatches"].append(
+                    "evidence_tier_before_mismatch"
+                )
+
+        later = [
+            h for h in history
+            if h["memory_id"] == memory_id
+            and (h["ledger_seq"] or 0) > (target["ledger_seq"] or 0)
+        ]
+        if later:
+            result["detail"]["superseded_by"] = (
+                later[-1]["evidence_id"]
+            )
+
+        # 版本戳只在该笔是这行账本链最后一笔时可比：此后行被
+        # 任何事件动过，戳必然不同，硬比只会假报不一致。
+        if evidence is not None and evidence.get("version_after"):
+            try:
+                events, _info = _ledger.read_events(self.ledger_path)
+                if self._controlled_ledger_doubtful(_info):
+                    # 账本残缺（补修 H3 复查 F2）：事件集合
+                    # 不完整，「这笔是不是最后一笔」定不
+                    # 了——跳过戳比对（同读失败口径），不许
+                    # 拿残缺集合下结论。
+                    events = []
+            except Exception:
+                events = []
+            my_seqs = [
+                (e.get("seq") or 0)
+                for e in events
+                if isinstance(e, dict)
+                and (e.get("memory_id") or e.get("key")) == memory_id
+            ]
+            if my_seqs and max(my_seqs) == (
+                target["ledger_seq"] or 0
+            ):
+                stamp_now = self._controlled_version_stamp(
+                    row[0] or "", row_meta, row[2]
+                )
+                stamp_ok = (
+                    stamp_now == evidence["version_after"]
+                )
+                result["checks"]["version_stamp_matches"] = stamp_ok
+                if not stamp_ok:
+                    result["mismatches"].append(
+                        "version_stamp_mismatch"
+                    )
+            else:
+                result["checks"]["version_stamp_matches"] = None
+        result["ok"] = not result["mismatches"]
+        return result
 
     def deletion_scope(self, memory_id):
         """删除范围预览（2026-11-21 网页测第二轮 #6）：真查库，不是桩。
@@ -5964,6 +11170,7 @@ class SQLiteStore:
                     "metadata": json.loads(row[2] or "{}"),
                 }
             history = []
+            _scope_ledger_doubtful = False
             try:
                 # read_events 返回 (events, info) 二元组，不是事件列表本身：
                 # 直接 for 遍历会拿到 events 列表再拿 info 字典，dict
@@ -5971,11 +11178,18 @@ class SQLiteStore:
                 # 抛 AttributeError，try 包着所以历史永远是空的
                 # （2026-11-22 修：先解包再遍历事件）。
                 events, _info = _ledger.read_events(self.ledger_path)
+                _scope_ledger_doubtful = (
+                    self._controlled_ledger_doubtful(_info)
+                )
                 for event in events:
                     if (event or {}).get("key") == key or (event or {}).get("memory_id") == key:
                         history.append(event)
             except Exception:
                 logger.warning("删除范围读账本历史失败。", exc_info=True)
+                # 读不出来＝存疑（H3 补修轮 2 F2-R2）：历史为空是
+                # 「没读到」，不是「没有历史」；删除预览必须如实
+                # 标存疑，不许让删除审批看着空历史＋不存疑做决定。
+                _scope_ledger_doubtful = True
             return {
                 "scope": "single",
                 "memory_id": memory_id,
@@ -5983,18 +11197,523 @@ class SQLiteStore:
                 "memory": memory,
                 "history_entries": history,
                 "history_count": len(history),
+                "ledger_doubtful": _scope_ledger_doubtful,
                 "in_scope": [memory],
                 "out_of_scope": [],
             }
 
     def pending_notices(self):
-        return []
+        """待问文件损坏的结论可见痕迹（崩溃恢复，追加决定十五）：
+        文件坏过就报一条（原件保全在哪、为什么坏、什么时候），
+        没坏过返回空——和以前桩的口径一致，不打扰正常流程。"""
+        notices = []
+        try:
+            info = self.pending_questions.recovery_report()
+        except Exception:
+            info = None
+        if info:
+            notices.append(
+                {
+                    "kind": "pending_questions_corrupt",
+                    "backup_path": info.get("backup_path"),
+                    "reason": info.get("reason"),
+                    "at": info.get("at"),
+                }
+            )
+        # 受控入口健康痕迹（H1 补修）：不变量失败/提交待核实/
+        # 持久化故障都在这里露头，与 H6 的落盘/结论页映射在
+        # 这里留接缝（H6 从 _controlled_health_issues 与
+        # _controlled_frozen_reason 取数）。
+        for issue in getattr(self, "_controlled_health_issues", []):
+            notices.append(
+                {
+                    "kind": "controlled_entry_health",
+                    "issue": issue.get("kind"),
+                    "detail": issue.get("detail"),
+                    "at": issue.get("at"),
+                }
+            )
+        # 保护迁移待补证（立项 H5）：迁移已落账本、但当场证据
+        # 没落盘的逐条列示——不许静默；账本派生历史里这些条目
+        # 同样标 evidence_recorded=False，两边对得上。
+        for pending in getattr(
+            self, "_protection_evidence_pending", []
+        ):
+            notices.append(
+                {
+                    "kind": "protection_evidence_pending",
+                    "evidence_id": pending.get("evidence_id"),
+                    "memory_id": pending.get("memory_id"),
+                    "ledger_seq": pending.get("ledger_seq"),
+                    "at": pending.get("ts"),
+                }
+            )
+        frozen = getattr(self, "_controlled_frozen_reason", None)
+        if frozen:
+            notices.append(
+                {
+                    "kind": "controlled_entry_frozen",
+                    "reason": frozen,
+                    "at": _now_iso(),
+                }
+            )
+        # 恢复健康度映射（立项 H6）：状态 frozen 必出（带
+        # 残余种类与冻结原因）；本进程还没产出自己的记录
+        # 时，上一进程落盘的未净记录也出——跨重启可见。
+        # attention 级残余各有上面的既有 kind 露头，这里不
+        # 重复汇总（映射全表见 H6 节头）。
+        health = getattr(self, "_recovery_health_latest", None)
+        if health and (
+            health.get("status") == "frozen"
+            or (
+                health.get("status") != "clean"
+                and not getattr(self, "_recovery_health_own", False)
+            )
+        ):
+            notices.append(
+                {
+                    "kind": "recovery_health",
+                    "status": health.get("status"),
+                    "residuals": [
+                        r.get("kind")
+                        for r in health.get("residuals") or []
+                    ],
+                    "frozen_reason": (
+                        health.get("controlled_entry") or {}
+                    ).get("frozen_reason"),
+                    "at": health.get("recorded_at"),
+                }
+            )
+        return notices
+
+    # ---------- 持锁稳定版本快照（立项 H4，2026-11-25） ----------
+
+    @staticmethod
+    def _snapshot_row_state(voided, deleted, superseded, meta):
+        """快照里一行的状态名：终态旗优先（deleted > voided >
+        superseded），活行再按衰减状态分 current / dormant。
+        与账本折叠的 key_states 口径对齐（同一条记忆两边同名）。"""
+        if deleted:
+            return "deleted"
+        if voided:
+            return "voided"
+        if superseded:
+            return "superseded"
+        if (meta or {}).get("decay_state") == _decay.DECAY_STATE_DORMANT:
+            return "dormant"
+        return "current"
+
+    def _frozen_rows_locked(self, memory_ids=None):
+        """持锁内一次读全库行，冻成 {id: 行视图}（调用方须已持
+        self._lock）。行视图 = 内容版本戳（与受控入口
+        controlled_entry_version 同一戳法，提案绑版本/H1 漂移
+        检出共用）＋原文＋meta 深拷贝＋状态＋保护档/抽屉。
+        同时返回全库活行 meta 列表（座位账从同一批读数算，
+        保证快照内部同源、不半新半旧）。"""
+        wanted = None
+        if memory_ids is not None:
+            wanted = {str(m) for m in memory_ids}
+        frozen = {}
+        live_metas = []
+        for mid, text, mjson, voided, deleted, superseded, uc in self._conn.execute(
+            "SELECT id, text, metadata_json, voided, deleted, superseded,"
+            " user_confirmed"
+            " FROM memories"
+        ).fetchall():
+            try:
+                meta = json.loads(mjson or "{}")
+            except Exception:
+                meta = {}
+            if not (voided or deleted or superseded):
+                live_metas.append(meta)
+            if wanted is not None and mid not in wanted:
+                continue
+            frozen[mid] = {
+                "version": self._controlled_version_stamp(
+                    text or "", meta, uc
+                ),
+                "text": text or "",
+                "meta": copy.deepcopy(meta),
+                "state": self._snapshot_row_state(
+                    voided, deleted, superseded, meta
+                ),
+                "live": not (voided or deleted or superseded),
+                "protection_tier": _core_cap.normalize_protection_tier(meta),
+                "core_drawer": _core_cap.normalize_core_drawer(meta),
+            }
+        return frozen, live_metas
+
+    def take_stable_snapshot(self, memory_ids=None):
+        """取一份持锁稳定版本快照（立项 H4）：在 store 锁内一
+        次性冻结——行版本戳＋保护版本＋账本序号（ledger_state
+        的 seq_max）同一临界区内取齐，生成过程不写账本、不写
+        库。整理员拿这份快照出提案、绑版本；之后库里再变，
+        快照视图纹丝不动，差异走 diff_stable_snapshot 对账。
+
+        形状：{snapshot_id, generated_at, ledger_seq,
+        ledger_snapshot_seq, seats, rows, row_count, scoped}。
+        seats 是全库座位账（count_seats 口径，与
+        core_seat_snapshot 同源同读）；rows 可按 memory_ids
+        缩小行范围（scoped=True），座位账永远全库口径。
+        快照只活在进程内登记里，不落盘：进程重启即失效。
+        返回的是深拷贝，调用方改它污染不了登记里的原件。"""
+        with self._lock:
+            frozen, live_metas = self._frozen_rows_locked(memory_ids)
+            seats = _core_cap.count_seats(
+                live_metas, limit=self.core_seat_limit
+            )
+            state = self.ledger_state() or {}
+            snapshot = {
+                "snapshot_id": uuid.uuid4().hex,
+                "generated_at": _now_iso(),
+                "ledger_seq": state.get("seq_max") or 0,
+                "ledger_snapshot_seq": state.get("snapshot_seq"),
+                "seats": seats,
+                "rows": frozen,
+                "row_count": len(frozen),
+                "scoped": memory_ids is not None,
+            }
+            self._stable_snapshots[snapshot["snapshot_id"]] = (
+                copy.deepcopy(snapshot)
+            )
+            return copy.deepcopy(snapshot)
+
+    def get_stable_snapshot(self, snapshot_id):
+        """按 id 取回快照（深拷贝）。没取过、已释放或进程重启
+        后登记已空——如实抛 KeyError，不给假数据。"""
+        with self._lock:
+            snap = self._stable_snapshots.get(snapshot_id)
+            if snap is None:
+                raise KeyError(snapshot_id)
+            return copy.deepcopy(snap)
+
+    def release_stable_snapshot(self, snapshot_id):
+        """释放一份快照：登记里摘掉，之后 get/diff 一律
+        KeyError。摘到了返回 True，本来就没有返回 False。"""
+        with self._lock:
+            return self._stable_snapshots.pop(snapshot_id, None) is not None
+
+    def diff_stable_snapshot(self, snapshot_id):
+        """快照 vs 当前：按 memory_id 给出变化清单。变化判定
+        只认版本戳与行状态（不用时间猜）：戳变了就是 changed，
+        并带 state_before/state_after——顶替（→superseded）、
+        进档案（→dormant）、删除（→deleted）都从状态迁移里
+        看得出。added 只对全库快照有意义（scoped 快照的行集
+        固定，只报 changed/removed）。快照不存在如实
+        KeyError。"""
+        with self._lock:
+            snap = self._stable_snapshots.get(snapshot_id)
+            if snap is None:
+                raise KeyError(snapshot_id)
+            then_rows = snap["rows"]
+            now_rows, _live = self._frozen_rows_locked(
+                list(then_rows) if snap.get("scoped") else None
+            )
+            state = self.ledger_state() or {}
+            added = []
+            if not snap.get("scoped"):
+                added = sorted(set(now_rows) - set(then_rows))
+            removed = sorted(set(then_rows) - set(now_rows))
+            changed = []
+            unchanged = 0
+            for mid in sorted(set(then_rows) & set(now_rows)):
+                before = then_rows[mid]
+                after = now_rows[mid]
+                if (
+                    before["version"] == after["version"]
+                    and before["state"] == after["state"]
+                ):
+                    unchanged += 1
+                    continue
+                changed.append(
+                    {
+                        "memory_id": mid,
+                        "version_before": before["version"],
+                        "version_after": after["version"],
+                        "state_before": before["state"],
+                        "state_after": after["state"],
+                    }
+                )
+            return {
+                "snapshot_id": snapshot_id,
+                "generated_at": snap["generated_at"],
+                "ledger_seq_then": snap["ledger_seq"],
+                "ledger_seq_now": state.get("seq_max") or 0,
+                "added": added,
+                "removed": removed,
+                "changed": changed,
+                "unchanged_count": unchanged,
+            }
 
     # ---------- 启动时要调的（接口兼容，SQLite 版里是空操作） ----------
 
+    # ---------- 性情区原件在壳（追加决定八，2026-11-25 补建） ----------
+    #
+    # 决定八五环的宿主落点（纯文本活在 memory/persona_shell.py）：
+    #   ① 壳原件：仓库根 SOUL.md 标记之间的 17 条（路径可注入
+    #      shell_soul_path，测试用临时壳；默认按 persona_shell
+    #      的仓库根口径）；
+    #   ② 逐字复印件行：slot="soul"、meta 带 persona_projection
+    #      只读投影标记、protection_tier="pinned"（钉死区口径，
+    #      不占座——core_cap.classify 按「活行+成员+保护档为空」
+    #      才占座）；_is_core_protected_row 对投影标记单独认，
+    #      受控入口/自动取代/清扫/衰减一律不碰（H1 的
+    #      core_protected 拒绝就是这条链）；
+    #   ③ 单向同步/重印：sync_persona_projection 只读壳、写记忆，
+    #      永远不写壳文件。三方哈希对照分清三种不一致：
+    #      复印件哈希≠上次重印戳 → 记忆侧被动过 = 冲突（挂问、
+    #      不覆盖）；复印件没变、壳哈希≠重印戳 → 壳侧正常改版，
+    #      照印（重印 = 新行落账 + 旧行 supersede，账本留痕）；
+    #      两边都对得上 = ok 什么都不做；
+    #   ④ 注入从壳原件生成：persona_injection_block 每次现读壳，
+    #      不读复印件——壳改了下一轮注入就是新版（main.py 接点）；
+    #   ⑤ 一致性校验：verify_persona_consistency（启动恢复收尾
+    #      自动跑一遍 _persona_startup_check）；冲突只挂待问
+    #      （auth_claim 类知情问，先例同受控入口拦截问），BOOS
+    #      裁定后以壳为准时调 sync_persona_projection(force=True)
+    #      重印——force 只许人工裁定后用，程序内部不自调。
+    #   Plan C 种子行调和：旧 soul 槽行（AGENT_SOUL_TEXT 一句话
+    #   概括版，mem0 时代种下、无投影标记）在第一次同步时被
+    #   「调和重印」——新投影行落账、种子行走 supersede 退役
+    #   （账本留痕、不删），库里从此只有一行活的 soul 行，不
+    #   留两行互相竞争的「人格」行。依据：决定八＋BOOS
+    #   2026-11-25「替换」拍板——种子本就是指向 SOUL.md 的一句
+    #   概括，原件回来后它没有独立存在的理由。
+
+    def _persona_soul_rows(self):
+        """活着的 soul 相关行：slot='soul' 或带投影标记的。
+
+        返回 [{"id", "text", "meta"}]，按 write_seq 从新到旧。
+        """
+        rows = []
+        cur = self._conn.execute(
+            "SELECT id, text, metadata_json FROM memories"
+            " WHERE superseded=0 AND deleted=0 AND voided=0"
+        )
+        for rid, text, meta_json in cur.fetchall():
+            try:
+                meta = json.loads(meta_json or "{}")
+            except Exception:
+                meta = {}
+            if meta.get("slot") == "soul" or meta.get("persona_projection"):
+                rows.append({"id": rid, "text": text or "", "meta": meta})
+        rows.sort(
+            key=lambda r: r["meta"].get("write_seq") or 0, reverse=True
+        )
+        return rows
+
+    def _persona_projection(self):
+        """当前活着的投影行（最新的一行）；没有返回 None。"""
+        for row in self._persona_soul_rows():
+            if row["meta"].get("persona_projection"):
+                return row
+        return None
+
+    def _queue_persona_conflict_question(self, projection, shell_hash,
+                                         copy_hash):
+        """壳↔复印件冲突攒一条知情待问（先例：受控入口拦截问）。
+
+        只知情、不裁决：BOOS 答「知道了」只是确认知晓，冲突本身
+        等他裁定（以壳为准重印 / 保留记忆这份另议），程序不自决。
+        """
+        return self.pending_questions.add(
+            _pq.QUESTION_KIND_AUTH_CLAIM,
+            "性情区壳原件与核心记忆复印件对不上（记忆 id：%s），"
+            "已挂起、两边都没动，等 BOOS 裁定。"
+            % (projection["id"],),
+            _pq.CHANGE_ATTEMPT_QUESTION_OPTIONS,
+            "性情区一致性校验（追加决定八）：壳与复印件冲突不许"
+            "程序自决或默默覆盖，挂起问 BOOS",
+            memory_id=projection["id"],
+            extra={
+                "auth_action": "persona_conflict",
+                "shell_sha256": shell_hash,
+                "copy_sha256": copy_hash,
+            },
+        )
+
+    def _print_persona_projection(self, shell_text, shell_hash):
+        """把壳条文逐字印成一行新的投影行（账本先行，走既有落行路）。
+
+        返回新行 key；账本写不进去返回 None（调用方如实报）。
+        调用方需持锁（_append_new_memory 的既有口径）。
+        """
+        created_at = _now_iso()
+        meta = {
+            "source": "shell",
+            "confidence": 1.0,
+            "user_confirmed": True,
+            "created_at": created_at,
+            "write_seq": _next_write_seq(),
+            "turn_id": None,
+            "slot": "soul",
+            "is_rule": False,
+            "curated": False,
+            "protection_tier": _core_cap.TIER_PINNED,
+            "core_drawer": None,
+            "decay_kind": _decay.DECAY_KIND_STABLE,
+            "importance": "high",
+            "event_date": None,
+            "last_used_at": created_at,
+            "decay_state": _decay.DECAY_STATE_VERBATIM,
+            "persona_projection": True,
+            "persona_shell_sha256": shell_hash,
+        }
+        dates, sessions, _added = _decay.record_seen_occurrence(
+            None, None, _shanghai_today().isoformat(), None
+        )
+        meta["seen_dates"] = _decay._dump_seen_list(dates)
+        meta["seen_sessions"] = _decay._dump_seen_list(sessions)
+        return self._append_new_memory(shell_text, meta)
+
+    def sync_persona_projection(self, force=False):
+        """壳→记忆单向同步/重印。返回 {"status", "memory_id", ...}。
+
+        status:
+          created    没有任何 soul 行 → 新印投影行；
+          reconciled 只有 Plan C 种子行 → 调和重印（种子退役）；
+          reprinted  壳改版（复印件未动）→ 照印新版，旧行退役；
+          ok         壳、复印件、重印戳三方一致，什么都不做；
+          conflict   复印件被记忆侧动过 → 挂待问、不覆盖（force
+                     =True 才照印，只许 BOOS 裁定后人工调用）；
+          no_shell   壳原件读不到/摘不出条文段 → 不动记忆；
+          ledger_failed  账本写不进去 → 没印成，如实报。
+        本函数永远不写壳文件（单向是死规矩，测试钉住）。
+        """
+        shell_text = _persona_shell.read_shell_clauses(
+            self._shell_soul_path
+        )
+        if not shell_text:
+            return {"status": "no_shell", "memory_id": None}
+        shell_hash = _persona_shell.clauses_sha256(shell_text)
+        with self._lock:
+            proj = None
+            others = []
+            for row in self._persona_soul_rows():
+                if row["meta"].get("persona_projection") and proj is None:
+                    proj = row
+                else:
+                    others.append(row)
+            if proj is not None and not force:
+                stored = proj["meta"].get("persona_shell_sha256")
+                copy_hash = _persona_shell.clauses_sha256(proj["text"])
+                if copy_hash != stored:
+                    question = self._queue_persona_conflict_question(
+                        proj, shell_hash, copy_hash
+                    )
+                    return {
+                        "status": "conflict",
+                        "memory_id": proj["id"],
+                        "question_id": (question or {}).get("id"),
+                    }
+                if shell_hash == stored:
+                    return {"status": "ok", "memory_id": proj["id"]}
+            if proj is not None:
+                status = "reprinted"
+            elif others:
+                status = "reconciled"
+            else:
+                status = "created"
+            new_id = self._print_persona_projection(shell_text, shell_hash)
+            if new_id is None:
+                return {"status": "ledger_failed", "memory_id": None}
+            retire = ([proj] if proj is not None else []) + others
+            for row in retire:
+                if row["id"] == new_id:
+                    continue
+                try:
+                    self._supersede_row(
+                        row["id"], row["text"], row["meta"],
+                        new_id, shell_text,
+                    )
+                except Exception:
+                    logger.warning(
+                        "性情投影重印：旧行取代失败（新行已落账）。",
+                        exc_info=True,
+                    )
+            return {"status": status, "memory_id": new_id}
+
+    def verify_persona_consistency(self):
+        """壳↔复印件一致性校验（决定八第 ⑤ 环）。
+
+        返回 {"ok", "status", ...}：ok=逐字一致；shell_changed=
+        壳改版待重印（正常流程，不挂问）；conflict=复印件被动过
+        （挂待问、两边不覆盖）；missing=还没有投影行；
+        legacy=只有种子行待调和；no_shell=壳读不到。
+        """
+        shell_text = _persona_shell.read_shell_clauses(
+            self._shell_soul_path
+        )
+        if not shell_text:
+            return {"ok": False, "status": "no_shell"}
+        shell_hash = _persona_shell.clauses_sha256(shell_text)
+        with self._lock:
+            proj = self._persona_projection()
+            if proj is None:
+                return {
+                    "ok": False,
+                    "status": "legacy" if self._persona_soul_rows()
+                    else "missing",
+                }
+            if proj["text"] == shell_text:
+                return {
+                    "ok": True, "status": "ok",
+                    "memory_id": proj["id"],
+                }
+            copy_hash = _persona_shell.clauses_sha256(proj["text"])
+            stored = proj["meta"].get("persona_shell_sha256")
+            if copy_hash == stored:
+                return {
+                    "ok": False, "status": "shell_changed",
+                    "memory_id": proj["id"],
+                }
+            question = self._queue_persona_conflict_question(
+                proj, shell_hash, copy_hash
+            )
+            return {
+                "ok": False, "status": "conflict",
+                "memory_id": proj["id"],
+                "question_id": (question or {}).get("id"),
+            }
+
+    def _persona_startup_check(self):
+        """启动恢复收尾的性情校验：没行不吵、种子行待同步不吵，
+        只有真投影在场才三方校验（冲突挂问在 verify 里）。"""
+        rows = self._persona_soul_rows()
+        if not rows:
+            return {"status": "absent"}
+        if self._persona_projection() is None:
+            return {"status": "legacy_pending_sync"}
+        return self.verify_persona_consistency()
+
+    def persona_injection_block(self):
+        """每轮注入的性情块：现读壳原件生成，不读记忆复印件。
+
+        壳读不到返回空串（宁可不带，也不拿复印件冒充原件——
+        决定八：注入从壳原件生成）。
+        """
+        shell_text = _persona_shell.read_shell_clauses(
+            self._shell_soul_path
+        )
+        if not shell_text:
+            return ""
+        return _persona_shell.build_persona_block(shell_text)
+
     def ensure_identity_memories(self):
-        """身份记忆已经在账本里了，SQLite 版启动时不用再种。"""
-        return {}
+        """身份种子接点（web 启动时调）：决定八起承担性情投影同步。
+
+        返回 {"soul": {...}}：新建/调和时 status="added"（沿调用方
+        既有口径），精确结果在 persona_status 里（created /
+        reconciled / reprinted / ok / conflict / no_shell /
+        ledger_failed）。名字/电脑配置种子是 mem0 时代的事、账本
+        里已有，本函数不再重复种（旧桩注释的口径不变）。
+        """
+        result = self.sync_persona_projection()
+        outcome = dict(result)
+        outcome["persona_status"] = result.get("status")
+        if result.get("status") in ("created", "reconciled"):
+            outcome["status"] = "added"
+        return {"soul": outcome}
 
     def backfill_timestamps(self):
         """补时间戳是 mem0 索引的事，SQLite 行里本来就有 created_at。"""
@@ -6109,9 +11828,10 @@ def _blob_to_vector(blob):
 def create_sqlite_store(budget_tracker=None, **kwargs):
     """建一个 SQLiteStore；建不好时返回 None（降级成“没有记忆也能聊”）。
 
-    建好后顺手对一次账（reconcile_ledger_index）：账本里有、索引里
-    没有的，按账本重建索引——写索引那步崩了、或索引坏过，重启后
-    靠这一笔把记忆捞回来。对账本身不抛异常、只记日志。
+    建好后先跑启动崩溃恢复（startup_recovery：校验账本、修残行、
+    按账本修投影的半截状态、待问文件损坏保全与重建），再对一次账
+    （reconcile_ledger_index）补缺行——两步写之间崩了、或索引坏过，
+    重启后靠这两笔把记忆捞回来。都不抛异常、只记日志。
     """
     try:
         store = SQLiteStore(budget_tracker=budget_tracker, **kwargs)
@@ -6119,7 +11839,22 @@ def create_sqlite_store(budget_tracker=None, **kwargs):
         logger.warning("SQLite 记忆未启用：%s，本次不带记忆运行。", exc)
         return None
     try:
+        store.startup_recovery()
+    except Exception:
+        logger.warning("启动崩溃恢复失败：继续启动，后面对账照常。", exc_info=True)
+    try:
         store.reconcile_ledger_index()
     except Exception:
         logger.warning("启动对账失败：本次不对索引补缺。", exc_info=True)
+    try:
+        # 待问重建补跑（2026-11-25 互查 (b)）：startup_recovery
+        # 里的重建跑在 reconcile 补缺之前——账本里有、SQLite 里
+        # 缺的行当时还不存在，靠行 meta 标记重建的 auth_claim
+        # 问题会漏掉。补缺完成后再扫一遍：攒问题自带去重
+        # （add 按 kind+memory_id 去重、挂起问题按原文去重），
+        # 不会重复攒。
+        if store.pending_questions.recovery_report():
+            store.rebuild_pending_questions()
+    except Exception:
+        logger.warning("启动对账后待问重建补跑失败。", exc_info=True)
     return store

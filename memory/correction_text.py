@@ -171,6 +171,60 @@ def _correction_topic_slot(text):
     return "pref:" + verb + obj
 
 
+# _PLAN_CHANGE（计划斜改，2026-11-25 实测问题二）：「成都不去了，
+# 改到重庆」这种说法没有任何经典纠正词（不对/记错了……），以前
+# _detect_correction 认不出来，整句被当新事实存下、旧行留活，
+# 成都重庆两行并存（BOOS 实测第 ① 组原案）。它的结构其实很明确：
+# 先否定一个旧值（X 不去了 / 不去 X 了），紧接着用改到/改成/
+# 改去/换成给出新值——缺一不认。认出后 old_value/new_value 都
+# 带出来：调用方按旧值定位旧行、把新值换进旧行原文（同碎片补句
+# 的换值法），不靠相似度猜。护栏：旧值不许是人称代词（“我不去
+# 了，改到明天”里被否定的不是一个值，是说话人自己）；新旧同值
+# 不认（没改）。
+_PLAN_CHANGE_VERBS = ("改到", "改成", "改去", "换成")
+_PLAN_CHANGE_BAD_OLD = {
+    "我", "你", "他", "她", "它", "我们", "你们", "他们",
+    "这", "那", "这个", "那个",
+}
+_PLAN_CHANGE_RE = re.compile(
+    r"(?P<old>[^，,。！？；;\s]{1,12}?)不去了?[，,]\s*"
+    r"(?:改到|改成|改去|换成)\s*(?P<new>[^，,。！？；;\s]{1,20})"
+    r"|不去(?P<old2>[^，,。！？；;\s]{1,12}?)了[，,]\s*"
+    r"(?:改到|改成|改去|换成)\s*(?P<new2>[^，,。！？；;\s]{1,20})"
+)
+
+
+def _detect_plan_change(text):
+    """认「X不去了，改到Y」式计划斜改（见上方 _PLAN_CHANGE 注释）。
+
+    返回 {"phrase": 换值动词, "fact": 新值, "old_value": 旧值,
+    "new_value": 新值, "plan_change": True, "span": (起, 止)}；
+    不认返回 None。fact 先只给新值本身，整句由调用方按旧值换进
+    旧行原文补全（sqlite_store._complete_plan_change）。"""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    for m in _PLAN_CHANGE_RE.finditer(text):
+        old = (m.group("old") or m.group("old2") or "").strip()
+        new = (m.group("new") or m.group("new2") or "").strip()
+        new = new.rstrip("了呢啊吧哦嘛").strip()
+        if not old or not new or old == new:
+            continue
+        if len(old) < 2 or old in _PLAN_CHANGE_BAD_OLD:
+            continue
+        if old.startswith(("我", "你", "他", "她", "它")):
+            continue
+        verb = next(v for v in _PLAN_CHANGE_VERBS if v in m.group(0))
+        return {
+            "phrase": verb,
+            "fact": new,
+            "old_value": old,
+            "new_value": new,
+            "plan_change": True,
+            "span": (m.start(), m.end()),
+        }
+    return None
+
+
 def _detect_correction(text):
     """从一句话里认出“纠错意图 + 新说法”。
 
@@ -215,6 +269,12 @@ def _detect_correction(text):
     text = text.strip()
     if not text:
         return None
+    # 计划斜改（实测问题二）先认：结构明确（否定旧值+换值动词+
+    # 新值），且要赶在“换成”弱信号之前——「成都不去了，换成重庆」
+    # 走弱信号只会剩下碎片新说法，落不了账。
+    plan = _detect_plan_change(text)
+    if plan is not None:
+        return plan
     best = None  # (出现位置, -说法长度, 说法, 新说法)
     for phrase in _CORRECTION_PHRASES:
         start = 0
@@ -374,6 +434,17 @@ def _strip_correction_sentences(latest_user):
         detected = _detect_correction(sentence)
         if detected is None:
             kept.append(sentence)
+            continue
+        if detected.get("plan_change") and detected.get("span"):
+            # 斜改句：纠正段从旧值处起，前半截是引子（“刚定的
+            # 事情，”）不是独立事实——只有像句独立陈述（带事实
+            # 动词）才留，免得把引子当事实存下。
+            before = sentence[:detected["span"][0]].strip()
+            before = before.strip("，,：:、；; \t")
+            if len(before) >= 2 and any(
+                ch in before for ch in "喜欢爱吃喝住叫去在是有"
+            ):
+                kept.append(before)
             continue
         before = sentence[:sentence.find(detected["phrase"])].strip()
         before = before.strip("，,：:、；; \t")

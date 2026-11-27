@@ -14,6 +14,7 @@
 import json
 import logging
 import os
+import shutil
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -26,10 +27,27 @@ logger = logging.getLogger(__name__)
 # 记忆和新事实冲突时，要不要换成新的——不许悄悄顶掉，先问 BOOS。
 QUESTION_KIND_IMPORTANCE = "importance"
 QUESTION_KIND_CONFLICT = "conflict"
+QUESTION_KIND_CORE_CAPACITY = "core_capacity"
+QUESTION_KIND_AUTH_CLAIM = "auth_claim"
+# 入口挂起问题（四件套·实测问题三，追加决定七）：入口当场拦
+# 拿不准的候选不落记忆行、先挂起，BOOS 裁这句存还是不存。
+QUESTION_KIND_INTAKE_HOLD = "intake_hold"
 
 # 冲突保护问题的选项（固定两个）：换成新的 = 按答案取代旧记忆；
 # 不换 = 两条都留着，这对冲突记为已裁决，不再重复问。
 CONFLICT_QUESTION_OPTIONS = ("换成新的", "不换")
+# 核心容量问题的选项（四件套第 1 块）：满座被容量门拦下的候选，
+# 先留作候选 = 只记下问题、记忆保持原样（还没进核心）；不要了 =
+# 按 BOOS 的回答删掉那条（走 delete_memory 的批准删除路）。
+CORE_CAPACITY_QUESTION_OPTIONS = ("先留作候选", "不要了")
+# 授权核实问题的选项（四件套·实测问题一）：是真的 = 这话确实是
+# BOOS 本人授权，那条按本人确认升级；不是真的 = 转述不实，
+# 那条删掉。非本人通道改记忆被拒的留痕问题只用「知道了」。
+AUTH_CLAIM_QUESTION_OPTIONS = ("是真的", "不是真的")
+CHANGE_ATTEMPT_QUESTION_OPTIONS = ("知道了",)
+# 入口挂起问题的选项：存 = 按 BOOS 裁决把原文回存；不存 =
+# 这句就不要了（本来就没落行，只消耗问题）。
+INTAKE_HOLD_QUESTION_OPTIONS = ("存", "不存")
 
 # 问题状态：pending（攒着、还没问过）、asked（已在某轮回复里问过、
 # 等回答）、answered（已回答、按答案处理完）。
@@ -76,8 +94,8 @@ class PendingQuestions:
 
     path 不传时默认 memory_dir/pending_questions.json；
     memory_dir 也不传时默认当前目录下的 memory/pending_questions.json
-    （测试传 tmp_path 更方便）。文件坏了/读不出来时按空算，不崩——
-    问题丢了可以再攒，绝不能因为问题文件坏了拦住聊天。
+    （测试传 tmp_path 更方便）。文件坏了不崩，但不许静默按空算
+    （追加决定十五）：原件先改名保全、load_error 报警，store 启动恢复按存活记录重建能重建的部分；文件不存在是第一次跑，不算坏。
     """
 
     def __init__(self, path=None, memory_dir=None):
@@ -88,21 +106,105 @@ class PendingQuestions:
         else:
             self._path = Path("memory") / "pending_questions.json"
         self._lock = threading.RLock()
+        self.load_error = None
+        # 损坏原件没能保全（改名、复制都失败）时置 True：_save
+        # 据此拒绝覆盖——宁可问题先只攒在内存里，也不许把唯一
+        # 的坏文件原件无副本覆盖掉（见 _preserve_corrupt）。
+        self._corrupt_unpreserved = False
         self._questions = self._load()
 
+    def _preserve_corrupt(self, reason):
+        """保全损坏的问题文件原件并报警（崩溃恢复，追加决定十五）。
+
+        原件改名为 pending_questions.json.corrupt-<时间戳> 留在同
+        目录——坏成什么样就是什么样，死无对证的事不许干。改名
+        失败再试复制留副本；两样都失败也照样把 load_error 记
+        下来（报警不能丢，store 的 pending_notices 会把它带到
+        结论可见处），并置 _corrupt_unpreserved——这种情况下
+        _save 拒绝覆盖原文件，免得坏内容无副本消失。"""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        backup = self._path.with_name(
+            "%s.corrupt-%s" % (self._path.name, stamp)
+        )
+        n = 2
+        while backup.exists():
+            backup = self._path.with_name(
+                "%s.corrupt-%s-%d" % (self._path.name, stamp, n)
+            )
+            n += 1
+        moved = False
+        try:
+            os.replace(self._path, backup)
+            moved = True
+        except OSError:
+            # 改名失败退一步试复制（2026-11-25 互查 (a)）：原件
+            # 动不了，至少留一份副本，后续 _save 覆盖原文件时
+            # 内容不至于无副本消失。复制也失败才算没保全住。
+            logger.error(
+                "pending_questions 文件损坏且保全改名失败，改试复制保全：%s",
+                self._path, exc_info=True,
+            )
+            try:
+                shutil.copyfile(self._path, backup)
+                moved = True
+            except OSError:
+                logger.error(
+                    "pending_questions 文件损坏且复制保全也失败：%s",
+                    self._path, exc_info=True,
+                )
+        self._corrupt_unpreserved = not moved
+        self.load_error = {
+            "path": str(self._path),
+            "backup_path": str(backup) if moved else None,
+            "reason": reason,
+            "at": _now_iso(),
+        }
+        logger.error(
+            "pending_questions 文件损坏（%s）：原件保全到 %s，"
+            "本次按空加载，待启动恢复按存活记录重建。",
+            reason,
+            str(backup) if moved else "（保全失败，原地保留，后续保存将被拒绝）",
+        )
+
+    def recovery_report(self):
+        """文件损坏的痕迹：没坏过返回 None；坏过返回 load_error
+        副本（原件保全在哪、坏在哪、什么时候）。"""
+        if not self.load_error:
+            return None
+        return dict(self.load_error)
+
     def _load(self):
+        # 文件不存在是第一次跑，不算损坏；文件在却读不出/解析
+        # 不了/形状不对 = 损坏（追加决定十五）：不许再静默按空
+        # 算——先保全原件、记 load_error 报警，再按空起步，问题
+        # 由 store 启动恢复按账本/入口留痕重建能重建的部分。
+        self.load_error = None
+        if not self._path.exists():
+            return []
         try:
             raw = self._path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as exc:
+            self._preserve_corrupt("read_failed: %s" % exc)
             return []
         try:
             data = json.loads(raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
+            self._preserve_corrupt("bad_json: %s" % exc)
             return []
         if not isinstance(data, dict):
+            self._preserve_corrupt("bad_shape: top level is not an object")
             return []
-        items = data.get("questions") or []
+        # questions 键缺失、或值不是 list（{} / "" / 0 / False /
+        # None 等）都是坏形状：旧写法 data.get(...) or [] 把这些
+        # 静默吞成空队列，绕过保全与报警，之后任意一次 _save
+        # 还会把原坏文件覆盖掉、连副本都不留（2026-11-25 互查
+        # 修复二，探针实证）。
+        if "questions" not in data:
+            self._preserve_corrupt("bad_shape: questions key missing")
+            return []
+        items = data["questions"]
         if not isinstance(items, list):
+            self._preserve_corrupt("bad_shape: questions is not a list")
             return []
         out = []
         for item in items:
@@ -115,7 +217,16 @@ class PendingQuestions:
 
     def _save(self):
         """原子写盘：先写临时文件再 os.replace。写失败只记不抛——
-        问题存不下来不拦聊天，下次还能再攒。"""
+        问题存不下来不拦聊天，下次还能再攒。例外：损坏原件没能
+        保全时拒绝保存（见 _preserve_corrupt），宁可这批问题先
+        只攒在内存里，也不许覆盖掉唯一的坏文件原件。"""
+        if getattr(self, "_corrupt_unpreserved", False):
+            logger.error(
+                "pending_questions 损坏原件未能保全，拒绝覆盖保存"
+                "（问题暂存内存，先保住原件）：%s",
+                self._path,
+            )
+            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_name(".%s.tmp" % self._path.name)

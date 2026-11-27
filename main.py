@@ -443,8 +443,17 @@ def handle_remember(budget_tracker, text):
     if store is None:
         print("记忆未启用：请先配置 DEEPSEEK_API_KEY。")
         return
+    # 不传多余参数：工厂给的库只保证 add_memory_text(原文) 这条
+    # 原语（鸭子类型）。入口当场拦（实测问题三）的结果按 event
+    # 如实播报——被拦/挂起时不许谎报「已记住」。
     result = store.add_memory_text(content)
-    if result:
+    _event = result.get("event") if isinstance(result, dict) else None
+    if _event == "INTAKE_DROPPED":
+        print("没存：这句被入口当场拦下了（%s）。"
+              % (result.get("reason") or "不像要记的事实"))
+    elif _event == "INTAKE_HELD":
+        print("先没存：这句拿不准，已挂起待你裁（存 / 不存）。")
+    elif result:
         print("已记住。")
     else:
         print("没记住：保存失败，记忆库可能出了问题，稍后再试。")
@@ -846,6 +855,39 @@ def run_question(prompt, task_type="question", budget_tracker=None, messages=Non
     # 揣摩提示词只在可能有没说出口的想法时才递（#4：_should_offer_mind_read
     # 把简单表态、交代做事、随口一提的喜好/安排直接拦在程序层）；数字规则
     # 常驻（#11）：给了本地计算结果就直接用，没给、不会算就说算不出来。
+    # 已确认事实回锚（四件套·实测问题四，2026-11-24）：已确认事实每轮
+    # 强制注入、独立成区标「已确认」并写明是定案；长对话每 8 轮用加强版
+    # 回锚块替换常规块（见 memory/reanchor.py）。只在有记忆库且非恢复
+    # 任务时拼（和检索、摘要同一口径——恢复任务的消息里已有当时拼好的
+    # 提示块）；拿事实或拼装失败不拦聊天，没带锚照常答。网页 ask() 另行
+    # 拼的检索块不经过这里，但最终发给模型的提示词在 run_question 里
+    # 组装，这一处两条路都覆盖。
+    if memory_store is not None and resume_task is None:
+        try:
+            from memory.reanchor import (
+                anchor_block_for_turn,
+                turn_number_from_messages,
+            )
+
+            _anchor_block = anchor_block_for_turn(
+                memory_store.confirmed_facts(),
+                turn_number_from_messages(messages),
+            )
+        except Exception:
+            logger.warning("已确认事实回锚拼装失败，本次不带锚继续。", exc_info=True)
+            _anchor_block = ""
+        if _anchor_block:
+            model_prompt = _anchor_block + "\n\n" + model_prompt
+        # 性情区注入（追加决定八）：从壳 SOUL.md 原件现读生成，
+        # 不读记忆复印件——壳改版，下一轮注入就是新版。拼装
+        # 失败不拦聊天（同回锚口径）。
+        try:
+            _persona_block = memory_store.persona_injection_block()
+        except Exception:
+            logger.warning("性情区注入拼装失败，本次不带性情区继续。", exc_info=True)
+            _persona_block = ""
+        if _persona_block:
+            model_prompt = _persona_block + "\n\n" + model_prompt
     _mind_read_hint = _MIND_READ_HINT if _should_offer_mind_read(prompt) else ""
     model_prompt = (
         "【给十二的提示】" + _mind_read_hint

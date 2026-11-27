@@ -57,6 +57,23 @@ LEDGER_EVENT_TOUCH = "touch"
 # slot），重建时按它把标带回来。只是索引提示，不改变记忆状态，
 # resolve_state 不处理它（状态层不认这个类型，无副作用）。
 LEDGER_EVENT_SLOT = "slot"
+# 图谱二期（2026-11-24）：图边事件——同义词边的新增/作废、关系边的
+# 显式作废都记这一笔（边进账本：谁提的、凭什么、什么时候连的、
+# 什么时候废的，全可追溯）。事件形状：action=add/invalidate、
+# kind（synonym 或四种关系之一）、entity_a/entity_b（同义词边的两个
+# 实体名）或 from_key/to_key（关系边的两个记忆 key）、scope（同义词
+# 边的作用域）、provenance（来源）、evidence（放行证据）、
+# valid_at/invalid_at、reason（作废理由）。resolve_state 只把它们
+# 折成 graph_edges 列表供建图重放，不改变任何记忆状态。
+LEDGER_EVENT_GRAPH_EDGE = "graph_edge"
+# 技能自动生成（2026-11-25，四件套第 4 块）：技能状态变更事件——
+# 提案/生成/补丁/试用/打回/转正/淘汰/恢复都记这一笔（事件形状：
+# action、skill_id、version、from_state/to_state、before_hash/
+# after_hash（正文内容哈希，只证一致不证对错）、reason、evidence、
+# actor）。resolve_state 只把它们折成 skill_events 列表供回溯，
+# 不改变任何记忆状态。遥测是高频计数，留在技能自己的 usage
+# 日志里，不灌主账本。
+LEDGER_EVENT_SKILL = "skill"
 LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_ADD,
     LEDGER_EVENT_SUPERSEDE,
@@ -69,6 +86,8 @@ LEDGER_EVENT_TYPES = (
     LEDGER_EVENT_SNAPSHOT,
     LEDGER_EVENT_TOUCH,
     LEDGER_EVENT_SLOT,
+    LEDGER_EVENT_GRAPH_EDGE,
+    LEDGER_EVENT_SKILL,
 )
 
 # 账本里的状态名（resolve_state 的 by_id 值里 "state" 字段的取值）。
@@ -280,6 +299,8 @@ def resolve_state(events, snapshot=None):
     by_id = {}
     adds = []
     relations = []
+    graph_edges = []
+    skill_events = []
     key_states = {}
     id_to_key = {}
     inferences = {}
@@ -294,6 +315,10 @@ def resolve_state(events, snapshot=None):
             adds.append(dict(entry))
         for entry in snapshot.get("relations") or []:
             relations.append(dict(entry))
+        for entry in snapshot.get("graph_edges") or []:
+            graph_edges.append(dict(entry))
+        for entry in snapshot.get("skill_events") or []:
+            skill_events.append(dict(entry))
         for key, state in (snapshot.get("key_states") or {}).items():
             key_states[key] = state
         for mem_id, key in (snapshot.get("id_to_key") or {}).items():
@@ -426,6 +451,41 @@ def resolve_state(events, snapshot=None):
                     "seq": seq,
                 }
             )
+        elif etype == LEDGER_EVENT_GRAPH_EDGE:
+            graph_edges.append(
+                {
+                    "action": event.get("action") or "add",
+                    "kind": event.get("kind") or "",
+                    "entity_a": event.get("entity_a"),
+                    "entity_b": event.get("entity_b"),
+                    "from_key": event.get("from_key"),
+                    "to_key": event.get("to_key"),
+                    "scope": event.get("scope"),
+                    "provenance": event.get("provenance") or "",
+                    "evidence": event.get("evidence") or "",
+                    "valid_at": event.get("valid_at"),
+                    "invalid_at": event.get("invalid_at"),
+                    "reason": event.get("reason") or "",
+                    "seq": seq,
+                }
+            )
+        elif etype == LEDGER_EVENT_SKILL:
+            skill_events.append(
+                {
+                    "action": event.get("action") or "",
+                    "skill_id": event.get("skill_id"),
+                    "version": event.get("version"),
+                    "from_state": event.get("from_state"),
+                    "to_state": event.get("to_state"),
+                    "before_hash": event.get("before_hash"),
+                    "after_hash": event.get("after_hash"),
+                    "reason": event.get("reason") or "",
+                    "evidence": event.get("evidence") or {},
+                    "actor": event.get("actor") or "",
+                    "proposal_id": event.get("proposal_id"),
+                    "seq": seq,
+                }
+            )
         elif etype == LEDGER_EVENT_TOUCH:
             _touch_ts = event.get("ts")
             if _touch_ts:
@@ -440,6 +500,8 @@ def resolve_state(events, snapshot=None):
         "by_id": by_id,
         "adds": adds,
         "relations": relations,
+        "graph_edges": graph_edges,
+        "skill_events": skill_events,
         "key_states": key_states,
         "id_to_key": id_to_key,
         "inferences": inferences,
@@ -581,6 +643,8 @@ def write_snapshot(path, state, seq_max):
         "by_id": (state or {}).get("by_id") or {},
         "adds": (state or {}).get("adds") or [],
         "relations": (state or {}).get("relations") or [],
+        "graph_edges": (state or {}).get("graph_edges") or [],
+        "skill_events": (state or {}).get("skill_events") or [],
         "key_states": (state or {}).get("key_states") or {},
         "id_to_key": (state or {}).get("id_to_key") or {},
         "inferences": (state or {}).get("inferences") or {},
@@ -642,7 +706,16 @@ def load_ledger_state(ledger_path, snapshot_path):
     snapshot = None
     if any(e.get("type") == LEDGER_EVENT_SNAPSHOT for e in events):
         snapshot = read_snapshot(snapshot_path)
-    return resolve_state(events, snapshot=snapshot)
+    state = resolve_state(events, snapshot=snapshot)
+    if _info.get("bad_lines") or _info.get("truncated"):
+        # 账本残缺（补修 H3 复查 F2）：折叠态是残缺投影，
+        # 如实标注 ledger_doubtful。这里不抛——修复/对账
+        # 路径要能读坏账才能修；下定案的消费方（受控入口
+        # 三态读、各类核对）另有 fail-closed 口径，不许静
+        # 默把残缺折叠当完整账本用。
+        state = dict(state)
+        state["ledger_doubtful"] = True
+    return state
 
 
 def compact_ledger(ledger_path, snapshot_path):
@@ -659,6 +732,13 @@ def compact_ledger(ledger_path, snapshot_path):
     ledger_path = Path(ledger_path)
     repaired = repair_ledger(ledger_path)
     events, _info = read_events(ledger_path)
+    if _info.get("bad_lines"):
+        # 坏行是解析不出的整行事件：压进快照等于静默丢事
+        # 件、还把账本截成一行无从恢复——拒绝压缩，留给
+        # 人工处置（补修 H3 复查 F2）。
+        raise ValueError(
+            "账本有坏行（%s 行），拒绝压缩" % _info.get("bad_lines")
+        )
     state = resolve_state(events)
     seq_max = state["seq_max"]
     write_snapshot(snapshot_path, state, seq_max)
