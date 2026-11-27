@@ -373,3 +373,45 @@ def test_protection_evidence_pending_count_in_record(store, tmp_path):
     # 注意级：不冻结
     assert rec["status"] == "attention", rec
     assert rec["controlled_entry"]["frozen"] is False
+
+
+# ---------- 待问损坏＋重建失败 → 冻结危险写（故障注入补测） ----------
+
+def test_pending_corrupt_and_rebuild_failure_freezes(store, monkeypatch):
+    """待问文件损坏且重建没跑成 → pending_questions_unrecovered
+    冻结级残余 → 恢复健康度 frozen、受控入口执行被拒
+    entry_frozen、影子照常（H6 判据「待问损坏且重建没跑成」
+    的直接故障注入；此前只有「损坏但重建成功→attention」
+    与其他冻结来源的用例，这条冻结路径没被直接打过）。"""
+    mid = _add_user(store, "用户每天定投五块钱买基金")
+    # 待问文件损坏：新实例构造时保全原件并记 load_error。
+    pq_path = store.memory_dir / "pending_questions.json"
+    pq_path.write_text("garbage!!!", encoding="utf-8")
+    store2 = _restart(store)
+    assert store2.pending_questions.recovery_report() is not None
+    # 故障注入：重建这一步抛错（模拟重建没跑成）。
+    def _boom(self):
+        raise RuntimeError("待问重建失败（测试注入的故障）。")
+    monkeypatch.setattr(SQLiteStore, "rebuild_pending_questions", _boom)
+    report = store2.startup_recovery()
+    assert report["pending"] is not None
+    assert report["pending_rebuilt"] is None
+    rec = store2.recovery_health()
+    assert rec["status"] == "frozen", rec
+    kinds = {r["kind"]: r for r in rec["residuals"]}
+    assert kinds["pending_questions_unrecovered"]["freezing"] is True
+    assert rec["controlled_entry"]["frozen"] is True
+    assert rec["controlled_entry"]["frozen_reason"] == "recovery_unclean"
+    # 危险写被拒：执行路 entry_frozen。
+    _enable(store2)
+    out = store2.submit_controlled_proposal(_prop(
+        memory_id=mid, session=_session(store2),
+        expected_version=store2.controlled_entry_version(mid),
+    ))
+    assert out["status"] == "refused", out
+    assert out["reason"] == "entry_frozen"
+    assert out["detail"]["frozen_reason"] == "recovery_unclean"
+    # 影子照常出回执。
+    store2.controlled_entry_execution_enabled = False
+    shadow = store2.submit_controlled_proposal(_prop(memory_id=mid))
+    assert shadow["status"] == "shadow"
