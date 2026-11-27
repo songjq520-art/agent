@@ -122,7 +122,12 @@ def test_detect_plan_change_rejects_non_values():
 # ---------- 实测原例：成都改重庆，当轮落账 ----------
 
 
-def test_sameturn_trip_correction_lands(store):
+def test_sameturn_trip_correction_lands(store, monkeypatch):
+    # 无判官钥匙时 _judge_degraded 为 True，G7 锁 #2 会把程序层
+    # 纠正挂成 pending_question、本条断言的「当轮落账」无从谈起。
+    # 本测试作用域内打桩成不降级（同 G1 口径，不污染全套、
+    # 不在全套层面塞假钥匙）；降级期挂起行为由专门用例覆盖。
+    monkeypatch.setattr(SQLiteStore, "_judge_degraded", lambda self: False)
     store.add_memory_text(TRIP_OLD, source="user")
     receipt = _turn(store, REAL_FIX, "sameturn-trip-1")
     corr = receipt.get("correction") or {}
@@ -136,8 +141,11 @@ def test_sameturn_trip_correction_lands(store):
     assert _live_texts(store) == [TRIP_NEW], rows
 
 
-def test_sameturn_classic_correction_verified_landed(store):
+def test_sameturn_classic_correction_verified_landed(store, monkeypatch):
     # 经典纠正（不对+整句新说法）照常落账，且带复核标记。
+    # 同上：本测试作用域内打桩 _judge_degraded=False，
+    # 免无钥匙环境把纠正挂成 pending_question。
+    monkeypatch.setattr(SQLiteStore, "_judge_degraded", lambda self: False)
     store.add_memory_text(TRIP_OLD, source="user")
     receipt = _turn(store, "不对，我下个月去重庆出差，住春熙路附近",
                     "sameturn-classic-1")

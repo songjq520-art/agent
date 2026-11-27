@@ -137,7 +137,11 @@ def test_diff_added_and_changed(store):
     assert diff["ledger_seq_now"] > diff["ledger_seq_then"]
 
 
-def test_diff_state_transitions(store):
+def test_diff_state_transitions(store, monkeypatch):
+    # 本条要靠 correct_memory 真落账产生顶替迁移；无判官钥匙时
+    # _judge_degraded 为 True、纠正会被挂成 pending_question。
+    # 本测试作用域内打桩成不降级（同 G1 口径，不污染全套）。
+    monkeypatch.setattr(SQLiteStore, "_judge_degraded", lambda self: False)
     a = _add_user(store, "BOOS 打算去成都玩")
     b = _add_user(store, "BOOS 的书房里有一台打印机")
     c = _add_user(store, "BOOS 养了一只猫")
