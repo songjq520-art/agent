@@ -15,6 +15,10 @@
 requests>=2.31
 pytest>=8.0
 
+# PyYAML：解析 SKILL.md 的 YAML frontmatter（skills/skill_format.py 用，
+# Agent Skills 公开规范的技能格式，2026-11-26 加）。
+pyyaml>=6.0
+
 # tzdata：Windows 的 Python 没有系统时区库，zoneinfo 要靠它才能认
 # "Asia/Shanghai" 这类时区（2026-11-16 笔记本跑套件时 13 个文件
 # 收集报错 ZoneInfoNotFoundError，装了 tzdata 才过）。Linux/macOS
