@@ -95,7 +95,10 @@ class SkillRegistry:
             )
         metadata, body = load_skill_md(entry.path / SKILL_FILE_NAME)
         resources = sorted(
-            str(item.relative_to(entry.path))
+            # 资源清单是给外部看的相对路径表示，统一 POSIX 写法：
+            # Windows 上 str(Path) 会给出反斜杠（如 scripts\run.py），
+            # 与 Agent Skills 规范及调用方预期不一致，故用 as_posix()。
+            item.relative_to(entry.path).as_posix()
             for item in entry.path.rglob("*")
             if item.is_file()
             and item.name != SKILL_FILE_NAME
