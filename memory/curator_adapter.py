@@ -223,13 +223,22 @@ def correction_evidence(store, receipt, *, turn_id):
     "ledger-seq:<seq>"（映射表第五节）。折叠里查不到这条关联
     时如实留 None，她侧判 incomplete，朝安全侧倒。
 
-    回查口径（贵妃互查 F5，2026-11-27 修）：旧行是否真被顶
-    替、新行是否真活，必须回到同一份稳定快照里按真实状态确
-    认——旧行在快照里 state 须为 superseded 且非活行，新行在
-    同一快照里须为活行；账本折叠与快照任一对不上（如折叠说
-    已顶替、快照里旧行还活着），old_row 如实报未顶替、她侧
-    判 incomplete，不许只凭折叠合成 superseded=True 报完成。
-    账本读或快照读失败时对应证据留空，同样朝 incomplete 倒。
+    回查口径（贵妃互查 F5，2026-11-27 修；残留同水位绑定同
+    日补）：旧行是否真被顶替、新行是否真活，必须回到同一份
+    稳定快照里按真实状态确认——旧行在快照里 state 须为
+    superseded 且非活行，新行在同一快照里须为活行；账本折叠
+    与快照任一对不上（如折叠说已顶替、快照里旧行还活着），
+    old_row 如实报未顶替、她侧判 incomplete，不许只凭折叠合
+    成 superseded=True 报完成。账本读或快照读失败时对应证据
+    留空，同样朝 incomplete 倒。
+
+    事件同源绑定（F5 残留）：顶替事件是另读一次 ledger_state
+    拿的，它的 seq 必须落在快照自带的账本水位（快照
+    ledger_seq＝冻结时刻 seq_max）之内——水位之后的事件属
+    于快照之后的未来时刻，证明不了「快照里这两行状态就是
+    这条事件造成的」，不许拼进本份证据。快照没带可用水位
+    （宿主不提供同刻水位）时无从绑定，事件一律不认、降格
+    incomplete，不许跨时刻拼装。
     """
     receipt = receipt or {}
     new_id = receipt.get("memory_id")
@@ -244,35 +253,56 @@ def correction_evidence(store, receipt, *, turn_id):
     new_row = {}
     if not new_id:
         return evidence_receipt, old_row, new_row
-    # 同一份稳定快照：新旧两行的真实状态同源同刻读齐。
+    # 同一份稳定快照：新旧两行的真实状态＋账本水位同源同刻读齐。
     try:
         snap = store.take_stable_snapshot()
         rows = snap.get("rows") or {}
+        watermark = snap.get("ledger_seq")
     except Exception:
         rows = {}
-    event_id = None
-    old_id = None
+        watermark = None
+    if not isinstance(watermark, int) or isinstance(watermark, bool):
+        watermark = None
     try:
         by_id = (store.ledger_state() or {}).get("by_id") or {}
     except Exception:
         by_id = {}
+    candidates = []
     for mid, folded in by_id.items():
         if (isinstance(folded, dict)
                 and folded.get("state") == "superseded"
                 and folded.get("superseded_by") == new_id):
+            candidates.append((mid, folded.get("seq")))
+    # 候选事件逐条验：seq 须为整数、落在快照水位内，且它点名
+    # 的新旧两行与快照里两行状态一致（旧行已顶替非活、新行
+    # 活）。全过才算同源同刻的证据；一条都不过 → 未确认。
+    old_id = None
+    event_id = None
+    confirmed = False
+    snap_new = rows.get(new_id)
+    for mid, seq in candidates:
+        if old_id is None:
             old_id = mid
-            if folded.get("seq") is not None:
-                event_id = "ledger-seq:%s" % folded["seq"]
-            break
+        if watermark is None:
+            continue
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            continue
+        if seq > watermark:
+            continue
+        snap_old = rows.get(mid)
+        if not (isinstance(snap_old, dict)
+                and snap_old.get("state") == "superseded"
+                and not snap_old.get("live")):
+            continue
+        if not (isinstance(snap_new, dict) and snap_new.get("live")):
+            continue
+        old_id = mid
+        event_id = "ledger-seq:%s" % seq
+        confirmed = True
+        break
     evidence_receipt["old_id"] = old_id
     evidence_receipt["event_id"] = event_id
     if old_id is not None:
-        snap_old = rows.get(old_id)
-        confirmed = (
-            isinstance(snap_old, dict)
-            and snap_old.get("state") == "superseded"
-            and not snap_old.get("live")
-        )
         old_row = {
             "id": old_id,
             "superseded": bool(confirmed),

@@ -16,7 +16,9 @@
 #      核对抛错一律 False；真库投影被绕账本篡改 → False。
 #   F5 纠正证据回查同一份快照：账本折叠说已顶替、快照里旧行
 #      还活着 → old_row 如实报未顶替、correction incomplete；
-#      两边一致才 complete。
+#      两边一致才 complete。残留补（贵妃复查 test_09）：顶替
+#      事件 seq 须落在快照 ledger_seq 水位内，水位之后的未来
+#      事件、点名配对与快照两行状态对不上的事件一律不认。
 #   F4 影子批次绑真实快照：未登记的 snapshot_id 直接拒绝；
 #      落盘 id 恒为组装所用快照的真实 id。
 #   F3 影子人口只算活行：默认人口排除死行；显式点名死行报错。
@@ -71,6 +73,9 @@ class FakeStore:
         self._ledger = ledger or {"by_id": {}}
         self.submissions = []
         self._snapshots = {}
+        # 快照账本水位：None＝按折叠最大 seq 现算（与真宿主快照
+        # ledger_seq 同口径）；钉成别的值可构造跨水位分叉场景。
+        self.snapshot_watermark = None
 
     def list_pending_questions(self):
         if self.pending_error:
@@ -78,7 +83,15 @@ class FakeStore:
         return []
 
     def take_stable_snapshot(self):
+        watermark = self.snapshot_watermark
+        if watermark is None:
+            seqs = [e.get("seq")
+                    for e in self._ledger.get("by_id", {}).values()
+                    if isinstance(e, dict)
+                    and isinstance(e.get("seq"), int)]
+            watermark = max(seqs) if seqs else 0
         snap = {"snapshot_id": "actual-h4-snapshot",
+                "ledger_seq": watermark,
                 "rows": copy.deepcopy(self.rows)}
         self._snapshots[snap["snapshot_id"]] = copy.deepcopy(snap)
         return snap
@@ -268,6 +281,47 @@ def test_f5_consistent_snapshot_and_ledger_complete():
     assert old["superseded_by"] == "new"
     result = _her_review.correction_receipt(ev, old, new, turn_id="turn")
     assert result["complete"] is True
+
+
+def test_f5_future_event_beyond_snapshot_watermark_incomplete():
+    # 贵妃复查残留（她的 test_09）：快照水位 7、快照里新旧两行
+    # 状态都对，但唯一点名这对新旧行的顶替事件 seq=700 在水位
+    # 之后——未来事件证明不了快照时刻的顶替，不许拼出 complete。
+    store = _f5_store("superseded", False)
+    store.snapshot_watermark = 7
+    store._ledger = {"by_id": {
+        "old": {"state": "superseded", "superseded_by": "new", "seq": 700},
+    }}
+    ev, old, new = _adapter.correction_evidence(
+        store, {"status": "updated", "memory_id": "new"}, turn_id="turn")
+    assert ev["event_id"] is None
+    assert old["superseded"] is False
+    result = _her_review.correction_receipt(ev, old, new, turn_id="turn")
+    assert result["complete"] is False
+
+
+def test_f5_event_target_mismatch_incomplete():
+    # 事件关联不对（一）：折叠事件把旧行顶替给了别的行，不是
+    # 回执的新行——没有点名本对新旧行的事件，证据不成立。
+    store = _f5_store("superseded", False)
+    store._ledger = {"by_id": {
+        "old": {"state": "superseded", "superseded_by": "other", "seq": 7},
+    }}
+    ev, old, new = _adapter.correction_evidence(
+        store, {"status": "updated", "memory_id": "new"}, turn_id="turn")
+    assert ev["old_id"] is None
+    result = _her_review.correction_receipt(ev, old, new, turn_id="turn")
+    assert result["complete"] is False
+    # 事件关联不对（二）：事件在水位内、点名也对，但快照里新
+    # 行不是活行——事件点名的配对与快照两行状态不一致，不认。
+    store = _f5_store("superseded", False)
+    store.rows["new"] = _row("new", False, state="deleted")
+    ev, old, new = _adapter.correction_evidence(
+        store, {"status": "updated", "memory_id": "new"}, turn_id="turn")
+    assert ev["event_id"] is None
+    assert old["superseded"] is False
+    result = _her_review.correction_receipt(ev, old, new, turn_id="turn")
+    assert result["complete"] is False
 
 
 # ---------- F4：影子批次绑真实快照 ----------
