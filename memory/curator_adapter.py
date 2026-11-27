@@ -156,6 +156,7 @@ def receipt_summary(receipt):
     receipt = receipt or {}
     status = receipt.get("status")
     return {
+        "status": status,
         "executed": status == "executed" and receipt.get("ok") is True,
         "shadow": status == "shadow",
         "refused": status == "refused",
