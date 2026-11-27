@@ -19,18 +19,20 @@
 # test_r1a_* 同口径、互为印证（那份是施工方修复自证，本份是
 # 整包验收侧的独立复跑）。
 #
-# 【同类残留：仍成立，strict xfail 挂账】read_events 的 _info 只报
+# 【同类残留：曾成立，2026-11-27 已修】read_events 的 _info 只报
 # 坏行与截断，不报「整行事件丢失」——把账本中间一整行事件删掉，
 # 其余行全部合法、seq 出现缺口时：ledger.verify_ledger 明确判
 # ok=False（gaps=[被删 seq]，其 docstring 定性「某几行事件丢了…
-# 这种事不该发生」），但 verify_backup 从不查 seq 连续性，照样
-# 拿残缺事件集合建备份并报 ok=True「备份演练通过」；
+# 这种事不该发生」），但当时的 verify_backup 从不查 seq 连续
+# 性，照样拿残缺事件集合建备份并报 ok=True「备份演练通过」；
 # supersede_events_since 同样静默少报一条、不抛存疑。
 # 即「账本损坏时备份演练假报通过」这一缺陷类未被 F2-R1 修复
-# 完全覆盖：修复只堵了坏行/截断两种损坏形态，整行丢失形态仍漏。
-# 下方两条 xfail(strict=True) 断言正确期望（损坏时应判败/应抛
-# 存疑）；机制一旦修好，XPASS 会让全套变红逼复核，不许改断言
-# 迁就现状。修法等 BOOS 在整包总结时拍板，本文件只复现不修。
+# 完全覆盖：修复只堵了坏行/截断两种损坏形态，整行丢失形态曾
+# 漏。本文件初版以两条 xfail(strict=True) 挂账；BOOS 在整包
+# 总结时拍板修进本包，2026-11-27 已修：verify_backup 在建备份
+# 前另走 verify_ledger 查 seq 连续性、有缺口判败；
+# supersede_events_since 对窗口内缺口抛 RuntimeError 存疑。
+# 下方两条已转正常测试，断言与挂账时逐字未动。
 #
 # 全程真路径：真 SQLiteStore 构造器、真适配器、真账本函数；
 # 故障只注入在真账本文件上（尾加坏行、末行截半、整行删除）。
@@ -113,7 +115,7 @@ def test_verify_backup_truncated_fails(store):
     assert "不完整" in (result.get("detail") or ""), result
 
 
-# ---------- 同类残留：整行丢失（seq 缺口）仍假报，strict xfail ----------
+# ---------- 同类残留：整行丢失（seq 缺口），2026-11-27 已修 ----------
 
 def _delete_middle_line(store):
     lines = _ledger_lines(store)
@@ -127,12 +129,6 @@ def _delete_middle_line(store):
     assert info["bad_lines"] == 0 and info["truncated"] is False, info
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="F2-R1 残留：账本整行丢失（seq 缺口）时 verify_backup 仍报 "
-    "ok=True 假报通过——它只查 bad_lines/truncated、从不查 seq "
-    "连续性。修法待 BOOS 拍板（整包验收第三批定向复现，2026-11-27）。",
-)
 def test_verify_backup_seq_gap_must_fail(store):
     _seed_three(store)
     _delete_middle_line(store)
@@ -140,12 +136,6 @@ def test_verify_backup_seq_gap_must_fail(store):
     assert result.get("ok") is False, result
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="F2-R1 残留：账本整行丢失（seq 缺口）吞掉一笔取代事件时，"
-    "supersede_events_since 静默少报、不抛 RuntimeError 存疑。"
-    "修法待 BOOS 拍板（整包验收第三批定向复现，2026-11-27）。",
-)
 def test_supersede_events_seq_gap_must_raise(store):
     ids = _seed_three(store)
     for mid in ids[:2]:

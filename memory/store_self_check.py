@@ -44,7 +44,9 @@ class _StoreSelfCheckAdapter:
         事件没时间戳的跳过（定不了是哪天的，不猜）。
 
         账本读失败或不完整（坏行/截断）时抛 RuntimeError 把存疑
-        传出去（H3 补修轮 2 F2-R1）：这份结果要进自检报告的
+        传出去（H3 补修轮 2 F2-R1）；窗口内有 seq 缺口（整行
+        丢失）同样抛——丢的那条没法证明不在窗口内（F2-R2 残留，
+        2026-11-27）：这份结果要进自检报告的
         replaced_last_month——残缺结果冒充完整、读失败冒充
         「最近没有取代事件」，都会让报告看着健康实则没查。
         自检框架的承接方式就是异常：run_self_check 不吞适配器
@@ -76,6 +78,43 @@ class _StoreSelfCheckAdapter:
         # 会往前推 1 微秒），那样 days=0 也会把刚发生的事件算进来。
         # 同一条时间线比先后才不会跑反（2026-11-19 全套 flaky 的根子）。
         cutoff = _now_dt().timestamp() - days * 86400.0
+        # seq 缺口存疑（F2-R2 残留，2026-11-27）：_info 只报坏行
+        # 和截断，整行丢失它看不见——被删的若恰是窗口内一笔取代
+        # 事件，结果就静默少一条、冒充完整。缺口紧挨着的前/后
+        # 一条事件只要有一条落在窗口内，就没法证明丢的那条在
+        # 窗口外（事件时间戳随 seq 单调），按存疑抛出去，口径
+        # 同上面的坏行/截断；前后邻居都在窗口外时，丢的那条
+        # 夹在两条窗口外事件之间，才确证与本窗口无关。
+        _seq_ts = sorted(
+            (
+                (event.get("seq"), _parse_created_at(event.get("ts")))
+                for event in events or []
+                if isinstance((event or {}).get("seq"), int)
+            ),
+            key=lambda pair: pair[0],
+        )
+        if _seq_ts:
+            _present = {seq for seq, _when in _seq_ts}
+            for _gap in range(1, _seq_ts[-1][0] + 1):
+                if _gap in _present:
+                    continue
+                _neighbors = []
+                _before = [w for s, w in _seq_ts if s < _gap]
+                _after = [w for s, w in _seq_ts if s > _gap]
+                if _before:
+                    _neighbors.append(_before[-1])
+                if _after:
+                    _neighbors.append(_after[0])
+                if any(
+                    w is None or w.timestamp() >= cutoff
+                    for w in _neighbors
+                ):
+                    raise RuntimeError(
+                        "账本序号有缺口（第 %d 号事件整行丢了），"
+                        "丢的事件没法证明不在最近 %s 天内，取代"
+                        "事件可能少报，不冒充完整结果。"
+                        % (_gap, days)
+                    )
         out = []
         for event in events or []:
             if (event or {}).get("type") != _ledger.LEDGER_EVENT_SUPERSEDE:
@@ -100,7 +139,9 @@ class _StoreSelfCheckAdapter:
         演练完临时文件就删，不留备份。返回 {"ok", "detail"}。
         源账本不完整（坏行/截断）时直接 ok=False：读出的事件集合
         是残的，拿残账本建的备份再自洽，也证明不了源账本完整
-        （H3 补修轮 2 F2-R1）。"""
+        （H3 补修轮 2 F2-R1）。整行丢失（seq 缺口）同理判败：
+        read_events 的 _info 报不出缺口，另走 verify_ledger 查
+        序号连续性（F2-R2 残留，2026-11-27）。"""
         try:
             items = self._store.get_all(include_sensitive=True) or []
             events, _info = _ledger.read_events(self._store.ledger_path)
@@ -115,6 +156,17 @@ class _StoreSelfCheckAdapter:
                     "detail": "备份演练没通过：源账本不完整（%s），"
                     "读出的事件集合不全，不拿残缺账本建备份。"
                     % "、".join(parts),
+                }
+            _verdict = _ledger.verify_ledger(self._store.ledger_path)
+            if _verdict.get("gaps"):
+                return {
+                    "ok": False,
+                    "detail": "备份演练没通过：源账本不完整（序号"
+                    "缺口：第 %s 号事件整行丢了），读出的事件集合"
+                    "不全，不拿残缺账本建备份。"
+                    % "、".join(
+                        str(g) for g in _verdict["gaps"]
+                    ),
                 }
             backup = _backup.build_backup(items, events)
             with tempfile.TemporaryDirectory() as tmp:

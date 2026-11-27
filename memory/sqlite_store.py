@@ -2618,46 +2618,96 @@ class SQLiteStore:
         meta["seen_sessions"] = _decay._dump_seen_list(sessions)
         meta["last_used_at"] = _now_iso()
         promoted = False
-        # 授权硬判：转述未核实声称（auth_claim=relayed_unverified）
-        # 不许走出现次数晋升路——重复出现再多次也还是未核实，
-        # 等 BOOS 在待问里裁过（改成 owner_confirmed）才解禁。
-        if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and meta.get("auth_claim") != _auth_guard.AUTH_CLAIM_RELAYED and _decay.should_promote(
-            dates, sessions,
-            # 2026-11-23 Phase 2 #2 根因：is_core 不能按“已确认”认——
-            # save_turn 存的用户亲口说的事实都是已确认的（含一次性经历），
-            # 按 _is_core_memory（confirmed 或有槽位）认，会把已确认的
-            # 一次性经历也当核心，3 天 3 次兜底永远走不到。核心记忆本来
-            # 就是稳定的（见 should_promote），这里 decay_kind 已保证
-            # 不是 stable，is_core 恒为 False。
-            is_core=False,
-            tone=meta.get("tone"),
-        ):
-            # R-4（2026-11-24）：账本先行——PROMOTE 写不进去就
-            # 不晋升，SQLite 不许跑到账本前面。以前写失败只警告、
-            # 照样把 decay_kind 改成 stable，账本里没有这笔晋升，
-            # 两边静默分叉（对账只补缺失行、不修已有行）。出现
-            # 记录（seen_*）照常写回，下次出现时再试晋升。
-            promoted_meta = dict(meta)
-            promoted_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+        # 写回前复核合并（F-G4-1，2026-11-27）：传进来的 metadata
+        # 可能是调用方早先读下的快照——后台整理线程在
+        # _organize_turn_memories 开头读行、中间隔着模型调用才走到
+        # 这里，主线程在这段时间里可能已经记了新的出现、甚至已经
+        # 把这行晋升了。按快照整行写回会把那些新事实整体打回
+        # （账本里 PROMOTE 还在、投影却退回去，两边分叉）。所以
+        # 真正落盘前在锁内复读现行行：以现行 meta 为底（快照里有、
+        # 现行没有的键补进来），出现集合取并集，状态由下面按合并
+        # 后的事实重算；现行已晋升的把 decay_kind 对齐到 stable，
+        # 绝不打回。复读失败就按原样走（不让复核本身挡住记账）。
+        with self._lock:
             try:
-                _ledger.append_event(
-                    self.ledger_path,
-                    {"type": _ledger.LEDGER_EVENT_PROMOTE,
-                     "memory_id": memory_id, "key": memory_id,
-                     "text": text,
-                     "meta": promoted_meta},
-                    lock=self._ledger_lock,
-                )
+                _cur = self._conn.execute(
+                    "SELECT metadata_json FROM memories"
+                    " WHERE id=?",
+                    (memory_id,),
+                ).fetchone()
             except Exception:
-                logger.warning("晋升记账失败：本次不晋升（账本为准）。", exc_info=True)
-            else:
-                meta["decay_kind"] = _decay.DECAY_KIND_STABLE
-                promoted = True
-        self._conn.execute(
-            "UPDATE memories SET metadata_json=?, decay_kind=? WHERE id=?",
-            (json.dumps(meta, ensure_ascii=False), meta.get("decay_kind"), memory_id),
-        )
-        self._conn.commit()
+                _cur = None
+            if _cur is not None:
+                try:
+                    _cur_meta = json.loads(_cur[0] or "{}")
+                except Exception:
+                    _cur_meta = None
+                if isinstance(_cur_meta, dict):
+                    for _d in _decay._parse_seen_list(
+                        _cur_meta.get("seen_dates")
+                    ):
+                        if _d not in dates:
+                            dates.append(_d)
+                    for _s in _decay._parse_seen_list(
+                        _cur_meta.get("seen_sessions")
+                    ):
+                        if _s not in sessions:
+                            sessions.append(_s)
+                    _merged = dict(_cur_meta)
+                    for _k, _v in meta.items():
+                        if _k not in _merged:
+                            _merged[_k] = _v
+                    meta = _merged
+                    meta["seen_dates"] = _decay._dump_seen_list(dates)
+                    meta["seen_sessions"] = _decay._dump_seen_list(
+                        sessions
+                    )
+                    meta["last_used_at"] = _now_iso()
+                    if (
+                        _cur_meta.get("decay_kind")
+                        == _decay.DECAY_KIND_STABLE
+                    ):
+                        meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+            # 授权硬判：转述未核实声称（auth_claim=relayed_unverified）
+            # 不许走出现次数晋升路——重复出现再多次也还是未核实，
+            # 等 BOOS 在待问里裁过（改成 owner_confirmed）才解禁。
+            if meta.get("decay_kind") != _decay.DECAY_KIND_STABLE and meta.get("auth_claim") != _auth_guard.AUTH_CLAIM_RELAYED and _decay.should_promote(
+                dates, sessions,
+                # 2026-11-23 Phase 2 #2 根因：is_core 不能按“已确认”认——
+                # save_turn 存的用户亲口说的事实都是已确认的（含一次性经历），
+                # 按 _is_core_memory（confirmed 或有槽位）认，会把已确认的
+                # 一次性经历也当核心，3 天 3 次兜底永远走不到。核心记忆本来
+                # 就是稳定的（见 should_promote），这里 decay_kind 已保证
+                # 不是 stable，is_core 恒为 False。
+                is_core=False,
+                tone=meta.get("tone"),
+            ):
+                # R-4（2026-11-24）：账本先行——PROMOTE 写不进去就
+                # 不晋升，SQLite 不许跑到账本前面。以前写失败只警告、
+                # 照样把 decay_kind 改成 stable，账本里没有这笔晋升，
+                # 两边静默分叉（对账只补缺失行、不修已有行）。出现
+                # 记录（seen_*）照常写回，下次出现时再试晋升。
+                promoted_meta = dict(meta)
+                promoted_meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                try:
+                    _ledger.append_event(
+                        self.ledger_path,
+                        {"type": _ledger.LEDGER_EVENT_PROMOTE,
+                         "memory_id": memory_id, "key": memory_id,
+                         "text": text,
+                         "meta": promoted_meta},
+                        lock=self._ledger_lock,
+                    )
+                except Exception:
+                    logger.warning("晋升记账失败：本次不晋升（账本为准）。", exc_info=True)
+                else:
+                    meta["decay_kind"] = _decay.DECAY_KIND_STABLE
+                    promoted = True
+            self._conn.execute(
+                "UPDATE memories SET metadata_json=?, decay_kind=? WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False), meta.get("decay_kind"), memory_id),
+            )
+            self._conn.commit()
         return promoted
 
     # 晋升聚合的相似门槛（2026-11-24）：余弦和内容二字组都要够高
