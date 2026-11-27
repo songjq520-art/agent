@@ -2188,13 +2188,20 @@ class MemoryMaintenanceScheduler:
       PROBE_SECONDS 可调），网络一恢复立刻补跑完整自检。
     自检走 store.run_self_check（SQLite 后端内部已接整理路由判官，
     R-6）；衰减走 store.sweep_decay。store 没这方法就跳过该任务。
+    - 影子观察窗（G4 生产接线，2026-11-27）：shadow_runner 注入
+      时多一项每日任务——调 memory/curator_shadow_runner 在真
+      服务里跑当天那批影子观察（只观察、execution_allowed 恒
+      False）；窗口台账与口径作废校验（G3-U4）都在跑批器里，
+      这里只管节奏（默认 24 小时一批）与状态键。没注入就没有
+      这项任务，run_due 返回值也不多出 shadow 键。
     """
 
     def __init__(self, store, state_path, decay_interval_seconds=24 * 3600,
                  self_check_interval_seconds=7 * 24 * 3600,
                  tick_seconds=3600, now_fn=None, network_probe=None,
                  probe_interval_seconds=900, backup_runner=None,
-                 backup_hour=3, backup_minute=51, on_network_recovered=None):
+                 backup_hour=3, backup_minute=51, on_network_recovered=None,
+                 shadow_runner=None, shadow_interval_seconds=24 * 3600):
         self._store = store
         self._state_path = Path(state_path)
         self._decay_interval = float(decay_interval_seconds)
@@ -2220,6 +2227,13 @@ class MemoryMaintenanceScheduler:
         # 全身体检并入（2026-11-24）：判官自检断网挂起后、网络恢复
         # 补跑完成时通知一声；None = 不通知（原行为）。
         self._on_network_recovered = on_network_recovered
+        # 影子观察窗（G4 生产接线）：shadow_runner 由
+        # start_memory_maintenance 注入（内部走
+        # memory/curator_shadow_runner），没注入就是没这项任务
+        # ——与 backup_runner 同一套路，run_due 返回值不多出
+        # shadow 键（旧测试按原样断言）。
+        self._shadow_runner = shadow_runner
+        self._shadow_interval = float(shadow_interval_seconds)
 
     def _load_state(self):
         try:
@@ -2252,9 +2266,12 @@ class MemoryMaintenanceScheduler:
         ran = {"decay": False, "self_check": False}
         if self._backup_runner is not None:
             ran["backup"] = False
+        if self._shadow_runner is not None:
+            ran["shadow"] = False
         self._run_decay_due(state, now, ran)
         self._run_self_check_due(state, now, ran)
         self._run_backup_due(state, now, ran)
+        self._run_shadow_due(state, now, ran)
         self._pending_known = bool(state.get("self_check_pending")) or bool(
             state.get("backup_pending")
         )
@@ -2499,6 +2516,37 @@ class MemoryMaintenanceScheduler:
             state["backup_pending"] = True
             state.setdefault("backup_pending_since", now)
 
+    def _run_shadow_due(self, state, now, ran):
+        """影子观察窗（G4 生产接线，2026-11-27）：每日一批，只
+        观察不动手——runner（memory/curator_shadow_runner）自己
+        管窗口台账、批次号与口径作废校验，这里照 decay 的套路
+        只管节奏：到期才跑、跑没跑成都记本次时间下个间隔再试、
+        异常只记日志绝不拖垮调度。runner 的摘要（status /
+        batch_id）顺手记进维护状态，窗口细账在它自己的台账里。
+        """
+        runner = self._shadow_runner
+        if runner is None:
+            return
+        key = "shadow_last_run"
+        last = state.get(key)
+        if isinstance(last, (int, float)) and now - float(last) < self._shadow_interval:
+            return
+        try:
+            result = runner() or {}
+            if isinstance(result, dict):
+                state["shadow_last_status"] = result.get("status")
+                if result.get("batch_id"):
+                    state["shadow_last_batch"] = result["batch_id"]
+            logger.info("记忆维护：影子观察批次已跑，结果 %s。", result)
+        except Exception:
+            logger.warning(
+                "记忆维护：影子观察批次跑失败，下个间隔再试。",
+                exc_info=True,
+            )
+            state["shadow_last_status"] = "error"
+        state[key] = now
+        ran["shadow"] = True
+
     def stop(self):
         self._stop.set()
 
@@ -2669,6 +2717,12 @@ def start_memory_maintenance(store):
 
         return drive_backup.run_backup(memory_dir, allow_upload=upload)
 
+    def _shadow_runner():
+        from memory import curator_shadow_runner
+
+        return curator_shadow_runner.run_daily_shadow_batch(
+            store, memory_dir)
+
     healthcheck_wakeup = _healthcheck_wakeup(store, memory_dir)
     scheduler = MemoryMaintenanceScheduler(
         store,
@@ -2687,6 +2741,10 @@ def start_memory_maintenance(store):
             "SHIER_MAINTENANCE_PROBE_SECONDS", 900
         ),
         backup_runner=_backup_runner,
+        shadow_runner=_shadow_runner,
+        shadow_interval_seconds=_maintenance_interval_value(
+            "SHIER_SHADOW_INTERVAL_HOURS", 24
+        ) * 3600,
         on_network_recovered=(
             healthcheck_wakeup.on_network_recovered
             if healthcheck_wakeup is not None
